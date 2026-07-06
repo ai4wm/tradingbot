@@ -48,6 +48,11 @@ class App:
 
         screen.condition_combo.activated.connect(self._on_condition_selected)
         screen.refresh_btn.clicked.connect(self._on_refresh)
+        # 자동재조회 간격/체크 상태 복원 (시그널 연결 전에 값부터 세팅)
+        screen.refresh_interval.setValue(int(self._settings.value("refresh_interval", 3)))
+        screen.auto_refresh.setChecked(self._settings.value("auto_refresh", "false") == "true")
+        if screen.auto_refresh.isChecked():
+            self._auto_timer.start(screen.refresh_interval.value() * 1000)
         screen.auto_refresh.toggled.connect(self._on_auto_refresh)
         screen.refresh_interval.valueChanged.connect(self._on_interval_changed)
 
@@ -105,6 +110,8 @@ class App:
 
     # --- 자동재조회: 동시호가 때 편입/이탈을 주기적으로 갱신 --------------
     def _on_auto_refresh(self, on: bool):
+        self._settings.setValue("auto_refresh", "true" if on else "false")
+        self._settings.sync()
         if on:
             self._auto_timer.start(self.screen.refresh_interval.value() * 1000)
             log.info("auto-requery ON (%ds)", self.screen.refresh_interval.value())
@@ -113,6 +120,8 @@ class App:
             log.info("auto-requery OFF")
 
     def _on_interval_changed(self, sec: int):
+        self._settings.setValue("refresh_interval", sec)
+        self._settings.sync()
         if self._auto_timer.isActive():  # 켜진 상태에서 간격 바꾸면 즉시 반영
             self._auto_timer.start(sec * 1000)
 

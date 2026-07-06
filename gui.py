@@ -25,6 +25,7 @@ BAR_COL = FIELDS.index("bar")
 BAR_ROLE = Qt.UserRole + 1  # 델리게이트에 (open, high, low, close, base, upper, lower) 전달
 
 LIMIT = 29.5  # 상한/하한 판정 임계 (KRX +-30%)
+DESC_FIRST = {"bid_qty", "rate", "price", "exp_price", "exp_rate"}  # 첫 클릭 내림차순 컬럼
 RED  = QColor("#e83030")
 BLUE = QColor("#2050d0")
 WHITE = QColor("white")
@@ -85,47 +86,28 @@ def _at_limit(d: dict) -> bool:
 
 
 class TieredProxy(QSortFilterProxyModel):
-    """매수세 정렬 모드(buy_mode):
-      ① 예상등락률=상한 & 매도잔량=0  -> 매수잔량 큰 순
-      ② 예상등락률 데이터 있음          -> 예상등락률 큰 순
-      ③ 예상등락률 데이터 없음          -> 등락률 큰 순
-    모드 off면 기본(헤더 클릭) 정렬. 오름차순 정렬 기준 key(작을수록 위)로 표현."""
+    """상한가정렬 모드(limit_mode):
+    상한(실제/예상)&매도잔량0 그룹을 항상 위로 고정하고, 그룹 안은 현재 정렬컬럼으로
+    정렬(아무 컬럼이나 헤더 클릭). 비그룹은 아래에 등락률 내림차순 고정.
+    모드 off면 전 컬럼 일반 정렬."""
 
     def __init__(self):
         super().__init__()
-        self.buy_mode = False
-
-    def _key(self, src_row: int):
-        m = self.sourceModel()
-        d = m.rows[m.codes[src_row]]
-        if _at_limit(d) and d["ask_qty"] == 0:
-            return (0, -d["bid_qty"])   # 티어0: 상한(실제/예상)&매도0 -> 매수잔량 내림차순
-        if d["exp_price"] > 0:
-            return (1, -d["exp_rate"])  # 티어1: 예상등락률 내림차순
-        return (2, -d["rate"])          # 티어2: 등락률 내림차순
-
-    def _bottom_sort(self, a_in, b_in, a_key, b_key):
-        """그룹 소속(a_in/b_in)끼리만 key로 정렬, 비소속은 정렬방향 무관 항상 맨 아래."""
-        if a_in and b_in:
-            return a_key < b_key
-        if a_in != b_in:
-            desc = self.sortOrder() == Qt.DescendingOrder
-            return desc if not a_in else (not desc)  # 비소속을 화면 맨 아래로
-        return False
+        self.limit_mode = False
 
     def lessThan(self, left, right):
-        if self.buy_mode:
-            return self._key(left.row()) < self._key(right.row())
-        m = self.sourceModel()
-        a = m.rows[m.codes[left.row()]]
-        b = m.rows[m.codes[right.row()]]
-        col = left.column()
-        if col == FIELDS.index("time"):     # 상한가진입시간: 시간 있는(상한가) 것만
-            return self._bottom_sort(bool(a["time"]), bool(b["time"]), a["time"], b["time"])
-        if col == FIELDS.index("bid_qty"):  # 매수잔량: 상한(실제/예상)&매도0 종목만
+        if self.limit_mode:
+            m = self.sourceModel()
+            a = m.rows[m.codes[left.row()]]
+            b = m.rows[m.codes[right.row()]]
             ga = _at_limit(a) and a["ask_qty"] == 0
             gb = _at_limit(b) and b["ask_qty"] == 0
-            return self._bottom_sort(ga, gb, a["bid_qty"], b["bid_qty"])
+            desc = self.sortOrder() == Qt.DescendingOrder
+            if ga != gb:  # 비그룹은 정렬방향 무관 항상 맨 아래
+                return desc if not ga else (not desc)
+            if not ga:    # 비그룹끼리: 등락률 내림차순 고정(방향 무관)
+                return a["rate"] < b["rate"] if desc else a["rate"] > b["rate"]
+            # 그룹끼리: 현재 정렬컬럼으로 일반 비교
         return super().lessThan(left, right)
 
 
@@ -278,11 +260,15 @@ class ConditionScreen(QWidget):
         self.refresh_interval.setRange(2, 30)  # 2초 미만은 유량초과 위험
         self.refresh_interval.setValue(3)
         self.refresh_interval.setSuffix("초")
-        self.refresh_interval.setFixedWidth(72)
+        self.refresh_interval.setFixedWidth(90)
+        # 화살표로 값 변경 시 텍스트가 선택돼(어두운 배경) 안 보이는 것 방지.
+        # Qt가 시그널 뒤에 선택을 다시 걸기 때문에 이벤트루프 한 틱 뒤에 해제.
+        self.refresh_interval.valueChanged.connect(
+            lambda _: QTimer.singleShot(0, self.refresh_interval.lineEdit().deselect))
         self.auto_remove = QCheckBox("이탈삭제")
         self.auto_remove.setChecked(True)
-        self.buy_sort = QCheckBox("매수세정렬")
-        self.buy_sort.setToolTip("예상상한&매도0 → 매수잔량순 / 예상등락률순 / 등락률순")
+        self.limit_sort = QCheckBox("상한가정렬")
+        self.limit_sort.setToolTip("상한(실제/예상)&매도0 종목을 위로 고정, 컬럼 클릭으로 그룹 내 정렬")
         self.count_label = QLabel("종목수: 0")
 
         top = QHBoxLayout()
@@ -291,7 +277,7 @@ class ConditionScreen(QWidget):
         top.addWidget(self.auto_refresh)
         top.addWidget(self.refresh_interval)
         top.addWidget(self.auto_remove)
-        top.addWidget(self.buy_sort)
+        top.addWidget(self.limit_sort)
         top.addStretch(1)  # 남는 공간은 오른쪽으로
         top.addWidget(self.count_label)
 
@@ -301,16 +287,21 @@ class ConditionScreen(QWidget):
         self.proxy.setSortRole(Qt.UserRole)
         self.table = QTableView()
         self.table.setModel(self.proxy)
-        self.table.setSortingEnabled(True)
-        self.table.sortByColumn(0, Qt.DescendingOrder)  # 등락률 내림차순
-        self.buy_sort.toggled.connect(self._on_buy_sort)
-        # 매수세정렬은 정렬키가 정렬컬럼(0) 밖의 값(매수잔량 등)이라 Qt 자동재정렬이
+        # 정렬 수동 제어: 첫 클릭을 내림차순(큰 값 위)부터. Qt 기본은 오름차순이라 직접 처리.
+        self.table.setSortingEnabled(False)
+        hdr0 = self.table.horizontalHeader()
+        hdr0.setSectionsClickable(True)
+        hdr0.setSortIndicatorShown(True)
+        hdr0.sectionClicked.connect(self._on_header_clicked)
+        self._sort_col, self._sort_order = 0, Qt.DescendingOrder  # 기본 등락률 내림차순
+        self.limit_sort.toggled.connect(self._on_limit_sort)
+        # 상한가정렬은 그룹 판정이 정렬컬럼 밖의 값(상한/매도잔량)이라 Qt 자동재정렬이
         # 안 걸림 -> 데이터 변경 시 직접 재정렬(디바운스로 틱마다 과다정렬 방지).
         self._resort_timer = QTimer(self)
         self._resort_timer.setSingleShot(True)
         self._resort_timer.timeout.connect(self.proxy.invalidate)
         self.model.dataChanged.connect(
-            lambda *a: self._resort_timer.start(200) if self.buy_sort.isChecked() else None)
+            lambda *a: self._resort_timer.start(200) if self.limit_sort.isChecked() else None)
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(22)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
@@ -338,6 +329,11 @@ class ConditionScreen(QWidget):
         state = self._settings.value("header")
         if state is not None:
             self.table.horizontalHeader().restoreState(state)
+            sec = self.table.horizontalHeader().sortIndicatorSection()
+            if sec >= 0:  # 마지막 정렬 컬럼/방향 복원
+                self._sort_col = sec
+                self._sort_order = self.table.horizontalHeader().sortIndicatorOrder()
+        self._apply_sort()
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.timeout.connect(self._save_layout)
@@ -373,14 +369,25 @@ class ConditionScreen(QWidget):
         code = self.model.codes[self.proxy.mapToSource(index).row()]
         QDesktopServices.openUrl(QUrl(f"https://finance.naver.com/item/board.naver?code={code}"))
 
-    def _on_buy_sort(self, on: bool):
-        self.proxy.buy_mode = on
-        if on:  # 커스텀 3티어 정렬 적용 (헤더 클릭 정렬은 잠금)
-            self.table.setSortingEnabled(False)
-            self.proxy.sort(0, Qt.AscendingOrder)
-        else:   # 기본 등락률 내림차순 복귀
-            self.table.setSortingEnabled(True)
-            self.table.sortByColumn(0, Qt.DescendingOrder)
+    def _apply_sort(self):
+        self.table.horizontalHeader().setSortIndicator(self._sort_col, self._sort_order)
+        self.proxy.sort(self._sort_col, self._sort_order)
+
+    def _on_header_clicked(self, col: int):
+        # 상한가정렬 중에도 헤더 클릭 허용: 그룹 내 정렬 기준이 바뀐다
+        if col == self._sort_col:  # 같은 컬럼 재클릭 -> 방향 토글
+            self._sort_order = (Qt.AscendingOrder if self._sort_order == Qt.DescendingOrder
+                                else Qt.DescendingOrder)
+        else:  # 새 컬럼 첫 클릭: DESC_FIRST 컬럼만 내림차순, 나머지는 오름차순부터
+            first = Qt.DescendingOrder if FIELDS[col] in DESC_FIRST else Qt.AscendingOrder
+            self._sort_col, self._sort_order = col, first
+        self._apply_sort()
+        self._save_timer.start(400)  # 정렬 상태도 기억
+
+    def _on_limit_sort(self, on: bool):
+        self.proxy.limit_mode = on
+        self.proxy.invalidate()  # 모드 전환 즉시 재정렬 (정렬컬럼/방향은 그대로)
+        self._apply_sort()
 
     # --- 웹소켓 계층 연결점 ----------------------------------------------
     def on_included(self, code: str, data: dict):

@@ -98,12 +98,18 @@ class RestClient:
             base = abs(_to_int(r.get("base_pric")))
             # 예상체결가/등락률은 여기(REST 스냅샷)서 안 채운다: 마감 후에도 마감동시호가 값이
             # 얼어붙어 계속 나오기 때문. 실시간(ws)에서 동시호가/VI 때만 들어오게 함.
+            vol = _to_int(r.get("trde_qty"))
+            # 전일거래량: ka10095엔 없지만 전일대비율(pred_trde_qty_pre=오늘/전일*100)로 역산.
+            # 실측 대조 오차 <0.01% (비율이 소수2자리 반올림이라 몇 주 오차).
+            ratio = _to_float(r.get("pred_trde_qty_pre"))
+            prev_vol = round(vol / (abs(ratio) / 100)) if ratio else 0
             out.append({
                 "code": code,
                 "name": r.get("stk_nm", ""),
                 "price": abs(_to_int(r.get("cur_prc"))),   # 부호 포함 -> abs
                 "rate": _to_float(r.get("flu_rt")),        # 등락율 (부호 유지: 색)
-                "vol": _to_int(r.get("trde_qty")),
+                "vol": vol,
+                "prev_vol": prev_vol,                      # 전일거래량 (역산)
                 "ask_qty": _to_int(r.get("pri_sel_req")),  # 최우선 매도잔량
                 "bid_qty": _to_int(r.get("pri_buy_req")),  # 최우선 매수잔량
                 "open": abs(_to_int(r.get("open_pric"))),  # 시가 (L일봉H 몸통)
