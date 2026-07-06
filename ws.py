@@ -24,8 +24,11 @@ FID = {
     "10": "price",     # 현재가 (부호 포함 -> abs)
     "12": "rate",      # 등락율
     "13": "vol",       # 누적거래량
-    "121": "ask_qty",  # 매도호가총잔량 (0D)
-    "125": "bid_qty",  # 매수호가총잔량 (0D)
+    "61": "ask_qty",   # 최우선 매도잔량 (0D 매도호가1 잔량)
+    "71": "bid_qty",   # 최우선 매수잔량 (0D 매수호가1 잔량)
+    # ⚠️ 예상체결가: 동시호가/VI 때만 실시간 수신 -> 이때만 예상 컬럼이 채워지고 평시엔 빈칸.
+    #    FID 번호(예상체결가)는 개장 동시호가에서 실제 REAL 메시지로 확인해 아래 값을 채울 것.
+    "예상체결가_FID_확인필요": "exp_price",
 }
 
 
@@ -58,17 +61,20 @@ def parse_real_item(item: dict) -> tuple[str, dict]:
         if not field:
             continue
         n = _num(raw)
-        out[field] = abs(n) if field == "price" else n
-        if field == "price":
-            out[field] = int(out[field])
-        if field in ("vol", "ask_qty", "bid_qty"):
+        if field in ("price", "exp_price"):   # 가격류: 부호 제거 + 정수
+            out[field] = int(abs(n))
+        elif field in ("vol", "ask_qty", "bid_qty"):
             out[field] = int(n)
+        else:
+            out[field] = n
     return code, out
 
 
 def parse_condition_list(data: list) -> list[tuple[str, str]]:
-    """CNSRLST data([[seq, name], ...]) -> [(seq, name)]."""
-    return [(str(row[0]), row[1]) for row in data if len(row) >= 2]
+    """CNSRLST data([[seq, name], ...]) -> [(seq, name)].
+    서버는 seq를 문자열 정렬(0,1,10,100,...,11)로 주므로 숫자로 재정렬해 영웅문 순서를 맞춘다."""
+    rows = [(str(row[0]), row[1]) for row in data if len(row) >= 2]
+    return sorted(rows, key=lambda r: int(r[0]) if r[0].isdigit() else 1 << 30)
 
 
 class WSClient:

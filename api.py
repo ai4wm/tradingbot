@@ -95,16 +95,48 @@ class RestClient:
             code = r.get("stk_cd", "")
             if not code:
                 continue
+            base = abs(_to_int(r.get("base_pric")))
+            # 예상체결가/등락률은 여기(REST 스냅샷)서 안 채운다: 마감 후에도 마감동시호가 값이
+            # 얼어붙어 계속 나오기 때문. 실시간(ws)에서 동시호가/VI 때만 들어오게 함.
             out.append({
                 "code": code,
                 "name": r.get("stk_nm", ""),
                 "price": abs(_to_int(r.get("cur_prc"))),   # 부호 포함 -> abs
                 "rate": _to_float(r.get("flu_rt")),        # 등락율 (부호 유지: 색)
                 "vol": _to_int(r.get("trde_qty")),
-                "ask_qty": _to_int(r.get("tot_sel_req")),  # 총매도잔량
-                "bid_qty": _to_int(r.get("tot_buy_req")),  # 총매수잔량
+                "ask_qty": _to_int(r.get("pri_sel_req")),  # 최우선 매도잔량
+                "bid_qty": _to_int(r.get("pri_buy_req")),  # 최우선 매수잔량
+                "open": abs(_to_int(r.get("open_pric"))),  # 시가 (L일봉H 몸통)
+                "low": abs(_to_int(r.get("low_pric"))),    # 당일 저가 (심지)
+                "high": abs(_to_int(r.get("high_pric"))),  # 당일 고가 (심지)
+                "base": base,                              # 전일종가 (L일봉H 축 중심)
+                "upper": abs(_to_int(r.get("upl_pric"))),  # 상한가 (축 오른쪽 끝)
+                "lower": abs(_to_int(r.get("lst_pric"))),  # 하한가 (축 왼쪽 끝)
             })
         return out
+
+    async def last_limit_entry(self, code: str, upper: int) -> str:
+        """상한가 마지막 진입시각. ka10080 1분봉을 최신->과거로 스캔해 종가=상한가인
+        연속 구간의 첫 봉 시각을 반환. 현재 상한가가 아니면 ''. 무너졌다 재진입하면
+        가장 최근 연속구간이 잡혀 자동으로 '마지막 진입'이 된다. 반환 'HH:MM:SS'."""
+        if not upper:
+            return ""
+        d = await self.request("ka10080", {"stk_cd": code, "tic_scope": "1", "upd_stkpc_tp": "1"},
+                               path="/api/dostk/chart")
+        bars = d.get("stk_min_pole_chart_qry", [])
+        if not bars:
+            return ""
+        today = bars[0].get("cntr_tm", "")[:8]  # 당일 봉만 (전일 가격 오매칭 방지)
+        entry = ""
+        for b in bars:  # row0=최신 -> 과거
+            t = b.get("cntr_tm", "")
+            if t[:8] != today:
+                break
+            if abs(_to_int(b.get("cur_prc"))) == upper:
+                entry = t  # 더 과거의 상한가 봉으로 계속 갱신 -> 연속구간 시작점
+            else:
+                break
+        return f"{entry[8:10]}:{entry[10:12]}:{entry[12:14]}" if len(entry) >= 14 else ""
 
     async def close(self):
         await self._client.aclose()
