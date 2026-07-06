@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-IS_MOCK = True  # 실전 전환 시 False
+IS_MOCK = False  # 실전. ⚠️ 이 화면은 조회 전용(주문 없음). 자동매매 붙일 땐 모의 키로 되돌릴 것.
 
 HOST = "https://mockapi.kiwoom.com" if IS_MOCK else "https://api.kiwoom.com"
 # 웹소켓 경로. ⚠️ 문서 확인: 포트/경로가 다르면 여기만 고치면 됨.

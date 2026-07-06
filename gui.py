@@ -52,6 +52,7 @@ class StockModel(QAbstractTableModel):
             return
         row = self.codes.index(code)
         stored = self.rows[code]
+        fields = {f: v for f, v in fields.items() if f in FIELDS}  # 모르는 키 무시
         changed = [FIELDS.index(f) for f, v in fields.items() if stored.get(f) != v]
         stored.update(fields)
         if changed:  # 바뀐 셀만 갱신

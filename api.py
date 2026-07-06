@@ -83,15 +83,28 @@ class RestClient:
         r.raise_for_status()
         return r.json()
 
-    async def stock_info(self, code: str) -> dict:
-        """ka10001 주식기본정보. 반환: gui가 쓰는 필드로 정규화.
-        ⚠️ 문서 확인: 응답 필드명(stk_nm, upname, pred_trde_qty 등)."""
-        d = await self.request("ka10001", {"stk_cd": code})
-        return {
-            "name": d.get("stk_nm", ""),
-            "sector": d.get("upname", d.get("sctr_nm", "")),
-            "prev_vol": _to_int(d.get("pred_trde_qty") or d.get("pre_trde_qty")),
-        }
+    async def watch_info(self, codes: list[str]) -> list[dict]:
+        """ka10095 관심종목정보: 여러 종목을 한 번에 조회 -> gui 필드로 정규화.
+        한 번의 호출로 현재가/등락률/거래량/매도·매수잔량을 채운다(장 마감 후에도 유효).
+        codes는 '|'로 join. 응답 리스트는 요청 순서와 무관하므로 code로 매칭할 것."""
+        if not codes:
+            return []
+        d = await self.request("ka10095", {"stk_cd": "|".join(codes)})
+        out = []
+        for r in d.get("atn_stk_infr", []):
+            code = r.get("stk_cd", "")
+            if not code:
+                continue
+            out.append({
+                "code": code,
+                "name": r.get("stk_nm", ""),
+                "price": abs(_to_int(r.get("cur_prc"))),   # 부호 포함 -> abs
+                "rate": _to_float(r.get("flu_rt")),        # 등락율 (부호 유지: 색)
+                "vol": _to_int(r.get("trde_qty")),
+                "ask_qty": _to_int(r.get("tot_sel_req")),  # 총매도잔량
+                "bid_qty": _to_int(r.get("tot_buy_req")),  # 총매수잔량
+            })
+        return out
 
     async def close(self):
         await self._client.aclose()
@@ -105,11 +118,20 @@ def _to_int(v) -> int:
         return 0
 
 
+def _to_float(v) -> float:
+    """부호/콤마 섞인 문자열 -> float(부호 유지). 빈값은 0.0."""
+    try:
+        return float(str(v).replace(",", "").replace("+", "").strip() or 0)
+    except (ValueError, TypeError):
+        return 0.0
+
+
 def _demo():
     """키 없이 도는 순수 로직 자가검증."""
     assert _to_int("+4,620") == 4620
     assert _to_int("-963") == -963
     assert _to_int("") == 0 and _to_int(None) == 0
+    assert _to_float("+2.75") == 2.75 and _to_float("-1.5") == -1.5 and _to_float("") == 0.0
     assert _parse_expires("20260706153000") > 0
     assert _parse_expires("bad") == 0.0
     print("api self-check OK")

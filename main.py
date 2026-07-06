@@ -32,7 +32,7 @@ class App:
         self.screen = screen
         self.rest = RestClient()
         self.ws = WSClient()
-        self._info_cache: dict[str, dict] = {}  # code -> ka10001 결과 (중복 조회 방지)
+        self._refresh_task = None  # 디바운스된 벌크 조회 태스크
         self._loop = asyncio.get_event_loop()
 
         self.ws.on_condition_list = self._on_condition_list
@@ -70,24 +70,30 @@ class App:
     # --- 편입/이탈 -------------------------------------------------------
     def _on_condition_event(self, code: str, is_insert: bool, time_str: str):
         if is_insert:
-            asyncio.ensure_future(self._on_insert(code, time_str))
+            # 행은 즉시 표시(종목코드 자리표시), 시세는 벌크 조회로 한꺼번에 채움.
+            self.screen.on_included(code, {"name": code, "time": time_str})
+            asyncio.ensure_future(self.ws.register_real(code))
+            self._schedule_refresh()
         else:
             self.screen.on_excluded(code)
             asyncio.ensure_future(self.ws.remove_real(code))
 
-    async def _on_insert(self, code: str, time_str: str):
-        # 이름 없이 먼저 행을 띄우고(그리드가 빈 값 허용), 시세부터 등록해 즉시 움직이게.
-        base = {"name": code, "time": time_str}
-        self.screen.on_included(code, base)
-        await self.ws.register_real(code)
-        # ka10001로 종목명/업종/전일거래량 채움 (rate limit 1req/s)
-        if code not in self._info_cache:
+    def _schedule_refresh(self):
+        """편입 이벤트 버스트를 모아 한 번의 ka10095로 조회(디바운스)."""
+        if self._refresh_task and not self._refresh_task.done():
+            return
+        self._refresh_task = asyncio.ensure_future(self._refresh_quotes())
+
+    async def _refresh_quotes(self):
+        await asyncio.sleep(0.4)  # 편입 이벤트가 몰려 들어오는 동안 코드 모으기
+        codes = list(self.screen.model.codes)
+        for i in range(0, len(codes), 100):  # ka10095 한 요청당 100종목씩
+            chunk = codes[i:i + 100]
             try:
-                self._info_cache[code] = await self.rest.stock_info(code)
+                for row in await self.rest.watch_info(chunk):
+                    self.screen.on_tick(row["code"], row)
             except Exception as e:  # noqa: BLE001
-                log.warning("stock_info %s failed: %s", code, e)
-                return
-        self.screen.on_tick(code, self._info_cache[code])
+                log.warning("watch_info failed: %s", e)
 
 
 async def _amain(screen):
