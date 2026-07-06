@@ -334,6 +334,8 @@ class ConditionScreen(QWidget):
                 self._sort_col = sec
                 self._sort_order = self.table.horizontalHeader().sortIndicatorOrder()
         self._apply_sort()
+        if self._settings.value("limit_sort", "false") == "true":  # 상한가정렬 상태 복원
+            self.limit_sort.setChecked(True)
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.timeout.connect(self._save_layout)
@@ -388,6 +390,8 @@ class ConditionScreen(QWidget):
         self.proxy.limit_mode = on
         self.proxy.invalidate()  # 모드 전환 즉시 재정렬 (정렬컬럼/방향은 그대로)
         self._apply_sort()
+        self._settings.setValue("limit_sort", "true" if on else "false")
+        self._settings.sync()
 
     # --- 웹소켓 계층 연결점 ----------------------------------------------
     def on_included(self, code: str, data: dict):
