@@ -87,6 +87,7 @@ class WSClient:
         self._active_seq = None          # 등록된 조건식 일련번호 (재등록용)
         self._reg_codes: set[str] = set()  # 실시간 등록 종목 (재등록용)
         self._connected = asyncio.Event()
+        self._seen_fids: set = set()       # 처음 본 (type,fid)만 로그 (FID 발굴용)
 
     # --- 외부 API -------------------------------------------------------
     async def run(self, token_fn):
@@ -174,9 +175,22 @@ class WSClient:
             self._handle_condition(msg)
         elif trnm == "REAL":
             for item in msg.get("data", []):
+                self._discover_fids(item)  # 처음 본 FID 로그 (개장 동시호가 때 예상체결가 FID 확인용)
                 code, fields = parse_real_item(item)
                 if code and fields and self.on_real:
                     self.on_real(code, fields)
+
+    def _discover_fids(self, item: dict):
+        """처음 보는 (type,fid)를 한 번씩 로그. 매핑여부+샘플값 포함.
+        개장 동시호가(08:50~) 때 bot.log 열면 예상체결가 등 UNMAPPED FID를 바로 찾는다."""
+        typ = item.get("type", "")
+        for fid, val in item.get("values", {}).items():
+            key = (typ, fid)
+            if key in self._seen_fids:
+                continue
+            self._seen_fids.add(key)
+            log.info("FID discover: type=%s fid=%s -> %s  sample=%r",
+                     typ, fid, FID.get(fid, "UNMAPPED"), val)
 
     def _handle_condition(self, msg: dict):
         """CNSRREQ 응답/실시간 편입·이탈. ⚠️ 문서 확인: 편입/이탈 필드명(I/D)."""
