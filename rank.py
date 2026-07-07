@@ -12,8 +12,8 @@ from PySide6.QtWidgets import (
 RED = QColor("#e83030")
 BLUE = QColor("#2050d0")
 
-COLUMNS = ["순위", "종목명", "기준시점주가", "기준등락률", "직전대비", "순위변동"]
-FIELDS  = ["rank", "name", "price", "rate", "prev_rate", "rank_chg"]
+COLUMNS = ["순위", "종목명", "변동", "기준시점주가", "기준등락률", "직전대비"]
+FIELDS  = ["rank", "name", "rank_chg", "price", "rate", "prev_rate"]
 PERIODS = [("30초", "5"), ("1분", "1"), ("10분", "2"), ("1시간", "3"), ("당일누적", "4")]
 
 
@@ -51,6 +51,8 @@ class RankModel(QAbstractTableModel):
                 return f"▲{v}" if v > 0 else f"▼{-v}" if v < 0 else ""
             return v
         if role == Qt.TextAlignmentRole:
+            if f == "rank_chg":
+                return Qt.AlignCenter
             return (Qt.AlignLeft if f == "name" else Qt.AlignRight) | Qt.AlignVCenter
         if role == Qt.ForegroundRole:
             key = r["rate"] if f in ("price", "rate") else v if f in ("prev_rate", "rank_chg") else 0
@@ -96,6 +98,7 @@ class RankScreen(QWidget):
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setColumnWidth(0, 40)
         self.table.setColumnWidth(1, 110)
+        self.table.setColumnWidth(2, 46)  # 변동(▲n/▼n)은 종목명 옆 좁은 컬럼 (HTS 동일)
         self.table.setSelectionBehavior(QTableView.SelectRows)
         self.table.setEditTriggers(QTableView.NoEditTriggers)
         self.table.clicked.connect(self._on_cell_clicked)
@@ -175,11 +178,11 @@ def _demo():
          "rate": 13.36, "prev_rate": 0.0, "rank_chg": -2, "time": "224200"},
     ])
     d = lambda r, c, role=Qt.DisplayRole: m.data(m.index(r, c), role)  # noqa: E731
-    assert d(0, 0) == 1 and d(0, 1) == "삼성전자" and d(0, 2) == "291,000"
-    assert d(0, 3) == "-8.49" and d(0, 5) == ""
-    assert d(1, 5) == "▲2" and d(2, 5) == "▼2"
-    assert d(1, 5, Qt.ForegroundRole) is RED and d(2, 5, Qt.ForegroundRole) is BLUE
-    assert d(0, 2, Qt.ForegroundRole) is BLUE and d(2, 2, Qt.ForegroundRole) is RED
+    assert d(0, 0) == 1 and d(0, 1) == "삼성전자" and d(0, 3) == "291,000"
+    assert d(0, 4) == "-8.49" and d(0, 2) == ""
+    assert d(1, 2) == "▲2" and d(2, 2) == "▼2"
+    assert d(1, 2, Qt.ForegroundRole) is RED and d(2, 2, Qt.ForegroundRole) is BLUE
+    assert d(0, 3, Qt.ForegroundRole) is BLUE and d(2, 3, Qt.ForegroundRole) is RED
     print("rank self-check OK")
 
 
