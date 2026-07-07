@@ -5,7 +5,7 @@ import asyncio
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSettings, Qt, QTimer
 from PySide6.QtGui import QColor, QCursor, QFont
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QHBoxLayout, QHeaderView, QLabel, QPushButton,
+    QApplication, QCheckBox, QComboBox, QHBoxLayout, QHeaderView, QLabel, QPushButton,
     QSpinBox, QTableView, QToolTip, QVBoxLayout, QWidget,
 )
 
@@ -17,6 +17,26 @@ LIMIT = 29.5  # 상/하한 판정 (gui.py와 동일)
 COLUMNS = ["순위", "종목명", "변동", "기준시점주가", "기준등락률", "직전대비"]
 FIELDS  = ["rank", "name", "rank_chg", "price", "rate", "prev_rate"]
 PERIODS = [("30초", "5"), ("1분", "1"), ("10분", "2"), ("1시간", "3"), ("당일누적", "4")]
+
+
+def _alert_kind(prev_top: str, rows: list[dict], top_on: bool, jump_on: bool, jump_n: int):
+    """새 집계 스냅샷에서 알림 종류 판정: 'top'=1위 변경, 'jump'=순위 급상승, None=없음."""
+    if not rows:
+        return None
+    if top_on and prev_top and rows[0]["code"] != prev_top:
+        return "top"
+    if jump_on and any(r["rank_chg"] >= jump_n for r in rows):
+        return "jump"
+    return None
+
+
+def _beep(kind: str):
+    try:
+        import winsound
+        alias = "SystemExclamation" if kind == "top" else "SystemAsterisk"
+        winsound.PlaySound(alias, winsound.SND_ALIAS | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+    except Exception:  # noqa: BLE001
+        QApplication.beep()
 
 
 class RankModel(QAbstractTableModel):
@@ -110,10 +130,31 @@ class RankScreen(QWidget):
         self.table.setEditTriggers(QTableView.NoEditTriggers)
         self.table.clicked.connect(self._on_cell_clicked)
 
+        # 하단: 사운드 알림 옵션 (새 집계 스냅샷에서만 판정 -> 중복 알림 없음)
+        self.alert_top = QCheckBox("1위 변경 알림")
+        self.alert_top.setChecked(self._settings.value("rank_alert_top", "false") == "true")
+        self.alert_jump = QCheckBox("순위 급상승 알림 ≥")
+        self.alert_jump.setChecked(self._settings.value("rank_alert_jump", "false") == "true")
+        self.jump_n = QSpinBox()
+        self.jump_n.setRange(1, 19)
+        self.jump_n.setValue(int(self._settings.value("rank_jump_n", 3)))
+        self.alert_top.toggled.connect(lambda on: self._save_opt("rank_alert_top", on))
+        self.alert_jump.toggled.connect(lambda on: self._save_opt("rank_alert_jump", on))
+        self.jump_n.valueChanged.connect(lambda v: self._save_opt("rank_jump_n", v))
+        self._last_tm = ""   # 마지막 판정한 집계 시각
+        self._last_top = ""  # 마지막 1위 종목코드
+
+        bottom = QHBoxLayout()
+        bottom.addWidget(self.alert_top)
+        bottom.addWidget(self.alert_jump)
+        bottom.addWidget(self.jump_n)
+        bottom.addStretch(1)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.addLayout(top)
         layout.addWidget(self.table)
+        layout.addLayout(bottom)
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._poll)
@@ -134,6 +175,10 @@ class RankScreen(QWidget):
         self._save_timer.setSingleShot(True)
         self._save_timer.timeout.connect(self._save_layout)
         self.table.horizontalHeader().sectionResized.connect(lambda *a: self._save_timer.start(400))
+
+    def _save_opt(self, key: str, v):
+        self._settings.setValue(key, "true" if v is True else "false" if v is False else v)
+        self._settings.sync()
 
     def _on_period(self, _):
         self._settings.setValue("rank_period", self.period.currentData())
@@ -158,6 +203,13 @@ class RankScreen(QWidget):
         self.model.set_rows(rows)
         t = rows[0]["time"] if rows else ""
         self.time_label.setText(f"{t[:2]}:{t[2:4]}:{t[4:6]} 기준" if len(t) == 6 else "데이터 없음")
+        if rows and t != self._last_tm:  # 새 집계 스냅샷에서만 알림 판정
+            if self._last_tm:  # 창 연 직후 첫 수신은 제외
+                kind = _alert_kind(self._last_top, rows, self.alert_top.isChecked(),
+                                   self.alert_jump.isChecked(), self.jump_n.value())
+                if kind:
+                    _beep(kind)
+            self._last_tm, self._last_top = t, rows[0]["code"]
 
     def _on_cell_clicked(self, index):
         if index.column() != FIELDS.index("name"):
@@ -215,6 +267,13 @@ def _demo():
     assert d(0, 3, Qt.ForegroundRole) is BLUE and d(2, 3, Qt.ForegroundRole) is RED
     assert d(3, 4, Qt.BackgroundRole) is RED and d(3, 4, Qt.ForegroundRole) is WHITE  # 상한 배경
     assert d(0, 4, Qt.BackgroundRole) is None  # 일반 등락률은 배경 없음
+    # 알림 판정: 1위 변경 / 급상승 임계 / 없음
+    rows = m.rows
+    assert _alert_kind("000000", rows, True, False, 3) == "top"      # 1위 코드 바뀜
+    assert _alert_kind("005930", rows, True, True, 2) == "jump"      # 1위 유지, ▲2 >= 2
+    assert _alert_kind("005930", rows, True, True, 3) is None        # 임계 미달
+    assert _alert_kind("", rows, True, True, 3) is None              # 이전 1위 없음(첫 수신)
+    assert _alert_kind("000000", rows, False, False, 1) is None      # 알림 꺼짐
     print("rank self-check OK")
 
 
