@@ -72,6 +72,7 @@ class RankScreen(QWidget):
         super().__init__(parent)
         self.rest = rest
         self.setWindowTitle("[0198] 실시간 종목조회순위")
+        self.setFont(QFont("돋움체", 10))  # 조건검색 그리드와 동일 서체 (툴바/헤더 포함)
         self._settings = QSettings("layout.ini", QSettings.IniFormat)
 
         self.period = QComboBox()
@@ -98,7 +99,6 @@ class RankScreen(QWidget):
         self.model = RankModel()
         self.table = QTableView()
         self.table.setModel(self.model)
-        self.table.setFont(QFont("돋움체", 10))
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(22)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
