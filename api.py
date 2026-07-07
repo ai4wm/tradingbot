@@ -180,6 +180,21 @@ class RestClient:
                     m.single.add(code)  # 저유동성 우선주
         return m
 
+    async def inquiry_rank(self, qry_tp: str = "5") -> list[dict]:
+        """ka00198 실시간 종목조회순위 -> rank.py 필드로 정규화.
+        qry_tp: 1=1분 2=10분 3=1시간 4=당일누적 5=30초 (기준 집계기간)."""
+        d = await self.request("ka00198", {"qry_tp": qry_tp})
+        return [{
+            "rank": _to_int(r.get("bigd_rank")),
+            "code": r.get("stk_cd", ""),
+            "name": r.get("stk_nm", ""),
+            "price": abs(_to_int(r.get("past_curr_prc"))),
+            "rate": _to_float(r.get("base_comp_chgr")),
+            "prev_rate": _to_float(r.get("prev_base_chgr")),
+            "rank_chg": _to_int(r.get("rank_chg")),
+            "time": r.get("tm", ""),
+        } for r in d.get("item_inq_rank", [])]
+
     async def last_limit_entry(self, code: str, upper: int) -> str:
         """상한가 마지막 진입시각(초단위). ka10079 틱차트를 최신->과거로 스캔해 현재가=상한가인
         연속 구간의 첫 틱 시각을 반환. 영웅문과 동일한 초단위. 현재 상한가가 아니면 ''.

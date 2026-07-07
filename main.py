@@ -18,6 +18,7 @@ from PySide6.QtWidgets import QApplication, QMainWindow
 import config
 from api import RestClient
 from gui import ConditionScreen
+from rank import RankScreen
 from ws import WSClient
 
 logging.basicConfig(
@@ -61,6 +62,8 @@ class App:
         screen.condition_combo.activated.connect(self._on_condition_selected)
         screen.refresh_btn.clicked.connect(self._on_refresh)
         screen.reload_btn.clicked.connect(self._on_reload_conditions)
+        self._rank = None  # [0198] 조회순위 창 (버튼 첫 클릭 때 생성)
+        screen.rank_btn.clicked.connect(self._on_rank)
         # 자동재조회 간격/체크 상태 복원 (시그널 연결 전에 값부터 세팅)
         screen.refresh_interval.setValue(int(self._settings.value("refresh_interval", 3)))
         screen.auto_refresh.setChecked(self._settings.value("auto_refresh", "false") == "true")
@@ -126,6 +129,16 @@ class App:
         await self.ws.remove_real_many(codes)
         for code in codes:
             self.screen.model.remove_stock(code)
+
+    # --- [0198] 조회순위 창 토글 -----------------------------------------
+    def _on_rank(self):
+        if self._rank is None:
+            self._rank = RankScreen(self.rest)
+        if self._rank.isVisible():
+            self._rank.close()  # 지오메트리 저장 + 숨김 + 폴링 중지
+        else:
+            self._rank.show()
+            self._rank.raise_()
 
     # --- 조건목록 재조회: 영웅문서 조건 추가/수정한 걸 재시작 없이 반영 ----
     def _on_reload_conditions(self):

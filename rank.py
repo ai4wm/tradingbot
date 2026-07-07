@@ -1,0 +1,187 @@
+# -*- coding: utf-8 -*-
+"""[0198] 실시간 종목조회순위 창. ka00198을 주기 폴링(창이 보일 때만)."""
+import asyncio
+
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSettings, Qt, QTimer
+from PySide6.QtGui import QColor, QCursor, QFont
+from PySide6.QtWidgets import (
+    QApplication, QComboBox, QHBoxLayout, QHeaderView, QLabel, QPushButton,
+    QSpinBox, QTableView, QToolTip, QVBoxLayout, QWidget,
+)
+
+RED = QColor("#e83030")
+BLUE = QColor("#2050d0")
+
+COLUMNS = ["순위", "종목명", "기준시점주가", "기준등락률", "직전대비", "순위변동"]
+FIELDS  = ["rank", "name", "price", "rate", "prev_rate", "rank_chg"]
+PERIODS = [("30초", "5"), ("1분", "1"), ("10분", "2"), ("1시간", "3"), ("당일누적", "4")]
+
+
+class RankModel(QAbstractTableModel):
+    def __init__(self):
+        super().__init__()
+        self.rows: list[dict] = []
+
+    def set_rows(self, rows: list[dict]):
+        self.beginResetModel()
+        self.rows = rows
+        self.endResetModel()
+
+    def rowCount(self, parent=QModelIndex()):
+        return len(self.rows)
+
+    def columnCount(self, parent=QModelIndex()):
+        return len(COLUMNS)
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role == Qt.DisplayRole and orientation == Qt.Horizontal:
+            return COLUMNS[section]
+        return None
+
+    def data(self, index, role=Qt.DisplayRole):
+        r = self.rows[index.row()]
+        f = FIELDS[index.column()]
+        v = r[f]
+        if role == Qt.DisplayRole:
+            if f == "price":
+                return f"{v:,}"
+            if f in ("rate", "prev_rate"):
+                return f"{v:+.2f}"
+            if f == "rank_chg":
+                return f"▲{v}" if v > 0 else f"▼{-v}" if v < 0 else ""
+            return v
+        if role == Qt.TextAlignmentRole:
+            return (Qt.AlignLeft if f == "name" else Qt.AlignRight) | Qt.AlignVCenter
+        if role == Qt.ForegroundRole:
+            key = r["rate"] if f in ("price", "rate") else v if f in ("prev_rate", "rank_chg") else 0
+            return RED if key > 0 else BLUE if key < 0 else None
+        return None
+
+
+class RankScreen(QWidget):
+    def __init__(self, rest, parent=None):
+        super().__init__(parent)
+        self.rest = rest
+        self.setWindowTitle("[0198] 실시간 종목조회순위")
+        self._settings = QSettings("layout.ini", QSettings.IniFormat)
+
+        self.period = QComboBox()
+        for name, tp in PERIODS:
+            self.period.addItem(name, tp)
+        idx = self.period.findData(self._settings.value("rank_period", "5"))
+        self.period.setCurrentIndex(max(idx, 0))
+        self.interval = QSpinBox()
+        self.interval.setRange(5, 300)
+        self.interval.setValue(int(self._settings.value("rank_interval", 30)))
+        self.interval.setSuffix("초")
+        self.refresh_btn = QPushButton("조회")
+        self.time_label = QLabel("")
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel("기준"))
+        top.addWidget(self.period)
+        top.addWidget(QLabel("갱신"))
+        top.addWidget(self.interval)
+        top.addWidget(self.refresh_btn)
+        top.addStretch(1)
+        top.addWidget(self.time_label)
+
+        self.model = RankModel()
+        self.table = QTableView()
+        self.table.setModel(self.model)
+        self.table.setFont(QFont("돋움체", 10))
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(22)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setColumnWidth(0, 40)
+        self.table.setColumnWidth(1, 110)
+        self.table.setSelectionBehavior(QTableView.SelectRows)
+        self.table.setEditTriggers(QTableView.NoEditTriggers)
+        self.table.clicked.connect(self._on_cell_clicked)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.addLayout(top)
+        layout.addWidget(self.table)
+
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._poll)
+        self.refresh_btn.clicked.connect(self._poll)
+        self.period.activated.connect(self._on_period)
+        self.interval.valueChanged.connect(self._on_interval)
+
+        geo = self._settings.value("rank_geometry")
+        if geo is not None:
+            self.restoreGeometry(geo)
+        else:
+            self.resize(440, 560)
+
+    def _on_period(self, _):
+        self._settings.setValue("rank_period", self.period.currentData())
+        self._settings.sync()
+        self._poll()
+
+    def _on_interval(self, sec: int):
+        self._settings.setValue("rank_interval", sec)
+        self._settings.sync()
+        if self._timer.isActive():
+            self._timer.start(sec * 1000)
+
+    def _poll(self):
+        asyncio.ensure_future(self._fetch())
+
+    async def _fetch(self):
+        try:
+            rows = await self.rest.inquiry_rank(self.period.currentData())
+        except Exception as e:  # noqa: BLE001
+            self.time_label.setText(str(e)[:40])
+            return
+        self.model.set_rows(rows)
+        t = rows[0]["time"] if rows else ""
+        self.time_label.setText(f"{t[:2]}:{t[2:4]}:{t[4:6]} 기준" if len(t) == 6 else "데이터 없음")
+
+    def _on_cell_clicked(self, index):
+        if index.column() != FIELDS.index("name"):
+            return
+        code = self.model.rows[index.row()]["code"]
+        QApplication.clipboard().setText(code)
+        QToolTip.showText(QCursor.pos(), f"{code} 복사됨")
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._timer.start(self.interval.value() * 1000)
+        self._poll()
+
+    def hideEvent(self, e):
+        self._timer.stop()  # 안 보일 땐 폴링 중지 (REST 큐 비움)
+        super().hideEvent(e)
+
+    def closeEvent(self, e):
+        self._settings.setValue("rank_geometry", self.saveGeometry())
+        self._settings.sync()
+        super().closeEvent(e)  # 닫기 = 숨김 (재클릭 시 재사용)
+
+
+def _demo():
+    app = QApplication.instance() or QApplication([])
+    m = RankModel()
+    m.set_rows([
+        {"rank": 1, "code": "005930", "name": "삼성전자", "price": 291000,
+         "rate": -8.49, "prev_rate": 0.0, "rank_chg": 0, "time": "224200"},
+        {"rank": 3, "code": "042660", "name": "한화오션", "price": 88600,
+         "rate": -23.69, "prev_rate": 0.0, "rank_chg": 2, "time": "224200"},
+        {"rank": 5, "code": "002990", "name": "금호건설", "price": 14000,
+         "rate": 13.36, "prev_rate": 0.0, "rank_chg": -2, "time": "224200"},
+    ])
+    d = lambda r, c, role=Qt.DisplayRole: m.data(m.index(r, c), role)  # noqa: E731
+    assert d(0, 0) == 1 and d(0, 1) == "삼성전자" and d(0, 2) == "291,000"
+    assert d(0, 3) == "-8.49" and d(0, 5) == ""
+    assert d(1, 5) == "▲2" and d(2, 5) == "▼2"
+    assert d(1, 5, Qt.ForegroundRole) is RED and d(2, 5, Qt.ForegroundRole) is BLUE
+    assert d(0, 2, Qt.ForegroundRole) is BLUE and d(2, 2, Qt.ForegroundRole) is RED
+    print("rank self-check OK")
+
+
+if __name__ == "__main__":
+    _demo()

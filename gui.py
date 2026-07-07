@@ -362,6 +362,9 @@ class ConditionScreen(QWidget):
         self.auto_remove.setChecked(True)
         self.limit_sort = QCheckBox("상한가정렬")
         self.limit_sort.setToolTip("상한(실제/예상)&매도0 종목을 위로 고정, 컬럼 클릭으로 그룹 내 정렬")
+        self.rank_btn = QPushButton("순위")
+        self.rank_btn.setToolTip("실시간 종목조회순위 [0198] 창 열기/닫기")
+        self.rank_btn.setFixedWidth(44)
         self.count_label = QLabel("종목수: 0")
 
         top = QHBoxLayout()
@@ -372,6 +375,7 @@ class ConditionScreen(QWidget):
         top.addWidget(self.refresh_interval)
         top.addWidget(self.auto_remove)
         top.addWidget(self.limit_sort)
+        top.addWidget(self.rank_btn)
         top.addStretch(1)  # 남는 공간은 오른쪽으로
         top.addWidget(self.count_label)
 
