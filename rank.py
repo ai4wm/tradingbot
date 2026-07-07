@@ -126,6 +126,14 @@ class RankScreen(QWidget):
             self.restoreGeometry(geo)
         else:
             self.resize(440, 560)
+        state = self._settings.value("rank_header")
+        if state is not None:
+            self.table.horizontalHeader().restoreState(state)
+        # 크기/컬럼 변경 시 디바운스 저장 (닫을 때만 저장하면 앱 종료 경로 따라 유실)
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.timeout.connect(self._save_layout)
+        self.table.horizontalHeader().sectionResized.connect(lambda *a: self._save_timer.start(400))
 
     def _on_period(self, _):
         self._settings.setValue("rank_period", self.period.currentData())
@@ -158,6 +166,19 @@ class RankScreen(QWidget):
         QApplication.clipboard().setText(code)
         QToolTip.showText(QCursor.pos(), f"{code} 복사됨")
 
+    def _save_layout(self):
+        self._settings.setValue("rank_geometry", self.saveGeometry())
+        self._settings.setValue("rank_header", self.table.horizontalHeader().saveState())
+        self._settings.sync()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._save_timer.start(400)
+
+    def moveEvent(self, e):
+        super().moveEvent(e)
+        self._save_timer.start(400)
+
     def showEvent(self, e):
         super().showEvent(e)
         self._timer.start(self.interval.value() * 1000)
@@ -165,11 +186,11 @@ class RankScreen(QWidget):
 
     def hideEvent(self, e):
         self._timer.stop()  # 안 보일 땐 폴링 중지 (REST 큐 비움)
+        self._save_layout()
         super().hideEvent(e)
 
     def closeEvent(self, e):
-        self._settings.setValue("rank_geometry", self.saveGeometry())
-        self._settings.sync()
+        self._save_layout()
         super().closeEvent(e)  # 닫기 = 숨김 (재클릭 시 재사용)
 
 
