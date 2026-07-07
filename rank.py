@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """[0198] 실시간 종목조회순위 창. ka00198을 주기 폴링(창이 보일 때만)."""
 import asyncio
+import threading
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSettings, Qt, QTimer
 from PySide6.QtGui import QColor, QCursor, QFont
@@ -30,13 +31,21 @@ def _alert_kind(prev_top: str, rows: list[dict], top_on: bool, jump_on: bool, ju
     return None
 
 
+TONES = {  # (주파수Hz, 길이ms) 나열 -> 멜로디. 시스템 테마 무관하게 또렷한 전용음
+    "top":  [(880, 120), (1320, 200)],   # 1위 변경: 뚜-띠↑ (상승 2음)
+    "jump": [(1568, 130), (1568, 130)],  # 급상승: 띠띠! (고음 2연타)
+}
+
+
 def _beep(kind: str):
-    try:
-        import winsound
-        alias = "SystemExclamation" if kind == "top" else "SystemAsterisk"
-        winsound.PlaySound(alias, winsound.SND_ALIAS | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
-    except Exception:  # noqa: BLE001
-        QApplication.beep()
+    def play():
+        try:
+            import winsound
+            for freq, ms in TONES[kind]:
+                winsound.Beep(freq, ms)
+        except Exception:  # noqa: BLE001
+            QApplication.beep()
+    threading.Thread(target=play, daemon=True).start()  # Beep은 블로킹 -> 스레드에서
 
 
 class RankModel(QAbstractTableModel):
