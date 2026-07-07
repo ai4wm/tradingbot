@@ -25,6 +25,7 @@ logging.basicConfig(
 log = logging.getLogger("main")
 
 MAX_WINDOWS = 3  # 실시간 등록 ~100종목 한도 내 (조건당 20~30종목 기준)
+_SHUTDOWN = [False]  # 메인 창 닫는 중: 추가 창 동반 종료를 '사용자 닫기'로 오인 방지
 
 
 class View:
@@ -346,6 +347,13 @@ class App:
         used = {v.prefix for v in self.views}
         n = next(i for i in range(2, MAX_WINDOWS + 1) if f"w{i}_" not in used)
         prefix = f"w{n}_"
+        # 처음 여는 창이면 본창의 크기/컬럼 상태를 기본값으로 복사 (이후엔 자기 것 기억)
+        seeded = False
+        if self._settings.value(prefix + "header") is None:
+            main = self.views[0].screen
+            self._settings.setValue(prefix + "header", main.table.horizontalHeader().saveState())
+            self._settings.setValue(prefix + "geometry", main.window().saveGeometry())
+            seeded = True
         screen = ConditionScreen(prefix=prefix)
         screen.newwin_btn.setVisible(False)  # 추가 창에선 창+/순위 숨김 (메인창에서만)
         screen.rank_btn.setVisible(False)
@@ -358,6 +366,8 @@ class App:
         self._wire_extra(screen)
         self._extra_windows.append(win)
         win.show()
+        if seeded:  # 본창과 완전히 겹치지 않게 살짝 비껴 배치
+            win.move(win.x() + 40, win.y() + 40)
         if self._cond_items:  # 이미 목록 받아놨으면 즉시 콤보 채움 + 자동 등록
             view.on_condition_list(self._cond_items)
 
@@ -366,6 +376,8 @@ class App:
             lambda: asyncio.ensure_future(self.ws.list_conditions()))
 
     def _on_window_closed(self, win):
+        if _SHUTDOWN[0]:  # 앱 종료 동반 닫힘: 창 개수 보존 (재시작 때 복원용)
+            return
         for v in list(self.views[1:]):
             if v.screen.window() is win:
                 asyncio.ensure_future(v.stop())
@@ -449,8 +461,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, e):
         self._save_geo()
-        if not getattr(self, "_closing", False):  # 재귀 방지
-            self._closing = True
+        if not _SHUTDOWN[0]:
+            _SHUTDOWN[0] = True  # 동반 닫힘을 사용자 닫기로 오인 방지 + 재귀 방지
             for w in QApplication.instance().topLevelWidgets():
                 if w is not self and w.isVisible():
                     w.close()  # 메인 닫으면 추가 창/순위창도 같이 종료
