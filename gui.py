@@ -331,8 +331,9 @@ def _list_reload_icon(style) -> QIcon:
 class ConditionScreen(QWidget):
     """조건검색실시간 화면 하나. 나중에 QMdiArea에 이 위젯을 여러 개 띄우면 다중창."""
 
-    def __init__(self, parent=None):
+    def __init__(self, prefix: str = "", parent=None):
         super().__init__(parent)
+        self.prefix = prefix  # 다중창: 창별 설정 키 접두사 ("", "w2_", ...)
         self.model = StockModel()
 
         # 툴바: 조건목록 새로고침 / 조건식 선택 / 등록 토글 / 이탈삭제 / 종목수
@@ -365,6 +366,9 @@ class ConditionScreen(QWidget):
         self.rank_btn = QPushButton("순위")
         self.rank_btn.setToolTip("실시간 종목조회순위 [0198] 창 열기/닫기")
         self.rank_btn.setFixedWidth(44)
+        self.newwin_btn = QPushButton("창+")
+        self.newwin_btn.setToolTip("조건검색 창 하나 더 열기 (다른 조건식 동시 감시)")
+        self.newwin_btn.setFixedWidth(44)
         self.count_label = QLabel("종목수: 0")
 
         top = QHBoxLayout()
@@ -376,6 +380,7 @@ class ConditionScreen(QWidget):
         top.addWidget(self.auto_remove)
         top.addWidget(self.limit_sort)
         top.addWidget(self.rank_btn)
+        top.addWidget(self.newwin_btn)
         top.addStretch(1)  # 남는 공간은 오른쪽으로
         top.addWidget(self.count_label)
 
@@ -425,7 +430,7 @@ class ConditionScreen(QWidget):
 
         # 컬럼 너비/순서 기억: 저장된 상태 복원 후, 변경 시 debounce 저장
         self._settings = QSettings("layout.ini", QSettings.IniFormat)
-        state = self._settings.value("header")
+        state = self._settings.value(self.prefix + "header")
         if state is not None:
             self.table.horizontalHeader().restoreState(state)
             sec = self.table.horizontalHeader().sortIndicatorSection()
@@ -433,7 +438,7 @@ class ConditionScreen(QWidget):
                 self._sort_col = sec
                 self._sort_order = self.table.horizontalHeader().sortIndicatorOrder()
         self._apply_sort()
-        if self._settings.value("limit_sort", "false") == "true":  # 상한가정렬 상태 복원
+        if self._settings.value(self.prefix + "limit_sort", "false") == "true":  # 상한가정렬 복원
             self.limit_sort.setChecked(True)
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -451,7 +456,7 @@ class ConditionScreen(QWidget):
         self.count_label.setText(f"종목수: {self.model.rowCount()}")
 
     def _save_layout(self):
-        self._settings.setValue("header", self.table.horizontalHeader().saveState())
+        self._settings.setValue(self.prefix + "header", self.table.horizontalHeader().saveState())
         self._settings.sync()  # 강제 종료돼도 디스크에 남게
 
     def _on_cell_clicked(self, index):
@@ -489,7 +494,7 @@ class ConditionScreen(QWidget):
         self.proxy.limit_mode = on
         self.proxy.invalidate()  # 모드 전환 즉시 재정렬 (정렬컬럼/방향은 그대로)
         self._apply_sort()
-        self._settings.setValue("limit_sort", "true" if on else "false")
+        self._settings.setValue(self.prefix + "limit_sort", "true" if on else "false")
         self._settings.sync()
 
     # --- 웹소켓 계층 연결점 ----------------------------------------------

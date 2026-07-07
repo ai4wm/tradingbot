@@ -93,15 +93,15 @@ def parse_condition_list(data: list) -> list[tuple[str, str]]:
 
 class WSClient:
     def __init__(self):
-        self.on_condition_event = None    # (code, is_insert, time_str) - 실시간 편입/이탈
-        self.on_condition_snapshot = None  # (list[code]) - CNSRREQ 초기 목록
+        self.on_condition_event = None    # (seq, code, is_insert) - 실시간 편입/이탈
+        self.on_condition_snapshot = None  # (seq, list[code]) - CNSRREQ 초기 목록
         self.on_real = None               # (code, fields)
         self.on_vi = None                 # (code, active, 발동가) - VI 발동/해제
         self.on_condition_list = None     # (list[(seq, name)])
         self._ws = None
         self._token_fn = None            # async () -> token
-        self._active_seq = None          # 등록된 조건식 일련번호 (재등록용)
-        self._reg_codes: set[str] = set()  # 실시간 등록 종목 (재등록용)
+        self._active_seqs: set[str] = set()  # 등록된 조건식들 (창마다 1개, 재등록용)
+        self._reg_codes: dict[str, int] = {}  # 실시간 등록 종목 -> 참조수(창 수)
         self._connected = asyncio.Event()
         self._seen_fids: set = set()       # 처음 본 (type,fid)만 로그 (FID 발굴용)
         self._real_stats: dict = {}        # 5초 단위 REAL 수신 빈도 (예상값 갱신속도 진단용)
@@ -126,39 +126,45 @@ class WSClient:
         await self._send({"trnm": "CNSRLST"})
 
     async def register_condition(self, seq: str):
-        self._active_seq = seq
+        self._active_seqs.add(str(seq))
         await self._send({"trnm": "CNSRREQ", "seq": seq, "search_type": "1", "stex_tp": "K"})
 
-    async def clear_condition(self):
-        if self._active_seq is not None:
-            await self._send({"trnm": "CNSRCLR", "seq": self._active_seq})
-            self._active_seq = None
+    async def clear_condition(self, seq: str):
+        if str(seq) in self._active_seqs:
+            self._active_seqs.discard(str(seq))
+            await self._send({"trnm": "CNSRCLR", "seq": seq})
 
     async def register_real(self, code: str):
         await self.register_real_many([code])
 
     async def register_real_many(self, codes: list[str]):
-        """여러 종목을 REG 1건으로 등록. 종목당 1건씩 연사하면 서버가
-        요청 빈도 제한(return_code 105110)으로 뒷부분을 거부한다 (2026-07-07 실측)."""
-        todo = [c for c in codes if c not in self._reg_codes]
-        room = config.REAL_REG_LIMIT - len(self._reg_codes)
-        if len(todo) > room:
-            log.warning("real-time reg limit %d, skip %d codes", config.REAL_REG_LIMIT, len(todo) - room)
-            todo = todo[:max(room, 0)]
-        if not todo:
-            return
-        self._reg_codes.update(todo)
-        await self._send(build_reg(todo, REAL_TYPES))
+        """여러 종목을 REG 1건으로 등록(연사하면 서버 105110 거부, 2026-07-07 실측).
+        참조수 관리: 여러 창이 같은 종목을 등록하면 카운트만 올리고 REG는 1회."""
+        todo = []
+        for c in codes:  # 중복 포함 리스트 허용: 발생 횟수만큼 참조수 증가
+            if self._reg_codes.get(c, 0) == 0 and c not in todo:
+                if len(self._reg_codes) + len(todo) >= config.REAL_REG_LIMIT:
+                    log.warning("real-time reg limit %d, skip %s", config.REAL_REG_LIMIT, c)
+                    continue
+                todo.append(c)
+            self._reg_codes[c] = self._reg_codes.get(c, 0) + 1
+        if todo:
+            await self._send(build_reg(todo, REAL_TYPES))
 
     async def remove_real(self, code: str):
         await self.remove_real_many([code])
 
     async def remove_real_many(self, codes: list[str]):
-        todo = [c for c in codes if c in self._reg_codes]
-        if not todo:
-            return
-        self._reg_codes.difference_update(todo)
-        await self._send(build_remove(todo, REAL_TYPES))
+        todo = []
+        for c in codes:
+            if c not in self._reg_codes:
+                continue
+            self._reg_codes[c] -= 1
+            if self._reg_codes[c] <= 0:  # 마지막 창이 뺄 때만 실제 REMOVE
+                del self._reg_codes[c]
+                todo.append(c)
+        if todo:
+            await self._send(build_remove(todo, REAL_TYPES))
 
     # --- 내부 ----------------------------------------------------------
     async def _connect_once(self):
@@ -179,8 +185,8 @@ class WSClient:
     async def _resubscribe(self):
         """재접속 시 조건검색 + 실시간 시세 자동 재등록."""
         await self.list_conditions()
-        if self._active_seq is not None:
-            await self._send({"trnm": "CNSRREQ", "seq": self._active_seq,
+        for seq in self._active_seqs:
+            await self._send({"trnm": "CNSRREQ", "seq": seq,
                               "search_type": "1", "stex_tp": "K"})
         if self._reg_codes:
             await self._send(build_reg(list(self._reg_codes), REAL_TYPES))
@@ -263,11 +269,12 @@ class WSClient:
         """REAL type=02 (2026-07-07 실수신으로 확정): values에
         841=조건seq, 9001=종목코드, 843='I'(편입)/'D'(이탈), 20=시각."""
         v = item.get("values", {})
-        if self._active_seq is not None and str(v.get("841")) != str(self._active_seq):
-            return  # 다른 조건식 이벤트 무시
+        seq = str(v.get("841"))
+        if seq not in self._active_seqs:
+            return  # 등록 안 한 조건식 이벤트 무시
         code = (v.get("9001") or "").lstrip("A")
         if code and self.on_condition_event:
-            self.on_condition_event(code, v.get("843") == "I", "")
+            self.on_condition_event(seq, code, v.get("843") == "I")
 
     def _on_vi(self, item: dict):
         # 1h fid: 9001=코드(_AL 접미사), 9068=1 발동/2 해제, 1221=발동가격 (2026-07-07 실수신 확정)
@@ -282,12 +289,15 @@ class WSClient:
         실시간 편입/이탈은 REAL type=02(_on_real_condition)로 따로 옴."""
         if not self.on_condition_snapshot:
             return
+        seq = str(msg.get("seq", ""))
+        if not seq and len(self._active_seqs) == 1:  # 응답에 seq 없으면 단일 등록으로 판정
+            seq = next(iter(self._active_seqs))
         codes = []
         for item in msg.get("data", []):
             code = (item.get("9001") or item.get("jmcode") or item.get("item") or "").lstrip("A")
             if code:
                 codes.append(code)
-        self.on_condition_snapshot(codes)
+        self.on_condition_snapshot(seq, codes)
 
 
 def _demo():
@@ -307,29 +317,33 @@ def _demo():
     # 매핑 없는 FID 무시
     _, f2 = parse_real_item({"item": "x", "values": {"9999": "1"}})
     assert f2 == {}, f2
-    # 실시간 편입/이탈 (REAL type=02)
+    # 실시간 편입/이탈 (REAL type=02): seq 라우팅 (창=조건 여러 개)
     c = WSClient()
     got = []
-    c.on_condition_event = lambda code, ins, t: got.append((code, ins))
-    c._active_seq = "2"
+    c.on_condition_event = lambda seq, code, ins: got.append((seq, code, ins))
+    c._active_seqs = {"2", "3"}
     c._on_real_condition({"type": "02", "values": {"841": "2", "9001": "A294140", "843": "I", "20": "090010"}})
-    c._on_real_condition({"type": "02", "values": {"841": "2", "9001": "011230", "843": "D", "20": "090430"}})
-    c._on_real_condition({"type": "02", "values": {"841": "9", "9001": "005930", "843": "I"}})  # 딴 조건 무시
-    assert got == [("294140", True), ("011230", False)], got
+    c._on_real_condition({"type": "02", "values": {"841": "3", "9001": "011230", "843": "D", "20": "090430"}})
+    c._on_real_condition({"type": "02", "values": {"841": "9", "9001": "005930", "843": "I"}})  # 미등록 조건 무시
+    assert got == [("2", "294140", True), ("3", "011230", False)], got
     # VI 발동/해제 (1h)
     vi = []
     c.on_vi = lambda code, active, price: vi.append((code, active, price))
     c._on_vi({"type": "1h", "values": {"9001": "109610_AL", "9068": "1", "1221": "2165"}})
     c._on_vi({"type": "1h", "values": {"9001": "760006_AL", "9068": "2", "1221": "8260"}})
     assert vi == [("109610", True, 2165), ("760006", False, 8260)], vi
-    # CNSRREQ 스냅샷 -> 코드 리스트
+    # CNSRREQ 스냅샷 -> (seq, 코드 리스트)
     snap = []
-    c.on_condition_snapshot = snap.extend
-    c._handle_condition({"trnm": "CNSRREQ", "data": [{"9001": "A005930"}, {"jmcode": "002995"}]})
-    assert snap == ["005930", "002995"], snap
+    c.on_condition_snapshot = lambda seq, codes: snap.append((seq, codes))
+    c._handle_condition({"trnm": "CNSRREQ", "seq": "2",
+                         "data": [{"9001": "A005930"}, {"jmcode": "002995"}]})
+    assert snap == [("2", ["005930", "002995"])], snap
+    c._active_seqs = {"7"}  # 응답에 seq 없고 단일 등록이면 그 seq로 판정
+    c._handle_condition({"trnm": "CNSRREQ", "data": [{"9001": "011230"}]})
+    assert snap[-1] == ("7", ["011230"]), snap
     # CNSRLST 파싱
     assert parse_condition_list([["0", "상한근접"], ["1", "급등주"]]) == [("0", "상한근접"), ("1", "급등주")]
-    # REG 묶음 전송: 이미 등록된 종목 제외, 1건의 메시지
+    # REG 묶음 전송 + 참조수: 두 창이 같은 종목이면 REG 1회, 마지막 창이 뺄 때만 REMOVE
     sent = []
     c2 = WSClient()
 
@@ -337,12 +351,16 @@ def _demo():
         sent.append(m)
     c2._send = _fake
     asyncio.run(c2.register_real_many(["1", "2"]))
-    asyncio.run(c2.register_real_many(["2", "3"]))
+    asyncio.run(c2.register_real_many(["2", "3"]))   # 2는 참조수만 2로
     asyncio.run(c2.remove_real_many(["1", "9"]))
+    asyncio.run(c2.remove_real_many(["2"]))          # 참조수 2->1, REMOVE 안 나감
     assert sent[0]["data"][0]["item"] == ["1", "2"], sent
     assert sent[1]["data"][0]["item"] == ["3"], sent
     assert sent[2]["trnm"] == "REMOVE" and sent[2]["data"][0]["item"] == ["1"], sent
-    assert c2._reg_codes == {"2", "3"}, c2._reg_codes
+    assert len(sent) == 3, sent
+    assert c2._reg_codes == {"2": 1, "3": 1}, c2._reg_codes
+    asyncio.run(c2.remove_real_many(["2"]))          # 참조수 0 -> 이제 REMOVE
+    assert sent[3]["data"][0]["item"] == ["2"], sent
     print("ws self-check OK")
 
 
