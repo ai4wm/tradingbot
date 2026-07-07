@@ -11,6 +11,8 @@ from PySide6.QtWidgets import (
 
 RED = QColor("#e83030")
 BLUE = QColor("#2050d0")
+WHITE = QColor("white")
+LIMIT = 29.5  # 상/하한 판정 (gui.py와 동일)
 
 COLUMNS = ["순위", "종목명", "변동", "기준시점주가", "기준등락률", "직전대비"]
 FIELDS  = ["rank", "name", "rank_chg", "price", "rate", "prev_rate"]
@@ -54,7 +56,12 @@ class RankModel(QAbstractTableModel):
             if f == "rank_chg":
                 return Qt.AlignCenter
             return (Qt.AlignLeft if f == "name" else Qt.AlignRight) | Qt.AlignVCenter
+        if role == Qt.BackgroundRole:
+            if f == "rate" and (v >= LIMIT or v <= -LIMIT):  # 상/하한 = 배경색
+                return RED if v > 0 else BLUE
         if role == Qt.ForegroundRole:
+            if f == "rate" and (v >= LIMIT or v <= -LIMIT):
+                return WHITE  # 상/하한 배경 위 흰 글씨
             key = r["rate"] if f in ("price", "rate") else v if f in ("prev_rate", "rank_chg") else 0
             return RED if key > 0 else BLUE if key < 0 else None
         return None
@@ -176,6 +183,8 @@ def _demo():
          "rate": -23.69, "prev_rate": 0.0, "rank_chg": 2, "time": "224200"},
         {"rank": 5, "code": "002990", "name": "금호건설", "price": 14000,
          "rate": 13.36, "prev_rate": 0.0, "rank_chg": -2, "time": "224200"},
+        {"rank": 7, "code": "042660", "name": "점상", "price": 88600,
+         "rate": 29.9, "prev_rate": 0.0, "rank_chg": 0, "time": "224200"},
     ])
     d = lambda r, c, role=Qt.DisplayRole: m.data(m.index(r, c), role)  # noqa: E731
     assert d(0, 0) == 1 and d(0, 1) == "삼성전자" and d(0, 3) == "291,000"
@@ -183,6 +192,8 @@ def _demo():
     assert d(1, 2) == "▲2" and d(2, 2) == "▼2"
     assert d(1, 2, Qt.ForegroundRole) is RED and d(2, 2, Qt.ForegroundRole) is BLUE
     assert d(0, 3, Qt.ForegroundRole) is BLUE and d(2, 3, Qt.ForegroundRole) is RED
+    assert d(3, 4, Qt.BackgroundRole) is RED and d(3, 4, Qt.ForegroundRole) is WHITE  # 상한 배경
+    assert d(0, 4, Qt.BackgroundRole) is None  # 일반 등락률은 배경 없음
     print("rank self-check OK")
 
 
