@@ -6,6 +6,7 @@
 import asyncio
 import logging
 import sys
+import time
 from collections import Counter
 
 import qasync
@@ -14,7 +15,7 @@ from PySide6.QtWidgets import QApplication, QMainWindow
 
 from api import RestClient
 from gui import ConditionScreen
-from rank import RankScreen
+from rank import RankScreen, _beep
 from ws import WSClient
 
 logging.basicConfig(
@@ -51,6 +52,9 @@ class View:
             self._auto_timer.start(screen.refresh_interval.value() * 1000)
         screen.auto_refresh.toggled.connect(self._on_auto_refresh)
         screen.refresh_interval.valueChanged.connect(self._on_interval_changed)
+        self._beep_t = 0.0  # 편입소리 스로틀 (개장 이벤트 폭주 때 소리 도배 방지)
+        screen.sound_check.setChecked(self._settings.value(self.prefix + "sound", "false") == "true")
+        screen.sound_check.toggled.connect(self._on_sound)
 
     # --- 조건 목록/선택 ---------------------------------------------------
     def on_condition_list(self, items):
@@ -102,6 +106,15 @@ class View:
         if seq is not None:
             asyncio.ensure_future(self._switch_condition(seq))
 
+    def _on_sound(self, on: bool):
+        self._settings.setValue(self.prefix + "sound", "true" if on else "false")
+        self._settings.sync()
+
+    def _maybe_beep(self):
+        if self.screen.sound_check.isChecked() and time.monotonic() - self._beep_t >= 1.0:
+            self._beep_t = time.monotonic()
+            _beep("in")
+
     def _on_auto_refresh(self, on: bool):
         self._settings.setValue(self.prefix + "auto_refresh", "true" if on else "false")
         self._settings.sync()
@@ -130,6 +143,7 @@ class View:
             self.app.queue_real(code, add=True)
         if new - cur:
             self._schedule_refresh()
+            self._maybe_beep()
         log.info("snapshot%s: %d codes (+%d/-%d) %s", self.prefix or " ",
                  len(new), len(new - cur), len(cur - new), ",".join(sorted(new)))
 
@@ -138,6 +152,7 @@ class View:
             self.screen.on_included(code, {"name": code})
             self.app.queue_real(code, add=True)
             self._schedule_refresh()
+            self._maybe_beep()
         else:
             self.screen.on_excluded(code)
             self.app.queue_real(code, add=False)

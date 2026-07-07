@@ -359,8 +359,11 @@ class ConditionScreen(QWidget):
         # Qt가 시그널 뒤에 선택을 다시 걸기 때문에 이벤트루프 한 틱 뒤에 해제.
         self.refresh_interval.valueChanged.connect(
             lambda _: QTimer.singleShot(0, self.refresh_interval.lineEdit().deselect))
-        self.auto_remove = QCheckBox("이탈삭제")
+        self.auto_remove = QCheckBox("자동삭제")
         self.auto_remove.setChecked(True)
+        self.auto_remove.setToolTip("이탈한 종목을 그리드에서 자동 제거")
+        self.sound_check = QCheckBox("소리")
+        self.sound_check.setToolTip("새 종목이 편입되면 소리 알림 (실시간/재조회 모두)")
         self.limit_sort = QCheckBox("상한가정렬")
         self.limit_sort.setToolTip("상한(실제/예상)&매도0 종목을 위로 고정, 컬럼 클릭으로 그룹 내 정렬")
         self.rank_btn = QPushButton("순위")
@@ -378,6 +381,7 @@ class ConditionScreen(QWidget):
         top.addWidget(self.auto_refresh)
         top.addWidget(self.refresh_interval)
         top.addWidget(self.auto_remove)
+        top.addWidget(self.sound_check)
         top.addWidget(self.limit_sort)
         top.addWidget(self.rank_btn)
         top.addWidget(self.newwin_btn)
