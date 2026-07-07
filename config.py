@@ -18,3 +18,4 @@ SECRETKEY = os.getenv("KIWOOM_SECRETKEY", "")
 
 REAL_REG_LIMIT = 95  # 실시간 등록 종목 수 상한
 REST_RATE_LIMIT = 1.0  # 초당 REST 호출 수 (TR당 1req/s)
+TICK_MAX_PAGES = 6  # 상한가 진입 틱조회 최대 페이지 (초과 시 분봉 분단위 폴백). 6페이지=최악 ~6초

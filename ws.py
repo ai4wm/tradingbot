@@ -11,6 +11,7 @@
 import asyncio
 import json
 import logging
+import time
 
 import websockets
 
@@ -26,10 +27,20 @@ FID = {
     "13": "vol",       # 누적거래량
     "61": "ask_qty",   # 최우선 매도잔량 (0D 매도호가1 잔량)
     "71": "bid_qty",   # 최우선 매수잔량 (0D 매수호가1 잔량)
-    # ⚠️ 예상체결가: 동시호가/VI 때만 실시간 수신 -> 이때만 예상 컬럼이 채워지고 평시엔 빈칸.
-    #    FID 번호(예상체결가)는 개장 동시호가에서 실제 REAL 메시지로 확인해 아래 값을 채울 것.
-    "예상체결가_FID_확인필요": "exp_price",
+    # 예상가: 0D 23/24는 장중에도 값이 바뀌며 옴(상한가 종목 등) -> 표시 ON 신호로 못 씀.
+    # gui가 0H/단일가/VI/동시호가REST로 켠 상태에서만 갱신용으로 반영한다.
+    "23": "exp_price",
+    "24": "exp_qty",
 }
+
+# 0H(주식예상체결): 단일가 국면(동시호가/VI/단일가종목)에만 서버가 보냄 = 자기게이트.
+# 같은 FID 번호가 0B와 다른 의미(10=예상체결가, 13=예상체결량).
+FID_0H = {
+    "10": "exp_price",
+    "13": "exp_qty",
+}
+
+REAL_TYPES = ["0B", "0D", "0H", "1h"]  # 체결 / 호가잔량 / 예상체결 / VI발동해제
 
 
 def _num(v):
@@ -55,18 +66,21 @@ def parse_real_item(item: dict) -> tuple[str, dict]:
     """REAL data 원소 하나 -> (종목코드, {gui필드: 값}). 매핑 없는 FID는 무시."""
     code = item.get("item", "")
     values = item.get("values", {})
+    table = FID_0H if item.get("type") == "0H" else FID
     out = {}
     for fid, raw in values.items():
-        field = FID.get(fid)
+        field = table.get(fid)
         if not field:
             continue
         n = _num(raw)
         if field in ("price", "exp_price"):   # 가격류: 부호 제거 + 정수
             out[field] = int(abs(n))
-        elif field in ("vol", "ask_qty", "bid_qty"):
+        elif field in ("vol", "ask_qty", "bid_qty", "exp_qty"):
             out[field] = int(n)
         else:
             out[field] = n
+    if table is FID_0H and out:
+        out["exp_hot"] = 1  # 0H는 단일가/VI 국면에만 옴 -> gui가 판정 없이 표시
     return code, out
 
 
@@ -79,15 +93,19 @@ def parse_condition_list(data: list) -> list[tuple[str, str]]:
 
 class WSClient:
     def __init__(self):
-        self.on_condition_event = None   # (code, is_insert, time_str)
-        self.on_real = None              # (code, fields)
-        self.on_condition_list = None    # (list[(seq, name)])
+        self.on_condition_event = None    # (code, is_insert, time_str) - 실시간 편입/이탈
+        self.on_condition_snapshot = None  # (list[code]) - CNSRREQ 초기 목록
+        self.on_real = None               # (code, fields)
+        self.on_vi = None                 # (code, active, 발동가) - VI 발동/해제
+        self.on_condition_list = None     # (list[(seq, name)])
         self._ws = None
         self._token_fn = None            # async () -> token
         self._active_seq = None          # 등록된 조건식 일련번호 (재등록용)
         self._reg_codes: set[str] = set()  # 실시간 등록 종목 (재등록용)
         self._connected = asyncio.Event()
         self._seen_fids: set = set()       # 처음 본 (type,fid)만 로그 (FID 발굴용)
+        self._real_stats: dict = {}        # 5초 단위 REAL 수신 빈도 (예상값 갱신속도 진단용)
+        self._stats_t = 0.0
 
     # --- 외부 API -------------------------------------------------------
     async def run(self, token_fn):
@@ -117,19 +135,30 @@ class WSClient:
             self._active_seq = None
 
     async def register_real(self, code: str):
-        if code in self._reg_codes:
+        await self.register_real_many([code])
+
+    async def register_real_many(self, codes: list[str]):
+        """여러 종목을 REG 1건으로 등록. 종목당 1건씩 연사하면 서버가
+        요청 빈도 제한(return_code 105110)으로 뒷부분을 거부한다 (2026-07-07 실측)."""
+        todo = [c for c in codes if c not in self._reg_codes]
+        room = config.REAL_REG_LIMIT - len(self._reg_codes)
+        if len(todo) > room:
+            log.warning("real-time reg limit %d, skip %d codes", config.REAL_REG_LIMIT, len(todo) - room)
+            todo = todo[:max(room, 0)]
+        if not todo:
             return
-        if len(self._reg_codes) >= config.REAL_REG_LIMIT:
-            log.warning("real-time reg limit %d reached, skip %s", config.REAL_REG_LIMIT, code)
-            return
-        self._reg_codes.add(code)
-        await self._send(build_reg([code], ["0B", "0D"]))
+        self._reg_codes.update(todo)
+        await self._send(build_reg(todo, REAL_TYPES))
 
     async def remove_real(self, code: str):
-        if code not in self._reg_codes:
+        await self.remove_real_many([code])
+
+    async def remove_real_many(self, codes: list[str]):
+        todo = [c for c in codes if c in self._reg_codes]
+        if not todo:
             return
-        self._reg_codes.discard(code)
-        await self._send(build_remove([code], ["0B", "0D"]))
+        self._reg_codes.difference_update(todo)
+        await self._send(build_remove(todo, REAL_TYPES))
 
     # --- 내부 ----------------------------------------------------------
     async def _connect_once(self):
@@ -154,7 +183,7 @@ class WSClient:
             await self._send({"trnm": "CNSRREQ", "seq": self._active_seq,
                               "search_type": "1", "stex_tp": "K"})
         if self._reg_codes:
-            await self._send(build_reg(list(self._reg_codes), ["0B", "0D"]))
+            await self._send(build_reg(list(self._reg_codes), REAL_TYPES))
 
     async def _send(self, msg: dict):
         if self._ws is None:
@@ -169,42 +198,96 @@ class WSClient:
             await self._ws.send(json.dumps(msg))  # 받은 그대로 echo
             return
         log.debug("recv %s", msg)
+        if trnm in ("REG", "REMOVE"):
+            if str(msg.get("return_code", "0")) not in ("0", ""):
+                log.warning("%s failed: %s", trnm, msg)
+            return
         if trnm == "CNSRLST" and self.on_condition_list:
             self.on_condition_list(parse_condition_list(msg.get("data", [])))
         elif trnm == "CNSRREQ":
             self._handle_condition(msg)
         elif trnm == "REAL":
             for item in msg.get("data", []):
-                self._discover_fids(item)  # 처음 본 FID 로그 (개장 동시호가 때 예상체결가 FID 확인용)
+                self._discover_fids(item)  # 처음 본 FID 로그 (FID 발굴용)
+                self._count_real(item)
+                if item.get("type") == "02":  # 조건검색 실시간 편입/이탈
+                    self._on_real_condition(item)
+                    continue
+                if item.get("type") == "1h":
+                    self._on_vi(item)
+                    continue
                 code, fields = parse_real_item(item)
                 if code and fields and self.on_real:
                     self.on_real(code, fields)
+
+    def _count_real(self, item: dict):
+        """REAL 수신 빈도 5초 단위 로그. 예상값 갱신이 영웅문보다 느린 게 서버 송신
+        간격 탓인지 확인용: 'exp:종목코드' 카운트 = 그 종목의 예상값 수신 횟수.
+        ponytail: 원인 확정되면 이 메서드와 호출부 삭제."""
+        typ = item.get("type", "?")
+        self._real_stats[typ] = self._real_stats.get(typ, 0) + 1
+        v = item.get("values", {})
+        if typ == "0H" or "23" in v:
+            k = ("expH:" if typ == "0H" else "expD:") + item.get("item", "?")
+            self._real_stats[k] = self._real_stats.get(k, 0) + 1
+            t = v.get("21", "")  # 호가시간(HHMMSS) 대비 수신 지연(초) = 피드 지연 실측
+            if len(t) == 6 and t.isdigit():
+                lt = time.localtime()
+                lag = (lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec
+                       - int(t[:2]) * 3600 - int(t[2:4]) * 60 - int(t[4:]))
+                if 0 <= lag < 3600:
+                    self._real_stats["lag_max"] = max(self._real_stats.get("lag_max", 0), lag)
+                    self._real_stats["lag_min"] = min(self._real_stats.get("lag_min", 9999), lag)
+        now = time.monotonic()
+        if not self._stats_t:
+            self._stats_t = now
+        elif now - self._stats_t >= 5:
+            log.info("REAL recv/%.0fs: %s", now - self._stats_t, self._real_stats)
+            self._real_stats = {}
+            self._stats_t = now
 
     def _discover_fids(self, item: dict):
         """처음 보는 (type,fid)를 한 번씩 로그. 매핑여부+샘플값 포함.
         개장 동시호가(08:50~) 때 bot.log 열면 예상체결가 등 UNMAPPED FID를 바로 찾는다."""
         typ = item.get("type", "")
+        table = FID_0H if typ == "0H" else FID
         for fid, val in item.get("values", {}).items():
             key = (typ, fid)
             if key in self._seen_fids:
                 continue
             self._seen_fids.add(key)
             log.info("FID discover: type=%s fid=%s -> %s  sample=%r",
-                     typ, fid, FID.get(fid, "UNMAPPED"), val)
+                     typ, fid, table.get(fid, "UNMAPPED"), val)
+
+    def _on_real_condition(self, item: dict):
+        """REAL type=02 (2026-07-07 실수신으로 확정): values에
+        841=조건seq, 9001=종목코드, 843='I'(편입)/'D'(이탈), 20=시각."""
+        v = item.get("values", {})
+        if self._active_seq is not None and str(v.get("841")) != str(self._active_seq):
+            return  # 다른 조건식 이벤트 무시
+        code = (v.get("9001") or "").lstrip("A")
+        if code and self.on_condition_event:
+            self.on_condition_event(code, v.get("843") == "I", "")
+
+    def _on_vi(self, item: dict):
+        # 1h fid: 9001=코드(_AL 접미사), 9068=1 발동/2 해제, 1221=발동가격 (2026-07-07 실수신 확정)
+        v = item.get("values", {})
+        code = (v.get("9001") or "").split("_")[0].lstrip("A")
+        if code and self.on_vi:
+            self.on_vi(code, v.get("9068") == "1", int(abs(_num(v.get("1221")))))
 
     def _handle_condition(self, msg: dict):
-        """CNSRREQ 응답/실시간 편입·이탈. ⚠️ 문서 확인: 편입/이탈 필드명(I/D)."""
-        if not self.on_condition_event:
+        """CNSRREQ 응답 = 현재 편입 전체 스냅샷. 통째로 넘겨 diff는 main이 한다
+        (행 삭제/재생성 없이 편입/이탈만 반영 -> 예상값 등 실시간 상태 유지).
+        실시간 편입/이탈은 REAL type=02(_on_real_condition)로 따로 옴."""
+        if not self.on_condition_snapshot:
             return
+        codes = []
         for item in msg.get("data", []):
             code = (item.get("9001") or item.get("jmcode") or item.get("item") or "").lstrip("A")
-            if not code:
-                continue
-            # type '1'/'I'=편입, '2'/'D'=이탈. 초기 리스트는 편입으로 취급.
-            t = str(item.get("type", item.get("841", "I")))
-            is_insert = t in ("1", "I", "insert")
-            time_str = item.get("time") or item.get("843") or ""
-            self.on_condition_event(code, is_insert, time_str)
+            if code:
+                codes.append(code)
+        self.on_condition_snapshot(codes)
 
 
 def _demo():
@@ -216,11 +299,50 @@ def _demo():
     code, f = parse_real_item({"item": "005930", "values": {"10": "-4,620", "12": "+29.96", "13": "19687"}})
     assert code == "005930", code
     assert f["price"] == 4620 and f["rate"] == 29.96 and f["vol"] == 19687, f
+    _, fe = parse_real_item({"item": "x", "type": "0D", "values": {"23": "+1215", "24": "8,151"}})
+    assert fe == {"exp_price": 1215, "exp_qty": 8151}, fe
+    # 0H(주식예상체결)는 같은 FID가 다른 의미: 10=예상체결가, 13=예상체결량
+    _, fh = parse_real_item({"item": "x", "type": "0H", "values": {"10": "-1215", "13": "8151", "12": "+21.02"}})
+    assert fh == {"exp_price": 1215, "exp_qty": 8151, "exp_hot": 1}, fh
     # 매핑 없는 FID 무시
     _, f2 = parse_real_item({"item": "x", "values": {"9999": "1"}})
     assert f2 == {}, f2
+    # 실시간 편입/이탈 (REAL type=02)
+    c = WSClient()
+    got = []
+    c.on_condition_event = lambda code, ins, t: got.append((code, ins))
+    c._active_seq = "2"
+    c._on_real_condition({"type": "02", "values": {"841": "2", "9001": "A294140", "843": "I", "20": "090010"}})
+    c._on_real_condition({"type": "02", "values": {"841": "2", "9001": "011230", "843": "D", "20": "090430"}})
+    c._on_real_condition({"type": "02", "values": {"841": "9", "9001": "005930", "843": "I"}})  # 딴 조건 무시
+    assert got == [("294140", True), ("011230", False)], got
+    # VI 발동/해제 (1h)
+    vi = []
+    c.on_vi = lambda code, active, price: vi.append((code, active, price))
+    c._on_vi({"type": "1h", "values": {"9001": "109610_AL", "9068": "1", "1221": "2165"}})
+    c._on_vi({"type": "1h", "values": {"9001": "760006_AL", "9068": "2", "1221": "8260"}})
+    assert vi == [("109610", True, 2165), ("760006", False, 8260)], vi
+    # CNSRREQ 스냅샷 -> 코드 리스트
+    snap = []
+    c.on_condition_snapshot = snap.extend
+    c._handle_condition({"trnm": "CNSRREQ", "data": [{"9001": "A005930"}, {"jmcode": "002995"}]})
+    assert snap == ["005930", "002995"], snap
     # CNSRLST 파싱
     assert parse_condition_list([["0", "상한근접"], ["1", "급등주"]]) == [("0", "상한근접"), ("1", "급등주")]
+    # REG 묶음 전송: 이미 등록된 종목 제외, 1건의 메시지
+    sent = []
+    c2 = WSClient()
+
+    async def _fake(m):
+        sent.append(m)
+    c2._send = _fake
+    asyncio.run(c2.register_real_many(["1", "2"]))
+    asyncio.run(c2.register_real_many(["2", "3"]))
+    asyncio.run(c2.remove_real_many(["1", "9"]))
+    assert sent[0]["data"][0]["item"] == ["1", "2"], sent
+    assert sent[1]["data"][0]["item"] == ["3"], sent
+    assert sent[2]["trnm"] == "REMOVE" and sent[2]["data"][0]["item"] == ["1"], sent
+    assert c2._reg_codes == {"2", "3"}, c2._reg_codes
     print("ws self-check OK")
 
 

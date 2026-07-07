@@ -4,30 +4,40 @@
 화면 = 위젯(ConditionScreen) 원칙: 나중에 QMdiArea에 넣으면 그대로 다중창이 된다.
 웹소켓 계층은 on_included / on_tick / on_excluded 세 메서드만 호출하면 된다.
 """
+import logging
 import sys
 import time
 
 from PySide6.QtCore import (
-    QAbstractTableModel, QModelIndex, QRect, QSettings, QSortFilterProxyModel, Qt, QTimer, QUrl,
+    QAbstractTableModel, QModelIndex, QPoint, QRect, QSettings, QSortFilterProxyModel, Qt, QTimer, QUrl,
 )
-from PySide6.QtGui import QColor, QCursor, QDesktopServices, QFont
+from PySide6.QtGui import QColor, QCursor, QDesktopServices, QFont, QIcon, QPainter, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QHBoxLayout, QHeaderView, QLabel,
     QMainWindow, QPushButton, QSpinBox, QStyle, QStyledItemDelegate, QTableView, QToolTip,
     QVBoxLayout, QWidget,
 )
 
-COLUMNS = ["등락률", "종목명", "현재가", "예상체결가", "L일봉H", "예상등락률", "전일거래량", "거래량", "매도잔량", "매수잔량", "상한가진입시간"]
-FIELDS  = ["rate",   "name",  "price", "exp_price", "bar",    "exp_rate",   "prev_vol", "vol",   "ask_qty",  "bid_qty",  "time"]
+log = logging.getLogger("gui")
+
+COLUMNS = ["등락률", "종목명", "현재가", "예상체결가", "L일봉H", "예상등락률", "전일거래량", "거래량", "매도잔량", "매수잔량", "예상체결량", "상한가진입시간"]
+FIELDS  = ["rate",   "name",  "price", "exp_price", "bar",    "exp_rate",   "prev_vol", "vol",   "ask_qty",  "bid_qty",  "exp_qty",  "time"]
 # 컬럼은 아니지만 L일봉H 그리기에 필요한 저장 필드 (시/저/고/전일종가/상한/하한)
 STORED = set(FIELDS) | {"open", "low", "high", "base", "upper", "lower"}
 BAR_COL = FIELDS.index("bar")
+NAME_COL = FIELDS.index("name")
 BAR_ROLE = Qt.UserRole + 1  # 델리게이트에 (open, high, low, close, base, upper, lower) 전달
+NXT_ROLE = Qt.UserRole + 2  # NameDelegate에 NXT 종목 여부 전달
+MISU_ROLE = Qt.UserRole + 3  # NameDelegate에 미수가능 여부 전달
 
 LIMIT = 29.5  # 상한/하한 판정 임계 (KRX +-30%)
 DESC_FIRST = {"bid_qty", "rate", "price", "exp_price", "exp_rate"}  # 첫 클릭 내림차순 컬럼
 RED  = QColor("#e83030")
 BLUE = QColor("#2050d0")
+PURPLE = QColor("#C080F0")  # 코스닥 종목명
+ADMIN = QColor("#FF6A3D")   # 관리종목 종목명 (경고 주황빨강, 코스닥보다 우선)
+NXT_MARK = QColor("#FFDD00")  # NXT 좌상단 삼각형 (밝은 노랑)
+MISU_MARK = QColor("#33C24D")  # 미수가능 우상단 삼각형 (녹색)
 WHITE = QColor("white")
 TRACK = QColor("#d8d8d8")
 CENTER = QColor("#707070")  # L일봉H 0% 중심선
@@ -79,10 +89,43 @@ class BarDelegate(QStyledItemDelegate):
         painter.restore()
 
 
+class NameDelegate(QStyledItemDelegate):
+    """종목명 셀: 기본 렌더(글자색=코스닥 보라/관리 주황) 후 모서리 삼각형.
+    좌상단 노랑=NXT, 우상단 녹색=미수가능. 증거금100%(미수불가)는 무표시."""
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        nxt, misu = index.data(NXT_ROLE), index.data(MISU_ROLE)
+        if not (nxt or misu):
+            return
+        r = option.rect
+        s = 10
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(Qt.NoPen)
+        if nxt:
+            painter.setBrush(NXT_MARK)
+            painter.drawPolygon(QPolygon([QPoint(r.left(), r.top()),
+                                          QPoint(r.left() + s, r.top()),
+                                          QPoint(r.left(), r.top() + s)]))
+        if misu:
+            painter.setBrush(MISU_MARK)
+            painter.drawPolygon(QPolygon([QPoint(r.right(), r.top()),
+                                          QPoint(r.right() - s, r.top()),
+                                          QPoint(r.right(), r.top() + s)]))
+        painter.restore()
+
+
 def _at_limit(d: dict) -> bool:
     """상한가 상태: 실제(현재가=상한가) 또는 예상(예상등락률≥상한).
     동시호가 땐 체결 전이라 예상으로, 장중엔 실제로 잡힌다."""
     return (d["upper"] > 0 and d["price"] == d["upper"]) or (d["exp_price"] > 0 and d["exp_rate"] >= LIMIT)
+
+
+def _eff_rate(d: dict) -> float:
+    """유효 등락률: 예상값이 살아있으면(동시호가/VI/단일가) 예상등락률, 아니면 실제.
+    VI/단일가 종목은 rate가 마지막 체결에 얼어있어 예상으로 비교해야 순위가 맞다."""
+    return d["exp_rate"] if d["exp_price"] else d["rate"]
 
 
 class TieredProxy(QSortFilterProxyModel):
@@ -95,6 +138,12 @@ class TieredProxy(QSortFilterProxyModel):
         super().__init__()
         self.limit_mode = False
 
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        # 세로 헤더 = 순위: 프록시 행번호(정렬 순서)로 1..N. 소스 매핑 안 함(편입순서 X).
+        if orientation == Qt.Vertical and role == Qt.DisplayRole:
+            return section + 1
+        return super().headerData(section, orientation, role)
+
     def lessThan(self, left, right):
         if self.limit_mode:
             m = self.sourceModel()
@@ -105,8 +154,8 @@ class TieredProxy(QSortFilterProxyModel):
             desc = self.sortOrder() == Qt.DescendingOrder
             if ga != gb:  # 비그룹은 정렬방향 무관 항상 맨 아래
                 return desc if not ga else (not desc)
-            if not ga:    # 비그룹끼리: 등락률 내림차순 고정(방향 무관)
-                return a["rate"] < b["rate"] if desc else a["rate"] > b["rate"]
+            if not ga:    # 비그룹끼리: 유효 등락률 내림차순 고정(방향 무관)
+                return _eff_rate(a) < _eff_rate(b) if desc else _eff_rate(a) > _eff_rate(b)
             # 그룹끼리: 현재 정렬컬럼으로 일반 비교
         return super().lessThan(left, right)
 
@@ -116,7 +165,15 @@ class StockModel(QAbstractTableModel):
         super().__init__()
         self.codes: list[str] = []          # 행 순서
         self.rows: dict[str, dict] = {}     # code -> {field: value}
-        self._exp_seen: dict[str, float] = {}  # code -> 마지막 예상체결가 수신 시각(monotonic)
+        # 예상값 표시 ON은 국면 확정 신호(hot)로만: 0H수신 / 단일가마킹 / VI발동 / 동시호가·VI REST.
+        # 0D 23/24는 연속매매 중에도 값이 미세하게 변하며 옴 -> ON 신호로 쓰면 오탐(012160 영흥).
+        # 켜진 뒤엔 0D값으로 갱신은 허용. 끄기는 exp_price=0 / 체결재개(거래량↑) / VI해제.
+        self._exp_live: set[str] = set()     # 예상 컬럼 표시중
+        self.kosdaq: set[str] = set()        # 코스닥 코드 집합 (main이 시작 시 주입)
+        self.single: set[str] = set()        # 단일가 매매 종목: 예상값 상시 표시 (main 주입)
+        self.nxt: set[str] = set()           # 넥스트레이드(NXT) 거래가능: 좌상단 노랑 삼각형 (main 주입)
+        self.misu: set[str] = set()          # 미수가능(증거금<100%): 우상단 녹색 삼각형 (main 주입)
+        self.admin: set[str] = set()         # 관리종목: 종목명 경고색 (코스닥보다 우선, main 주입)
 
     # --- 웹소켓/전략 계층이 부르는 API ---------------------------------
     def add_stock(self, code: str, data: dict):
@@ -126,8 +183,9 @@ class StockModel(QAbstractTableModel):
         row = len(self.codes)
         self.beginInsertRows(QModelIndex(), row, row)
         self.codes.append(code)
-        self.rows[code] = {f: data.get(f, "" if f in ("name", "time") else 0) for f in STORED}
+        self.rows[code] = {f: "" if f in ("name", "time") else 0 for f in STORED}
         self.endInsertRows()
+        self.update_stock(code, data)  # exp 게이트/파생/로그를 신규 행에도 동일 적용
 
     def remove_stock(self, code: str):
         if code not in self.rows:
@@ -136,15 +194,40 @@ class StockModel(QAbstractTableModel):
         self.beginRemoveRows(QModelIndex(), row, row)
         self.codes.remove(code)
         del self.rows[code]
-        self._exp_seen.pop(code, None)
+        self._exp_live.discard(code)
         self.endRemoveRows()
+
+    def set_vi(self, code: str, active: bool, price: int = 0):
+        if active and price:  # 발동가로 즉시 채움, 이후 틱이 덮어씀
+            self.update_stock(code, {"exp_price": price, "exp_hot": 1})
+        elif not active:
+            self.update_stock(code, {"exp_price": 0, "exp_qty": 0})  # 해제 즉시 비움
 
     def update_stock(self, code: str, fields: dict):
         if code not in self.rows:
             return
         row = self.codes.index(code)
         stored = self.rows[code]
+        hot = fields.get("exp_hot", 0) or code in self.single  # 0H발/단일가종목 = 국면 확정
         fields = {f: v for f, v in fields.items() if f in STORED}  # 모르는 키 무시
+        if "exp_price" in fields:
+            if not fields["exp_price"]:
+                if code in self._exp_live:
+                    self._exp_live.discard(code)
+                    log.info("expOFF %s zero", code)
+            elif hot:                          # 확정신호 -> 켜고 값 갱신
+                if code not in self._exp_live:
+                    self._exp_live.add(code)
+                    log.info("expON %s %s", code, fields["exp_price"])
+            elif code not in self._exp_live:   # 안 켜진 상태의 0D값 = 연속매매 echo -> 무시
+                fields.pop("exp_price")
+                fields.pop("exp_qty", None)
+            # 이미 켜진(VI/단일가) 종목의 0D값은 그대로 통과 -> 실시간 갱신
+        if (code in self._exp_live and code not in self.single
+                and "exp_price" not in fields and fields.get("vol", 0) > stored["vol"]):
+            self._exp_live.discard(code)  # 체결 재개 = 국면 종료 (단일가 종목은 유지)
+            fields["exp_price"], fields["exp_qty"] = 0, 0
+            log.info("expOFF %s vol", code)
         cols = set()
         for f, v in fields.items():
             if stored.get(f) == v:
@@ -154,13 +237,7 @@ class StockModel(QAbstractTableModel):
             if f in ("price", "open", "low", "high", "base", "upper", "lower"):  # L일봉H 의존
                 cols.add(BAR_COL)
         stored.update(fields)
-        # 예상체결가 수신 시각 기록(도착 기준). 값 변화 없어도 도착하면 갱신 -> staleness 판정용.
-        if "exp_price" in fields:
-            if fields["exp_price"]:
-                self._exp_seen[code] = time.monotonic()
-            else:
-                self._exp_seen.pop(code, None)
-        # 예상등락률은 실시간 예상체결가/전일종가에서 파생 (동시호가/VI 때만 값이 옴)
+        # 예상등락률은 예상체결가/전일종가에서 파생 (동시호가/VI 때만 값이 옴)
         if "exp_price" in fields or "base" in fields:
             ep, base = stored["exp_price"], stored["base"]
             er = round((ep - base) / base * 100, 2) if (ep and base) else 0.0
@@ -169,14 +246,6 @@ class StockModel(QAbstractTableModel):
                 cols.add(FIELDS.index("exp_rate"))
         if cols:  # 바뀐 셀만 갱신
             self.dataChanged.emit(self.index(row, min(cols)), self.index(row, max(cols)))
-
-    def clear_stale_exp(self, timeout: float = 3.0):
-        """예상체결가가 timeout초 이상 안 들어오면 예상 컬럼 비움(동시호가/VI 종료 시 값 잔류 방지).
-        피드가 0을 보내며 끝나지 않고 그냥 송신을 멈추므로 도착 기준 staleness로 판정."""
-        now = time.monotonic()
-        for code, ts in list(self._exp_seen.items()):
-            if now - ts > timeout:
-                self.update_stock(code, {"exp_price": 0})  # -> exp_rate도 0 파생, 셀 갱신
 
     # --- Qt 모델 구현 ---------------------------------------------------
     def rowCount(self, parent=QModelIndex()):
@@ -198,6 +267,10 @@ class StockModel(QAbstractTableModel):
         if role == BAR_ROLE and field == "bar":  # 델리게이트용
             return (stored["open"], stored["high"], stored["low"], stored["price"],
                     stored["base"], stored["upper"], stored["lower"])
+        if role == NXT_ROLE:  # 델리게이트 모서리 삼각형 판단
+            return self.codes[index.row()] in self.nxt
+        if role == MISU_ROLE:
+            return self.codes[index.row()] in self.misu
         if role == Qt.DisplayRole:
             if field == "bar":
                 return ""  # 델리게이트가 그림
@@ -205,7 +278,7 @@ class StockModel(QAbstractTableModel):
                 return f"{value:+.2f}"
             if field == "exp_rate":
                 return f"{value:+.2f}" if value else ""
-            if field in ("price", "exp_price", "prev_vol", "vol", "ask_qty", "bid_qty"):
+            if field in ("price", "exp_price", "prev_vol", "vol", "ask_qty", "bid_qty", "exp_qty"):
                 return f"{value:,}" if value else ""
             return value
         if role == Qt.UserRole:  # 정렬용 원본값
@@ -224,6 +297,11 @@ class StockModel(QAbstractTableModel):
             if field == "exp_rate" and exp_is_limit:
                 return RED if er > 0 else BLUE
         if role == Qt.ForegroundRole:
+            if field == "name":
+                code = self.codes[index.row()]
+                if code in self.admin:       # 관리종목 = 경고색 (코스닥보다 우선)
+                    return ADMIN
+                return PURPLE if code in self.kosdaq else None
             if field == "rate":
                 if is_limit:
                     return WHITE  # 상/하한 배경 위 흰 글씨
@@ -239,6 +317,17 @@ class StockModel(QAbstractTableModel):
         return None
 
 
+def _list_reload_icon(style) -> QIcon:
+    """새로고침 아이콘(=오른쪽 재조회 버튼과 동일)을 메인으로, 좌하단에 작은 목록 아이콘을
+    배지로 얹어 '조건목록 재조회'임을 구분. 재조회 버튼과 크기/모양 일관성 유지."""
+    base = style.standardIcon(QStyle.StandardPixmap.SP_BrowserReload).pixmap(18, 18)
+    over = style.standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView).pixmap(10, 10)
+    p = QPainter(base)
+    p.drawPixmap(0, base.height() - over.height(), over)  # 좌하단 작은 목록 배지
+    p.end()
+    return QIcon(base)
+
+
 class ConditionScreen(QWidget):
     """조건검색실시간 화면 하나. 나중에 QMdiArea에 이 위젯을 여러 개 띄우면 다중창."""
 
@@ -246,13 +335,17 @@ class ConditionScreen(QWidget):
         super().__init__(parent)
         self.model = StockModel()
 
-        # 툴바: 조건식 선택 / 등록 토글 / 이탈삭제 / 종목수
+        # 툴바: 조건목록 새로고침 / 조건식 선택 / 등록 토글 / 이탈삭제 / 종목수
+        self.reload_btn = QPushButton()  # 조건 목록(CNSRLST) 새로 받기: 영웅문서 조건 추가/수정 시
+        self.reload_btn.setIcon(_list_reload_icon(self.style()))
+        self.reload_btn.setToolTip("조건목록 재조회 — 영웅문에서 새로 만들거나 수정한 조건식을 목록에 반영")
+        self.reload_btn.setFixedWidth(32)
         self.condition_combo = QComboBox()
         self.condition_combo.setFixedWidth(320)  # 창 크기와 무관하게 고정
         # 등록/해제 버튼 없음: 콤보에서 조건 고르는 순간 바로 등록됨(영웅문 방식).
         self.refresh_btn = QPushButton()  # 현재 조건 편입목록 새로 받아오기(해제->재등록)
         self.refresh_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
-        self.refresh_btn.setToolTip("재조회")
+        self.refresh_btn.setToolTip("재조회 — 현재 조건의 편입 종목을 지금 다시 받아옵니다")
         self.refresh_btn.setFixedWidth(32)
         self.auto_refresh = QCheckBox("자동재조회")  # 동시호가 때 편입/이탈 수동갱신용
         self.auto_refresh.setToolTip("동시호가 때 편입/이탈이 실시간으로 안 와서 주기적으로 재조회")
@@ -272,6 +365,7 @@ class ConditionScreen(QWidget):
         self.count_label = QLabel("종목수: 0")
 
         top = QHBoxLayout()
+        top.addWidget(self.reload_btn)
         top.addWidget(self.condition_combo)
         top.addWidget(self.refresh_btn)
         top.addWidget(self.auto_refresh)
@@ -295,22 +389,23 @@ class ConditionScreen(QWidget):
         hdr0.sectionClicked.connect(self._on_header_clicked)
         self._sort_col, self._sort_order = 0, Qt.DescendingOrder  # 기본 등락률 내림차순
         self.limit_sort.toggled.connect(self._on_limit_sort)
-        # 상한가정렬은 그룹 판정이 정렬컬럼 밖의 값(상한/매도잔량)이라 Qt 자동재정렬이
-        # 안 걸림 -> 데이터 변경 시 직접 재정렬(디바운스로 틱마다 과다정렬 방지).
+        # 상한가정렬은 그룹 판정이 정렬컬럼 밖의 값(상한/매도잔량/예상등락률)이라 Qt 자동재정렬이
+        # 안 걸림 -> 데이터 변경 시 직접 재정렬. 스로틀: 실행중이면 리셋 안 함(디바운스로 하면
+        # 틱이 200ms보다 자주 오는 장중엔 계속 리셋돼 영영 안 불림 = 재정렬 멈춤 버그).
         self._resort_timer = QTimer(self)
         self._resort_timer.setSingleShot(True)
         self._resort_timer.timeout.connect(self.proxy.invalidate)
-        self.model.dataChanged.connect(
-            lambda *a: self._resort_timer.start(200) if self.limit_sort.isChecked() else None)
-        self.table.verticalHeader().setVisible(False)
+        self.model.dataChanged.connect(self._on_data_changed)
+        self.table.verticalHeader().setVisible(True)  # 순위(정렬 순서대로 1..N 자동)
         self.table.verticalHeader().setDefaultSectionSize(22)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setColumnWidth(1, 110)
         self.table.setColumnWidth(BAR_COL, 70)
         self.table.setItemDelegateForColumn(BAR_COL, BarDelegate(self.table))
+        self.table.setItemDelegateForColumn(NAME_COL, NameDelegate(self.table))
         self.table.setSelectionBehavior(QTableView.SelectRows)
-        self.table.setFont(QFont("맑은 고딕", 9))
+        self.table.setFont(QFont("돋움체", 10))
         self.table.setEditTriggers(QTableView.NoEditTriggers)
         self.table.clicked.connect(self._on_cell_clicked)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -343,10 +438,10 @@ class ConditionScreen(QWidget):
         hdr.sectionResized.connect(lambda *a: self._save_timer.start(400))
         hdr.sectionMoved.connect(lambda *a: self._save_timer.start(400))
 
-        # 예상체결가가 멎으면 자동으로 비우는 staleness 타이머
-        self._exp_timer = QTimer(self)
-        self._exp_timer.timeout.connect(lambda: self.model.clear_stale_exp())
-        self._exp_timer.start(1000)
+    def _on_data_changed(self, *a):
+        # 스로틀: 이미 대기중이면 리셋하지 않음 -> 틱이 몰려도 200ms마다 반드시 재정렬됨
+        if self.limit_sort.isChecked() and not self._resort_timer.isActive():
+            self._resort_timer.start(200)
 
     def _update_count(self):
         self.count_label.setText(f"종목수: {self.model.rowCount()}")
