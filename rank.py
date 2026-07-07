@@ -141,6 +141,9 @@ class RankScreen(QWidget):
         self.alert_top.toggled.connect(lambda on: self._save_opt("rank_alert_top", on))
         self.alert_jump.toggled.connect(lambda on: self._save_opt("rank_alert_jump", on))
         self.jump_n.valueChanged.connect(lambda v: self._save_opt("rank_jump_n", v))
+        # 화살표로 값 변경 시 텍스트 선택(어두운 배경에 가림) 방지 — gui.py 간격 스핀과 동일
+        self.jump_n.valueChanged.connect(
+            lambda _: QTimer.singleShot(0, self.jump_n.lineEdit().deselect))
         self._last_tm = ""   # 마지막 판정한 집계 시각
         self._last_top = ""  # 마지막 1위 종목코드
 
