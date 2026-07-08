@@ -20,18 +20,20 @@ from PySide6.QtWidgets import (
 
 log = logging.getLogger("gui")
 
-COLUMNS = ["등락률", "종목명", "현재가", "예상체결가", "L일봉H", "예상등락률", "전일거래량", "거래량", "매도잔량", "매수잔량", "예상체결량", "상한가진입시간"]
-FIELDS  = ["rate",   "name",  "price", "exp_price", "bar",    "exp_rate",   "prev_vol", "vol",   "ask_qty",  "bid_qty",  "exp_qty",  "time"]
+COLUMNS = ["등락률", "연상", "종목명", "현재가", "예상체결가", "L일봉H", "예상등락률", "전일거래량", "거래량", "매도잔량", "매수잔량", "예상체결량", "상한가진입시간"]
+FIELDS  = ["rate",   "streak", "name",  "price", "exp_price", "bar",    "exp_rate",   "prev_vol", "vol",   "ask_qty",  "bid_qty",  "exp_qty",  "time"]
 # 컬럼은 아니지만 L일봉H 그리기에 필요한 저장 필드 (시/저/고/전일종가/상한/하한)
-STORED = set(FIELDS) | {"open", "low", "high", "base", "upper", "lower"}
+# streak(연상)는 저장 안 함: 어제cnt + 오늘상한 여부로 매번 계산 (상태 꼬임 방지)
+STORED = (set(FIELDS) - {"streak"}) | {"open", "low", "high", "base", "upper", "lower"}
 BAR_COL = FIELDS.index("bar")
 NAME_COL = FIELDS.index("name")
+STREAK_COL = FIELDS.index("streak")
 BAR_ROLE = Qt.UserRole + 1  # 델리게이트에 (open, high, low, close, base, upper, lower) 전달
 NXT_ROLE = Qt.UserRole + 2  # NameDelegate에 NXT 종목 여부 전달
 MISU_ROLE = Qt.UserRole + 3  # NameDelegate에 미수가능 여부 전달
 
 LIMIT = 29.5  # 상한/하한 판정 임계 (KRX +-30%)
-DESC_FIRST = {"bid_qty", "rate", "price", "exp_price", "exp_rate"}  # 첫 클릭 내림차순 컬럼
+DESC_FIRST = {"bid_qty", "rate", "price", "exp_price", "exp_rate", "streak"}  # 첫 클릭 내림차순 컬럼
 RED  = QColor("#e83030")
 BLUE = QColor("#2050d0")
 PURPLE = QColor("#C080F0")  # 코스닥 종목명
@@ -174,6 +176,7 @@ class StockModel(QAbstractTableModel):
         self.nxt: set[str] = set()           # 넥스트레이드(NXT) 거래가능: 좌상단 노랑 삼각형 (main 주입)
         self.misu: set[str] = set()          # 미수가능(증거금<100%): 우상단 녹색 삼각형 (main 주입)
         self.admin: set[str] = set()         # 관리종목: 종목명 경고색 (코스닥보다 우선, main 주입)
+        self.limit_cnt: dict[str, int] = {}  # 어제 연속상한 일수 ka10017 (main 주입, 연상 컬럼)
 
     # --- 웹소켓/전략 계층이 부르는 API ---------------------------------
     def add_stock(self, code: str, data: dict):
@@ -238,6 +241,8 @@ class StockModel(QAbstractTableModel):
                 cols.add(FIELDS.index(f))
             if f in ("price", "open", "low", "high", "base", "upper", "lower"):  # L일봉H 의존
                 cols.add(BAR_COL)
+            if f in ("price", "upper", "exp_price"):  # 연상 판정(_at_limit) 의존
+                cols.add(STREAK_COL)
         stored.update(fields)
         # 예상등락률은 예상체결가/전일종가에서 파생 (동시호가/VI 때만 값이 옴)
         if "exp_price" in fields or "base" in fields:
@@ -257,13 +262,28 @@ class StockModel(QAbstractTableModel):
         return len(COLUMNS)
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
-        if role == Qt.DisplayRole and orientation == Qt.Horizontal:
-            return COLUMNS[section]
+        if orientation == Qt.Horizontal:
+            if role == Qt.DisplayRole:
+                return COLUMNS[section]
+            # 진입시간=마지막 스트레치 컬럼: 헤더 글자도 데이터처럼 왼쪽 (rank 직전대비와 동일)
+            if role == Qt.TextAlignmentRole and FIELDS[section] == "time":
+                return Qt.AlignLeft | Qt.AlignVCenter
         return None
 
     def data(self, index, role=Qt.DisplayRole):
         field = FIELDS[index.column()]
         stored = self.rows[self.codes[index.row()]]
+        if field == "streak":  # 연상 = 어제cnt + (지금 상한이면 1), 매번 계산 (저장 안 함)
+            n = self.limit_cnt.get(self.codes[index.row()], 0) + (1 if _at_limit(stored) else 0)
+            if role == Qt.DisplayRole:
+                return str(n) if n else ""
+            if role == Qt.UserRole:
+                return n
+            if role == Qt.TextAlignmentRole:
+                return Qt.AlignCenter
+            if role == Qt.ForegroundRole and n:
+                return RED
+            return None
         value = stored[field]
 
         if role == BAR_ROLE and field == "bar":  # 델리게이트용
@@ -426,7 +446,8 @@ class ConditionScreen(QWidget):
         self.table.verticalHeader().setDefaultSectionSize(22)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.setColumnWidth(1, 110)
+        self.table.setColumnWidth(NAME_COL, 110)
+        self.table.setColumnWidth(STREAK_COL, 34)
         self.table.setColumnWidth(BAR_COL, 70)
         self.table.setItemDelegateForColumn(BAR_COL, BarDelegate(self.table))
         self.table.setItemDelegateForColumn(NAME_COL, NameDelegate(self.table))

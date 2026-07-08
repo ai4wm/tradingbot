@@ -216,6 +216,7 @@ class App:
         self._extra_windows: list = []  # 추가 창(ConditionWindow) 목록
         self._cond_items = []           # CNSRLST 결과 (새 창 콤보 채우기용)
         self._market = None             # MarketInfo (새 창 모델 주입용)
+        self._limit_cnt = None          # ka10017 어제 연속상한 (연상 컬럼, 시작 시 1회)
         # REG/REMOVE는 0.3초 모아 각 1건으로 (서버 105110 유량거부 방지).
         # Counter: 두 창이 같은 종목을 등록하면 참조수 2가 되도록 발생 횟수 유지.
         self._reg_pending = Counter()
@@ -257,11 +258,22 @@ class App:
                      len(m.kosdaq), len(m.single), len(m.nxt), len(m.misu), len(m.admin))
         except Exception as e:  # noqa: BLE001
             log.warning("market_info failed: %s", e)
+        try:
+            # ponytail: 시작 시 1회. 자정 넘겨 켜두면 옛 목록 -> 날짜 가드는 필요해지면
+            self._limit_cnt = await self.rest.yesterday_limit_counts()
+            for v in self.views:
+                self._inject_market(v)
+            log.info("yesterday limit: %d codes %s", len(self._limit_cnt),
+                     ",".join(self._limit_cnt))
+        except Exception as e:  # noqa: BLE001
+            log.warning("limit_counts failed: %s", e)
 
     def _inject_market(self, view: View):
+        m = view.screen.model
+        if self._limit_cnt is not None:
+            m.limit_cnt = self._limit_cnt
         if self._market is None:
             return
-        m = view.screen.model
         m.kosdaq, m.single, m.nxt, m.misu, m.admin = (
             self._market.kosdaq, self._market.single, self._market.nxt,
             self._market.misu, self._market.admin)
@@ -389,11 +401,11 @@ class App:
         used = {v.prefix for v in self.views}
         n = next(i for i in range(2, MAX_WINDOWS + 1) if f"w{i}_" not in used)
         prefix = f"w{n}_"
-        # 처음 여는 창이면 본창의 크기/컬럼 상태를 기본값으로 복사 (이후엔 자기 것 기억)
+        # 컬럼폭/정렬은 열 때마다 본창 복사 (크기와 함께 통일). 위치만 창별 기억.
+        main = self.views[0].screen
+        self._settings.setValue(prefix + "header", main.table.horizontalHeader().saveState())
         seeded = False
-        if self._settings.value(prefix + "header") is None:
-            main = self.views[0].screen
-            self._settings.setValue(prefix + "header", main.table.horizontalHeader().saveState())
+        if self._settings.value(prefix + "geometry") is None:  # 첫 오픈: 위치도 본창에서
             self._settings.setValue(prefix + "geometry", main.window().saveGeometry())
             seeded = True
         screen = ConditionScreen(prefix=prefix)
@@ -408,6 +420,7 @@ class App:
         self._wire_extra(screen)
         self._extra_windows.append(win)
         win.show()
+        win.resize(self.views[0].screen.window().size())  # 크기는 항상 본창 따라감 (위치만 창별 기억)
         if seeded:  # 본창과 완전히 겹치지 않게 살짝 비껴 배치
             win.move(win.x() + 40, win.y() + 40)
         if self._cond_items:  # 이미 목록 받아놨으면 즉시 콤보 채움 + 자동 등록

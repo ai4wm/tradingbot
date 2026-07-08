@@ -148,6 +148,15 @@ class RestClient:
             })
         return out
 
+    async def yesterday_limit_counts(self) -> dict[str, int]:
+        """ka10017 전일상한(updown_tp=6): 어제 상한 마감 종목 -> 연속 상한 일수(cnt, 실측 확인).
+        하루 동안 불변 -> 시작 시 1회. 연상 표시 = cnt + (오늘 상한이면 1)."""
+        d = await self.request("ka10017", {
+            "mrkt_tp": "000", "updown_tp": "6", "sort_tp": "1", "stk_cnd": "0",
+            "trde_qty_tp": "00000", "crd_cnd": "0", "trde_gold_tp": "0", "stex_tp": "1"})
+        return {r["stk_cd"]: _to_int(r.get("cnt"))
+                for r in d.get("updown_pric", []) if r.get("stk_cd")}
+
     async def prev_volume(self, code: str) -> int:
         """전일(직전 거래일) 절대 거래량 = ka10081 일봉의 첫 dt<오늘 행.
         동시호가엔 오늘 체결이 없어 ka10095 역산(오늘거래량÷전일대비율)이 0이 됨.
