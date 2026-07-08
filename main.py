@@ -11,6 +11,7 @@ from collections import Counter
 
 import qasync
 from PySide6.QtCore import QSettings, QTimer
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QApplication, QMainWindow
 
 from api import RestClient
@@ -172,6 +173,7 @@ class View:
                     self.screen.on_tick(row["code"], row)
             except Exception as e:  # noqa: BLE001
                 log.warning("watch_info failed: %s", e)
+        self.app.ensure_prev_vol(self.screen.model)  # 역산 0인 종목 ka10081 백필
         self._fill_entry_times()
 
     def _fill_entry_times(self):
@@ -221,6 +223,9 @@ class App:
         self._reg_task = None
         # 단일가 종목은 WS 무송신(실측 0건) -> REST 3초 폴이 유일한 채널
         self._single_task = None
+        # 전일거래량: 동시호가 역산실패(0) 종목만 ka10081로 1회 백필 (정적값 캐시)
+        self._prevvol_pending: set[str] = set()
+        self._prevvol_done: set[str] = set()
         self._single_timer = QTimer()
         self._single_timer.timeout.connect(self._on_single_poll)
         self._single_timer.start(3000)
@@ -333,6 +338,28 @@ class App:
                         if c in v.screen.model.single})
         if codes and not (self._single_task and not self._single_task.done()):
             self._single_task = asyncio.ensure_future(self._poll_single(codes))
+
+    def ensure_prev_vol(self, model):
+        """전일거래량이 0인(동시호가 역산실패) 종목만 ka10081로 1회 백필."""
+        for code in list(model.codes):
+            if (model.rows[code].get("prev_vol", 0) == 0
+                    and code not in self._prevvol_pending
+                    and code not in self._prevvol_done):
+                self._prevvol_pending.add(code)
+                asyncio.ensure_future(self._fetch_prev_vol(code))
+
+    async def _fetch_prev_vol(self, code: str):
+        try:
+            vol = await self.rest.prev_volume(code)
+            self._prevvol_done.add(code)  # 응답 받았으면(0이라도) 재조회 안 함
+            if vol:
+                for v in self.views:
+                    if code in v.screen.model.rows:
+                        v.screen.on_tick(code, {"prev_vol": vol})
+        except Exception as e:  # noqa: BLE001
+            log.warning("prev_vol %s: %s", code, e)  # 실패는 done 안 찍어 다음 refresh 재시도
+        finally:
+            self._prevvol_pending.discard(code)
 
     async def _poll_single(self, codes: list[str]):
         try:
@@ -486,6 +513,9 @@ class MainWindow(QMainWindow):
 
 def main():
     qapp = QApplication(sys.argv)
+    f = QFont("굴림체", 9)
+    f.setStyleStrategy(QFont.NoAntialias)  # 영웅문식 비트맵 렌더링, 전 위젯 통일
+    qapp.setFont(f)  # 그리드/툴바/헤더/툴팁 전부. 타이틀바는 OS 소관(변경 불가)
     loop = qasync.QEventLoop(qapp)
     asyncio.set_event_loop(loop)
 

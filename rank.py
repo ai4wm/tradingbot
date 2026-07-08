@@ -4,7 +4,7 @@ import asyncio
 import threading
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSettings, Qt, QTimer
-from PySide6.QtGui import QColor, QCursor, QFont
+from PySide6.QtGui import QColor, QCursor
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QHBoxLayout, QHeaderView, QLabel, QPushButton,
     QSpinBox, QTableView, QToolTip, QVBoxLayout, QWidget,
@@ -66,8 +66,12 @@ class RankModel(QAbstractTableModel):
         return len(COLUMNS)
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
-        if role == Qt.DisplayRole and orientation == Qt.Horizontal:
-            return COLUMNS[section]
+        if orientation == Qt.Horizontal:
+            if role == Qt.DisplayRole:
+                return COLUMNS[section]
+            # 직전대비=마지막 스트레치 컬럼: 헤더 글자도 왼쪽(중앙이면 넓은 컬럼 한가운데 떠 보임)
+            if role == Qt.TextAlignmentRole and FIELDS[section] == "prev_rate":
+                return Qt.AlignLeft | Qt.AlignVCenter
         return None
 
     def data(self, index, role=Qt.DisplayRole):
@@ -85,7 +89,8 @@ class RankModel(QAbstractTableModel):
         if role == Qt.TextAlignmentRole:
             if f == "rank_chg":
                 return Qt.AlignCenter
-            return (Qt.AlignLeft if f == "name" else Qt.AlignRight) | Qt.AlignVCenter
+            # prev_rate=마지막 스트레치 컬럼: 왼쪽 정렬이라야 데이터가 붙어 창 폭 줄이기 좋음
+            return (Qt.AlignLeft if f in ("name", "prev_rate") else Qt.AlignRight) | Qt.AlignVCenter
         if role == Qt.BackgroundRole:
             if f == "rate" and (v >= LIMIT or v <= -LIMIT):  # 상/하한 = 배경색
                 return RED if v > 0 else BLUE
@@ -102,7 +107,6 @@ class RankScreen(QWidget):
         super().__init__(parent)
         self.rest = rest
         self.setWindowTitle("[0198] 실시간 종목조회순위")
-        self.setFont(QFont("돋움체", 10))  # 조건검색 그리드와 동일 서체 (툴바/헤더 포함)
         self._settings = QSettings("layout.ini", QSettings.IniFormat)
 
         self.period = QComboBox()
@@ -114,8 +118,17 @@ class RankScreen(QWidget):
         self.interval.setRange(5, 300)
         self.interval.setValue(int(self._settings.value("rank_interval", 30)))
         self.interval.setSuffix("초")
+        self.interval.setFixedWidth(80)  # 기본 sizeHint가 과대 -> 상단 가로폭 절약
+        # 화살표로 값 변경 시 텍스트 선택(어두운 배경에 가림) 방지 — jump_n과 동일
+        self.interval.valueChanged.connect(
+            lambda _: QTimer.singleShot(0, self.interval.lineEdit().deselect))
         self.refresh_btn = QPushButton("조회")
         self.time_label = QLabel("")
+        self.time_label.setToolTip("집계 기준시각")
+        self.on_top_btn = QPushButton("📌")  # 항상 맨 위 토글
+        self.on_top_btn.setCheckable(True)
+        self.on_top_btn.setFixedWidth(32)
+        self.on_top_btn.setToolTip("항상 맨 위 — 이 창을 다른 창들 위에 계속 고정")
 
         top = QHBoxLayout()
         top.addWidget(QLabel("기준"))
@@ -127,7 +140,7 @@ class RankScreen(QWidget):
         top.addWidget(self.time_label)
 
         self.model = RankModel()
-        self.table = QTableView()
+        self.table = QTableView()  # 폰트는 앱 전역(main.py: 굴림체9 NoAA) 상속
         self.table.setModel(self.model)
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(22)
@@ -141,9 +154,11 @@ class RankScreen(QWidget):
         self.table.clicked.connect(self._on_cell_clicked)
 
         # 하단: 사운드 알림 옵션 (새 집계 스냅샷에서만 판정 -> 중복 알림 없음)
-        self.alert_top = QCheckBox("1위 변경 알림")
+        self.alert_top = QCheckBox("1위변경")
+        self.alert_top.setToolTip("1위 종목이 바뀌면 소리 알림")
         self.alert_top.setChecked(self._settings.value("rank_alert_top", "false") == "true")
-        self.alert_jump = QCheckBox("순위 급상승 알림 ≥")
+        self.alert_jump = QCheckBox("급상승≥")
+        self.alert_jump.setToolTip("순위가 N계단 이상 뛰어오르면 소리 알림")
         self.alert_jump.setChecked(self._settings.value("rank_alert_jump", "false") == "true")
         self.jump_n = QSpinBox()
         self.jump_n.setRange(1, 19)
@@ -162,6 +177,7 @@ class RankScreen(QWidget):
         bottom.addWidget(self.alert_jump)
         bottom.addWidget(self.jump_n)
         bottom.addStretch(1)
+        bottom.addWidget(self.on_top_btn)  # 하단 오른쪽 구석 (상단 가로폭 확보)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -183,6 +199,9 @@ class RankScreen(QWidget):
         state = self._settings.value("rank_header")
         if state is not None:
             self.table.horizontalHeader().restoreState(state)
+        self.on_top_btn.toggled.connect(self._on_top_toggle)
+        if self._settings.value("rank_on_top", "false") == "true":  # 항상위 복원
+            self.on_top_btn.setChecked(True)  # 창 뜨기 전 = 플래그만 걸림(재생성 튐 없음)
         # 크기/컬럼 변경 시 디바운스 저장 (닫을 때만 저장하면 앱 종료 경로 따라 유실)
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -192,6 +211,19 @@ class RankScreen(QWidget):
     def _save_opt(self, key: str, v):
         self._settings.setValue(key, "true" if v is True else "false" if v is False else v)
         self._settings.sync()
+
+    def _apply_on_top(self, on: bool):
+        w = self.window()  # top-level 창 = 자기 자신
+        was_visible = w.isVisible()  # setWindowFlag이 창을 숨기므로 '전에' 잡아야 함
+        geo = w.geometry()  # 창 재생성 때 위치 유실 -> 보존 (안 하면 이동된 위치가 저장돼 복원 오염)
+        w.setWindowFlag(Qt.WindowStaysOnTopHint, on)
+        if was_visible:    # 떠 있던 창만 재표시(플래그 변경 후 숨겨짐). 숨은 채 복원이면 show 안 함
+            w.show()
+            w.setGeometry(geo)  # 재생성된 창을 원위치로
+
+    def _on_top_toggle(self, on: bool):
+        self._apply_on_top(on)
+        self._save_opt("rank_on_top", on)
 
     def _on_period(self, _):
         self._settings.setValue("rank_period", self.period.currentData())
@@ -215,7 +247,7 @@ class RankScreen(QWidget):
             return
         self.model.set_rows(rows)
         t = rows[0]["time"] if rows else ""
-        self.time_label.setText(f"{t[:2]}:{t[2:4]}:{t[4:6]} 기준" if len(t) == 6 else "데이터 없음")
+        self.time_label.setText(f"{t[:2]}:{t[2:4]}:{t[4:6]}" if len(t) == 6 else "데이터 없음")
         if rows and t != self._last_tm:  # 새 집계 스냅샷에서만 알림 판정
             if self._last_tm:  # 창 연 직후 첫 수신은 제외
                 kind = _alert_kind(self._last_top, rows, self.alert_top.isChecked(),

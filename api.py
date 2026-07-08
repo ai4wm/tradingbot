@@ -148,6 +148,20 @@ class RestClient:
             })
         return out
 
+    async def prev_volume(self, code: str) -> int:
+        """전일(직전 거래일) 절대 거래량 = ka10081 일봉의 첫 dt<오늘 행.
+        동시호가엔 오늘 체결이 없어 ka10095 역산(오늘거래량÷전일대비율)이 0이 됨.
+        이 절대값으로 채운다. 정적값이라 종목당 1회만 조회하면 됨."""
+        import datetime
+        today = datetime.datetime.now().strftime("%Y%m%d")
+        d = await self.request("ka10081",
+                               {"stk_cd": code, "base_dt": today, "upd_stkpc_tp": "1"},
+                               path="/api/dostk/chart")
+        for r in d.get("stk_dt_pole_chart_qry", []):
+            if r.get("dt", "") < today:            # 오늘 행(부분체결) 건너뛰고 전일
+                return abs(_to_int(r.get("trde_qty")))
+        return 0
+
     async def market_info(self) -> "MarketInfo":
         """ka10099 양시장 1회 조회 -> 종목 분류셋 묶음(MarketInfo).
         단일가: orderWarning 2=정리매매 3=단기과열 (30분 단일가)

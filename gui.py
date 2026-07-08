@@ -210,6 +210,8 @@ class StockModel(QAbstractTableModel):
         stored = self.rows[code]
         hot = fields.get("exp_hot", 0) or code in self.single  # 0H발/단일가종목 = 국면 확정
         fields = {f: v for f, v in fields.items() if f in STORED}  # 모르는 키 무시
+        if fields.get("prev_vol") == 0 and stored.get("prev_vol"):
+            fields.pop("prev_vol")  # 전일거래량=정적값. 0(동시호가 역산실패)으로 덮어쓰기 금지
         if "exp_price" in fields:
             if not fields["exp_price"]:
                 if code in self._exp_live:
@@ -289,8 +291,14 @@ class StockModel(QAbstractTableModel):
             return Qt.AlignRight | Qt.AlignVCenter
         rate = stored["rate"]
         er = stored["exp_rate"]
-        is_limit = rate >= LIMIT or rate <= -LIMIT          # 등락률 상한/하한
-        exp_is_limit = er >= LIMIT or er <= -LIMIT          # 예상등락률 상한/하한
+        up, lo, pr, ep = stored["upper"], stored["lower"], stored["price"], stored["exp_price"]
+        # 상한/하한가 값이 있으면 실제 도달 여부로 판정(29.75%≠30% 오탐 방지), 없으면 rate 폴백
+        if up > 0 and lo > 0:
+            is_limit = pr >= up or pr <= lo
+            exp_is_limit = ep >= up or (ep > 0 and ep <= lo)
+        else:
+            is_limit = rate >= LIMIT or rate <= -LIMIT
+            exp_is_limit = er >= LIMIT or er <= -LIMIT
         if role == Qt.BackgroundRole:
             if field == "rate" and is_limit:
                 return RED if rate > 0 else BLUE
@@ -342,7 +350,7 @@ class ConditionScreen(QWidget):
         self.reload_btn.setToolTip("조건목록 재조회 — 영웅문에서 새로 만들거나 수정한 조건식을 목록에 반영")
         self.reload_btn.setFixedWidth(32)
         self.condition_combo = QComboBox()
-        self.condition_combo.setFixedWidth(320)  # 창 크기와 무관하게 고정
+        self.condition_combo.setFixedWidth(220)  # 창 크기와 무관하게 고정 (굴림9 기준 한글 ~20자)
         # 등록/해제 버튼 없음: 콤보에서 조건 고르는 순간 바로 등록됨(영웅문 방식).
         self.refresh_btn = QPushButton()  # 현재 조건 편입목록 새로 받아오기(해제->재등록)
         self.refresh_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
@@ -373,6 +381,10 @@ class ConditionScreen(QWidget):
         self.newwin_btn.setToolTip("조건검색 창 하나 더 열기 (다른 조건식 동시 감시)")
         self.newwin_btn.setFixedWidth(44)
         self.count_label = QLabel("종목수: 0")
+        self.on_top_btn = QPushButton("📌")  # 항상 맨 위 토글 (창별)
+        self.on_top_btn.setCheckable(True)
+        self.on_top_btn.setFixedWidth(32)
+        self.on_top_btn.setToolTip("항상 맨 위 — 이 창을 다른 창들 위에 계속 고정")
 
         top = QHBoxLayout()
         top.addWidget(self.reload_btn)
@@ -387,6 +399,7 @@ class ConditionScreen(QWidget):
         top.addWidget(self.newwin_btn)
         top.addStretch(1)  # 남는 공간은 오른쪽으로
         top.addWidget(self.count_label)
+        top.addWidget(self.on_top_btn)  # 오른쪽 끝 = 창 크롬(핀) 자리
 
         # 그리드
         self.proxy = TieredProxy()
@@ -418,7 +431,7 @@ class ConditionScreen(QWidget):
         self.table.setItemDelegateForColumn(BAR_COL, BarDelegate(self.table))
         self.table.setItemDelegateForColumn(NAME_COL, NameDelegate(self.table))
         self.table.setSelectionBehavior(QTableView.SelectRows)
-        self.table.setFont(QFont("돋움체", 10))
+        # 폰트는 앱 전역(main.py: 굴림체9 NoAA)에서 상속 — 그리드/툴바 통일
         self.table.setEditTriggers(QTableView.NoEditTriggers)
         self.table.clicked.connect(self._on_cell_clicked)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -444,6 +457,10 @@ class ConditionScreen(QWidget):
         self._apply_sort()
         if self._settings.value(self.prefix + "limit_sort", "false") == "true":  # 상한가정렬 복원
             self.limit_sort.setChecked(True)
+        if self._settings.value(self.prefix + "on_top", "false") == "true":  # 항상위 복원
+            self.on_top_btn.setChecked(True)  # 연결 전이라 핸들러 안 불림(시각상태만)
+            QTimer.singleShot(0, lambda: self._apply_on_top(True))  # 창 붙은 뒤 실제 적용
+        self.on_top_btn.toggled.connect(self._on_top_toggle)
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.timeout.connect(self._save_layout)
@@ -497,6 +514,18 @@ class ConditionScreen(QWidget):
     def _on_limit_sort(self, on: bool):
         self.proxy.limit_mode = on
         self.proxy.invalidate()  # 모드 전환 즉시 재정렬 (정렬컬럼/방향은 그대로)
+
+    def _apply_on_top(self, on: bool):
+        w = self.window()  # central widget이라 최상위 QMainWindow
+        geo = w.geometry()  # 창 재생성 때 위치 유실 -> 보존
+        w.setWindowFlag(Qt.WindowStaysOnTopHint, on)
+        w.show()  # 플래그 변경 후 재표시 필수 (안 하면 창이 숨음)
+        if not geo.isEmpty():  # 시작 복원 경로(창 뜨기 전, geo 무의미)는 건너뜀
+            w.setGeometry(geo)  # 재생성된 창을 원위치로
+
+    def _on_top_toggle(self, on: bool):
+        self._apply_on_top(on)
+        self._settings.setValue(self.prefix + "on_top", "true" if on else "false")
         self._apply_sort()
         self._settings.setValue(self.prefix + "limit_sort", "true" if on else "false")
         self._settings.sync()
