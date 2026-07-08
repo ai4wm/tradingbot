@@ -23,6 +23,9 @@ class MarketInfo:
     nxt: set[str] = field(default_factory=set)     # 넥스트레이드 거래가능 (좌상단 노랑)
     misu: set[str] = field(default_factory=set)    # 미수가능 (우상단 녹색)
     admin: set[str] = field(default_factory=set)   # 관리종목 (종목명 경고색)
+    new_today: set[str] = field(default_factory=set)  # 상장 당일 (좌하단 마젠타)
+    new15: set[str] = field(default_factory=set)      # 상장 15일 이내 (좌하단 하늘색)
+    new30: set[str] = field(default_factory=set)      # 상장 16~30일 (좌하단 청회색)
 
 
 def _parse_expires(dt: str) -> float:
@@ -180,6 +183,8 @@ class RestClient:
         NXT: nxtEnable='Y' = 넥스트레이드(대체거래소) 거래가능.
         미수가능: state에 증거금 있고 100% 아님(=일부 현금). 증거금100%는 미수 불가.
         관리종목: state 토큰 '관리종목' (거래정지 겸하면 auditInfo엔 안 잡혀 state로 판정)."""
+        import datetime
+        today = datetime.date.today()
         m = MarketInfo()
         for mrkt in ("0", "10"):
             d = await self.request("ka10099", {"mrkt_tp": mrkt})
@@ -188,6 +193,18 @@ class RestClient:
                 if not code:
                     continue
                 state = r.get("state") or ""
+                reg = r.get("regDay") or ""  # 상장일 yyyyMMdd -> 신규 3단계 (당일/15일/30일, 달력일)
+                if len(reg) == 8:
+                    try:
+                        days = (today - datetime.date(int(reg[:4]), int(reg[4:6]), int(reg[6:]))).days
+                        if days == 0:
+                            m.new_today.add(code)
+                        elif days <= 15:
+                            m.new15.add(code)
+                        elif days <= 30:
+                            m.new30.add(code)
+                    except ValueError:
+                        pass
                 if mrkt == "10":
                     m.kosdaq.add(code)
                 if r.get("nxtEnable") == "Y":

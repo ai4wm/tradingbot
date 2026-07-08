@@ -31,6 +31,7 @@ STREAK_COL = FIELDS.index("streak")
 BAR_ROLE = Qt.UserRole + 1  # 델리게이트에 (open, high, low, close, base, upper, lower) 전달
 NXT_ROLE = Qt.UserRole + 2  # NameDelegate에 NXT 종목 여부 전달
 MISU_ROLE = Qt.UserRole + 3  # NameDelegate에 미수가능 여부 전달
+NEW_ROLE = Qt.UserRole + 4  # NameDelegate에 신규상장 단계 전달 (3=당일 2=15일이내 1=30일이내 0=아님)
 
 LIMIT = 29.5  # 상한/하한 판정 임계 (KRX +-30%)
 DESC_FIRST = {"bid_qty", "rate", "price", "exp_price", "exp_rate", "streak"}  # 첫 클릭 내림차순 컬럼
@@ -40,6 +41,7 @@ PURPLE = QColor("#C080F0")  # 코스닥 종목명
 ADMIN = QColor("#FF6A3D")   # 관리종목 종목명 (경고 주황빨강, 코스닥보다 우선)
 NXT_MARK = QColor("#FFDD00")  # NXT 좌상단 삼각형 (밝은 노랑)
 MISU_MARK = QColor("#33C24D")  # 미수가능 우상단 삼각형 (녹색)
+NEW_MARKS = {3: QColor("#FF3DC8"), 2: QColor("#38B8FF"), 1: QColor("#8098B8")}  # 신규: 당일/15일/30일
 WHITE = QColor("white")
 TRACK = QColor("#d8d8d8")
 CENTER = QColor("#707070")  # L일봉H 0% 중심선
@@ -93,12 +95,14 @@ class BarDelegate(QStyledItemDelegate):
 
 class NameDelegate(QStyledItemDelegate):
     """종목명 셀: 기본 렌더(글자색=코스닥 보라/관리 주황) 후 모서리 삼각형.
-    좌상단 노랑=NXT, 우상단 녹색=미수가능. 증거금100%(미수불가)는 무표시."""
+    좌상단 노랑=NXT, 우상단 녹색=미수가능(증거금100%는 무표시),
+    좌하단=신규상장(마젠타=당일, 하늘=15일이내, 청회=30일이내)."""
 
     def paint(self, painter, option, index):
         super().paint(painter, option, index)
         nxt, misu = index.data(NXT_ROLE), index.data(MISU_ROLE)
-        if not (nxt or misu):
+        new = index.data(NEW_ROLE)
+        if not (nxt or misu or new):
             return
         r = option.rect
         s = 10
@@ -115,6 +119,11 @@ class NameDelegate(QStyledItemDelegate):
             painter.drawPolygon(QPolygon([QPoint(r.right(), r.top()),
                                           QPoint(r.right() - s, r.top()),
                                           QPoint(r.right(), r.top() + s)]))
+        if new:
+            painter.setBrush(NEW_MARKS[new])
+            painter.drawPolygon(QPolygon([QPoint(r.left(), r.bottom()),
+                                          QPoint(r.left() + s, r.bottom()),
+                                          QPoint(r.left(), r.bottom() - s)]))
         painter.restore()
 
 
@@ -177,6 +186,9 @@ class StockModel(QAbstractTableModel):
         self.misu: set[str] = set()          # 미수가능(증거금<100%): 우상단 녹색 삼각형 (main 주입)
         self.admin: set[str] = set()         # 관리종목: 종목명 경고색 (코스닥보다 우선, main 주입)
         self.limit_cnt: dict[str, int] = {}  # 어제 연속상한 일수 ka10017 (main 주입, 연상 컬럼)
+        self.new_today: set[str] = set()     # 상장 당일 (main 주입, 좌하단 마젠타)
+        self.new15: set[str] = set()         # 상장 15일 이내 (좌하단 하늘)
+        self.new30: set[str] = set()         # 상장 16~30일 (좌하단 청회)
 
     # --- 웹소켓/전략 계층이 부르는 API ---------------------------------
     def add_stock(self, code: str, data: dict):
@@ -293,6 +305,10 @@ class StockModel(QAbstractTableModel):
             return self.codes[index.row()] in self.nxt
         if role == MISU_ROLE:
             return self.codes[index.row()] in self.misu
+        if role == NEW_ROLE:
+            code = self.codes[index.row()]
+            return (3 if code in self.new_today else 2 if code in self.new15
+                    else 1 if code in self.new30 else 0)
         if role == Qt.DisplayRole:
             if field == "bar":
                 return ""  # 델리게이트가 그림
