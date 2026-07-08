@@ -26,6 +26,7 @@ class MarketInfo:
     new_today: set[str] = field(default_factory=set)  # 상장 당일 (좌하단 마젠타)
     new15: set[str] = field(default_factory=set)      # 상장 15일 이내 (좌하단 하늘색)
     new30: set[str] = field(default_factory=set)      # 상장 16~30일 (좌하단 청회색)
+    shares: dict = field(default_factory=dict)        # 상장주식수 (시가총액 = x현재가)
 
 
 def _parse_expires(dt: str) -> float:
@@ -193,6 +194,9 @@ class RestClient:
                 if not code:
                     continue
                 state = r.get("state") or ""
+                shares = _to_int(r.get("listCount"))
+                if shares:
+                    m.shares[code] = shares
                 reg = r.get("regDay") or ""  # 상장일 yyyyMMdd -> 신규 3단계 (당일/15일/30일, 달력일)
                 if len(reg) == 8:
                     try:
@@ -216,7 +220,7 @@ class RestClient:
                 if r.get("orderWarning") in ("2", "3"):
                     m.single.add(code)
                 elif (r.get("marketCode") in ("0", "10") and not code.endswith("0")
-                        and 0 < _to_int(r.get("listCount")) < 500_000):
+                        and 0 < shares < 500_000):
                     m.single.add(code)  # 저유동성 우선주
         return m
 

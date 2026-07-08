@@ -279,6 +279,7 @@ class App:
             self._market.misu, self._market.admin)
         m.new_today, m.new15, m.new30 = (
             self._market.new_today, self._market.new15, self._market.new30)
+        m.shares = self._market.shares
 
     # --- 웹소켓 콜백 라우팅 -------------------------------------------------
     def _on_condition_list(self, items):

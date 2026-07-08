@@ -20,14 +20,15 @@ from PySide6.QtWidgets import (
 
 log = logging.getLogger("gui")
 
-COLUMNS = ["등락률", "연상", "종목명", "현재가", "예상체결가", "L일봉H", "예상등락률", "전일거래량", "거래량", "매도잔량", "매수잔량", "예상체결량", "상한가진입시간"]
-FIELDS  = ["rate",   "streak", "name",  "price", "exp_price", "bar",    "exp_rate",   "prev_vol", "vol",   "ask_qty",  "bid_qty",  "exp_qty",  "time"]
+COLUMNS = ["등락률", "연상", "종목명", "현재가", "예상체결가", "L일봉H", "예상등락률", "전일거래량", "거래량", "매도잔량", "매수잔량", "예상체결량", "시가총액", "상한가진입시간"]
+FIELDS  = ["rate",   "streak", "name",  "price", "exp_price", "bar",    "exp_rate",   "prev_vol", "vol",   "ask_qty",  "bid_qty",  "exp_qty",  "mcap",   "time"]
 # 컬럼은 아니지만 L일봉H 그리기에 필요한 저장 필드 (시/저/고/전일종가/상한/하한)
-# streak(연상)는 저장 안 함: 어제cnt + 오늘상한 여부로 매번 계산 (상태 꼬임 방지)
-STORED = (set(FIELDS) - {"streak"}) | {"open", "low", "high", "base", "upper", "lower"}
+# streak(연상)/mcap(시가총액)은 저장 안 함: 매번 계산 (연상=어제cnt+오늘상한, 시총=주식수x현재가)
+STORED = (set(FIELDS) - {"streak", "mcap"}) | {"open", "low", "high", "base", "upper", "lower"}
 BAR_COL = FIELDS.index("bar")
 NAME_COL = FIELDS.index("name")
 STREAK_COL = FIELDS.index("streak")
+MCAP_COL = FIELDS.index("mcap")
 BAR_ROLE = Qt.UserRole + 1  # 델리게이트에 (open, high, low, close, base, upper, lower) 전달
 NXT_ROLE = Qt.UserRole + 2  # NameDelegate에 NXT 종목 여부 전달
 MISU_ROLE = Qt.UserRole + 3  # NameDelegate에 미수가능 여부 전달
@@ -189,6 +190,7 @@ class StockModel(QAbstractTableModel):
         self.new_today: set[str] = set()     # 상장 당일 (main 주입, 좌하단 마젠타)
         self.new15: set[str] = set()         # 상장 15일 이내 (좌하단 하늘)
         self.new30: set[str] = set()         # 상장 16~30일 (좌하단 청회)
+        self.shares: dict[str, int] = {}     # 상장주식수 ka10099 (main 주입, 시가총액 컬럼)
 
     # --- 웹소켓/전략 계층이 부르는 API ---------------------------------
     def add_stock(self, code: str, data: dict):
@@ -255,6 +257,8 @@ class StockModel(QAbstractTableModel):
                 cols.add(BAR_COL)
             if f in ("price", "upper", "exp_price"):  # 연상 판정(_at_limit) 의존
                 cols.add(STREAK_COL)
+            if f in ("price", "base"):  # 시가총액 의존
+                cols.add(MCAP_COL)
         stored.update(fields)
         # 예상등락률은 예상체결가/전일종가에서 파생 (동시호가/VI 때만 값이 옴)
         if "exp_price" in fields or "base" in fields:
@@ -274,12 +278,8 @@ class StockModel(QAbstractTableModel):
         return len(COLUMNS)
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
-        if orientation == Qt.Horizontal:
-            if role == Qt.DisplayRole:
-                return COLUMNS[section]
-            # 진입시간=마지막 스트레치 컬럼: 헤더 글자도 데이터처럼 왼쪽 (rank 직전대비와 동일)
-            if role == Qt.TextAlignmentRole and FIELDS[section] == "time":
-                return Qt.AlignLeft | Qt.AlignVCenter
+        if orientation == Qt.Horizontal and role in (Qt.DisplayRole, Qt.ToolTipRole):
+            return COLUMNS[section]  # 툴팁: 칸 좁혀 헤더 글자 잘려도 오버로 확인
         return None
 
     def data(self, index, role=Qt.DisplayRole):
@@ -295,6 +295,15 @@ class StockModel(QAbstractTableModel):
                 return Qt.AlignCenter
             if role == Qt.ForegroundRole and n:
                 return RED
+            return None
+        if field == "mcap":  # 시가총액(억) = 상장주식수 x 현재가(체결 전엔 전일종가), 매번 계산
+            v = self.shares.get(self.codes[index.row()], 0) * (stored["price"] or stored["base"]) // 100_000_000
+            if role == Qt.DisplayRole:
+                return f"{v:,}" if v else ""
+            if role == Qt.UserRole:
+                return v
+            if role == Qt.TextAlignmentRole:
+                return Qt.AlignRight | Qt.AlignVCenter
             return None
         value = stored[field]
 
@@ -462,6 +471,8 @@ class ConditionScreen(QWidget):
         self.table.verticalHeader().setDefaultSectionSize(22)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
+        # 헤더 글자 왼쪽 정렬: 가운데면 칸 좁힐 때 앞자리부터 잘림 (시가총액->총액)
+        self.table.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.table.setColumnWidth(NAME_COL, 110)
         self.table.setColumnWidth(STREAK_COL, 34)
         self.table.setColumnWidth(BAR_COL, 70)
@@ -487,6 +498,8 @@ class ConditionScreen(QWidget):
         state = self._settings.value(self.prefix + "header")
         if state is not None:
             self.table.horizontalHeader().restoreState(state)
+            # restoreState가 옛 정렬값(가운데)까지 되살림 -> 왼쪽 재적용
+            self.table.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
             sec = self.table.horizontalHeader().sortIndicatorSection()
             if sec >= 0:  # 마지막 정렬 컬럼/방향 복원
                 self._sort_col = sec

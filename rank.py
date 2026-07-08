@@ -66,12 +66,8 @@ class RankModel(QAbstractTableModel):
         return len(COLUMNS)
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
-        if orientation == Qt.Horizontal:
-            if role == Qt.DisplayRole:
-                return COLUMNS[section]
-            # 직전대비=마지막 스트레치 컬럼: 헤더 글자도 왼쪽(중앙이면 넓은 컬럼 한가운데 떠 보임)
-            if role == Qt.TextAlignmentRole and FIELDS[section] == "prev_rate":
-                return Qt.AlignLeft | Qt.AlignVCenter
+        if orientation == Qt.Horizontal and role in (Qt.DisplayRole, Qt.ToolTipRole):
+            return COLUMNS[section]  # 툴팁: 칸 좁혀 헤더 글자 잘려도 오버로 확인
         return None
 
     def data(self, index, role=Qt.DisplayRole):
@@ -146,6 +142,8 @@ class RankScreen(QWidget):
         self.table.verticalHeader().setDefaultSectionSize(22)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
+        # 헤더 글자 왼쪽 정렬: 가운데면 칸 좁힐 때 앞자리부터 잘림 (조건창과 동일)
+        self.table.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.table.setColumnWidth(0, 40)
         self.table.setColumnWidth(1, 110)
         self.table.setColumnWidth(2, 46)  # 변동(▲n/▼n)은 종목명 옆 좁은 컬럼 (HTS 동일)
@@ -199,6 +197,8 @@ class RankScreen(QWidget):
         state = self._settings.value("rank_header")
         if state is not None:
             self.table.horizontalHeader().restoreState(state)
+            # restoreState가 옛 정렬값(가운데)까지 되살림 -> 왼쪽 재적용
+            self.table.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.on_top_btn.toggled.connect(self._on_top_toggle)
         if self._settings.value("rank_on_top", "false") == "true":  # 항상위 복원
             self.on_top_btn.setChecked(True)  # 창 뜨기 전 = 플래그만 걸림(재생성 튐 없음)
