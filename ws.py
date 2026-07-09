@@ -63,8 +63,9 @@ def build_remove(codes: list[str], types: list[str], grp_no: str = "1") -> dict:
 
 
 def parse_real_item(item: dict) -> tuple[str, dict]:
-    """REAL data 원소 하나 -> (종목코드, {gui필드: 값}). 매핑 없는 FID는 무시."""
-    code = item.get("item", "")
+    """REAL data 원소 하나 -> (종목코드, {gui필드: 값}). 매핑 없는 FID는 무시.
+    통합(_AL)/NXT(_NX) 등록 시 item에 접미사가 붙어 옴 -> 떼서 순수코드로."""
+    code = (item.get("item") or "").split("_")[0]
     values = item.get("values", {})
     table = FID_0H if item.get("type") == "0H" else FID
     out = {}
@@ -101,7 +102,10 @@ class WSClient:
         self._ws = None
         self._token_fn = None            # async () -> token
         self._active_seqs: set[str] = set()  # 등록된 조건식들 (창마다 1개, 재등록용)
-        self._reg_codes: dict[str, int] = {}  # 실시간 등록 종목 -> 참조수(창 수)
+        self._reg_codes: dict[str, int] = {}  # 실시간 등록 종목 -> 참조수(창 수), 접미사 없는 순수코드
+        # 시세 접미사: "" = KRX 전용, "_AL" = KRX+NXT 통합 (REG 코드에만 붙임, 실측 확인).
+        # 조건검색(CNSRREQ)은 stex_tp "K"만 허용이라 편입/이탈은 항상 KRX 기준.
+        self.real_suffix = ""
         self._connected = asyncio.Event()
         self._seen_fids: set = set()       # 처음 본 (type,fid)만 로그 (FID 발굴용)
         self._real_stats: dict = {}        # 5초 단위 REAL 수신 빈도 (예상값 갱신속도 진단용)
@@ -149,7 +153,7 @@ class WSClient:
                 todo.append(c)
             self._reg_codes[c] = self._reg_codes.get(c, 0) + 1
         if todo:
-            await self._send(build_reg(todo, REAL_TYPES))
+            await self._send(build_reg([c + self.real_suffix for c in todo], REAL_TYPES))
 
     async def remove_real(self, code: str):
         await self.remove_real_many([code])
@@ -164,7 +168,18 @@ class WSClient:
                 del self._reg_codes[c]
                 todo.append(c)
         if todo:
-            await self._send(build_remove(todo, REAL_TYPES))
+            await self._send(build_remove([c + self.real_suffix for c in todo], REAL_TYPES))
+
+    async def set_real_suffix(self, suffix: str):
+        """KRX 전용("") <-> 통합("_AL") 런타임 전환: 기존 등록 전부 갈아끼움."""
+        if suffix == self.real_suffix:
+            return
+        if self._reg_codes:
+            await self._send(build_remove([c + self.real_suffix for c in self._reg_codes], REAL_TYPES))
+        self.real_suffix = suffix
+        log.info("real suffix -> %r", suffix)
+        if self._reg_codes:
+            await self._send(build_reg([c + self.real_suffix for c in self._reg_codes], REAL_TYPES))
 
     # --- 내부 ----------------------------------------------------------
     async def _connect_once(self):
@@ -189,7 +204,7 @@ class WSClient:
             await self._send({"trnm": "CNSRREQ", "seq": seq,
                               "search_type": "1", "stex_tp": "K"})
         if self._reg_codes:
-            await self._send(build_reg(list(self._reg_codes), REAL_TYPES))
+            await self._send(build_reg([c + self.real_suffix for c in self._reg_codes], REAL_TYPES))
 
     async def _send(self, msg: dict):
         if self._ws is None:
@@ -365,6 +380,18 @@ def _demo():
     assert c2._reg_codes == {"2": 1, "3": 1}, c2._reg_codes
     asyncio.run(c2.remove_real_many(["2"]))          # 참조수 0 -> 이제 REMOVE
     assert sent[3]["data"][0]["item"] == ["2"], sent
+    # 통합(_AL) 접미사: REG/REMOVE에만 붙고 _reg_codes는 순수코드 유지, 수신은 접미사 떼서 매칭
+    asyncio.run(c2.register_real_many(["4"]))        # 잔여 등록 = {3, 4}
+    asyncio.run(c2.set_real_suffix("_AL"))           # 전환: REMOVE(구) + REG(_AL)
+    assert sent[5]["trnm"] == "REMOVE" and sent[5]["data"][0]["item"] == ["3", "4"], sent
+    assert sent[6]["trnm"] == "REG" and sent[6]["data"][0]["item"] == ["3_AL", "4_AL"], sent
+    asyncio.run(c2.register_real_many(["5"]))
+    assert sent[7]["data"][0]["item"] == ["5_AL"], sent
+    assert c2._reg_codes == {"3": 1, "4": 1, "5": 1}, c2._reg_codes
+    asyncio.run(c2.remove_real_many(["5"]))
+    assert sent[8]["trnm"] == "REMOVE" and sent[8]["data"][0]["item"] == ["5_AL"], sent
+    code, f = parse_real_item({"item": "005930_AL", "values": {"10": "-4620"}})
+    assert code == "005930" and f["price"] == 4620, (code, f)
     print("ws self-check OK")
 
 

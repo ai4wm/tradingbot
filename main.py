@@ -239,6 +239,11 @@ class App:
         self.ws.on_condition_snapshot = self._on_condition_snapshot
         self.ws.on_real = self._on_real
         self.ws.on_vi = self._on_vi
+        # 통합(_AL) 시세: 전 창 공통 설정. 첫 REG 전에 접미사 확정돼야 해서 여기서 복원
+        if self._settings.value("unified_real", "false") == "true":
+            self.ws.real_suffix = self.rest.suffix = "_AL"
+            screen.unified_check.setChecked(True)  # toggled 연결 전 = 시각 상태만
+        screen.unified_check.toggled.connect(self._on_unified)
         self._wire_common(screen)
 
     def _wire_common(self, screen: ConditionScreen):
@@ -246,6 +251,14 @@ class App:
             lambda: asyncio.ensure_future(self.ws.list_conditions()))
         screen.rank_btn.clicked.connect(self._on_rank)
         screen.newwin_btn.clicked.connect(self._on_newwin)
+
+    def _on_unified(self, on: bool):
+        self._settings.setValue("unified_real", "true" if on else "false")
+        self._settings.sync()
+        self.rest.suffix = "_AL" if on else ""  # watch_info 백필도 같은 소스로
+        asyncio.ensure_future(self.ws.set_real_suffix("_AL" if on else ""))
+        for v in self.views:  # 전 종목 시세 강제 재백필: 편입 diff 없어도 KRX<->통합 값 교체
+            v._schedule_refresh()
 
     async def start(self):
         self.ws_task = asyncio.create_task(self.ws.run(self.rest.tokens.token))
@@ -418,8 +431,9 @@ class App:
             self._settings.setValue(prefix + "geometry", main.window().saveGeometry())
             seeded = True
         screen = ConditionScreen(prefix=prefix)
-        screen.newwin_btn.setVisible(False)  # 추가 창에선 창+/순위 숨김 (메인창에서만)
+        screen.newwin_btn.setVisible(False)  # 추가 창에선 창+/순위/통합 숨김 (메인창에서만)
         screen.rank_btn.setVisible(False)
+        screen.unified_check.setVisible(False)  # 통합 시세는 전 창 공통 -> 메인창에서만 전환
         win = ConditionWindow(prefix, on_close=self._on_window_closed)
         win.setWindowTitle(f"[0156-{n}] 조건검색실시간")
         win.setCentralWidget(screen)

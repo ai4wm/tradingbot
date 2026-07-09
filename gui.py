@@ -462,6 +462,12 @@ class ConditionScreen(QWidget):
         self.sound_check.setToolTip("새 종목이 편입되면 소리 알림 (실시간/재조회 모두)")
         self.limit_sort = QCheckBox("상한가정렬")
         self.limit_sort.setToolTip("상한(실제/예상)&매도0 종목을 위로 고정, 컬럼 클릭으로 그룹 내 정렬")
+        self.unified_check = QPushButton("K")  # KRX<->통합(_AL) 시세 전환 토글, 전 창 공통 (main이 배선)
+        self.unified_check.setCheckable(True)
+        self.unified_check.setFixedSize(24, 24)
+        self.unified_check.setToolTip("시세 소스 전환 — KRX 전용 / KRX+NXT 통합(_AL). "
+                                      "편입/이탈(조건검색)은 KRX 기준 그대로")
+        self.unified_check.toggled.connect(self._on_unified_style)
         self.rank_btn = QPushButton("순위")
         self.rank_btn.setToolTip("실시간 종목조회순위 [0198] 창 열기/닫기")
         self.rank_btn.setFixedWidth(44)
@@ -483,6 +489,7 @@ class ConditionScreen(QWidget):
         top.addWidget(self.auto_remove)
         top.addWidget(self.sound_check)
         top.addWidget(self.limit_sort)
+        top.addWidget(self.unified_check)
         top.addWidget(self.rank_btn)
         top.addWidget(self.newwin_btn)
         top.addStretch(1)  # 남는 공간은 오른쪽으로
@@ -563,6 +570,12 @@ class ConditionScreen(QWidget):
         hdr = self.table.horizontalHeader()
         hdr.sectionResized.connect(lambda *a: self._save_timer.start(400))
         hdr.sectionMoved.connect(lambda *a: self._save_timer.start(400))
+
+    def _on_unified_style(self, on: bool):
+        # 통합 = 노랑 배경(NXT 마크색)에 '통', KRX = 기본 버튼에 'K'
+        self.unified_check.setText("통" if on else "K")
+        self.unified_check.setStyleSheet(
+            "QPushButton{background:#FFDD00;color:black;font-weight:bold}" if on else "")
 
     def _on_data_changed(self, *a):
         # 스로틀: 이미 대기중이면 리셋하지 않음 -> 틱이 몰려도 200ms마다 반드시 재정렬됨

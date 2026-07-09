@@ -75,6 +75,9 @@ class RestClient:
         self.tokens = TokenManager(self._client)
         self._sem = asyncio.Semaphore(1)  # 동시 1건
         self._last_call = 0.0
+        # 시세 접미사: "" KRX, "_AL" 통합. watch_info 백필이 WS 통합시세를 KRX 종가로
+        # 덮어쓰지 않게 ws.real_suffix와 함께 전환 (ka10095 _AL 실측: NXT 야간가 반영)
+        self.suffix = ""
 
     async def _throttle(self):
         import time
@@ -113,10 +116,10 @@ class RestClient:
             return []
         if exp is None:
             exp = _in_auction()
-        d = await self.request("ka10095", {"stk_cd": "|".join(codes)})
+        d = await self.request("ka10095", {"stk_cd": "|".join(c + self.suffix for c in codes)})
         out = []
         for r in d.get("atn_stk_infr", []):
-            code = r.get("stk_cd", "")
+            code = (r.get("stk_cd") or "").split("_")[0]  # _AL 응답 접미사 제거
             if not code:
                 continue
             base = abs(_to_int(r.get("base_pric")))
