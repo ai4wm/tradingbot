@@ -7,6 +7,7 @@
 import logging
 import sys
 import time
+from collections import deque
 
 from PySide6.QtCore import (
     QAbstractTableModel, QModelIndex, QPoint, QRect, QSettings, QSortFilterProxyModel, Qt, QTimer, QUrl,
@@ -20,22 +21,23 @@ from PySide6.QtWidgets import (
 
 log = logging.getLogger("gui")
 
-COLUMNS = ["등락률", "연상", "종목명", "현재가", "예상체결가", "L일봉H", "예상등락률", "전일거래량", "거래량", "매도잔량", "매수잔량", "예상체결량", "시가총액", "상한가진입시간"]
-FIELDS  = ["rate",   "streak", "name",  "price", "exp_price", "bar",    "exp_rate",   "prev_vol", "vol",   "ask_qty",  "bid_qty",  "exp_qty",  "mcap",   "time"]
+COLUMNS = ["등락률", "연상", "종목명", "현재가", "예상체결가", "L일봉H", "예상등락률", "전일거래량", "거래량", "매도잔량", "매수잔량", "예상체결량", "체결/분", "시가총액", "상한가진입시간"]
+FIELDS  = ["rate",   "streak", "name",  "price", "exp_price", "bar",    "exp_rate",   "prev_vol", "vol",   "ask_qty",  "bid_qty",  "exp_qty",  "tpm",    "mcap",   "time"]
 # 컬럼은 아니지만 L일봉H 그리기에 필요한 저장 필드 (시/저/고/전일종가/상한/하한)
-# streak(연상)/mcap(시가총액)은 저장 안 함: 매번 계산 (연상=어제cnt+오늘상한, 시총=주식수x현재가)
-STORED = (set(FIELDS) - {"streak", "mcap"}) | {"open", "low", "high", "base", "upper", "lower"}
+# streak(연상)/mcap(시가총액)/tpm(체결/분)은 저장 안 함: 매번 계산
+STORED = (set(FIELDS) - {"streak", "mcap", "tpm"}) | {"open", "low", "high", "base", "upper", "lower"}
 BAR_COL = FIELDS.index("bar")
 NAME_COL = FIELDS.index("name")
 STREAK_COL = FIELDS.index("streak")
 MCAP_COL = FIELDS.index("mcap")
+TPM_COL = FIELDS.index("tpm")
 BAR_ROLE = Qt.UserRole + 1  # 델리게이트에 (open, high, low, close, base, upper, lower) 전달
 NXT_ROLE = Qt.UserRole + 2  # NameDelegate에 NXT 종목 여부 전달
 MISU_ROLE = Qt.UserRole + 3  # NameDelegate에 미수가능 여부 전달
 NEW_ROLE = Qt.UserRole + 4  # NameDelegate에 신규상장 단계 전달 (3=당일 2=15일이내 1=30일이내 0=아님)
 
 LIMIT = 29.5  # 상한/하한 판정 임계 (KRX +-30%)
-DESC_FIRST = {"bid_qty", "rate", "price", "exp_price", "exp_rate", "streak"}  # 첫 클릭 내림차순 컬럼
+DESC_FIRST = {"bid_qty", "rate", "price", "exp_price", "exp_rate", "streak", "tpm"}  # 첫 클릭 내림차순 컬럼
 RED  = QColor("#e83030")
 BLUE = QColor("#2050d0")
 PURPLE = QColor("#C080F0")  # 코스닥 종목명
@@ -187,10 +189,12 @@ class StockModel(QAbstractTableModel):
         self.misu: set[str] = set()          # 미수가능(증거금<100%): 우상단 녹색 삼각형 (main 주입)
         self.admin: set[str] = set()         # 관리종목: 종목명 경고색 (코스닥보다 우선, main 주입)
         self.limit_cnt: dict[str, int] = {}  # 어제 연속상한 일수 ka10017 (main 주입, 연상 컬럼)
+        self.limit_rolled = False            # 장마감 후 조회: cnt에 오늘 연장분 포함 -> +1 억제
         self.new_today: set[str] = set()     # 상장 당일 (main 주입, 좌하단 마젠타)
         self.new15: set[str] = set()         # 상장 15일 이내 (좌하단 하늘)
         self.new30: set[str] = set()         # 상장 16~30일 (좌하단 청회)
         self.shares: dict[str, int] = {}     # 상장주식수 ka10099 (main 주입, 시가총액 컬럼)
+        self.ticks: dict[str, deque] = {}    # 체결 틱 시각(monotonic) 최근 60초 (체결/분 컬럼)
 
     # --- 웹소켓/전략 계층이 부르는 API ---------------------------------
     def add_stock(self, code: str, data: dict):
@@ -212,6 +216,7 @@ class StockModel(QAbstractTableModel):
         self.codes.remove(code)
         del self.rows[code]
         self._exp_live.discard(code)
+        self.ticks.pop(code, None)
         self.endRemoveRows()
 
     def set_vi(self, code: str, active: bool, price: int = 0):
@@ -247,12 +252,20 @@ class StockModel(QAbstractTableModel):
             self._exp_live.discard(code)  # 체결 재개 = 국면 종료 (단일가 종목은 유지)
             fields["exp_price"], fields["exp_qty"] = 0, 0
             log.info("expOFF %s vol", code)
+        if fields.get("vol", 0) > stored["vol"]:  # 거래량 증가 = 체결 틱 1건 (체결/분)
+            dq = self.ticks.setdefault(code, deque())
+            now = time.monotonic()
+            dq.append(now)
+            while dq and dq[0] < now - 60:
+                dq.popleft()
         cols = set()
         for f, v in fields.items():
             if stored.get(f) == v:
                 continue
             if f in FIELDS:
                 cols.add(FIELDS.index(f))
+            if f == "vol":  # 체결/분 의존
+                cols.add(TPM_COL)
             if f in ("price", "open", "low", "high", "base", "upper", "lower"):  # L일봉H 의존
                 cols.add(BAR_COL)
             if f in ("price", "upper", "exp_price"):  # 연상 판정(_at_limit) 의존
@@ -270,6 +283,11 @@ class StockModel(QAbstractTableModel):
         if cols:  # 바뀐 셀만 갱신
             self.dataChanged.emit(self.index(row, min(cols)), self.index(row, max(cols)))
 
+    def refresh_tpm(self):
+        """체결/분 감쇠 갱신: 틱이 끊긴 종목도 1초마다 재계산되게 컬럼 전체 리페인트."""
+        if self.codes:
+            self.dataChanged.emit(self.index(0, TPM_COL), self.index(len(self.codes) - 1, TPM_COL))
+
     # --- Qt 모델 구현 ---------------------------------------------------
     def rowCount(self, parent=QModelIndex()):
         return len(self.codes)
@@ -286,7 +304,10 @@ class StockModel(QAbstractTableModel):
         field = FIELDS[index.column()]
         stored = self.rows[self.codes[index.row()]]
         if field == "streak":  # 연상 = 어제cnt + (지금 상한이면 1), 매번 계산 (저장 안 함)
-            n = self.limit_cnt.get(self.codes[index.row()], 0) + (1 if _at_limit(stored) else 0)
+            cnt = self.limit_cnt.get(self.codes[index.row()], 0)
+            # rolled(장마감 후 조회): 연장 종목은 cnt에 오늘분 포함 -> +1 생략.
+            # 오늘 첫 상한(cnt=0)은 목록에 없어서 여전히 +1 필요.
+            n = cnt + (1 if _at_limit(stored) and not (self.limit_rolled and cnt) else 0)
             if role == Qt.DisplayRole:
                 return str(n) if n else ""
             if role == Qt.UserRole:
@@ -295,6 +316,16 @@ class StockModel(QAbstractTableModel):
                 return Qt.AlignCenter
             if role == Qt.ForegroundRole and n:
                 return RED
+            return None
+        if field == "tpm":  # 체결/분 = 최근 60초 체결 틱수, 매번 계산 (저장 안 함)
+            t0 = time.monotonic() - 60
+            n = sum(1 for t in self.ticks.get(self.codes[index.row()], ()) if t >= t0)
+            if role == Qt.DisplayRole:
+                return str(n) if n else ""
+            if role == Qt.UserRole:
+                return n
+            if role == Qt.TextAlignmentRole:
+                return Qt.AlignRight | Qt.AlignVCenter
             return None
         if field == "mcap":  # 시가총액(억) = 상장주식수 x 현재가(체결 전엔 전일종가), 매번 계산
             v = self.shares.get(self.codes[index.row()], 0) * (stored["price"] or stored["base"]) // 100_000_000
@@ -479,6 +510,9 @@ class ConditionScreen(QWidget):
         self._resort_timer.setSingleShot(True)
         self._resort_timer.timeout.connect(self.proxy.invalidate)
         self.model.dataChanged.connect(self._on_data_changed)
+        self._tpm_timer = QTimer(self)  # 체결/분: 틱 끊겨도 값이 줄어들게 주기 갱신
+        self._tpm_timer.timeout.connect(self.model.refresh_tpm)
+        self._tpm_timer.start(1000)
         self.table.verticalHeader().setVisible(True)  # 순위(정렬 순서대로 1..N 자동)
         self.table.verticalHeader().setDefaultSectionSize(22)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)

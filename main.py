@@ -4,6 +4,7 @@
 구조: App(공유: 웹소켓/REST/등록큐/순위창) + View(조건검색 창 하나 = 화면+조건seq).
 '창+' 버튼으로 독립 조건검색 창 추가(조건별 동시 감시, 시세 REG는 참조수 공유)."""
 import asyncio
+import datetime
 import logging
 import sys
 import time
@@ -217,6 +218,7 @@ class App:
         self._cond_items = []           # CNSRLST 결과 (새 창 콤보 채우기용)
         self._market = None             # MarketInfo (새 창 모델 주입용)
         self._limit_cnt = None          # ka10017 어제 연속상한 (연상 컬럼, 시작 시 1회)
+        self._limit_rolled = False      # 장마감 후 조회 = cnt에 오늘 연장분 포함됨
         # REG/REMOVE는 0.3초 모아 각 1건으로 (서버 105110 유량거부 방지).
         # Counter: 두 창이 같은 종목을 등록하면 참조수 2가 되도록 발생 횟수 유지.
         self._reg_pending = Counter()
@@ -261,10 +263,13 @@ class App:
         try:
             # ponytail: 시작 시 1회. 자정 넘겨 켜두면 옛 목록 -> 날짜 가드는 필요해지면
             self._limit_cnt = await self.rest.yesterday_limit_counts()
+            # 장마감 후 조회면 서버 cnt가 오늘 연장분까지 포함(07-09 실측: 마감 후 2연상 cnt=2).
+            # 이때 화면의 "+오늘 상한 1"과 겹쳐 3으로 오탐 -> rolled 플래그로 +1 억제.
+            self._limit_rolled = datetime.datetime.now().strftime("%H%M") >= "1530"
             for v in self.views:
                 self._inject_market(v)
-            log.info("yesterday limit: %d codes %s", len(self._limit_cnt),
-                     ",".join(self._limit_cnt))
+            log.info("yesterday limit: %d codes%s %s", len(self._limit_cnt),
+                     " (rolled)" if self._limit_rolled else "", ",".join(self._limit_cnt))
         except Exception as e:  # noqa: BLE001
             log.warning("limit_counts failed: %s", e)
 
@@ -272,6 +277,7 @@ class App:
         m = view.screen.model
         if self._limit_cnt is not None:
             m.limit_cnt = self._limit_cnt
+            m.limit_rolled = self._limit_rolled
         if self._market is None:
             return
         m.kosdaq, m.single, m.nxt, m.misu, m.admin = (
