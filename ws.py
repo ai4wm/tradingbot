@@ -278,8 +278,12 @@ class WSClient:
 
     def _on_vi(self, item: dict):
         # 1h fid: 9001=코드(_AL 접미사), 9068=1 발동/2 해제, 1221=발동가격 (2026-07-07 실수신 확정)
+        # 의심: 07-09 007390 해제가 하루종일 미처리(expOFF zero 0건). 9068이 발동/해제가 아니라
+        # 정적/동적 구분(1225와 동일)일 가능성 -> 우리 종목 raw 전체를 남겨 다음 VI에서 확정
         v = item.get("values", {})
         code = (v.get("9001") or "").split("_")[0].lstrip("A")
+        if code in self._reg_codes:
+            log.info("VI raw %s: %s", code, v)
         if code and self.on_vi:
             self.on_vi(code, v.get("9068") == "1", int(abs(_num(v.get("1221")))))
 

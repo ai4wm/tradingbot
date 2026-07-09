@@ -318,6 +318,18 @@ class StockModel(QAbstractTableModel):
             code = self.codes[index.row()]
             return (3 if code in self.new_today else 2 if code in self.new15
                     else 1 if code in self.new30 else 0)
+        if role == Qt.ToolTipRole and field == "name":  # 모서리 삼각형 설명
+            code = self.codes[index.row()]
+            parts = []
+            if code in self.nxt:
+                parts.append("좌상단 노랑 = NXT 거래가능")
+            if code in self.misu:
+                parts.append("우상단 녹색 = 미수가능")
+            new = self.data(index, NEW_ROLE)
+            if new:
+                parts.append("좌하단 " + {3: "마젠타 = 오늘 상장", 2: "하늘 = 상장 15일 이내",
+                                          1: "청회 = 상장 16~30일"}[new])
+            return "\n".join(parts) or None
         if role == Qt.DisplayRole:
             if field == "bar":
                 return ""  # 델리게이트가 그림
