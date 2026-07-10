@@ -210,7 +210,12 @@ class WSClient:
         if self._ws is None:
             log.warning("send while disconnected: %s", msg.get("trnm"))
             return
-        await self._ws.send(json.dumps(msg))
+        try:
+            await self._ws.send(json.dumps(msg))
+        except websockets.exceptions.ConnectionClosed:
+            # 재접속 창 사이의 send: _active_seqs/_reg_codes로 _resubscribe가 복구함
+            log.warning("send on closed socket: %s", msg.get("trnm"))
+            return
         log.debug("send %s", msg)
 
     async def _dispatch(self, msg: dict):

@@ -37,6 +37,7 @@ MISU_ROLE = Qt.UserRole + 3  # NameDelegate에 미수가능 여부 전달
 NEW_ROLE = Qt.UserRole + 4  # NameDelegate에 신규상장 단계 전달 (3=당일 2=15일이내 1=30일이내 0=아님)
 
 LIMIT = 29.5  # 상한/하한 판정 임계 (KRX +-30%)
+# ponytail: 매크로가 2주+로 갈아타면 이 값을 올리거나 금액기준(delta*price)으로 교체
 DESC_FIRST = {"bid_qty", "rate", "price", "exp_price", "exp_rate", "streak", "tpm"}  # 첫 클릭 내림차순 컬럼
 RED  = QColor("#e83030")
 BLUE = QColor("#2050d0")
@@ -252,7 +253,9 @@ class StockModel(QAbstractTableModel):
             self._exp_live.discard(code)  # 체결 재개 = 국면 종료 (단일가 종목은 유지)
             fields["exp_price"], fields["exp_qty"] = 0, 0
             log.info("expOFF %s vol", code)
-        if fields.get("vol", 0) > stored["vol"]:  # 거래량 증가 = 체결 틱 1건 (체결/분)
+        dvol = fields.get("vol", 0) - stored["vol"]  # 체결 틱 (체결/분)
+        # 1주 이상 카운트, 단 10만원 이하 종목의 1주는 매크로 churn으로 보고 제외(하이닉스류 고가주는 통과)
+        if dvol >= 2 or (dvol == 1 and fields.get("price", stored["price"]) > 100_000):
             dq = self.ticks.setdefault(code, deque())
             now = time.monotonic()
             dq.append(now)
@@ -307,7 +310,9 @@ class StockModel(QAbstractTableModel):
             cnt = self.limit_cnt.get(self.codes[index.row()], 0)
             # rolled(장마감 후 조회): 연장 종목은 cnt에 오늘분 포함 -> +1 생략.
             # 오늘 첫 상한(cnt=0)은 목록에 없어서 여전히 +1 필요.
-            n = cnt + (1 if _at_limit(stored) and not (self.limit_rolled and cnt) else 0)
+            # +1은 실제 체결 상한(현재가=상한가)만: 예상등락률(동시호가/VI 예상)로는 안 셈.
+            today_limit = stored["upper"] > 0 and stored["price"] == stored["upper"]
+            n = cnt + (1 if today_limit and not (self.limit_rolled and cnt) else 0)
             if role == Qt.DisplayRole:
                 return str(n) if n else ""
             if role == Qt.UserRole:
@@ -326,6 +331,13 @@ class StockModel(QAbstractTableModel):
                 return n
             if role == Qt.TextAlignmentRole:
                 return Qt.AlignRight | Qt.AlignVCenter
+            if n > 500:  # 급증: 노랑 배경 + 검정 볼드로 강조
+                if role == Qt.BackgroundRole:
+                    return QColor("#FFE000")
+                if role == Qt.ForegroundRole:
+                    return QColor("black")
+                if role == Qt.FontRole:
+                    f = QFont(); f.setBold(True); return f
             return None
         if field == "mcap":  # 시가총액(억) = 상장주식수 x 현재가(체결 전엔 전일종가), 매번 계산
             v = self.shares.get(self.codes[index.row()], 0) * (stored["price"] or stored["base"]) // 100_000_000
@@ -444,7 +456,7 @@ class ConditionScreen(QWidget):
         self.refresh_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
         self.refresh_btn.setToolTip("재조회 — 현재 조건의 편입 종목을 지금 다시 받아옵니다")
         self.refresh_btn.setFixedWidth(32)
-        self.auto_refresh = QCheckBox("자동재조회")  # 동시호가 때 편입/이탈 수동갱신용
+        self.auto_refresh = QCheckBox("재조회")  # 동시호가 때 편입/이탈 수동갱신용
         self.auto_refresh.setToolTip("동시호가 때 편입/이탈이 실시간으로 안 와서 주기적으로 재조회")
         self.refresh_interval = QSpinBox()
         self.refresh_interval.setRange(2, 30)  # 2초 미만은 유량초과 위험
@@ -455,12 +467,11 @@ class ConditionScreen(QWidget):
         # Qt가 시그널 뒤에 선택을 다시 걸기 때문에 이벤트루프 한 틱 뒤에 해제.
         self.refresh_interval.valueChanged.connect(
             lambda _: QTimer.singleShot(0, self.refresh_interval.lineEdit().deselect))
-        self.auto_remove = QCheckBox("자동삭제")
-        self.auto_remove.setChecked(True)
+        self.auto_remove = QCheckBox("자동삭제")  # 복원/저장은 _settings 준비 후(아래)
         self.auto_remove.setToolTip("이탈한 종목을 그리드에서 자동 제거")
         self.sound_check = QCheckBox("소리")
         self.sound_check.setToolTip("새 종목이 편입되면 소리 알림 (실시간/재조회 모두)")
-        self.limit_sort = QCheckBox("상한가정렬")
+        self.limit_sort = QCheckBox("상한↑")
         self.limit_sort.setToolTip("상한(실제/예상)&매도0 종목을 위로 고정, 컬럼 클릭으로 그룹 내 정렬")
         self.unified_check = QPushButton("K")  # KRX<->통합(_AL) 시세 전환 토글, 전 창 공통 (main이 배선)
         self.unified_check.setCheckable(True)
@@ -560,6 +571,9 @@ class ConditionScreen(QWidget):
         self._apply_sort()
         if self._settings.value(self.prefix + "limit_sort", "false") == "true":  # 상한가정렬 복원
             self.limit_sort.setChecked(True)
+        self.auto_remove.setChecked(  # 자동삭제 복원 (기본 켜짐)
+            self._settings.value(self.prefix + "auto_remove", "true") == "true")
+        self.auto_remove.toggled.connect(self._save_auto_remove)
         if self._settings.value(self.prefix + "on_top", "false") == "true":  # 항상위 복원
             self.on_top_btn.setChecked(True)  # 연결 전이라 핸들러 안 불림(시각상태만)
             QTimer.singleShot(0, lambda: self._apply_on_top(True))  # 창 붙은 뒤 실제 적용
@@ -620,9 +634,15 @@ class ConditionScreen(QWidget):
         self._apply_sort()
         self._save_timer.start(400)  # 정렬 상태도 기억
 
+    def _save_auto_remove(self, on: bool):
+        self._settings.setValue(self.prefix + "auto_remove", "true" if on else "false")
+        self._settings.sync()
+
     def _on_limit_sort(self, on: bool):
         self.proxy.limit_mode = on
         self.proxy.invalidate()  # 모드 전환 즉시 재정렬 (정렬컬럼/방향은 그대로)
+        self._settings.setValue(self.prefix + "limit_sort", "true" if on else "false")
+        self._settings.sync()
 
     def _apply_on_top(self, on: bool):
         w = self.window()  # central widget이라 최상위 QMainWindow
@@ -635,8 +655,6 @@ class ConditionScreen(QWidget):
     def _on_top_toggle(self, on: bool):
         self._apply_on_top(on)
         self._settings.setValue(self.prefix + "on_top", "true" if on else "false")
-        self._apply_sort()
-        self._settings.setValue(self.prefix + "limit_sort", "true" if on else "false")
         self._settings.sync()
 
     # --- 웹소켓 계층 연결점 ----------------------------------------------

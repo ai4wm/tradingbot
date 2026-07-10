@@ -20,20 +20,22 @@ FIELDS  = ["rank", "name", "rank_chg", "price", "rate", "prev_rate"]
 PERIODS = [("30초", "5"), ("1분", "1"), ("10분", "2"), ("1시간", "3"), ("당일누적", "4")]
 
 
-def _alert_kind(prev_top: str, rows: list[dict], top_on: bool, jump_on: bool, jump_n: int):
-    """새 집계 스냅샷에서 알림 종류 판정: 'top'=1위 변경, 'jump'=순위 급상승,
-    'both'=둘 다 동시, None=없음."""
+def _alert_kind(prev_codes: list, rows: list[dict], top_on: bool, jump_on: bool,
+                jump_n: int, top_n: int = 1):
+    """새 집계 스냅샷에서 알림 종류 판정: 'top'=상위 top_n위 구성 변경, 'jump'=순위 급상승,
+    'both'=둘 다 동시, None=없음. prev_codes=직전 스냅샷의 순위순 코드 리스트."""
     if not rows:
         return None
-    top = top_on and prev_top and rows[0]["code"] != prev_top
+    cur = [r["code"] for r in rows[:top_n]]
+    top = top_on and prev_codes and set(cur) != set(prev_codes[:top_n])
     jump = jump_on and any(r["rank_chg"] >= jump_n for r in rows)
-    return "both" if top and jump else "top" if top else "jump" if jump else None
+    return "top" if top else "jump" if jump else None  # 동시 발생 땐 1위변경 우선
 
 
 TONES = {  # (주파수Hz, 길이ms) 나열 -> 멜로디. 시스템 테마 무관하게 또렷한 전용음
-    "top":  [(880, 120), (1320, 200)],   # 1위 변경: 뚜-띠↑ (상승 2음)
-    "jump": [(1760, 70), (1760, 70), (1760, 70)],  # 급상승: 띠띠띠! (초고음 3연타, top 상승음과 구분)
-    "both": [(880, 120), (1320, 150), (1760, 70), (1760, 70), (1760, 70)],  # 1위변경+급상승: 뚜-띠↑띠띠띠
+    # 1위 변경(가장 중요): 도-미-솔↑ 상승 팡파레, 마지막 음 길게 -> 확실히 각인 (jump와 확 구분)
+    "top":  [(1047, 130), (1319, 130), (1568, 420)],
+    "jump": [(1760, 70), (1760, 70), (1760, 70)],  # 급상승: 띠띠띠! (초고음 3연타 flat, top 상승음과 구분)
     "in":   [(784, 140), (1047, 140), (1319, 280)],  # 조건 편입: 뚜-뚜-띠~↑ (3음 차임, 길고 또렷)
 }
 
@@ -152,8 +154,13 @@ class RankScreen(QWidget):
         self.table.clicked.connect(self._on_cell_clicked)
 
         # 하단: 사운드 알림 옵션 (새 집계 스냅샷에서만 판정 -> 중복 알림 없음)
-        self.alert_top = QCheckBox("1위변경")
-        self.alert_top.setToolTip("1위 종목이 바뀌면 소리 알림")
+        self.top_n = QComboBox()  # 스핀보다 폭 절약: 드롭다운 1개 화살표
+        self.top_n.addItems([str(i) for i in range(1, 20)])
+        self.top_n.setCurrentText(str(self._settings.value("rank_top_n", 1)))
+        self.top_n.setFixedWidth(60)
+        self.top_n.currentTextChanged.connect(lambda v: self._save_opt("rank_top_n", int(v)))
+        self.alert_top = QCheckBox("위변경")
+        self.alert_top.setToolTip("상위 N위 안에서 종목 구성이 바뀌면 소리 알림")
         self.alert_top.setChecked(self._settings.value("rank_alert_top", "false") == "true")
         self.alert_jump = QCheckBox("급상승≥")
         self.alert_jump.setToolTip("순위가 N계단 이상 뛰어오르면 소리 알림")
@@ -167,10 +174,11 @@ class RankScreen(QWidget):
         # 화살표로 값 변경 시 텍스트 선택(어두운 배경에 가림) 방지 — gui.py 간격 스핀과 동일
         self.jump_n.valueChanged.connect(
             lambda _: QTimer.singleShot(0, self.jump_n.lineEdit().deselect))
-        self._last_tm = ""   # 마지막 판정한 집계 시각
-        self._last_top = ""  # 마지막 1위 종목코드
+        self._last_tm = ""    # 마지막 판정한 집계 시각
+        self._last_codes = []  # 직전 스냅샷 순위순 코드 리스트
 
         bottom = QHBoxLayout()
+        bottom.addWidget(self.top_n)
         bottom.addWidget(self.alert_top)
         bottom.addWidget(self.alert_jump)
         bottom.addWidget(self.jump_n)
@@ -250,11 +258,13 @@ class RankScreen(QWidget):
         self.time_label.setText(f"{t[:2]}:{t[2:4]}:{t[4:6]}" if len(t) == 6 else "데이터 없음")
         if rows and t != self._last_tm:  # 새 집계 스냅샷에서만 알림 판정
             if self._last_tm:  # 창 연 직후 첫 수신은 제외
-                kind = _alert_kind(self._last_top, rows, self.alert_top.isChecked(),
-                                   self.alert_jump.isChecked(), self.jump_n.value())
+                kind = _alert_kind(self._last_codes, rows, self.alert_top.isChecked(),
+                                   self.alert_jump.isChecked(), self.jump_n.value(),
+                                   int(self.top_n.currentText()))
                 if kind:
                     _beep(kind)
-            self._last_tm, self._last_top = t, rows[0]["code"]
+            self._last_tm = t
+            self._last_codes = [r["code"] for r in rows]
 
     def _on_cell_clicked(self, index):
         if index.column() != FIELDS.index("name"):
@@ -312,13 +322,16 @@ def _demo():
     assert d(0, 3, Qt.ForegroundRole) is BLUE and d(2, 3, Qt.ForegroundRole) is RED
     assert d(3, 4, Qt.BackgroundRole) is RED and d(3, 4, Qt.ForegroundRole) is WHITE  # 상한 배경
     assert d(0, 4, Qt.BackgroundRole) is None  # 일반 등락률은 배경 없음
-    # 알림 판정: 1위 변경 / 급상승 임계 / 없음
-    rows = m.rows
-    assert _alert_kind("000000", rows, True, False, 3) == "top"      # 1위 코드 바뀜
-    assert _alert_kind("005930", rows, True, True, 2) == "jump"      # 1위 유지, ▲2 >= 2
-    assert _alert_kind("000000", rows, True, True, 2) == "both"      # 1위 변경 + 급상승 동시
-    assert _alert_kind("005930", rows, True, True, 3) is None        # 임계 미달
-    assert _alert_kind("", rows, True, True, 3) is None              # 이전 1위 없음(첫 수신)
+    # 알림 판정: 상위 N위 변경 / 급상승 임계 / 없음
+    rows = m.rows  # 순위순 코드: 005930, 042660, 002990, 042660
+    assert _alert_kind(["000000"], rows, True, False, 3) == "top"     # 1위 코드 바뀜
+    assert _alert_kind(["005930"], rows, True, True, 2) == "jump"     # 1위 유지, ▲2 >= 2
+    assert _alert_kind(["000000"], rows, True, True, 2) == "top"      # 1위변경+급상승 동시 -> 1위 우선
+    assert _alert_kind(["005930"], rows, True, True, 3) is None       # 임계 미달
+    assert _alert_kind([], rows, True, True, 3) is None               # 이전 없음(첫 수신)
+    # top_n=3: 상위3 구성 {005930,042660,002990} 유지면 top 아님, 새 코드 끼면 top
+    assert _alert_kind(["005930", "042660", "002990"], rows, True, False, 3, 3) is None
+    assert _alert_kind(["005930", "042660", "999999"], rows, True, False, 3, 3) == "top"
     assert _alert_kind("000000", rows, False, False, 1) is None      # 알림 꺼짐
     print("rank self-check OK")
 
