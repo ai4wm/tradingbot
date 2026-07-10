@@ -4,15 +4,14 @@
 구조: App(공유: 웹소켓/REST/등록큐/순위창) + View(조건검색 창 하나 = 화면+조건seq).
 '창+' 버튼으로 독립 조건검색 창 추가(조건별 동시 감시, 시세 REG는 참조수 공유)."""
 import asyncio
-import datetime
 import logging
 import sys
 import time
 from collections import Counter
 
 import qasync
-from PySide6.QtCore import QSettings, QTimer
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QSettings, Qt, QTimer
+from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import QApplication, QMainWindow
 
 from api import RestClient
@@ -28,6 +27,8 @@ logging.basicConfig(
 log = logging.getLogger("main")
 
 MAX_WINDOWS = 3  # 실시간 등록 ~100종목 한도 내 (조건당 20~30종목 기준)
+RANK_SEQ = "RANK"  # ★조회순위 가짜 조건 seq (ka00198 폴 -> on_snapshot)
+RANK_TOP = 20      # 순위 모드 실시간 슬롯 캡 (95한도 공유)
 _SHUTDOWN = [False]  # 메인 창 닫는 중: 추가 창 동반 종료를 '사용자 닫기'로 오인 방지
 
 
@@ -47,6 +48,7 @@ class View:
         self._auto_timer.timeout.connect(self.on_refresh)
 
         screen.condition_combo.activated.connect(self._on_condition_selected)
+        screen.rank_period.activated.connect(self.on_refresh)  # 기준시간 변경 -> 즉시 재폴
         screen.refresh_btn.clicked.connect(self.on_refresh)
         screen.refresh_interval.setValue(int(self._settings.value(self.prefix + "refresh_interval", 3)))
         screen.auto_refresh.setChecked(self._settings.value(self.prefix + "auto_refresh", "false") == "true")
@@ -62,14 +64,19 @@ class View:
     def on_condition_list(self, items):
         combo = self.screen.condition_combo
         combo.clear()
+        combo.addItem("[순위]조회순위", RANK_SEQ)  # 맨 위 고정 (상위 20)
+        f = QFont(combo.font())
+        f.setBold(True)
+        combo.setItemData(0, f, Qt.FontRole)  # 드롭다운에서 노랑+볼드로 조건식과 구분
+        combo.setItemData(0, QColor("#FFDD00"), Qt.ForegroundRole)
+        combo.insertSeparator(1)  # 진짜 조건식과 구분선
         for seq, name in items:
             combo.addItem(name, seq)
-        if combo.count() == 0:
-            return
         if self.seq is None:
             last = self._settings.value(self.prefix + "last_condition")
             idx = combo.findData(last) if last is not None else -1
-            idx = idx if idx >= 0 else 0
+            if idx < 0:  # 저장 없음: 첫 진짜 조건식 기본 (0=순위, 1=구분선, 2=첫 조건식)
+                idx = 2 if combo.count() > 2 else 0
             combo.setCurrentIndex(idx)  # setCurrentIndex는 activated 안 터짐 -> 수동 등록
             asyncio.ensure_future(self._switch_condition(combo.itemData(idx)))
         else:  # 재접속: ws가 재등록하므로 콤보 선택만 복원
@@ -87,10 +94,19 @@ class View:
     async def _switch_condition(self, seq: str):
         if seq != self.seq:  # 조건 변경: 이전 조건 해제 + 이 창 행 전량 정리
             await self.stop()
-        else:                # 같은 조건 재조회: 행 유지, 스냅샷 diff로만 반영
+        elif seq != RANK_SEQ:  # 같은 조건 재조회: 행 유지, 스냅샷 diff로만 반영
             await self.app.clear_condition_if_sole(self.seq, self)
-        await self.app.ws.register_condition(seq)
+        switched = self.screen.set_rank_mode(seq == RANK_SEQ)
         self.seq = str(seq)
+        if switched:  # 재조회/간격도 모드별 저장 -> 새 모드 값 로드 (시그널이 타이머까지 정리)
+            self.screen.refresh_interval.setValue(
+                int(self._settings.value(self._mkey("refresh_interval"), 3)))
+            self.screen.auto_refresh.setChecked(
+                self._settings.value(self._mkey("auto_refresh"), "false") == "true")
+        if seq == RANK_SEQ:  # ★조회순위: 서버 조건검색 대신 ka00198 폴 -> 같은 snapshot 경로
+            await self._poll_rank()
+            return
+        await self.app.ws.register_condition(seq)
 
     async def stop(self):
         """이 창의 조건/시세 구독 정리 (조건 변경·창 닫기)."""
@@ -102,11 +118,28 @@ class View:
             self.app.queue_real(code, add=False)
             self.screen.model.remove_stock(code)
 
+    async def _poll_rank(self):
+        """★조회순위: ka00198(30초 기준) 상위 RANK_TOP개 -> 조건검색과 동일한 snapshot 경로."""
+        try:
+            rows = (await self.app.rest.inquiry_rank(
+                self.screen.rank_period.currentData()))[:RANK_TOP]
+        except Exception as e:  # noqa: BLE001
+            log.warning("rank poll%s: %s", self.prefix or "", e)
+            return
+        self.on_snapshot([r["code"] for r in rows])
+        for r in rows:  # 순위/변동/이름은 ka00198에서 바로 채움 (시세는 실시간+백필)
+            self.screen.on_tick(r["code"], {"qrank": r["rank"], "qrank_chg": r["rank_chg"],
+                                            "name": r["name"]})
+
     # --- 재조회 -----------------------------------------------------------
     def on_refresh(self):
         seq = self.screen.condition_combo.currentData()
         if seq is not None:
             asyncio.ensure_future(self._switch_condition(seq))
+
+    def _mkey(self, name: str) -> str:
+        """모드별 설정 키 (재조회/간격): 순위 모드면 rankmode_ 접두 (gui._mkey와 동일 규칙)."""
+        return self.prefix + ("rankmode_" if self.seq == RANK_SEQ else "") + name
 
     def _on_sound(self, on: bool):
         self._settings.setValue(self.prefix + "sound", "true" if on else "false")
@@ -118,7 +151,7 @@ class View:
             _beep("in")
 
     def _on_auto_refresh(self, on: bool):
-        self._settings.setValue(self.prefix + "auto_refresh", "true" if on else "false")
+        self._settings.setValue(self._mkey("auto_refresh"), "true" if on else "false")
         self._settings.sync()
         if on:
             self._auto_timer.start(self.screen.refresh_interval.value() * 1000)
@@ -128,7 +161,7 @@ class View:
             log.info("auto-requery OFF %s", self.prefix)
 
     def _on_interval_changed(self, sec: int):
-        self._settings.setValue(self.prefix + "refresh_interval", sec)
+        self._settings.setValue(self._mkey("refresh_interval"), sec)
         self._settings.sync()
         if self._auto_timer.isActive():
             self._auto_timer.start(sec * 1000)
@@ -217,8 +250,7 @@ class App:
         self._extra_windows: list = []  # 추가 창(ConditionWindow) 목록
         self._cond_items = []           # CNSRLST 결과 (새 창 콤보 채우기용)
         self._market = None             # MarketInfo (새 창 모델 주입용)
-        self._limit_cnt = None          # ka10017 어제 연속상한 (연상 컬럼, 시작 시 1회)
-        self._limit_rolled = False      # 장마감 후 조회 = cnt에 오늘 연장분 포함됨
+        self._limit_cnt = None          # 어제까지 연속상한 일수 (연상 컬럼, 시작 시 1회, 일봉 계산)
         # REG/REMOVE는 0.3초 모아 각 1건으로 (서버 105110 유량거부 방지).
         # Counter: 두 창이 같은 종목을 등록하면 참조수 2가 되도록 발생 횟수 유지.
         self._reg_pending = Counter()
@@ -276,13 +308,10 @@ class App:
         try:
             # ponytail: 시작 시 1회. 자정 넘겨 켜두면 옛 목록 -> 날짜 가드는 필요해지면
             self._limit_cnt = await self.rest.yesterday_limit_counts()
-            # 장마감 후 조회면 서버 cnt가 오늘 연장분까지 포함(07-09 실측: 마감 후 2연상 cnt=2).
-            # 이때 화면의 "+오늘 상한 1"과 겹쳐 3으로 오탐 -> rolled 플래그로 +1 억제.
-            self._limit_rolled = datetime.datetime.now().strftime("%H%M") >= "1530"
             for v in self.views:
                 self._inject_market(v)
-            log.info("yesterday limit: %d codes%s %s", len(self._limit_cnt),
-                     " (rolled)" if self._limit_rolled else "", ",".join(self._limit_cnt))
+            log.info("yesterday limit: %s",
+                     ",".join(f"{c}={n}" for c, n in self._limit_cnt.items()))
         except Exception as e:  # noqa: BLE001
             log.warning("limit_counts failed: %s", e)
 
@@ -290,7 +319,6 @@ class App:
         m = view.screen.model
         if self._limit_cnt is not None:
             m.limit_cnt = self._limit_cnt
-            m.limit_rolled = self._limit_rolled
         if self._market is None:
             return
         m.kosdaq, m.single, m.nxt, m.misu, m.admin = (
@@ -515,11 +543,12 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        self._key = "geometry"  # 순위 모드 전환 시 set_rank_mode가 rank_geometry로 교체
         self._settings = QSettings("layout.ini", QSettings.IniFormat)
         self._geo_timer = QTimer(self)
         self._geo_timer.setSingleShot(True)
         self._geo_timer.timeout.connect(self._save_geo)
-        geo = self._settings.value("geometry")
+        geo = self._settings.value(self._key)
         if geo is not None:
             self.restoreGeometry(geo)
         else:
@@ -534,7 +563,7 @@ class MainWindow(QMainWindow):
         self._geo_timer.start(400)
 
     def _save_geo(self):
-        self._settings.setValue("geometry", self.saveGeometry())
+        self._settings.setValue(self._key, self.saveGeometry())
         self._settings.sync()  # 강제 종료돼도 남게
 
     def closeEvent(self, e):

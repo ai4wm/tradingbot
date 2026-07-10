@@ -156,13 +156,37 @@ class RestClient:
         return out
 
     async def yesterday_limit_counts(self) -> dict[str, int]:
-        """ka10017 전일상한(updown_tp=6): 어제 상한 마감 종목 -> 연속 상한 일수(cnt, 실측 확인).
-        하루 동안 불변 -> 시작 시 1회. 연상 표시 = cnt + (오늘 상한이면 1)."""
+        """어제 상한 마감 종목 -> 어제까지 연속 상한 일수. 연상 표시 = 이 값 + (오늘 상한이면 1).
+        목록만 ka10017(updown_tp=6)에서 받고, 일수는 일봉으로 직접 계산.
+        (서버 cnt는 장중에 오늘분이 섞여드는 시점이 불규칙 -> 신뢰 불가. 07-10 15:21 실측:
+        마감 전인데 cnt에 오늘 상한 포함. 일봉 과거 행은 하루 종일 불변이라 결정적.)"""
         d = await self.request("ka10017", {
             "mrkt_tp": "000", "updown_tp": "6", "sort_tp": "1", "stk_cnd": "0",
             "trde_qty_tp": "00000", "crd_cnd": "0", "trde_gold_tp": "0", "stex_tp": "1"})
-        return {r["stk_cd"]: _to_int(r.get("cnt"))
-                for r in d.get("updown_pric", []) if r.get("stk_cd")}
+        out = {}
+        for code in (r["stk_cd"] for r in d.get("updown_pric", []) if r.get("stk_cd")):
+            try:
+                out[code] = await self._yesterday_streak(code)
+            except Exception as e:  # noqa: BLE001 - 개별 실패는 최소값 1 (목록에 있음 = 어제 상한)
+                log.warning("yesterday_streak %s: %s", code, e)
+                out[code] = 1
+        return out
+
+    async def _yesterday_streak(self, code: str) -> int:
+        """일봉에서 어제까지 연속 상한 일수: 종가 대비 +29.5% 이상 연속 (gui.py LIMIT과 동일 판정)."""
+        import datetime
+        today = datetime.datetime.now().strftime("%Y%m%d")
+        d = await self.request("ka10081",
+                               {"stk_cd": code, "base_dt": today, "upd_stkpc_tp": "1"},
+                               path="/api/dostk/chart")
+        rows = [r for r in d.get("stk_dt_pole_chart_qry", []) if r.get("dt", "") < today]
+        n = 0
+        for a, b in zip(rows, rows[1:]):  # 최신(어제) -> 과거
+            c0, c1 = abs(_to_int(a.get("cur_prc"))), abs(_to_int(b.get("cur_prc")))
+            if not c1 or (c0 - c1) / c1 * 100 < 29.5:
+                break
+            n += 1
+        return n
 
     async def prev_volume(self, code: str) -> int:
         """전일(직전 거래일) 절대 거래량 = ka10081 일봉의 첫 dt<오늘 행.
