@@ -195,7 +195,7 @@ class StockModel(QAbstractTableModel):
         self.nxt: set[str] = set()           # 넥스트레이드(NXT) 거래가능: 좌상단 노랑 삼각형 (main 주입)
         self.misu: set[str] = set()          # 미수가능(증거금<100%): 우상단 녹색 삼각형 (main 주입)
         self.admin: set[str] = set()         # 관리종목: 종목명 경고색 (코스닥보다 우선, main 주입)
-        self.limit_cnt: dict[str, int] = {}  # 어제까지 연속상한 일수 (main 주입, 연상 컬럼, 일봉 계산)
+        self.limit_cnt: dict[str, tuple[int, int]] = {}  # (어제까지 연속상한 일수, 어제 종가) (main 주입, 연상 컬럼)
         self.new_today: set[str] = set()     # 상장 당일 (main 주입, 좌하단 마젠타)
         self.new15: set[str] = set()         # 상장 15일 이내 (좌하단 하늘)
         self.new30: set[str] = set()         # 상장 16~30일 (좌하단 청회)
@@ -312,9 +312,11 @@ class StockModel(QAbstractTableModel):
         field = FIELDS[index.column()]
         stored = self.rows[self.codes[index.row()]]
         if field == "streak":  # 연상 = 어제까지 일수 + (지금 상한이면 1), 매번 계산 (저장 안 함)
-            cnt = self.limit_cnt.get(self.codes[index.row()], 0)
+            cnt, yclose = self.limit_cnt.get(self.codes[index.row()], (0, 0))
             # +1은 실제 체결 상한(현재가=상한가)만: 예상등락률(동시호가/VI 예상)로는 안 셈.
-            today_limit = stored["upper"] > 0 and stored["price"] == stored["upper"]
+            # upper==어제종가면 휴장일 묵은 세션(이미 cnt에 포함) -> +1 억제 (003680 사건).
+            today_limit = (stored["upper"] > 0 and stored["price"] == stored["upper"]
+                           and stored["upper"] != yclose)
             n = cnt + (1 if today_limit else 0)
             if role == Qt.DisplayRole:
                 return str(n) if n else ""

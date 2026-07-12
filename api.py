@@ -168,8 +168,11 @@ class RestClient:
             })
         return out
 
-    async def yesterday_limit_counts(self) -> dict[str, int]:
-        """어제 상한 마감 종목 -> 어제까지 연속 상한 일수. 연상 표시 = 이 값 + (오늘 상한이면 1).
+    async def yesterday_limit_counts(self) -> dict[str, tuple[int, int]]:
+        """어제 상한 마감 종목 -> (어제까지 연속 상한 일수, 어제 종가).
+        연상 표시 = 일수 + (오늘 상한이면 1). 어제 종가는 휴장일 이중계산 방지용:
+        휴장일엔 ka10095가 마지막 세션 그대로라 현재가==상한가인데 그 상한은 이미 일수에
+        포함됨. 진짜 오늘 상한이면 상한가=전일종가x1.3이라 어제 종가와 절대 같을 수 없음.
         목록만 ka10017(updown_tp=6)에서 받고, 일수는 일봉으로 직접 계산.
         (서버 cnt는 장중에 오늘분이 섞여드는 시점이 불규칙 -> 신뢰 불가. 07-10 15:21 실측:
         마감 전인데 cnt에 오늘 상한 포함. 일봉 과거 행은 하루 종일 불변이라 결정적.)"""
@@ -182,11 +185,12 @@ class RestClient:
                 out[code] = await self._yesterday_streak(code)
             except Exception as e:  # noqa: BLE001 - 개별 실패는 최소값 1 (목록에 있음 = 어제 상한)
                 log.warning("yesterday_streak %s: %s", code, e)
-                out[code] = 1
+                out[code] = (1, 0)
         return out
 
-    async def _yesterday_streak(self, code: str) -> int:
-        """일봉에서 어제까지 연속 상한 일수: 종가 대비 +29.5% 이상 연속 (gui.py LIMIT과 동일 판정)."""
+    async def _yesterday_streak(self, code: str) -> tuple[int, int]:
+        """일봉에서 (어제까지 연속 상한 일수, 어제 종가): 종가 대비 +29.5% 이상 연속
+        (gui.py LIMIT과 동일 판정)."""
         import datetime
         today = datetime.datetime.now().strftime("%Y%m%d")
         d = await self.request("ka10081",
@@ -199,7 +203,7 @@ class RestClient:
             if not c1 or (c0 - c1) / c1 * 100 < 29.5:
                 break
             n += 1
-        return n
+        return n, abs(_to_int(rows[0].get("cur_prc"))) if rows else 0
 
     async def prev_volume(self, code: str) -> int:
         """전일(직전 거래일) 절대 거래량 = ka10081 일봉의 첫 dt<오늘 행.

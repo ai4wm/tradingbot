@@ -356,7 +356,7 @@ class App:
             for v in self.views:
                 self._inject_market(v)
             log.info("yesterday limit: %s",
-                     ",".join(f"{c}={n}" for c, n in self._limit_cnt.items()))
+                     ",".join(f"{c}={n}" for c, (n, _) in self._limit_cnt.items()))
         except Exception as e:  # noqa: BLE001
             log.warning("limit_counts failed: %s", e)
 
