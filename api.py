@@ -14,6 +14,13 @@ import config
 
 log = logging.getLogger("api")
 
+# 거래대금상위 등에서 ETF/ETN 제외용 발행사 접두(레버리지/인버스가 상위 독식).
+# 일반주 종목명과 충돌하지 않는 브랜드만(예: '파워'는 파워로직스와 충돌 -> 제외).
+ETF_PREFIXES = (
+    "KODEX", "TIGER", "KBSTAR", "RISE", "ACE", "SOL", "PLUS", "ARIRANG",
+    "HANARO", "KOSEF", "KINDEX", "TIMEFOLIO", "히어로즈", "마이티",
+)
+
 
 @dataclass
 class MarketInfo:
@@ -107,6 +114,12 @@ class RestClient:
 
     async def request(self, api_id: str, body: dict, path: str = "/api/dostk/stkinfo") -> dict:
         return (await self._request_raw(api_id, body, path)).json()
+
+    async def public_ip(self) -> str:
+        """공인 IP (키움 REST는 IP 화이트리스트 -> 바뀌면 접속 차단. 감시용). 실패 시 ''."""
+        r = await self._client.get("https://api.ipify.org", timeout=5.0)
+        r.raise_for_status()
+        return r.text.strip()
 
     async def watch_info(self, codes: list[str], exp: bool = None) -> list[dict]:
         """ka10095 관심종목정보: 여러 종목을 한 번에 조회 -> gui 필드로 정규화.
@@ -265,6 +278,60 @@ class RestClient:
             "rank_chg": _to_int(r.get("rank_chg")),
             "time": r.get("tm", ""),
         } for r in d.get("item_inq_rank", [])]
+
+    async def volume_surge(self, tm: str = "60", stex_tp: str = "3",
+                           drop_etf: bool = True) -> list[dict]:
+        """ka10023 거래량급증 -> 조회순위와 같은 필드로 정규화 (순위=목록순, 변동 없음).
+        tm: 집계 구간(분) — 직전 tm분 대비 급증. stex_tp: 1=KRX 2=NXT 3=통합(애프터마켓 포함).
+        drop_etf: 종목명 접두로 ETF/ETN 제외 -> 코스피·코스닥 일반주는 유지.
+        필드명 07-10 실측 확정: cur_prc/flu_rt/stk_cd/stk_nm, 컨테이너 trde_qty_sdnin."""
+        d = await self.request("ka10023", {
+            "mrkt_tp": "000", "sort_tp": "1", "tm_tp": "2", "trde_qty_tp": "0",
+            "tm": tm, "stk_cnd": "0", "pric_tp": "0", "stex_tp": stex_tp,
+        }, path="/api/dostk/rkinfo")
+        rows = d.get("trde_qty_sdnin", [])
+        out = []
+        rank = 0
+        for r in rows:
+            code = (r.get("stk_cd") or "").split("_")[0]
+            name = r.get("stk_nm", "")
+            if not code or (drop_etf and name.startswith(ETF_PREFIXES)):
+                continue
+            rank += 1
+            out.append({
+                "rank": rank, "code": code, "name": name,
+                "price": abs(_to_int(r.get("cur_prc"))),
+                "rate": _to_float(r.get("flu_rt")),
+                "prev_rate": 0.0, "rank_chg": 0, "time": "",
+            })
+        return out
+
+    async def trade_value_rank(self, stex_tp: str = "3", drop_etf: bool = True) -> list[dict]:
+        """ka10032 거래대금상위 -> 조회순위와 같은 필드로 정규화. 순위=now_rank, 변동=pred-now.
+        stex_tp: 1=KRX 2=NXT 3=통합(애프터마켓 포함).
+        drop_etf: 종목명 접두로 ETF/ETN 제외(응답에 종목구분 필드가 없어 이름으로 거름).
+        메이저 발행사 접두만 커버(레버리지/인버스가 거래대금 상위 독식) -> 코스피·코스닥 일반주는 유지."""
+        d = await self.request("ka10032", {
+            "mrkt_tp": "000", "mang_stk_incls": "1", "stex_tp": stex_tp,
+        }, path="/api/dostk/rkinfo")
+        rows = d.get("trde_prica_upper", [])
+        out = []
+        rank = 0
+        for r in rows:
+            code = (r.get("stk_cd") or "").split("_")[0]
+            name = r.get("stk_nm", "")
+            if not code or (drop_etf and name.startswith(ETF_PREFIXES)):
+                continue
+            rank += 1
+            out.append({
+                "rank": rank, "code": code, "name": name,
+                "price": abs(_to_int(r.get("cur_prc"))),
+                "rate": _to_float(r.get("flu_rt")),
+                "prev_rate": 0.0,
+                "rank_chg": _to_int(r.get("pred_rank")) - _to_int(r.get("now_rank")),
+                "time": "",
+            })
+        return out
 
     async def last_limit_entry(self, code: str, upper: int) -> str:
         """상한가 마지막 진입시각(초단위). ka10079 틱차트를 최신->과거로 스캔해 현재가=상한가인

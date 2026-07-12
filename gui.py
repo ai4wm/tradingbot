@@ -33,6 +33,10 @@ STREAK_COL = FIELDS.index("streak")
 MCAP_COL = FIELDS.index("mcap")
 TPM_COL = FIELDS.index("tpm")
 RANK_COLS = (FIELDS.index("qrank"), FIELDS.index("qrank_chg"))
+RANK_PERIODS = {  # 순위 계열 기준시간 콤보: (표시, data). 모드 따라 교체
+    "rank":   [("30초", "5"), ("1분", "1"), ("10분", "2"), ("1시간", "3"), ("당일", "4")],  # ka00198 qry_tp
+    "vsurge": [("1분", "1"), ("3분", "3"), ("5분", "5"), ("10분", "10"), ("30분", "30"), ("60분", "60")],  # ka10023 집계분(tm)
+}
 BAR_ROLE = Qt.UserRole + 1  # 델리게이트에 (open, high, low, close, base, upper, lower) 전달
 NXT_ROLE = Qt.UserRole + 2  # NameDelegate에 NXT 종목 여부 전달
 MISU_ROLE = Qt.UserRole + 3  # NameDelegate에 미수가능 여부 전달
@@ -471,12 +475,10 @@ class ConditionScreen(QWidget):
         self.condition_combo = QComboBox()
         self.condition_combo.setFixedWidth(220)  # 창 크기와 무관하게 고정 (굴림9 기준 한글 ~20자)
         # 등록/해제 버튼 없음: 콤보에서 조건 고르는 순간 바로 등록됨(영웅문 방식).
-        self.rank_period = QComboBox()  # ★조회순위 기준시간(집계 구간) — 순위 모드에서만 보임
-        for name, tp in (("30초", "5"), ("1분", "1"), ("10분", "2"), ("1시간", "3"), ("당일", "4")):
-            self.rank_period.addItem(name, tp)
+        self.rank_period = QComboBox()  # 순위 계열 기준시간 — 모드 따라 내용 교체(set_rank_period)
         self.rank_period.setFixedWidth(80)
-        self.rank_period.setToolTip("조회순위 집계 구간 — 최근 N 동안의 조회수로 순위 산정")
         self.rank_period.setVisible(False)
+        self._rank_period_mode = None
         self.refresh_btn = QPushButton()  # 현재 조건 편입목록 새로 받아오기(해제->재등록)
         self.refresh_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
         self.refresh_btn.setToolTip("재조회 — 현재 조건의 편입 종목을 지금 다시 받아옵니다")
@@ -510,6 +512,8 @@ class ConditionScreen(QWidget):
         self.newwin_btn = QPushButton("창+")
         self.newwin_btn.setToolTip("조건검색 창 하나 더 열기 (다른 조건식 동시 감시)")
         self.newwin_btn.setFixedWidth(44)
+        self.ip_label = QLabel()  # 공인 IP (App이 메인창만 채움). IP 바뀌면 빨강 강조
+        self.ip_label.setVisible(False)
         self.count_label = QLabel("종목수: 0")
         self.on_top_btn = QPushButton("📌")  # 항상 맨 위 토글 (창별)
         self.on_top_btn.setCheckable(True)
@@ -530,6 +534,7 @@ class ConditionScreen(QWidget):
         top.addWidget(self.rank_btn)
         top.addWidget(self.newwin_btn)
         top.addStretch(1)  # 남는 공간은 오른쪽으로
+        top.addWidget(self.ip_label)
         top.addWidget(self.count_label)
         top.addWidget(self.on_top_btn)  # 오른쪽 끝 = 창 크롬(핀) 자리
 
@@ -597,12 +602,8 @@ class ConditionScreen(QWidget):
         self._apply_sort()
         self._rank_on = None  # 순위 모드 여부 (None=초기)
         self.set_rank_mode(False)  # 순위/변동 기본 숨김 (★조회순위 선택 시 main이 켬)
-        idx = self.rank_period.findData(self._settings.value(self.prefix + "rank_period", "5"))
-        if idx >= 0:  # 기준시간 복원 (창별)
-            self.rank_period.setCurrentIndex(idx)
-        self.rank_period.activated.connect(lambda _: (
-            self._settings.setValue(self.prefix + "rank_period", self.rank_period.currentData()),
-            self._settings.sync()))
+        self.rank_period.activated.connect(self._save_rank_period)
+        self.set_rank_period("rank")  # 기본: 조회순위 기준시간 (급증 선택 시 main이 교체)
         if self._settings.value(self.prefix + "limit_sort", "false") == "true":  # 상한가정렬 복원
             self.limit_sort.setChecked(True)
         self.auto_remove.setChecked(  # 자동삭제 복원 (기본 켜짐)
@@ -694,6 +695,42 @@ class ConditionScreen(QWidget):
         self.limit_sort.setChecked(  # 상한가정렬: 새 모드 저장값 로드 (toggled -> 적용+저장)
             self._settings.value(self._mkey("limit_sort"), "false") == "true")
         return True
+
+    def set_ip(self, ip: str, changed: bool):
+        """상단바 공인 IP 표시. changed=True면 빨강 배경+볼드로 확 띄움 (API 차단 경보).
+        한번 바뀌면 재시작까지 빨강 유지 (키움에 IP 재등록 필요하니까)."""
+        self.ip_label.setVisible(True)
+        if changed:
+            self.ip_label.setText(f" ⚠ IP 변경됨 {ip} — API 재등록 필요 ")
+            self.ip_label.setStyleSheet("background:#e83030; color:white; font-weight:bold;")
+        else:
+            self.ip_label.setText(f"IP {ip}")
+            self.ip_label.setStyleSheet("color:#33C24D;")
+
+    def set_rank_period(self, mode: str):
+        """순위 계열 기준시간 콤보 내용 교체 + 저장값 복원 (창별·모드별).
+        기준시간 없는 모드(대금상위 등)는 콤보 숨김. mode: RANK_PERIODS 키 또는 그 외."""
+        periods = RANK_PERIODS.get(mode)
+        self.rank_period.setVisible(bool(periods))  # 콤보 표시/숨김은 여기서 소유
+        if not periods or mode == self._rank_period_mode:
+            self._rank_period_mode = mode
+            return
+        self._rank_period_mode = mode
+        c = self.rank_period
+        c.blockSignals(True)  # 재구성 중 activated 저장 방지
+        c.clear()
+        for name, data in periods:
+            c.addItem(name, data)
+        saved = self._settings.value(self.prefix + "rankperiod_" + mode, c.itemData(0))
+        idx = c.findData(saved)
+        c.setCurrentIndex(idx if idx >= 0 else 0)
+        c.setToolTip("조회순위 집계 구간" if mode == "rank" else "거래량급증 집계 구간(분)")
+        c.blockSignals(False)
+
+    def _save_rank_period(self, _):
+        self._settings.setValue(self.prefix + "rankperiod_" + self._rank_period_mode,
+                                self.rank_period.currentData())
+        self._settings.sync()
 
     def _save_auto_remove(self, on: bool):
         self._settings.setValue(self.prefix + "auto_remove", "true" if on else "false")

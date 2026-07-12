@@ -27,8 +27,13 @@ logging.basicConfig(
 log = logging.getLogger("main")
 
 MAX_WINDOWS = 3  # 실시간 등록 ~100종목 한도 내 (조건당 20~30종목 기준)
-RANK_SEQ = "RANK"  # ★조회순위 가짜 조건 seq (ka00198 폴 -> on_snapshot)
-RANK_TOP = 20      # 순위 모드 실시간 슬롯 캡 (95한도 공유)
+RANK_SEQ = "RANK"      # [순위]조회순위 (ka00198 폴 -> on_snapshot)
+VSURGE_SEQ = "VSURGE"  # [급증]거래량급증 (ka10023)
+TVAL_SEQ = "TVAL"      # [대금]거래대금상위 (ka10032)
+# 순위 계열: 서버 조건검색 대신 REST 폴, 순위 그리드 공유. seq -> 기준시간 콤보 서브모드
+RANK_SUBMODE = {RANK_SEQ: "rank", VSURGE_SEQ: "vsurge", TVAL_SEQ: "tval"}
+RANK_SEQS = set(RANK_SUBMODE)
+RANK_TOP = 20          # 순위 모드 실시간 슬롯 캡 (95한도 공유)
 _SHUTDOWN = [False]  # 메인 창 닫는 중: 추가 창 동반 종료를 '사용자 닫기'로 오인 방지
 
 
@@ -64,19 +69,22 @@ class View:
     def on_condition_list(self, items):
         combo = self.screen.condition_combo
         combo.clear()
-        combo.addItem("[순위]조회순위", RANK_SEQ)  # 맨 위 고정 (상위 20)
+        combo.addItem("[순위]조회순위", RANK_SEQ)   # 맨 위 고정: REST 순위 계열
+        combo.addItem("[급증]거래량급증", VSURGE_SEQ)
+        combo.addItem("[대금]거래대금상위", TVAL_SEQ)
         f = QFont(combo.font())
         f.setBold(True)
-        combo.setItemData(0, f, Qt.FontRole)  # 드롭다운에서 노랑+볼드로 조건식과 구분
-        combo.setItemData(0, QColor("#FFDD00"), Qt.ForegroundRole)
-        combo.insertSeparator(1)  # 진짜 조건식과 구분선
+        for i, color in ((0, "#FFDD00"), (1, "#FF8C00"), (2, "#38B8FF")):  # 볼드+색으로 조건식과 구분
+            combo.setItemData(i, f, Qt.FontRole)
+            combo.setItemData(i, QColor(color), Qt.ForegroundRole)
+        combo.insertSeparator(3)  # 진짜 조건식과 구분선
         for seq, name in items:
             combo.addItem(name, seq)
         if self.seq is None:
             last = self._settings.value(self.prefix + "last_condition")
             idx = combo.findData(last) if last is not None else -1
-            if idx < 0:  # 저장 없음: 첫 진짜 조건식 기본 (0=순위, 1=구분선, 2=첫 조건식)
-                idx = 2 if combo.count() > 2 else 0
+            if idx < 0:  # 저장 없음: 첫 진짜 조건식 (0=순위,1=급증,2=대금,3=구분선,4=첫 조건식)
+                idx = 4 if combo.count() > 4 else 0
             combo.setCurrentIndex(idx)  # setCurrentIndex는 activated 안 터짐 -> 수동 등록
             asyncio.ensure_future(self._switch_condition(combo.itemData(idx)))
         else:  # 재접속: ws가 재등록하므로 콤보 선택만 복원
@@ -94,16 +102,18 @@ class View:
     async def _switch_condition(self, seq: str):
         if seq != self.seq:  # 조건 변경: 이전 조건 해제 + 이 창 행 전량 정리
             await self.stop()
-        elif seq != RANK_SEQ:  # 같은 조건 재조회: 행 유지, 스냅샷 diff로만 반영
+        elif seq not in RANK_SEQS:  # 같은 조건 재조회: 행 유지, 스냅샷 diff로만 반영
             await self.app.clear_condition_if_sole(self.seq, self)
-        switched = self.screen.set_rank_mode(seq == RANK_SEQ)
+        switched = self.screen.set_rank_mode(seq in RANK_SEQS)
+        if seq in RANK_SEQS:  # 기준시간 콤보 내용을 서브모드에 맞게 교체 (계열 간 직접 전환 포함)
+            self.screen.set_rank_period(RANK_SUBMODE[seq])
         self.seq = str(seq)
         if switched:  # 재조회/간격도 모드별 저장 -> 새 모드 값 로드 (시그널이 타이머까지 정리)
             self.screen.refresh_interval.setValue(
                 int(self._settings.value(self._mkey("refresh_interval"), 3)))
             self.screen.auto_refresh.setChecked(
                 self._settings.value(self._mkey("auto_refresh"), "false") == "true")
-        if seq == RANK_SEQ:  # ★조회순위: 서버 조건검색 대신 ka00198 폴 -> 같은 snapshot 경로
+        if seq in RANK_SEQS:  # 순위 계열: 서버 조건검색 대신 REST 폴 -> 같은 snapshot 경로
             await self._poll_rank()
             return
         await self.app.ws.register_condition(seq)
@@ -119,15 +129,22 @@ class View:
             self.screen.model.remove_stock(code)
 
     async def _poll_rank(self):
-        """★조회순위: ka00198(30초 기준) 상위 RANK_TOP개 -> 조건검색과 동일한 snapshot 경로."""
+        """순위 계열: REST 상위 RANK_TOP개 -> 조건검색과 동일한 snapshot 경로.
+        조회순위=ka00198(기준시간 콤보), 거래량급증=ka10023(통합 stex_tp=3)."""
         try:
-            rows = (await self.app.rest.inquiry_rank(
-                self.screen.rank_period.currentData()))[:RANK_TOP]
+            if self.seq == VSURGE_SEQ:
+                rows = (await self.app.rest.volume_surge(
+                    self.screen.rank_period.currentData()))[:RANK_TOP]
+            elif self.seq == TVAL_SEQ:
+                rows = (await self.app.rest.trade_value_rank())[:RANK_TOP]
+            else:
+                rows = (await self.app.rest.inquiry_rank(
+                    self.screen.rank_period.currentData()))[:RANK_TOP]
         except Exception as e:  # noqa: BLE001
             log.warning("rank poll%s: %s", self.prefix or "", e)
             return
         self.on_snapshot([r["code"] for r in rows])
-        for r in rows:  # 순위/변동/이름은 ka00198에서 바로 채움 (시세는 실시간+백필)
+        for r in rows:  # 순위/변동/이름 바로 채움 (시세는 실시간+백필)
             self.screen.on_tick(r["code"], {"qrank": r["rank"], "qrank_chg": r["rank_chg"],
                                             "name": r["name"]})
 
@@ -138,8 +155,8 @@ class View:
             asyncio.ensure_future(self._switch_condition(seq))
 
     def _mkey(self, name: str) -> str:
-        """모드별 설정 키 (재조회/간격): 순위 모드면 rankmode_ 접두 (gui._mkey와 동일 규칙)."""
-        return self.prefix + ("rankmode_" if self.seq == RANK_SEQ else "") + name
+        """모드별 설정 키 (재조회/간격): 순위 계열이면 rankmode_ 접두 (gui._mkey와 동일 규칙)."""
+        return self.prefix + ("rankmode_" if self.seq in RANK_SEQS else "") + name
 
     def _on_sound(self, on: bool):
         self._settings.setValue(self.prefix + "sound", "true" if on else "false")
@@ -265,6 +282,14 @@ class App:
         self._single_timer.timeout.connect(self._on_single_poll)
         self._single_timer.start(3000)
         self._rank = None
+        # 공인 IP 감시: 바뀌면 키움 화이트리스트에서 벗어나 API 차단 -> 상단바 경보
+        self._public_ip = None
+        self._ip_task = None
+        self._ip_timer = QTimer()
+        self._ip_timer.timeout.connect(
+            lambda: setattr(self, "_ip_task", asyncio.ensure_future(self._check_ip()))
+            if not (self._ip_task and not self._ip_task.done()) else None)
+        self._ip_timer.start(60000)
 
         self.ws.on_condition_list = self._on_condition_list
         self.ws.on_condition_event = self._on_condition_event
@@ -292,7 +317,27 @@ class App:
         for v in self.views:  # 전 종목 시세 강제 재백필: 편입 diff 없어도 KRX<->통합 값 교체
             v._schedule_refresh()
 
+    async def _check_ip(self):
+        try:
+            ip = await self.rest.public_ip()
+        except Exception as e:  # noqa: BLE001 - 외부 서비스 실패는 무시(다음 주기 재시도)
+            log.warning("public_ip: %s", e)
+            return
+        if not ip or ip == self._public_ip:
+            return
+        screen = self.views[0].screen  # 메인창에만 표시
+        changed = self._public_ip is not None  # None=최초 확인(정상), 값 있으면 실제 변경
+        self._public_ip = ip
+        screen.set_ip(ip, changed)
+        screen.window().setWindowTitle(
+            (f"⚠ IP변경 {ip} — " if changed else "") + "[0156] 조건검색실시간" +
+            ("" if changed else f" — {ip}"))
+        if changed:
+            log.warning("public IP changed -> %s (키움 화이트리스트 재등록 필요)", ip)
+            _beep("jump")  # 초고음 3연타 경보
+
     async def start(self):
+        asyncio.ensure_future(self._check_ip())  # 시작 즉시 IP 표시
         self.ws_task = asyncio.create_task(self.ws.run(self.rest.tokens.token))
         for _ in range(int(self._settings.value("cond_windows", 0))):
             self._open_window()  # 지난 세션의 추가 창 복원
