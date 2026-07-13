@@ -68,6 +68,7 @@ class View:
     # --- 조건 목록/선택 ---------------------------------------------------
     def on_condition_list(self, items):
         combo = self.screen.condition_combo
+        selected_seq = self.seq
         combo.clear()
         combo.addItem("[순위]조회순위", RANK_SEQ)   # 맨 위 고정: REST 순위 계열
         combo.addItem("[급증]거래량급증", VSURGE_SEQ)
@@ -87,10 +88,16 @@ class View:
                 idx = 4 if combo.count() > 4 else 0
             combo.setCurrentIndex(idx)  # setCurrentIndex는 activated 안 터짐 -> 수동 등록
             asyncio.ensure_future(self._switch_condition(combo.itemData(idx)))
-        else:  # 재접속: ws가 재등록하므로 콤보 선택만 복원
-            idx = combo.findData(self.seq)
+        else:  # 재조회/재접속: 현재 조건 선택 복원
+            idx = combo.findData(selected_seq)
             if idx >= 0:
                 combo.setCurrentIndex(idx)
+            else:
+                # 영웅문에서 현재 조건식을 삭제한 뒤 목록을 재조회한 경우,
+                # 콤보는 자동으로 0번을 표시하지만 실제 구독은 예전 조건에 남는 문제가 있다.
+                idx = 4 if combo.count() > 4 else 0
+                combo.setCurrentIndex(idx)
+                asyncio.ensure_future(self._switch_condition(combo.itemData(idx)))
 
     def _on_condition_selected(self, index: int):
         seq = self.screen.condition_combo.itemData(index)
@@ -142,6 +149,10 @@ class View:
                     self.screen.rank_period.currentData()))[:RANK_TOP]
         except Exception as e:  # noqa: BLE001
             log.warning("rank poll%s: %s", self.prefix or "", e)
+            return
+        rows = [r for r in rows if r.get("code")]
+        if len(rows) < RANK_TOP:
+            log.warning("rank poll%s: incomplete %d/%d", self.prefix or "", len(rows), RANK_TOP)
             return
         self.on_snapshot([r["code"] for r in rows])
         for r in rows:  # 순위/변동/이름 바로 채움 (시세는 실시간+백필)
@@ -266,6 +277,7 @@ class App:
         self.views: list[View] = [View(self, screen)]
         self._extra_windows: list = []  # 추가 창(ConditionWindow) 목록
         self._cond_items = []           # CNSRLST 결과 (새 창 콤보 채우기용)
+        self._condition_reload_id = 0   # 재조회 타임아웃과 실제 응답의 경합 방지
         self._market = None             # MarketInfo (새 창 모델 주입용)
         self._limit_cnt = None          # 어제까지 연속상한 일수 (연상 컬럼, 시작 시 1회, 일봉 계산)
         # REG/REMOVE는 0.3초 모아 각 1건으로 (서버 105110 유량거부 방지).
@@ -304,10 +316,35 @@ class App:
         self._wire_common(screen)
 
     def _wire_common(self, screen: ConditionScreen):
-        screen.reload_btn.clicked.connect(
-            lambda: asyncio.ensure_future(self.ws.list_conditions()))
+        screen.reload_btn.clicked.connect(self._reload_conditions)
         screen.rank_btn.clicked.connect(self._on_rank)
         screen.newwin_btn.clicked.connect(self._on_newwin)
+
+    def _reload_conditions(self):
+        """조건 목록 재조회 요청. 응답 전후가 화면에 보이도록 버튼 상태도 갱신한다."""
+        self._condition_reload_id += 1
+        request_id = self._condition_reload_id
+        for v in self.views:
+            v.screen.reload_btn.setEnabled(False)
+            v.screen.reload_btn.setText("…")
+            v.screen.reload_btn.setToolTip("조건목록 조회 중")
+        asyncio.ensure_future(self.ws.list_conditions())
+        # 연결 이상 등으로 응답이 없더라도 버튼이 영구 비활성화되지 않게 한다.
+        QTimer.singleShot(5000, lambda: self._finish_condition_reload(None, request_id))
+
+    def _finish_condition_reload(self, count, request_id=None):
+        if request_id is not None and request_id != self._condition_reload_id:
+            return
+        if count is not None:
+            self._condition_reload_id += 1  # 예약된 타임아웃 무효화
+        for v in self.views:
+            btn = v.screen.reload_btn
+            btn.setEnabled(True)
+            btn.setText("")
+            if count is None:
+                btn.setToolTip("조건목록 응답 없음 — 다시 시도하세요")
+            else:
+                btn.setToolTip(f"조건목록 재조회 완료 — {count}개")
 
     def _on_unified(self, on: bool):
         self._settings.setValue("unified_real", "true" if on else "false")
@@ -381,6 +418,7 @@ class App:
         log.info("condition list: %d", len(items))
         for v in self.views:
             v.on_condition_list(items)
+        self._finish_condition_reload(len(items))
 
     def _on_condition_event(self, seq: str, code: str, is_insert: bool):
         for v in self.views:
@@ -527,8 +565,7 @@ class App:
             view.on_condition_list(self._cond_items)
 
     def _wire_extra(self, screen: ConditionScreen):
-        screen.reload_btn.clicked.connect(
-            lambda: asyncio.ensure_future(self.ws.list_conditions()))
+        screen.reload_btn.clicked.connect(self._reload_conditions)
 
     def _on_window_closed(self, win):
         if _SHUTDOWN[0]:  # 앱 종료 동반 닫힘: 창 개수 보존 (재시작 때 복원용)

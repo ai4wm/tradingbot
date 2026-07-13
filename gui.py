@@ -259,8 +259,7 @@ class StockModel(QAbstractTableModel):
             fields["exp_price"], fields["exp_qty"] = 0, 0
             log.info("expOFF %s vol", code)
         dvol = fields.get("vol", 0) - stored["vol"]  # 체결 틱 (체결/분)
-        # 1주 이상 카운트, 단 10만원 이하 종목의 1주는 매크로 churn으로 보고 제외(하이닉스류 고가주는 통과)
-        if dvol >= 2 or (dvol == 1 and fields.get("price", stored["price"]) > 100_000):
+        if dvol > 0:
             dq = self.ticks.setdefault(code, deque())
             now = time.monotonic()
             dq.append(now)
