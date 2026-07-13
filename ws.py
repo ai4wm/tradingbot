@@ -317,7 +317,7 @@ class WSClient:
         if not seq and len(self._active_seqs) == 1:  # 응답에 seq 없으면 단일 등록으로 판정
             seq = next(iter(self._active_seqs))
         codes = []
-        for item in msg.get("data", []):
+        for item in msg.get("data") or []:
             code = (item.get("9001") or item.get("jmcode") or item.get("item") or "").lstrip("A")
             if code:
                 codes.append(code)
@@ -364,7 +364,8 @@ def _demo():
     assert snap == [("2", ["005930", "002995"])], snap
     c._active_seqs = {"7"}  # 응답에 seq 없고 단일 등록이면 그 seq로 판정
     c._handle_condition({"trnm": "CNSRREQ", "data": [{"9001": "011230"}]})
-    assert snap[-1] == ("7", ["011230"]), snap
+    c._handle_condition({"trnm": "CNSRREQ", "data": None})
+    assert snap[-2:] == [("7", ["011230"]), ("7", [])], snap
     # CNSRLST 파싱
     assert parse_condition_list([["0", "상한근접"], ["1", "급등주"]]) == [("0", "상한근접"), ("1", "급등주")]
     # REG 묶음 전송 + 참조수: 두 창이 같은 종목이면 REG 1회, 마지막 창이 뺄 때만 REMOVE
