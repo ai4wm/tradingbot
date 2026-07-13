@@ -345,6 +345,8 @@ class App:
             self._market = await self.rest.market_info()
             for v in self.views:
                 self._inject_market(v)
+            if self._rank is not None:
+                self._rank.set_market(self._market)
             m = self._market
             log.info("kosdaq %d, single %d, nxt %d, misu %d, admin %d",
                      len(m.kosdaq), len(m.single), len(m.nxt), len(m.misu), len(m.admin))
@@ -479,6 +481,8 @@ class App:
     def _on_rank(self):
         if self._rank is None:
             self._rank = RankScreen(self.rest)
+            if self._market is not None:
+                self._rank.set_market(self._market)
         if self._rank.isVisible():
             self._rank.close()
         else:
