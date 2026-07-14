@@ -538,9 +538,10 @@ class App:
         used = {v.prefix for v in self.views}
         n = next(i for i in range(2, MAX_WINDOWS + 1) if f"w{i}_" not in used)
         prefix = f"w{n}_"
-        # 컬럼폭/정렬은 열 때마다 본창 복사 (크기와 함께 통일). 위치만 창별 기억.
+        # 최초 생성 때만 본창의 컬럼폭/정렬을 복사. 이후에는 해당 창의 마지막 상태를 유지.
         main = self.views[0].screen
-        self._settings.setValue(prefix + "header", main.table.horizontalHeader().saveState())
+        if self._settings.value(prefix + "header") is None:
+            self._settings.setValue(prefix + "header", main.table.horizontalHeader().saveState())
         seeded = False
         if self._settings.value(prefix + "geometry") is None:  # 첫 오픈: 위치도 본창에서
             self._settings.setValue(prefix + "geometry", main.window().saveGeometry())
@@ -614,6 +615,9 @@ class ConditionWindow(QMainWindow):
 
     def closeEvent(self, e):
         self._save_geo()
+        screen = self.centralWidget()
+        if hasattr(screen, "_save_layout"):
+            screen._save_layout()  # 400ms 저장 타이머 전에 닫혀도 마지막 정렬 보존
         if self._on_close:
             self._on_close(self)
         super().closeEvent(e)
@@ -654,6 +658,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, e):
         self._save_geo()
+        screen = self.centralWidget()
+        if hasattr(screen, "_save_layout"):
+            screen._save_layout()  # 400ms 저장 타이머 전에 닫혀도 마지막 정렬 보존
         if not _SHUTDOWN[0]:
             _SHUTDOWN[0] = True  # 동반 닫힘을 사용자 닫기로 오인 방지 + 재귀 방지
             for w in QApplication.instance().topLevelWidgets():

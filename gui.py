@@ -15,7 +15,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QColor, QCursor, QDesktopServices, QFont, QIcon, QPainter, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QHBoxLayout, QHeaderView, QLabel,
-    QMainWindow, QPushButton, QSpinBox, QStyle, QStyledItemDelegate, QTableView, QToolTip,
+    QMainWindow, QPushButton, QSpinBox, QStyle, QStyledItemDelegate, QStyleOptionViewItem, QTableView, QToolTip,
     QVBoxLayout, QWidget,
 )
 
@@ -41,6 +41,7 @@ BAR_ROLE = Qt.UserRole + 1  # 델리게이트에 (open, high, low, close, base, 
 NXT_ROLE = Qt.UserRole + 2  # NameDelegate에 NXT 종목 여부 전달
 MISU_ROLE = Qt.UserRole + 3  # NameDelegate에 미수가능 여부 전달
 NEW_ROLE = Qt.UserRole + 4  # NameDelegate에 신규상장 단계 전달 (3=당일 2=15일이내 1=30일이내 0=아님)
+TPM_TREND_ROLE = Qt.UserRole + 5  # 체결/분 추세: 최근 10초 속도 vs 이전 50초 (-1/0/+1)
 
 LIMIT = 29.5  # 상한/하한 판정 임계 (KRX +-30%)
 # ponytail: 매크로가 2주+로 갈아타면 이 값을 올리거나 금액기준(delta*price)으로 교체
@@ -134,6 +135,44 @@ class NameDelegate(QStyledItemDelegate):
             painter.drawPolygon(QPolygon([QPoint(r.left(), r.bottom()),
                                           QPoint(r.left() + s, r.bottom()),
                                           QPoint(r.left(), r.bottom() - s)]))
+        painter.restore()
+
+
+class TpmDelegate(QStyledItemDelegate):
+    """체결/분 숫자 오른쪽에 증가=빨강 ▲, 감소=파랑 ▼를 별도 색으로 표시."""
+
+    def paint(self, painter, option, index):
+        trend = index.data(TPM_TREND_ROLE) or 0
+        if not index.data(Qt.DisplayRole):
+            super().paint(painter, option, index)
+            return
+
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        text = opt.text
+
+        painter.save()
+        if option.state & QStyle.State_Selected:
+            painter.fillRect(option.rect, option.palette.highlight())
+        elif opt.backgroundBrush.style() != Qt.NoBrush:
+            painter.fillRect(option.rect, opt.backgroundBrush)
+        else:
+            painter.fillRect(option.rect, option.palette.base())
+        painter.setFont(opt.font)
+        r = option.rect.adjusted(3, 0, -3, 0)
+        arrow = "▲" if trend > 0 else "▼"
+        # 추세가 없어도 삼각형 한 칸을 항상 확보해 숫자가 좌우로 움직이지 않게 한다.
+        arrow_w = max(painter.fontMetrics().horizontalAdvance("▲"),
+                      painter.fontMetrics().horizontalAdvance("▼")) + 3
+        number_rect = QRect(r.left(), r.top(), max(0, r.width() - arrow_w), r.height())
+        arrow_rect = QRect(number_rect.right() + 1, r.top(), arrow_w, r.height())
+        number_color = (option.palette.highlightedText().color()
+                        if option.state & QStyle.State_Selected else opt.palette.text().color())
+        painter.setPen(number_color)
+        painter.drawText(number_rect, Qt.AlignRight | Qt.AlignVCenter, text)
+        if trend:
+            painter.setPen(RED if trend > 0 else BLUE)
+            painter.drawText(arrow_rect, Qt.AlignRight | Qt.AlignVCenter, arrow)
         painter.restore()
 
 
@@ -327,12 +366,22 @@ class StockModel(QAbstractTableModel):
                 return RED
             return None
         if field == "tpm":  # 체결/분 = 최근 60초 체결 틱수, 매번 계산 (저장 안 함)
-            t0 = time.monotonic() - 60
-            n = sum(1 for t in self.ticks.get(self.codes[index.row()], ()) if t >= t0)
+            now = time.monotonic()
+            dq = self.ticks.get(self.codes[index.row()], ())
+            n = sum(1 for t in dq if t >= now - 60)
+            recent = sum(1 for t in dq if t >= now - 10)
+            previous = n - recent
+            # 최근 10초와 이전 50초를 각각 분당 속도로 환산. 20% 완충 + 최소 표본으로 깜빡임 억제.
+            recent_rate, previous_rate = recent * 6, previous * 1.2
+            trend = (1 if recent >= 3 and recent_rate > previous_rate * 1.2
+                     else -1 if previous >= 5 and recent_rate < previous_rate * 0.8
+                     else 0)
             if role == Qt.DisplayRole:
                 return str(n) if n else ""
             if role == Qt.UserRole:
                 return n
+            if role == TPM_TREND_ROLE:
+                return trend
             if role == Qt.TextAlignmentRole:
                 return Qt.AlignRight | Qt.AlignVCenter
             if n > 500:  # 급증 단계: 500 노랑 / 1000 주황 / 1500 빨강 (볼드)
@@ -574,6 +623,7 @@ class ConditionScreen(QWidget):
         self.table.setColumnWidth(BAR_COL, 70)
         self.table.setItemDelegateForColumn(BAR_COL, BarDelegate(self.table))
         self.table.setItemDelegateForColumn(NAME_COL, NameDelegate(self.table))
+        self.table.setItemDelegateForColumn(TPM_COL, TpmDelegate(self.table))
         self.table.setSelectionBehavior(QTableView.SelectRows)
         # 폰트는 앱 전역(main.py: 굴림체9 NoAA)에서 상속 — 그리드/툴바 통일
         self.table.setEditTriggers(QTableView.NoEditTriggers)
