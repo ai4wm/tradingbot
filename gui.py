@@ -60,9 +60,11 @@ TRACK = QColor("#d8d8d8")
 CENTER = QColor("#707070")  # L일봉H 0% 중심선
 
 
-def _draw_selection_lines(painter, rect):
+def _draw_selection_lines(painter, rect, palette):
     painter.save()
-    painter.setPen(QColor("#707070"))
+    # 한 색으로는 흰/검정 배경 모두 대비가 부족하므로 현재 시스템 팔레트에 맞춰 전환.
+    dark = palette.base().color().lightness() < 128
+    painter.setPen(QColor("#4FC3F7") if dark else QColor("#1565C0"))
     painter.drawLine(rect.left(), rect.top(), rect.right(), rect.top())
     painter.drawLine(rect.left(), rect.bottom(), rect.right(), rect.bottom())
     painter.restore()
@@ -108,7 +110,7 @@ class PreserveTextColorDelegate(QStyledItemDelegate):
         opt.state &= ~(QStyle.State_Selected | QStyle.State_HasFocus)
         super().paint(painter, opt, index)
         if selected:
-            _draw_selection_lines(painter, option.rect)
+            _draw_selection_lines(painter, option.rect, option.palette)
 
 
 class BarDelegate(QStyledItemDelegate):
@@ -118,7 +120,7 @@ class BarDelegate(QStyledItemDelegate):
 
     def paint(self, painter, option, index):
         if _is_current_row(option, index):
-            _draw_selection_lines(painter, option.rect)
+            _draw_selection_lines(painter, option.rect, option.palette)
         data = index.data(BAR_ROLE)
         if not data:
             return
@@ -184,7 +186,7 @@ class NameDelegate(QStyledItemDelegate):
         new = index.data(NEW_ROLE)
         if not (nxt or misu or new):
             if selected:
-                _draw_selection_lines(painter, option.rect)
+                _draw_selection_lines(painter, option.rect, option.palette)
             return
         r = option.rect
         s = 10
@@ -208,7 +210,7 @@ class NameDelegate(QStyledItemDelegate):
                                           QPoint(r.left(), r.bottom() - s)]))
         painter.restore()
         if selected:
-            _draw_selection_lines(painter, option.rect)
+            _draw_selection_lines(painter, option.rect, option.palette)
 
 
 class TpmDelegate(QStyledItemDelegate):
@@ -226,7 +228,7 @@ class TpmDelegate(QStyledItemDelegate):
             opt.state &= ~(QStyle.State_Selected | QStyle.State_HasFocus)
             super().paint(painter, opt, index)
             if selected:
-                _draw_selection_lines(painter, option.rect)
+                _draw_selection_lines(painter, option.rect, option.palette)
             return
 
         opt = QStyleOptionViewItem(option)
@@ -256,7 +258,7 @@ class TpmDelegate(QStyledItemDelegate):
             painter.setPen(WHITE if trend > 0 and hot_tpm else RED if trend > 0 else BLUE)
             painter.drawText(arrow_rect, Qt.AlignRight | Qt.AlignVCenter, arrow)
         if selected:
-            _draw_selection_lines(painter, option.rect)
+            _draw_selection_lines(painter, option.rect, option.palette)
         painter.restore()
 
 
