@@ -34,6 +34,26 @@ TVAL_SEQ = "TVAL"      # [대금]거래대금상위 (ka10032)
 RANK_SUBMODE = {RANK_SEQ: "rank", VSURGE_SEQ: "vsurge", TVAL_SEQ: "tval"}
 RANK_SEQS = set(RANK_SUBMODE)
 RANK_TOP = 20          # 순위 모드 실시간 슬롯 캡 (95한도 공유)
+
+
+def _start_title_clock(win: QMainWindow, title: str):
+    """영웅문에서 동기화한 PC 시각을 창 제목에 1초 단위로 표시."""
+    def update():
+        win.setWindowTitle(f"{win._title_clock_base} | {time.strftime('%H:%M:%S')}")
+
+    win._title_clock_base = title
+    win._update_title_clock = update
+    timer = QTimer(win)
+    timer.timeout.connect(update)
+    timer.start(1000)
+    win._title_clock = timer  # 부모가 보관하지만 명시적으로 수명 유지
+    update()
+
+
+def _set_title_clock_base(win: QMainWindow, title: str):
+    """IP 상태처럼 변하는 제목을 시계 갱신에 보존."""
+    win._title_clock_base = title
+    win._update_title_clock()
 _SHUTDOWN = [False]  # 메인 창 닫는 중: 추가 창 동반 종료를 '사용자 닫기'로 오인 방지
 
 
@@ -366,7 +386,8 @@ class App:
         changed = self._public_ip is not None  # None=최초 확인(정상), 값 있으면 실제 변경
         self._public_ip = ip
         screen.set_ip(ip, changed)
-        screen.window().setWindowTitle(
+        _set_title_clock_base(
+            screen.window(),
             (f"⚠ IP변경 {ip} — " if changed else "") + "[0156] 조건검색실시간" +
             ("" if changed else f" — {ip}"))
         if changed:
@@ -551,7 +572,7 @@ class App:
         screen.rank_btn.setVisible(False)
         screen.unified_check.setVisible(False)  # 통합 시세는 전 창 공통 -> 메인창에서만 전환
         win = ConditionWindow(prefix, on_close=self._on_window_closed)
-        win.setWindowTitle(f"[0156-{n}] 조건검색실시간")
+        _start_title_clock(win, f"[0156-{n}] 조건검색실시간")
         win.setCentralWidget(screen)
         view = View(self, screen)
         self._inject_market(view)
@@ -678,7 +699,7 @@ def main():
     asyncio.set_event_loop(loop)
 
     win = MainWindow()
-    win.setWindowTitle("[0156] 조건검색실시간")
+    _start_title_clock(win, "[0156] 조건검색실시간")
     screen = ConditionScreen()
     win.setCentralWidget(screen)
     win.show()

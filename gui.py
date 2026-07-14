@@ -81,7 +81,7 @@ class PreserveTextColorDelegate(QStyledItemDelegate):
     def paint(self, painter, option, index):
         selected = _is_current_row(option, index)
         opt = QStyleOptionViewItem(option)
-        opt.state &= ~QStyle.State_Selected
+        opt.state &= ~(QStyle.State_Selected | QStyle.State_HasFocus)
         super().paint(painter, opt, index)
         if selected:
             _draw_selection_lines(painter, option.rect)
@@ -143,7 +143,7 @@ class NameDelegate(QStyledItemDelegate):
         # 스타일에 맡기고 글자는 직접 그려 `…` 변환 경로 자체를 타지 않게 한다.
         selected = _is_current_row(option, index)
         opt = QStyleOptionViewItem(option)
-        opt.state &= ~QStyle.State_Selected
+        opt.state &= ~(QStyle.State_Selected | QStyle.State_HasFocus)
         self.initStyleOption(opt, index)
         text = opt.text
         opt.text = ""
@@ -199,14 +199,14 @@ class TpmDelegate(QStyledItemDelegate):
         selected = _is_current_row(option, index)
         if not index.data(Qt.DisplayRole):
             opt = QStyleOptionViewItem(option)
-            opt.state &= ~QStyle.State_Selected
+            opt.state &= ~(QStyle.State_Selected | QStyle.State_HasFocus)
             super().paint(painter, opt, index)
             if selected:
                 _draw_selection_lines(painter, option.rect)
             return
 
         opt = QStyleOptionViewItem(option)
-        opt.state &= ~QStyle.State_Selected
+        opt.state &= ~(QStyle.State_Selected | QStyle.State_HasFocus)
         self.initStyleOption(opt, index)
         text = opt.text
 
@@ -226,7 +226,10 @@ class TpmDelegate(QStyledItemDelegate):
         painter.setPen(opt.palette.text().color())
         painter.drawText(number_rect, Qt.AlignRight | Qt.AlignVCenter, text)
         if trend:
-            painter.setPen(RED if trend > 0 else BLUE)
+            # 체결/분 1500 초과는 셀 배경도 빨강이라 빨강 ▲가 묻힌다.
+            # 이 구간의 증가 ▲만 흰색으로 바꿔 방향과 가독성을 함께 유지한다.
+            hot_tpm = self.trend_role == TPM_TREND_ROLE and (index.data(Qt.UserRole) or 0) > 1500
+            painter.setPen(WHITE if trend > 0 and hot_tpm else RED if trend > 0 else BLUE)
             painter.drawText(arrow_rect, Qt.AlignRight | Qt.AlignVCenter, arrow)
         if selected:
             _draw_selection_lines(painter, option.rect)
@@ -719,7 +722,9 @@ class ConditionScreen(QWidget):
         self.table.setItemDelegateForColumn(BUY_PCT_COL, TpmDelegate(BUY_TREND_ROLE, self.table))
         self.table.setSelectionBehavior(QTableView.SelectRows)
         self.table.setSelectionMode(QTableView.NoSelection)  # Windows 네이티브 선택 세로 바 차단
-        self.table.setFocusPolicy(Qt.NoFocus)  # 현재 셀 앞의 Windows 포커스 세로 바 제거
+        # 행을 클릭한 뒤 위/아래 화살표로 현재 행을 옮길 수 있게 포커스는 허용한다.
+        # 델리게이트에서 State_HasFocus를 제거하므로 Windows 포커스 세로 바는 그리지 않는다.
+        self.table.setFocusPolicy(Qt.StrongFocus)
         self.table.selectionModel().currentChanged.connect(lambda *_: self.table.viewport().update())
         # 폰트는 앱 전역(main.py: 굴림체9 NoAA)에서 상속 — 그리드/툴바 통일
         self.table.setEditTriggers(QTableView.NoEditTriggers)
