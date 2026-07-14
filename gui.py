@@ -12,10 +12,10 @@ from collections import deque
 from PySide6.QtCore import (
     QAbstractTableModel, QModelIndex, QPoint, QRect, QSettings, QSortFilterProxyModel, Qt, QTimer, QUrl,
 )
-from PySide6.QtGui import QColor, QCursor, QDesktopServices, QFont, QIcon, QPainter, QPixmap, QPolygon
+from PySide6.QtGui import QColor, QCursor, QDesktopServices, QFont, QIcon, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QHBoxLayout, QHeaderView, QLabel,
-    QMainWindow, QPushButton, QSpinBox, QStyle, QStyledItemDelegate, QStyleOptionViewItem, QTableView, QToolTip,
+    QMainWindow, QProxyStyle, QPushButton, QSpinBox, QStyle, QStyledItemDelegate, QStyleOptionViewItem, QTableView, QToolTip,
     QVBoxLayout, QWidget,
 )
 
@@ -73,6 +73,30 @@ def _is_current_row(option, index):
     view = option.widget
     current = view.currentIndex() if view is not None else QModelIndex()
     return current.isValid() and current.row() == index.row()
+
+
+class VisibleCheckStyle(QProxyStyle):
+    """비활성 창에서도 체크 상태가 다크 배경에 묻히지 않게 직접 그린다."""
+
+    def drawPrimitive(self, element, option, painter, widget=None):
+        if (element == QStyle.PE_IndicatorCheckBox
+                and option.state & QStyle.State_On
+                and option.state & QStyle.State_Enabled):
+            painter.save()
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            r = option.rect.adjusted(1, 1, -1, -1)
+            painter.setPen(QPen(QColor("#8E249F"), 1))
+            painter.setBrush(QColor("#B638C7"))
+            painter.drawRoundedRect(r, 3, 3)
+            painter.setPen(QPen(WHITE, 2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            painter.drawPolyline(QPolygon([
+                QPoint(r.left() + r.width() * 2 // 9, r.center().y()),
+                QPoint(r.left() + r.width() * 4 // 9, r.bottom() - r.height() * 2 // 9),
+                QPoint(r.right() - r.width() // 7, r.top() + r.height() // 4),
+            ]))
+            painter.restore()
+            return
+        super().drawPrimitive(element, option, painter, widget)
 
 
 class PreserveTextColorDelegate(QStyledItemDelegate):
@@ -643,6 +667,10 @@ class ConditionScreen(QWidget):
         self.sound_check.setToolTip("새 종목이 편입되면 소리 알림 (실시간/재조회 모두)")
         self.limit_sort = QCheckBox("상한↑")
         self.limit_sort.setToolTip("상한(실제/예상)&매도0 종목을 위로 고정, 컬럼 클릭으로 그룹 내 정렬")
+        self._checkbox_style = VisibleCheckStyle()
+        self._checkbox_style.setParent(self)
+        for checkbox in (self.auto_refresh, self.auto_remove, self.sound_check, self.limit_sort):
+            checkbox.setStyle(self._checkbox_style)
         self.unified_check = QPushButton("K")  # KRX<->통합(_AL) 시세 전환 토글, 전 창 공통 (main이 배선)
         self.unified_check.setCheckable(True)
         self.unified_check.setFixedSize(24, 24)
