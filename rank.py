@@ -11,7 +11,8 @@ from PySide6.QtWidgets import (
 )
 
 from api import MarketInfo
-from gui import ADMIN, MISU_ROLE, NEW_ROLE, NXT_ROLE, PURPLE, NameDelegate
+from gui import (ADMIN, MISU_ROLE, NEW_ROLE, NXT_ROLE, PURPLE, NameDelegate,
+                 PreserveTextColorDelegate)
 
 RED = QColor("#e83030")
 BLUE = QColor("#2050d0")
@@ -176,17 +177,23 @@ class RankScreen(QWidget):
         self.model = RankModel()
         self.table = QTableView()  # 폰트는 앱 전역(main.py: 굴림체9 NoAA) 상속
         self.table.setModel(self.model)
+        self.table.setItemDelegate(PreserveTextColorDelegate(self.table))
         self.table.setItemDelegateForColumn(FIELDS.index("name"), NameDelegate(self.table))
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(22)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
+        # 행 선택으로 표가 활성화돼도 Windows 스타일이 헤더 전체를 굵게 바꾸지 않게 고정.
+        self.table.horizontalHeader().setStyleSheet("QHeaderView::section { font-weight: normal; }")
         # 헤더 글자 왼쪽 정렬: 가운데면 칸 좁힐 때 앞자리부터 잘림 (조건창과 동일)
         self.table.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.table.setColumnWidth(0, 40)
         self.table.setColumnWidth(1, 110)
         self.table.setColumnWidth(2, 46)  # 변동(▲n/▼n)은 종목명 옆 좁은 컬럼 (HTS 동일)
         self.table.setSelectionBehavior(QTableView.SelectRows)
+        self.table.setSelectionMode(QTableView.NoSelection)
+        self.table.setFocusPolicy(Qt.StrongFocus)  # 클릭 후 위/아래 화살표로 순위 자리 이동
+        self.table.selectionModel().currentChanged.connect(lambda *_: self.table.viewport().update())
         self.table.setEditTriggers(QTableView.NoEditTriggers)
         self.table.clicked.connect(self._on_cell_clicked)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -305,7 +312,14 @@ class RankScreen(QWidget):
         except Exception as e:  # noqa: BLE001
             self.time_label.setText(str(e)[:40])
             return
+        current = self.table.currentIndex()
+        selected_row = current.row() if current.isValid() else -1
+        selected_col = current.column() if current.isValid() else 0
         self.model.set_rows(rows)
+        if 0 <= selected_row < len(rows):
+            # 종목이 아니라 선택한 순위 자리를 유지: 3위 선택이면 갱신 후에도 3위.
+            index = self.model.index(selected_row, min(selected_col, self.model.columnCount() - 1))
+            self.table.setCurrentIndex(index)
         t = rows[0]["time"] if rows else ""
         self.time_label.setText(f"{t[:2]}:{t[2:4]}:{t[4:6]}" if len(t) == 6 else "데이터 없음")
         signature = (t, tuple((r["code"], r["rank_chg"]) for r in rows))
