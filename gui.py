@@ -64,7 +64,7 @@ def _draw_selection_lines(painter, rect, palette):
     painter.save()
     # 한 색으로는 흰/검정 배경 모두 대비가 부족하므로 현재 시스템 팔레트에 맞춰 전환.
     dark = palette.base().color().lightness() < 128
-    painter.setPen(QColor("#4FC3F7") if dark else QColor("#1565C0"))
+    painter.setPen(QColor("#4FC3F7") if dark else QColor("#0057FF"))
     painter.drawLine(rect.left(), rect.top(), rect.right(), rect.top())
     painter.drawLine(rect.left(), rect.bottom(), rect.right(), rect.bottom())
     painter.restore()
