@@ -28,10 +28,12 @@ log = logging.getLogger("main")
 
 MAX_WINDOWS = 3  # 실시간 등록 ~100종목 한도 내 (조건당 20~30종목 기준)
 RANK_SEQ = "RANK"      # [순위]조회순위 (ka00198 폴 -> on_snapshot)
+NXT_RATE_SEQ = "NXT_RATE"  # [NXT]등락률순위 (ka10027, NXT 전용)
 VSURGE_SEQ = "VSURGE"  # [급증]거래량급증 (ka10023)
 TVAL_SEQ = "TVAL"      # [대금]거래대금상위 (ka10032)
 # 순위 계열: 서버 조건검색 대신 REST 폴, 순위 그리드 공유. seq -> 기준시간 콤보 서브모드
-RANK_SUBMODE = {RANK_SEQ: "rank", VSURGE_SEQ: "vsurge", TVAL_SEQ: "tval"}
+RANK_SUBMODE = {RANK_SEQ: "rank", NXT_RATE_SEQ: "nxt_rate",
+                VSURGE_SEQ: "vsurge", TVAL_SEQ: "tval"}
 RANK_SEQS = set(RANK_SUBMODE)
 RANK_TOP = 20          # 순위 모드 실시간 슬롯 캡 (95한도 공유)
 
@@ -91,21 +93,23 @@ class View:
         selected_seq = self.seq
         combo.clear()
         combo.addItem("[순위]조회순위", RANK_SEQ)   # 맨 위 고정: REST 순위 계열
+        combo.addItem("[NXT]등락률순위", NXT_RATE_SEQ)
         combo.addItem("[급증]거래량급증", VSURGE_SEQ)
         combo.addItem("[대금]거래대금상위", TVAL_SEQ)
         f = QFont(combo.font())
         f.setBold(True)
-        for i, color in ((0, "#FFDD00"), (1, "#FF8C00"), (2, "#38B8FF")):  # 볼드+색으로 조건식과 구분
+        for i, color in ((0, "#FFDD00"), (1, "#33C24D"),
+                         (2, "#FF8C00"), (3, "#38B8FF")):  # 볼드+색으로 조건식과 구분
             combo.setItemData(i, f, Qt.FontRole)
             combo.setItemData(i, QColor(color), Qt.ForegroundRole)
-        combo.insertSeparator(3)  # 진짜 조건식과 구분선
+        combo.insertSeparator(4)  # 진짜 조건식과 구분선
         for seq, name in items:
             combo.addItem(name, seq)
         if self.seq is None:
             last = self._settings.value(self.prefix + "last_condition")
             idx = combo.findData(last) if last is not None else -1
-            if idx < 0:  # 저장 없음: 첫 진짜 조건식 (0=순위,1=급증,2=대금,3=구분선,4=첫 조건식)
-                idx = 4 if combo.count() > 4 else 0
+            if idx < 0:  # 저장 없음: 첫 진짜 조건식 (0~3=순위계열,4=구분선,5=첫 조건식)
+                idx = 5 if combo.count() > 5 else 0
             combo.setCurrentIndex(idx)  # setCurrentIndex는 activated 안 터짐 -> 수동 등록
             asyncio.ensure_future(self._switch_condition(combo.itemData(idx)))
         else:  # 재조회/재접속: 현재 조건 선택 복원
@@ -115,7 +119,7 @@ class View:
             else:
                 # 영웅문에서 현재 조건식을 삭제한 뒤 목록을 재조회한 경우,
                 # 콤보는 자동으로 0번을 표시하지만 실제 구독은 예전 조건에 남는 문제가 있다.
-                idx = 4 if combo.count() > 4 else 0
+                idx = 5 if combo.count() > 5 else 0
                 combo.setCurrentIndex(idx)
                 asyncio.ensure_future(self._switch_condition(combo.itemData(idx)))
 
@@ -147,19 +151,26 @@ class View:
 
     async def stop(self):
         """이 창의 조건/시세 구독 정리 (조건 변경·창 닫기)."""
+        suffix = self._real_suffix()
         if self.seq is not None:
             await self.app.clear_condition_if_sole(self.seq, self)
             self.seq = None
         codes = list(self.screen.model.codes)
         for code in codes:
-            self.app.queue_real(code, add=False)
+            self.app.queue_real(code, add=False, suffix=suffix)
             self.screen.model.remove_stock(code)
+
+    def _real_suffix(self):
+        """None=전역 KRX/통합 설정, _NX=NXT 등락률 메뉴 전용."""
+        return "_NX" if self.seq == NXT_RATE_SEQ else None
 
     async def _poll_rank(self):
         """순위 계열: REST 상위 RANK_TOP개 -> 조건검색과 동일한 snapshot 경로.
-        조회순위=ka00198(기준시간 콤보), 거래량급증=ka10023(통합 stex_tp=3)."""
+        조회순위=ka00198, NXT등락률=ka10027(stex_tp=2), 거래량급증=ka10023."""
         try:
-            if self.seq == VSURGE_SEQ:
+            if self.seq == NXT_RATE_SEQ:
+                rows = (await self.app.rest.change_rate_rank("2"))[:RANK_TOP]
+            elif self.seq == VSURGE_SEQ:
                 rows = (await self.app.rest.volume_surge(
                     self.screen.rank_period.currentData()))[:RANK_TOP]
             elif self.seq == TVAL_SEQ:
@@ -220,10 +231,10 @@ class View:
         new = set(codes)
         for code in cur - new:
             self.screen.on_excluded(code)
-            self.app.queue_real(code, add=False)
+            self.app.queue_real(code, add=False, suffix=self._real_suffix())
         for code in new - cur:
             self.screen.on_included(code, {"name": code})
-            self.app.queue_real(code, add=True)
+            self.app.queue_real(code, add=True, suffix=self._real_suffix())
         if new - cur:
             self._schedule_refresh()
             self._maybe_beep()
@@ -233,12 +244,12 @@ class View:
     def on_event(self, code: str, is_insert: bool):
         if is_insert:
             self.screen.on_included(code, {"name": code})
-            self.app.queue_real(code, add=True)
+            self.app.queue_real(code, add=True, suffix=self._real_suffix())
             self._schedule_refresh()
             self._maybe_beep()
         else:
             self.screen.on_excluded(code)
-            self.app.queue_real(code, add=False)
+            self.app.queue_real(code, add=False, suffix=self._real_suffix())
 
     # --- 시세 채우기/진입시각 ----------------------------------------------
     def _schedule_refresh(self):
@@ -251,7 +262,8 @@ class View:
         codes = list(self.screen.model.codes)
         for i in range(0, len(codes), 100):
             try:
-                for row in await self.app.rest.watch_info(codes[i:i + 100]):
+                for row in await self.app.rest.watch_info(
+                        codes[i:i + 100], suffix=self._real_suffix()):
                     self.screen.on_tick(row["code"], row)
             except Exception as e:  # noqa: BLE001
                 log.warning("watch_info failed: %s", e)
@@ -452,8 +464,11 @@ class App:
                 v.on_snapshot(codes)
 
     def _on_real(self, code: str, fields: dict):
+        source = fields.pop("_real_suffix", None)
         for v in self.views:
-            if code in v.screen.model.rows:
+            expected = "_NX" if v.seq == NXT_RATE_SEQ else self.ws.real_suffix
+            # REST/내부 갱신(source=None)은 기존처럼 전달하고, 웹소켓은 시장 출처가 맞는 창에만 전달.
+            if code in v.screen.model.rows and (source is None or source == expected):
                 v.screen.on_tick(code, fields)
 
     def _on_vi(self, code: str, active: bool, price: int):
@@ -478,32 +493,38 @@ class App:
         if not any(v is not me and v.seq == str(seq) for v in self.views):
             await self.ws.clear_condition(seq)
 
-    def queue_real(self, code: str, add: bool):
+    def queue_real(self, code: str, add: bool, suffix: str = None):
         tgt, opp = ((self._reg_pending, self._rm_pending) if add
                     else (self._rm_pending, self._reg_pending))
-        if opp[code] > 0:  # 같은 창에서 편입<->이탈이 겹치면 상쇄
-            opp[code] -= 1
-            if opp[code] == 0:
-                del opp[code]
+        key = (code, suffix)
+        if opp[key] > 0:  # 같은 창/시장소스에서 편입<->이탈이 겹치면 상쇄
+            opp[key] -= 1
+            if opp[key] == 0:
+                del opp[key]
         else:
-            tgt[code] += 1
+            tgt[key] += 1
         if not (self._reg_task and not self._reg_task.done()):
             self._reg_task = asyncio.ensure_future(self._flush_real())
 
     async def _flush_real(self):
         await asyncio.sleep(0.3)
-        reg = sorted(self._reg_pending.elements())  # 발생 횟수 유지 (참조수 = 창 수)
-        rm = sorted(self._rm_pending.elements())
+        reg = list(self._reg_pending.elements())  # 발생 횟수 유지 (참조수 = 창 수)
+        rm = list(self._rm_pending.elements())
         self._reg_pending.clear()
         self._rm_pending.clear()
-        if rm:
-            await self.ws.remove_real_many(rm)
-        if reg:
-            await self.ws.register_real_many(reg)
+        for items, add in ((rm, False), (reg, True)):
+            by_suffix = {}
+            for code, suffix in items:
+                by_suffix.setdefault(suffix, []).append(code)
+            for suffix, codes in by_suffix.items():
+                if add:
+                    await self.ws.register_real_many(sorted(codes), suffix)
+                else:
+                    await self.ws.remove_real_many(sorted(codes), suffix)
 
     def _on_single_poll(self):
-        codes = sorted({c for v in self.views for c in v.screen.model.codes
-                        if c in v.screen.model.single})
+        codes = sorted({c for v in self.views if v.seq != NXT_RATE_SEQ
+                        for c in v.screen.model.codes if c in v.screen.model.single})
         if codes and not (self._single_task and not self._single_task.done()):
             self._single_task = asyncio.ensure_future(self._poll_single(codes))
 

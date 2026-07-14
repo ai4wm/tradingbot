@@ -103,7 +103,9 @@ class WSClient:
         self._ws = None
         self._token_fn = None            # async () -> token
         self._active_seqs: set[str] = set()  # 등록된 조건식들 (창마다 1개, 재등록용)
-        self._reg_codes: dict[str, int] = {}  # 실시간 등록 종목 -> 참조수(창 수), 접미사 없는 순수코드
+        # (순수코드, 명시 접미사) -> 참조수. suffix=None은 전역 KRX/통합 설정을 따르고,
+        # "_NX"는 NXT 전용 창이라 전역 설정이 바뀌어도 그대로 유지한다.
+        self._reg_codes: dict[tuple[str, str | None], int] = {}
         # 시세 접미사: "" = KRX 전용, "_AL" = KRX+NXT 통합 (REG 코드에만 붙임, 실측 확인).
         # 조건검색(CNSRREQ)은 stex_tp "K"만 허용이라 편입/이탈은 항상 KRX 기준.
         self.real_suffix = ""
@@ -139,48 +141,55 @@ class WSClient:
             self._active_seqs.discard(str(seq))
             await self._send({"trnm": "CNSRCLR", "seq": seq})
 
-    async def register_real(self, code: str):
-        await self.register_real_many([code])
+    def _registered_item(self, key: tuple[str, str | None]) -> str:
+        code, suffix = key
+        return code + (self.real_suffix if suffix is None else suffix)
 
-    async def register_real_many(self, codes: list[str]):
+    async def register_real(self, code: str, suffix: str = None):
+        await self.register_real_many([code], suffix)
+
+    async def register_real_many(self, codes: list[str], suffix: str = None):
         """여러 종목을 REG 1건으로 등록(연사하면 서버 105110 거부, 2026-07-07 실측).
         참조수 관리: 여러 창이 같은 종목을 등록하면 카운트만 올리고 REG는 1회."""
         todo = []
         for c in codes:  # 중복 포함 리스트 허용: 발생 횟수만큼 참조수 증가
-            if self._reg_codes.get(c, 0) == 0 and c not in todo:
+            key = (c, suffix)
+            if self._reg_codes.get(key, 0) == 0 and key not in todo:
                 if len(self._reg_codes) + len(todo) >= config.REAL_REG_LIMIT:
                     log.warning("real-time reg limit %d, skip %s", config.REAL_REG_LIMIT, c)
                     continue
-                todo.append(c)
-            self._reg_codes[c] = self._reg_codes.get(c, 0) + 1
+                todo.append(key)
+            self._reg_codes[key] = self._reg_codes.get(key, 0) + 1
         if todo:
-            await self._send(build_reg([c + self.real_suffix for c in todo], REAL_TYPES))
+            await self._send(build_reg([self._registered_item(k) for k in todo], REAL_TYPES))
 
-    async def remove_real(self, code: str):
-        await self.remove_real_many([code])
+    async def remove_real(self, code: str, suffix: str = None):
+        await self.remove_real_many([code], suffix)
 
-    async def remove_real_many(self, codes: list[str]):
+    async def remove_real_many(self, codes: list[str], suffix: str = None):
         todo = []
         for c in codes:
-            if c not in self._reg_codes:
+            key = (c, suffix)
+            if key not in self._reg_codes:
                 continue
-            self._reg_codes[c] -= 1
-            if self._reg_codes[c] <= 0:  # 마지막 창이 뺄 때만 실제 REMOVE
-                del self._reg_codes[c]
-                todo.append(c)
+            self._reg_codes[key] -= 1
+            if self._reg_codes[key] <= 0:  # 마지막 창이 뺄 때만 실제 REMOVE
+                del self._reg_codes[key]
+                todo.append(key)
         if todo:
-            await self._send(build_remove([c + self.real_suffix for c in todo], REAL_TYPES))
+            await self._send(build_remove([self._registered_item(k) for k in todo], REAL_TYPES))
 
     async def set_real_suffix(self, suffix: str):
         """KRX 전용("") <-> 통합("_AL") 런타임 전환: 기존 등록 전부 갈아끼움."""
         if suffix == self.real_suffix:
             return
-        if self._reg_codes:
-            await self._send(build_remove([c + self.real_suffix for c in self._reg_codes], REAL_TYPES))
+        default_keys = [k for k in self._reg_codes if k[1] is None]
+        if default_keys:
+            await self._send(build_remove([self._registered_item(k) for k in default_keys], REAL_TYPES))
         self.real_suffix = suffix
         log.info("real suffix -> %r", suffix)
-        if self._reg_codes:
-            await self._send(build_reg([c + self.real_suffix for c in self._reg_codes], REAL_TYPES))
+        if default_keys:
+            await self._send(build_reg([self._registered_item(k) for k in default_keys], REAL_TYPES))
 
     # --- 내부 ----------------------------------------------------------
     async def _connect_once(self):
@@ -205,7 +214,7 @@ class WSClient:
             await self._send({"trnm": "CNSRREQ", "seq": seq,
                               "search_type": "1", "stex_tp": "K"})
         if self._reg_codes:
-            await self._send(build_reg([c + self.real_suffix for c in self._reg_codes], REAL_TYPES))
+            await self._send(build_reg([self._registered_item(k) for k in self._reg_codes], REAL_TYPES))
 
     async def _send(self, msg: dict):
         if self._ws is None:
@@ -245,6 +254,9 @@ class WSClient:
                     continue
                 code, fields = parse_real_item(item)
                 if code and fields and self.on_real:
+                    raw_item = item.get("item") or ""
+                    fields["_real_suffix"] = ("_NX" if raw_item.endswith("_NX") else
+                                              "_AL" if raw_item.endswith("_AL") else "")
                     self.on_real(code, fields)
 
     def _count_real(self, item: dict):
@@ -303,7 +315,7 @@ class WSClient:
         # 정적/동적 구분(1225와 동일)일 가능성 -> 우리 종목 raw 전체를 남겨 다음 VI에서 확정
         v = item.get("values", {})
         code = (v.get("9001") or "").split("_")[0].lstrip("A")
-        if code in self._reg_codes:
+        if any(c == code for c, _ in self._reg_codes):
             log.info("VI raw %s: %s", code, v)
         if code and self.on_vi:
             self.on_vi(code, v.get("9068") == "1", int(abs(_num(v.get("1221")))))
@@ -387,7 +399,7 @@ def _demo():
     assert sent[1]["data"][0]["item"] == ["3"], sent
     assert sent[2]["trnm"] == "REMOVE" and sent[2]["data"][0]["item"] == ["1"], sent
     assert len(sent) == 3, sent
-    assert c2._reg_codes == {"2": 1, "3": 1}, c2._reg_codes
+    assert c2._reg_codes == {("2", None): 1, ("3", None): 1}, c2._reg_codes
     asyncio.run(c2.remove_real_many(["2"]))          # 참조수 0 -> 이제 REMOVE
     assert sent[3]["data"][0]["item"] == ["2"], sent
     # 통합(_AL) 접미사: REG/REMOVE에만 붙고 _reg_codes는 순수코드 유지, 수신은 접미사 떼서 매칭
@@ -397,9 +409,16 @@ def _demo():
     assert sent[6]["trnm"] == "REG" and sent[6]["data"][0]["item"] == ["3_AL", "4_AL"], sent
     asyncio.run(c2.register_real_many(["5"]))
     assert sent[7]["data"][0]["item"] == ["5_AL"], sent
-    assert c2._reg_codes == {"3": 1, "4": 1, "5": 1}, c2._reg_codes
+    assert c2._reg_codes == {("3", None): 1, ("4", None): 1, ("5", None): 1}, c2._reg_codes
     asyncio.run(c2.remove_real_many(["5"]))
     assert sent[8]["trnm"] == "REMOVE" and sent[8]["data"][0]["item"] == ["5_AL"], sent
+    # NXT 명시 등록은 전역 KRX/통합 전환과 분리된다.
+    asyncio.run(c2.register_real_many(["6"], "_NX"))
+    assert sent[9]["data"][0]["item"] == ["6_NX"], sent
+    asyncio.run(c2.set_real_suffix(""))
+    assert sent[10]["data"][0]["item"] == ["3_AL", "4_AL"], sent
+    assert sent[11]["data"][0]["item"] == ["3", "4"], sent
+    assert ("6", "_NX") in c2._reg_codes
     code, f = parse_real_item({"item": "005930_AL", "values": {"10": "-4620"}})
     assert code == "005930" and f["price"] == 4620, (code, f)
     print("ws self-check OK")

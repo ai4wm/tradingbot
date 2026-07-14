@@ -121,7 +121,8 @@ class RestClient:
         r.raise_for_status()
         return r.text.strip()
 
-    async def watch_info(self, codes: list[str], exp: bool = None) -> list[dict]:
+    async def watch_info(self, codes: list[str], exp: bool = None,
+                         suffix: str = None) -> list[dict]:
         """ka10095 관심종목정보: 여러 종목을 한 번에 조회 -> gui 필드로 정규화.
         한 번의 호출로 현재가/등락률/거래량/매도·매수잔량을 채운다(장 마감 후에도 유효).
         codes는 '|'로 join. 응답 리스트는 요청 순서와 무관하므로 code로 매칭할 것."""
@@ -129,7 +130,8 @@ class RestClient:
             return []
         if exp is None:
             exp = _in_auction()
-        d = await self.request("ka10095", {"stk_cd": "|".join(c + self.suffix for c in codes)})
+        real_suffix = self.suffix if suffix is None else suffix
+        d = await self.request("ka10095", {"stk_cd": "|".join(c + real_suffix for c in codes)})
         out = []
         for r in d.get("atn_stk_infr", []):
             code = (r.get("stk_cd") or "").split("_")[0]  # _AL 응답 접미사 제거
@@ -334,6 +336,28 @@ class RestClient:
                 "prev_rate": 0.0,
                 "rank_chg": _to_int(r.get("pred_rank")) - _to_int(r.get("now_rank")),
                 "time": "",
+            })
+        return out
+
+    async def change_rate_rank(self, stex_tp: str = "2") -> list[dict]:
+        """ka10027 전일대비등락률상위 -> 상승률순. stex_tp=2면 NXT 전용.
+        NXT 서버가 매매체결 대상만 반환하므로 ETF/ETN 등의 별도 필터는 적용하지 않는다."""
+        d = await self.request("ka10027", {
+            "mrkt_tp": "000", "sort_tp": "1", "trde_qty_cnd": "0000",
+            "stk_cnd": "0", "crd_cnd": "0", "updown_incls": "1",
+            "pric_cnd": "0", "trde_prica_cnd": "0", "stex_tp": stex_tp,
+        }, path="/api/dostk/rkinfo")
+        rows = d.get("pred_pre_flu_rt_upper", [])
+        out = []
+        for rank, r in enumerate(rows, 1):
+            code = (r.get("stk_cd") or "").split("_")[0]
+            if not code:
+                continue
+            out.append({
+                "rank": rank, "code": code, "name": r.get("stk_nm", ""),
+                "price": abs(_to_int(r.get("cur_prc"))),
+                "rate": _to_float(r.get("flu_rt")),
+                "prev_rate": 0.0, "rank_chg": 0, "time": "",
             })
         return out
 
