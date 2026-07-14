@@ -25,6 +25,7 @@ FID = {
     "10": "price",     # 현재가 (부호 포함 -> abs)
     "12": "rate",      # 등락율
     "13": "vol",       # 누적거래량
+    "15": "tick_qty",  # 개별 체결량 (+매수체결 / -매도체결, 부호 보존)
     "61": "ask_qty",   # 최우선 매도잔량 (0D 매도호가1 잔량)
     "71": "bid_qty",   # 최우선 매수잔량 (0D 매수호가1 잔량)
     # 예상가: 0D 23/24는 장중에도 값이 바뀌며 옴(상한가 종목 등) -> 표시 ON 신호로 못 씀.
@@ -76,7 +77,7 @@ def parse_real_item(item: dict) -> tuple[str, dict]:
         n = _num(raw)
         if field in ("price", "exp_price"):   # 가격류: 부호 제거 + 정수
             out[field] = int(abs(n))
-        elif field in ("vol", "ask_qty", "bid_qty", "exp_qty"):
+        elif field in ("vol", "tick_qty", "ask_qty", "bid_qty", "exp_qty"):
             out[field] = int(n)
         else:
             out[field] = n
@@ -330,9 +331,12 @@ def _demo():
     assert build_reg(["005930"], ["0B"])["data"][0]["item"] == ["005930"]
     assert build_remove(["005930"], ["0B"])["trnm"] == "REMOVE"
     # REAL 파싱: 부호/콤마 정규화 + price abs
-    code, f = parse_real_item({"item": "005930", "values": {"10": "-4,620", "12": "+29.96", "13": "19687"}})
+    code, f = parse_real_item({"item": "005930", "values": {
+        "10": "-4,620", "12": "+29.96", "13": "19687", "15": "-125",
+    }})
     assert code == "005930", code
     assert f["price"] == 4620 and f["rate"] == 29.96 and f["vol"] == 19687, f
+    assert f["tick_qty"] == -125, f
     _, fe = parse_real_item({"item": "x", "type": "0D", "values": {"23": "+1215", "24": "8,151"}})
     assert fe == {"exp_price": 1215, "exp_qty": 8151}, fe
     # 0H(주식예상체결)는 같은 FID가 다른 의미: 10=예상체결가, 13=예상체결량

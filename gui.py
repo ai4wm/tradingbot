@@ -22,16 +22,17 @@ from PySide6.QtWidgets import (
 log = logging.getLogger("gui")
 
 # 순위/변동: ★조회순위(ka00198) 모드 전용 -> 일반 조건식에선 숨김 (set_rank_mode)
-COLUMNS = ["순위",  "변동",      "등락률", "연상", "종목명", "현재가", "예상체결가", "L일봉H", "예상등락률", "전일거래량", "거래량", "매도잔량", "매수잔량", "예상체결량", "체결/분", "시가총액", "상한가진입시간"]
-FIELDS  = ["qrank", "qrank_chg", "rate",   "streak", "name",  "price", "exp_price", "bar",    "exp_rate",   "prev_vol", "vol",   "ask_qty",  "bid_qty",  "exp_qty",  "tpm",    "mcap",   "time"]
+COLUMNS = ["순위",  "변동",      "등락률", "연상", "종목명", "현재가", "예상체결가", "L일봉H", "예상등락률", "전일거래량", "거래량", "매도잔량", "매수잔량", "예상체결량", "체결/분", "매수%",   "시가총액", "상한가진입시간"]
+FIELDS  = ["qrank", "qrank_chg", "rate",   "streak", "name",  "price", "exp_price", "bar",    "exp_rate",   "prev_vol", "vol",   "ask_qty",  "bid_qty",  "exp_qty",  "tpm",    "buy_pct", "mcap",   "time"]
 # 컬럼은 아니지만 L일봉H 그리기에 필요한 저장 필드 (시/저/고/전일종가/상한/하한)
 # streak(연상)/mcap(시가총액)/tpm(체결/분)은 저장 안 함: 매번 계산
-STORED = (set(FIELDS) - {"streak", "mcap", "tpm"}) | {"open", "low", "high", "base", "upper", "lower"}
+STORED = (set(FIELDS) - {"streak", "mcap", "tpm", "buy_pct"}) | {"open", "low", "high", "base", "upper", "lower"}
 BAR_COL = FIELDS.index("bar")
 NAME_COL = FIELDS.index("name")
 STREAK_COL = FIELDS.index("streak")
 MCAP_COL = FIELDS.index("mcap")
 TPM_COL = FIELDS.index("tpm")
+BUY_PCT_COL = FIELDS.index("buy_pct")
 RANK_COLS = (FIELDS.index("qrank"), FIELDS.index("qrank_chg"))
 RANK_PERIODS = {  # 순위 계열 기준시간 콤보: (표시, data). 모드 따라 교체
     "rank":   [("30초", "5"), ("1분", "1"), ("10분", "2"), ("1시간", "3"), ("당일", "4")],  # ka00198 qry_tp
@@ -42,10 +43,11 @@ NXT_ROLE = Qt.UserRole + 2  # NameDelegate에 NXT 종목 여부 전달
 MISU_ROLE = Qt.UserRole + 3  # NameDelegate에 미수가능 여부 전달
 NEW_ROLE = Qt.UserRole + 4  # NameDelegate에 신규상장 단계 전달 (3=당일 2=15일이내 1=30일이내 0=아님)
 TPM_TREND_ROLE = Qt.UserRole + 5  # 체결/분 추세: 최근 10초 속도 vs 이전 50초 (-1/0/+1)
+BUY_TREND_ROLE = Qt.UserRole + 6  # 매수% 추세: 최근 1분 비중 vs 이전 2분 (-1/0/+1)
 
 LIMIT = 29.5  # 상한/하한 판정 임계 (KRX +-30%)
 # ponytail: 매크로가 2주+로 갈아타면 이 값을 올리거나 금액기준(delta*price)으로 교체
-DESC_FIRST = {"bid_qty", "rate", "price", "exp_price", "exp_rate", "streak", "tpm", "qrank_chg"}  # 첫 클릭 내림차순 컬럼
+DESC_FIRST = {"bid_qty", "rate", "price", "exp_price", "exp_rate", "streak", "tpm", "buy_pct", "qrank_chg"}  # 첫 클릭 내림차순 컬럼
 RED  = QColor("#e83030")
 BLUE = QColor("#2050d0")
 PURPLE = QColor("#C080F0")  # 코스닥 종목명
@@ -58,14 +60,41 @@ TRACK = QColor("#d8d8d8")
 CENTER = QColor("#707070")  # L일봉H 0% 중심선
 
 
+def _draw_selection_lines(painter, rect):
+    painter.save()
+    painter.setPen(QColor("#707070"))
+    painter.drawLine(rect.left(), rect.top(), rect.right(), rect.top())
+    painter.drawLine(rect.left(), rect.bottom(), rect.right(), rect.bottom())
+    painter.restore()
+
+
+def _is_current_row(option, index):
+    """네이티브 선택 대신 현재 클릭한 행을 자체 선택 표시로 사용."""
+    view = option.widget
+    current = view.currentIndex() if view is not None else QModelIndex()
+    return current.isValid() and current.row() == index.row()
+
+
+class PreserveTextColorDelegate(QStyledItemDelegate):
+    """셀은 평상시 그대로 그리고 선택 행에는 위/아래 선만 추가."""
+
+    def paint(self, painter, option, index):
+        selected = _is_current_row(option, index)
+        opt = QStyleOptionViewItem(option)
+        opt.state &= ~QStyle.State_Selected
+        super().paint(painter, opt, index)
+        if selected:
+            _draw_selection_lines(painter, option.rect)
+
+
 class BarDelegate(QStyledItemDelegate):
     """L일봉H: 가로 일봉 캔들. 축 = 하한가(왼쪽)~전일종가(0%,가운데)~상한가(오른쪽).
     심지=저가~고가, 몸통=시가~종가. 양봉(종가>=시가) 빨강, 음봉 파랑.
     점상한가는 O=H=L=C=상한가라 오른쪽 끝에 세로선으로 표시됨."""
 
     def paint(self, painter, option, index):
-        if option.state & QStyle.State_Selected:
-            painter.fillRect(option.rect, option.palette.highlight())
+        if _is_current_row(option, index):
+            _draw_selection_lines(painter, option.rect)
         data = index.data(BAR_ROLE)
         if not data:
             return
@@ -110,10 +139,28 @@ class NameDelegate(QStyledItemDelegate):
     좌하단=신규상장(마젠타=당일, 하늘=15일이내, 청회=30일이내)."""
 
     def paint(self, painter, option, index):
-        super().paint(painter, option, index)
+        # 일부 Windows 스타일은 textElideMode=ElideNone도 무시한다. 배경/선택은
+        # 스타일에 맡기고 글자는 직접 그려 `…` 변환 경로 자체를 타지 않게 한다.
+        selected = _is_current_row(option, index)
+        opt = QStyleOptionViewItem(option)
+        opt.state &= ~QStyle.State_Selected
+        self.initStyleOption(opt, index)
+        text = opt.text
+        opt.text = ""
+        style = opt.widget.style() if opt.widget else QApplication.style()
+        style.drawControl(QStyle.CE_ItemViewItem, opt, painter, opt.widget)
+        text_rect = style.subElementRect(QStyle.SE_ItemViewItemText, opt, opt.widget).adjusted(3, 0, -2, 0)
+        painter.save()
+        painter.setClipRect(option.rect)
+        painter.setFont(opt.font)
+        painter.setPen(opt.palette.text().color())
+        painter.drawText(text_rect, Qt.AlignLeft | Qt.AlignVCenter | Qt.TextSingleLine, text)
+        painter.restore()
         nxt, misu = index.data(NXT_ROLE), index.data(MISU_ROLE)
         new = index.data(NEW_ROLE)
         if not (nxt or misu or new):
+            if selected:
+                _draw_selection_lines(painter, option.rect)
             return
         r = option.rect
         s = 10
@@ -136,25 +183,35 @@ class NameDelegate(QStyledItemDelegate):
                                           QPoint(r.left() + s, r.bottom()),
                                           QPoint(r.left(), r.bottom() - s)]))
         painter.restore()
+        if selected:
+            _draw_selection_lines(painter, option.rect)
 
 
 class TpmDelegate(QStyledItemDelegate):
     """체결/분 숫자 오른쪽에 증가=빨강 ▲, 감소=파랑 ▼를 별도 색으로 표시."""
 
+    def __init__(self, trend_role=TPM_TREND_ROLE, parent=None):
+        super().__init__(parent)
+        self.trend_role = trend_role
+
     def paint(self, painter, option, index):
-        trend = index.data(TPM_TREND_ROLE) or 0
+        trend = index.data(self.trend_role) or 0
+        selected = _is_current_row(option, index)
         if not index.data(Qt.DisplayRole):
-            super().paint(painter, option, index)
+            opt = QStyleOptionViewItem(option)
+            opt.state &= ~QStyle.State_Selected
+            super().paint(painter, opt, index)
+            if selected:
+                _draw_selection_lines(painter, option.rect)
             return
 
         opt = QStyleOptionViewItem(option)
+        opt.state &= ~QStyle.State_Selected
         self.initStyleOption(opt, index)
         text = opt.text
 
         painter.save()
-        if option.state & QStyle.State_Selected:
-            painter.fillRect(option.rect, option.palette.highlight())
-        elif opt.backgroundBrush.style() != Qt.NoBrush:
+        if opt.backgroundBrush.style() != Qt.NoBrush:
             painter.fillRect(option.rect, opt.backgroundBrush)
         else:
             painter.fillRect(option.rect, option.palette.base())
@@ -166,13 +223,13 @@ class TpmDelegate(QStyledItemDelegate):
                       painter.fontMetrics().horizontalAdvance("▼")) + 3
         number_rect = QRect(r.left(), r.top(), max(0, r.width() - arrow_w), r.height())
         arrow_rect = QRect(number_rect.right() + 1, r.top(), arrow_w, r.height())
-        number_color = (option.palette.highlightedText().color()
-                        if option.state & QStyle.State_Selected else opt.palette.text().color())
-        painter.setPen(number_color)
+        painter.setPen(opt.palette.text().color())
         painter.drawText(number_rect, Qt.AlignRight | Qt.AlignVCenter, text)
         if trend:
             painter.setPen(RED if trend > 0 else BLUE)
             painter.drawText(arrow_rect, Qt.AlignRight | Qt.AlignVCenter, arrow)
+        if selected:
+            _draw_selection_lines(painter, option.rect)
         painter.restore()
 
 
@@ -239,7 +296,7 @@ class StockModel(QAbstractTableModel):
         self.new15: set[str] = set()         # 상장 15일 이내 (좌하단 하늘)
         self.new30: set[str] = set()         # 상장 16~30일 (좌하단 청회)
         self.shares: dict[str, int] = {}     # 상장주식수 ka10099 (main 주입, 시가총액 컬럼)
-        self.ticks: dict[str, deque] = {}    # 체결 틱 시각(monotonic) 최근 60초 (체결/분 컬럼)
+        self.ticks: dict[str, deque] = {}    # (체결시각, 부호있는 개별체결량) 최근 180초
 
     # --- 웹소켓/전략 계층이 부르는 API ---------------------------------
     def add_stock(self, code: str, data: dict):
@@ -275,6 +332,7 @@ class StockModel(QAbstractTableModel):
             return
         row = self.codes.index(code)
         stored = self.rows[code]
+        tick_qty = fields.get("tick_qty")  # STORED 필터 전에 보존: +매수체결 / -매도체결
         hot = fields.get("exp_hot", 0) or code in self.single  # 0H발/단일가종목 = 국면 확정
         fields = {f: v for f, v in fields.items() if f in STORED}  # 모르는 키 무시
         if fields.get("prev_vol") == 0 and stored.get("prev_vol"):
@@ -297,21 +355,22 @@ class StockModel(QAbstractTableModel):
             self._exp_live.discard(code)  # 체결 재개 = 국면 종료 (단일가 종목은 유지)
             fields["exp_price"], fields["exp_qty"] = 0, 0
             log.info("expOFF %s vol", code)
-        dvol = fields.get("vol", 0) - stored["vol"]  # 체결 틱 (체결/분)
-        if dvol > 0:
+        dvol = fields.get("vol", 0) - stored["vol"]  # FID 15가 없을 때 체결 틱 폴백
+        ticked = tick_qty not in (None, 0) or dvol > 0
+        if ticked:
             dq = self.ticks.setdefault(code, deque())
             now = time.monotonic()
-            dq.append(now)
-            while dq and dq[0] < now - 60:
+            dq.append((now, int(tick_qty or 0)))
+            while dq and dq[0][0] < now - 180:
                 dq.popleft()
-        cols = set()
+        cols = {TPM_COL, BUY_PCT_COL} if ticked else set()
         for f, v in fields.items():
             if stored.get(f) == v:
                 continue
             if f in FIELDS:
                 cols.add(FIELDS.index(f))
             if f == "vol":  # 체결/분 의존
-                cols.add(TPM_COL)
+                cols.update((TPM_COL, BUY_PCT_COL))
             if f in ("price", "open", "low", "high", "base", "upper", "lower"):  # L일봉H 의존
                 cols.add(BAR_COL)
             if f in ("price", "upper", "exp_price"):  # 연상 판정(_at_limit) 의존
@@ -330,9 +389,9 @@ class StockModel(QAbstractTableModel):
             self.dataChanged.emit(self.index(row, min(cols)), self.index(row, max(cols)))
 
     def refresh_tpm(self):
-        """체결/분 감쇠 갱신: 틱이 끊긴 종목도 1초마다 재계산되게 컬럼 전체 리페인트."""
+        """최근 체결 지표 감쇠 갱신: 틱이 끊겨도 1초마다 재계산."""
         if self.codes:
-            self.dataChanged.emit(self.index(0, TPM_COL), self.index(len(self.codes) - 1, TPM_COL))
+            self.dataChanged.emit(self.index(0, TPM_COL), self.index(len(self.codes) - 1, BUY_PCT_COL))
 
     # --- Qt 모델 구현 ---------------------------------------------------
     def rowCount(self, parent=QModelIndex()):
@@ -368,8 +427,8 @@ class StockModel(QAbstractTableModel):
         if field == "tpm":  # 체결/분 = 최근 60초 체결 틱수, 매번 계산 (저장 안 함)
             now = time.monotonic()
             dq = self.ticks.get(self.codes[index.row()], ())
-            n = sum(1 for t in dq if t >= now - 60)
-            recent = sum(1 for t in dq if t >= now - 10)
+            n = sum(1 for t, _ in dq if t >= now - 60)
+            recent = sum(1 for t, _ in dq if t >= now - 10)
             previous = n - recent
             # 최근 10초와 이전 50초를 각각 분당 속도로 환산. 20% 완충 + 최소 표본으로 깜빡임 억제.
             recent_rate, previous_rate = recent * 6, previous * 1.2
@@ -391,6 +450,37 @@ class StockModel(QAbstractTableModel):
                     return WHITE if n > 1500 else QColor("black")
                 if role == Qt.FontRole:
                     f = QFont(); f.setBold(True); return f
+            return None
+        if field == "buy_pct":  # 최근 3분 체결수량 중 공격적 매수체결 비중
+            now = time.monotonic()
+            dq = self.ticks.get(self.codes[index.row()], ())
+            current = [(t, q) for t, q in dq if t >= now - 180 and q]
+            buy = sum(q for _, q in current if q > 0)
+            sell = sum(-q for _, q in current if q < 0)
+            total = buy + sell
+            pct = buy / total * 100 if total else 0.0
+            recent = [(t, q) for t, q in current if t >= now - 60]
+            previous = [(t, q) for t, q in current if t < now - 60]
+
+            def ratio(items):
+                b = sum(q for _, q in items if q > 0)
+                s = sum(-q for _, q in items if q < 0)
+                return b / (b + s) * 100 if b + s else None
+
+            rp, pp = ratio(recent), ratio(previous)
+            trend = (1 if len(recent) >= 3 and len(previous) >= 5 and rp is not None and pp is not None and rp > pp + 5
+                     else -1 if len(recent) >= 3 and len(previous) >= 5 and rp is not None and pp is not None and rp < pp - 5
+                     else 0)
+            if role == Qt.DisplayRole:
+                return f"{pct:.0f}%" if total else ""
+            if role == Qt.UserRole:
+                return pct if total else -1
+            if role == BUY_TREND_ROLE:
+                return trend
+            if role == Qt.TextAlignmentRole:
+                return Qt.AlignRight | Qt.AlignVCenter
+            if role == Qt.ForegroundRole and total:
+                return RED if pct >= 55 else BLUE if pct <= 45 else None
             return None
         if field == "mcap":  # 시가총액(억) = 상장주식수 x 현재가(체결 전엔 전일종가), 매번 계산
             v = self.shares.get(self.codes[index.row()], 0) * (stored["price"] or stored["base"]) // 100_000_000
@@ -621,10 +711,16 @@ class ConditionScreen(QWidget):
         self.table.setColumnWidth(NAME_COL, 110)
         self.table.setColumnWidth(STREAK_COL, 34)
         self.table.setColumnWidth(BAR_COL, 70)
+        self.table.setColumnWidth(BUY_PCT_COL, 58)
+        self.table.setItemDelegate(PreserveTextColorDelegate(self.table))
         self.table.setItemDelegateForColumn(BAR_COL, BarDelegate(self.table))
         self.table.setItemDelegateForColumn(NAME_COL, NameDelegate(self.table))
-        self.table.setItemDelegateForColumn(TPM_COL, TpmDelegate(self.table))
+        self.table.setItemDelegateForColumn(TPM_COL, TpmDelegate(TPM_TREND_ROLE, self.table))
+        self.table.setItemDelegateForColumn(BUY_PCT_COL, TpmDelegate(BUY_TREND_ROLE, self.table))
         self.table.setSelectionBehavior(QTableView.SelectRows)
+        self.table.setSelectionMode(QTableView.NoSelection)  # Windows 네이티브 선택 세로 바 차단
+        self.table.setFocusPolicy(Qt.NoFocus)  # 현재 셀 앞의 Windows 포커스 세로 바 제거
+        self.table.selectionModel().currentChanged.connect(lambda *_: self.table.viewport().update())
         # 폰트는 앱 전역(main.py: 굴림체9 NoAA)에서 상속 — 그리드/툴바 통일
         self.table.setEditTriggers(QTableView.NoEditTriggers)
         self.table.clicked.connect(self._on_cell_clicked)
