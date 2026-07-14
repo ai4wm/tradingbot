@@ -686,6 +686,9 @@ class ConditionScreen(QWidget):
         self.ip_label = QLabel()  # 공인 IP (App이 메인창만 채움). IP 바뀌면 빨강 강조
         self.ip_label.setVisible(False)
         self.count_label = QLabel("종목수: 0")
+        self.theme_btn = QPushButton("🖥")  # 시스템/다크/라이트 앱 전체 테마 순환 (메인창만 배선)
+        self.theme_btn.setFixedWidth(32)
+        self.theme_btn.setToolTip("테마: 시스템")
         self.on_top_btn = QPushButton("📌")  # 항상 맨 위 토글 (창별)
         self.on_top_btn.setCheckable(True)
         self.on_top_btn.setFixedWidth(32)
@@ -707,6 +710,7 @@ class ConditionScreen(QWidget):
         top.addStretch(1)  # 남는 공간은 오른쪽으로
         top.addWidget(self.ip_label)
         top.addWidget(self.count_label)
+        top.addWidget(self.theme_btn)
         top.addWidget(self.on_top_btn)  # 오른쪽 끝 = 창 크롬(핀) 자리
 
         # 그리드

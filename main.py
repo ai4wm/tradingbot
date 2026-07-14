@@ -36,6 +36,18 @@ RANK_SUBMODE = {RANK_SEQ: "rank", NXT_RATE_SEQ: "nxt_rate",
                 VSURGE_SEQ: "vsurge", TVAL_SEQ: "tval"}
 RANK_SEQS = set(RANK_SUBMODE)
 RANK_TOP = 20          # 순위 모드 실시간 슬롯 캡 (95한도 공유)
+THEME_MODES = ("system", "dark", "light")
+THEME_UI = {
+    "system": ("🖥", "테마: 시스템 — Windows 설정을 따름"),
+    "dark": ("🌙", "테마: 다크 — 클릭하면 라이트"),
+    "light": ("☀", "테마: 라이트 — 클릭하면 시스템"),
+}
+
+
+def _apply_theme(app: QApplication, mode: str):
+    scheme = {"dark": Qt.ColorScheme.Dark, "light": Qt.ColorScheme.Light}.get(
+        mode, Qt.ColorScheme.Unknown)
+    app.styleHints().setColorScheme(scheme)
 
 
 def _start_title_clock(win: QMainWindow, title: str):
@@ -306,6 +318,9 @@ class App:
         self.rest = RestClient()
         self.ws = WSClient()
         self._settings = QSettings("layout.ini", QSettings.IniFormat)
+        self._theme_mode = str(self._settings.value("theme_mode", "system"))
+        if self._theme_mode not in THEME_MODES:
+            self._theme_mode = "system"
         self.views: list[View] = [View(self, screen)]
         self._extra_windows: list = []  # 추가 창(ConditionWindow) 목록
         self._cond_items = []           # CNSRLST 결과 (새 창 콤보 채우기용)
@@ -345,7 +360,23 @@ class App:
             self.ws.real_suffix = self.rest.suffix = "_AL"
             screen.unified_check.setChecked(True)  # toggled 연결 전 = 시각 상태만
         screen.unified_check.toggled.connect(self._on_unified)
+        screen.theme_btn.clicked.connect(self._cycle_theme)
+        self._sync_theme_button()
         self._wire_common(screen)
+
+    def _sync_theme_button(self):
+        icon, tip = THEME_UI[self._theme_mode]
+        btn = self.views[0].screen.theme_btn
+        btn.setText(icon)
+        btn.setToolTip(tip)
+
+    def _cycle_theme(self):
+        i = (THEME_MODES.index(self._theme_mode) + 1) % len(THEME_MODES)
+        self._theme_mode = THEME_MODES[i]
+        _apply_theme(QApplication.instance(), self._theme_mode)
+        self._settings.setValue("theme_mode", self._theme_mode)
+        self._settings.sync()
+        self._sync_theme_button()
 
     def _wire_common(self, screen: ConditionScreen):
         screen.reload_btn.clicked.connect(self._reload_conditions)
@@ -592,6 +623,7 @@ class App:
         screen.newwin_btn.setVisible(False)  # 추가 창에선 창+/순위/통합 숨김 (메인창에서만)
         screen.rank_btn.setVisible(False)
         screen.unified_check.setVisible(False)  # 통합 시세는 전 창 공통 -> 메인창에서만 전환
+        screen.theme_btn.setVisible(False)  # 테마는 앱 전체 공통 -> 메인창에서만 전환
         win = ConditionWindow(prefix, on_close=self._on_window_closed)
         _start_title_clock(win, f"[0156-{n}] 조건검색실시간")
         win.setCentralWidget(screen)
@@ -713,6 +745,8 @@ class MainWindow(QMainWindow):
 
 def main():
     qapp = QApplication(sys.argv)
+    theme = str(QSettings("layout.ini", QSettings.IniFormat).value("theme_mode", "system"))
+    _apply_theme(qapp, theme if theme in THEME_MODES else "system")
     f = QFont("굴림체", 9)
     f.setStyleStrategy(QFont.NoAntialias)  # 영웅문식 비트맵 렌더링, 전 위젯 통일
     qapp.setFont(f)  # 그리드/툴바/헤더/툴팁 전부. 타이틀바는 OS 소관(변경 불가)
