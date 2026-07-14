@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 log = logging.getLogger("gui")
 
 # 순위/변동: ★조회순위(ka00198) 모드 전용 -> 일반 조건식에선 숨김 (set_rank_mode)
-COLUMNS = ["순위",  "변동",      "등락률", "연상", "종목명", "현재가", "예상체결가", "L일봉H", "예상등락률", "전일거래량", "거래량", "매도잔량", "매수잔량", "예상체결량", "체결/분", "매수%",   "시가총액", "상한가진입시간"]
+COLUMNS = ["순위",  "변동",      "등락률", "연상", "종목명", "현재가", "예상체결가", "L일봉H", "예상등락률", "전일거래량", "거래량", "매도잔량", "매수잔량", "예상체결량", "체결/분", "매수%",   "시총(억)", "상한가진입시간"]
 FIELDS  = ["qrank", "qrank_chg", "rate",   "streak", "name",  "price", "exp_price", "bar",    "exp_rate",   "prev_vol", "vol",   "ask_qty",  "bid_qty",  "exp_qty",  "tpm",    "buy_pct", "mcap",   "time"]
 # 컬럼은 아니지만 L일봉H 그리기에 필요한 저장 필드 (시/저/고/전일종가/상한/하한)
 # streak(연상)/mcap(시가총액)/tpm(체결/분)은 저장 안 함: 매번 계산
