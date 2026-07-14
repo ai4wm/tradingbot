@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
 
 from api import MarketInfo
 from gui import (ADMIN, MISU_ROLE, NEW_ROLE, NXT_ROLE, PURPLE, NameDelegate,
-                 PreserveTextColorDelegate)
+                 PreserveTextColorDelegate, VisibleCheckStyle)
 
 RED = QColor("#e83030")
 BLUE = QColor("#2050d0")
@@ -211,6 +211,10 @@ class RankScreen(QWidget):
         self.alert_jump = QCheckBox("급상승≥")
         self.alert_jump.setToolTip("순위가 N계단 이상 뛰어오르면 소리 알림")
         self.alert_jump.setChecked(self._settings.value("rank_alert_jump", "false") == "true")
+        self._checkbox_style = VisibleCheckStyle()
+        self._checkbox_style.setParent(self)
+        self.alert_top.setStyle(self._checkbox_style)
+        self.alert_jump.setStyle(self._checkbox_style)
         self.jump_n = QSpinBox()
         self.jump_n.setRange(1, 19)
         self.jump_n.setValue(int(self._settings.value("rank_jump_n", 3)))
