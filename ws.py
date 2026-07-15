@@ -47,7 +47,16 @@ FID_0H = {
     "13": "exp_qty",
 }
 
-REAL_TYPES = ["0B", "0D", "0H", "1h"]  # 체결 / 호가잔량 / 예상체결 / VI발동해제
+# 0w(종목프로그램매매): 매수/매도수량은 장중 누적값이므로 GUI가 직전값과의
+# 차분만 1·3·5분 흐름으로 사용한다. 같은 FID 번호의 일반 시세 오해석을 막기
+# 위해 0B/0D용 FID와 분리한다.
+FID_0W = {
+    "202": "program_sell_qty",
+    "206": "program_buy_qty",
+    "210": "program_net_qty",
+}
+
+REAL_TYPES = ["0B", "0D", "0H", "0w", "1h"]  # 체결 / 호가 / 예상 / 프로그램 / VI
 
 
 def _num(v):
@@ -74,7 +83,8 @@ def parse_real_item(item: dict) -> tuple[str, dict]:
     통합(_AL)/NXT(_NX) 등록 시 item에 접미사가 붙어 옴 -> 떼서 순수코드로."""
     code = (item.get("item") or "").split("_")[0]
     values = item.get("values", {})
-    table = FID_0H if item.get("type") == "0H" else FID
+    typ = item.get("type")
+    table = FID_0H if typ == "0H" else FID_0W if typ == "0w" else FID
     out = {}
     for fid, raw in values.items():
         field = table.get(fid)
@@ -83,12 +93,17 @@ def parse_real_item(item: dict) -> tuple[str, dict]:
         n = _num(raw)
         if field in ("price", "exp_price") or "price" in field:  # 가격류
             out[field] = int(abs(n))
-        elif field in ("vol", "tick_qty", "exp_qty") or "qty" in field:
+        elif (field in ("vol", "tick_qty", "exp_qty") or "qty" in field
+              or field.endswith("_amount")):
             out[field] = int(n)
         else:
             out[field] = n
     if table is FID_0H and out:
         out["exp_hot"] = 1  # 0H는 단일가/VI 국면에만 옴 -> gui가 판정 없이 표시
+    elif table is FID_0W and out:
+        raw_item = item.get("item") or ""
+        out["_program_source"] = ("_NX" if raw_item.endswith("_NX") else
+                                  "_AL" if raw_item.endswith("_AL") else "")
     return code, out
 
 
@@ -295,7 +310,7 @@ class WSClient:
         """처음 보는 (type,fid)를 한 번씩 로그. 매핑여부+샘플값 포함.
         개장 동시호가(08:50~) 때 bot.log 열면 예상체결가 등 UNMAPPED FID를 바로 찾는다."""
         typ = item.get("type", "")
-        table = FID_0H if typ == "0H" else FID
+        table = FID_0H if typ == "0H" else FID_0W if typ == "0w" else FID
         for fid, val in item.get("values", {}).items():
             key = (typ, fid)
             if key in self._seen_fids:
@@ -367,6 +382,13 @@ def _demo():
     # 0H(주식예상체결)는 같은 FID가 다른 의미: 10=예상체결가, 13=예상체결량
     _, fh = parse_real_item({"item": "x", "type": "0H", "values": {"10": "-1215", "13": "8151", "12": "+21.02"}})
     assert fh == {"exp_price": 1215, "exp_qty": 8151, "exp_hot": 1}, fh
+    # 0w(종목프로그램매매)는 누적 매수/매도수량을 별도 필드로 넘긴다.
+    _, fp = parse_real_item({"item": "005930_AL", "type": "0w", "values": {
+        "202": "1,200,000", "206": "2,500,000", "210": "+1,300,000", "10": "99999"}})
+    assert fp == {"program_sell_qty": 1_200_000,
+                  "program_buy_qty": 2_500_000,
+                  "program_net_qty": 1_300_000,
+                  "_program_source": "_AL"}, fp
     # 매핑 없는 FID 무시
     _, f2 = parse_real_item({"item": "x", "values": {"9999": "1"}})
     assert f2 == {}, f2
