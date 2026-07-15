@@ -26,8 +26,14 @@ FID = {
     "12": "rate",      # 등락율
     "13": "vol",       # 누적거래량
     "15": "tick_qty",  # 개별 체결량 (+매수체결 / -매도체결, 부호 보존)
+    "41": "ask_price",  # 매도호가1
+    "42": "ask_price2", "43": "ask_price3", "44": "ask_price4", "45": "ask_price5",
+    "51": "bid_price",  # 매수호가1
+    "52": "bid_price2", "53": "bid_price3", "54": "bid_price4", "55": "bid_price5",
     "61": "ask_qty",   # 최우선 매도잔량 (0D 매도호가1 잔량)
+    "62": "ask_qty2", "63": "ask_qty3", "64": "ask_qty4", "65": "ask_qty5",
     "71": "bid_qty",   # 최우선 매수잔량 (0D 매수호가1 잔량)
+    "72": "bid_qty2", "73": "bid_qty3", "74": "bid_qty4", "75": "bid_qty5",
     # 예상가: 0D 23/24는 장중에도 값이 바뀌며 옴(상한가 종목 등) -> 표시 ON 신호로 못 씀.
     # gui가 0H/단일가/VI/동시호가REST로 켠 상태에서만 갱신용으로 반영한다.
     "23": "exp_price",
@@ -75,9 +81,9 @@ def parse_real_item(item: dict) -> tuple[str, dict]:
         if not field:
             continue
         n = _num(raw)
-        if field in ("price", "exp_price"):   # 가격류: 부호 제거 + 정수
+        if field in ("price", "exp_price") or "price" in field:  # 가격류
             out[field] = int(abs(n))
-        elif field in ("vol", "tick_qty", "ask_qty", "bid_qty", "exp_qty"):
+        elif field in ("vol", "tick_qty", "exp_qty") or "qty" in field:
             out[field] = int(n)
         else:
             out[field] = n
@@ -351,6 +357,13 @@ def _demo():
     assert f["tick_qty"] == -125, f
     _, fe = parse_real_item({"item": "x", "type": "0D", "values": {"23": "+1215", "24": "8,151"}})
     assert fe == {"exp_price": 1215, "exp_qty": 8151}, fe
+    _, book = parse_real_item({"item": "x", "type": "0D", "values": {
+        "41": "1010", "42": "1020", "51": "1000", "52": "990",
+        "61": "100", "62": "200", "71": "300", "72": "400"}})
+    assert book == {"ask_price": 1010, "ask_price2": 1020,
+                    "bid_price": 1000, "bid_price2": 990,
+                    "ask_qty": 100, "ask_qty2": 200,
+                    "bid_qty": 300, "bid_qty2": 400}, book
     # 0H(주식예상체결)는 같은 FID가 다른 의미: 10=예상체결가, 13=예상체결량
     _, fh = parse_real_item({"item": "x", "type": "0H", "values": {"10": "-1215", "13": "8151", "12": "+21.02"}})
     assert fh == {"exp_price": 1215, "exp_qty": 8151, "exp_hot": 1}, fh

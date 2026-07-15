@@ -28,6 +28,7 @@ log = logging.getLogger("main")
 
 MAX_WINDOWS = 3  # 실시간 등록 ~100종목 한도 내 (조건당 20~30종목 기준)
 RANK_SEQ = "RANK"      # [순위]조회순위 (ka00198 폴 -> on_snapshot)
+HOLDINGS_SEQ = "HOLDINGS"  # [계좌]보유종목 (kt00018)
 NXT_RATE_SEQ = "NXT_RATE"  # [NXT]등락률순위 (ka10027, NXT 전용)
 VSURGE_SEQ = "VSURGE"  # [급증]거래량급증 (ka10023)
 TVAL_SEQ = "TVAL"      # [대금]거래대금상위 (ka10032)
@@ -105,23 +106,24 @@ class View:
         selected_seq = self.seq
         combo.clear()
         combo.addItem("[순위]조회순위", RANK_SEQ)   # 맨 위 고정: REST 순위 계열
+        combo.addItem("[계좌]보유종목", HOLDINGS_SEQ)
         combo.addItem("[NXT]등락률순위", NXT_RATE_SEQ)
         combo.addItem("[급증]거래량급증", VSURGE_SEQ)
         combo.addItem("[대금]거래대금상위", TVAL_SEQ)
         f = QFont(combo.font())
         f.setBold(True)
-        for i, color in ((0, "#FFDD00"), (1, "#33C24D"),
-                         (2, "#FF8C00"), (3, "#38B8FF")):  # 볼드+색으로 조건식과 구분
+        for i, color in ((0, "#FFDD00"), (1, "#D6A5FF"), (2, "#33C24D"),
+                         (3, "#FF8C00"), (4, "#38B8FF")):  # 볼드+색으로 조건식과 구분
             combo.setItemData(i, f, Qt.FontRole)
             combo.setItemData(i, QColor(color), Qt.ForegroundRole)
-        combo.insertSeparator(4)  # 진짜 조건식과 구분선
+        combo.insertSeparator(5)  # 진짜 조건식과 구분선
         for seq, name in items:
             combo.addItem(name, seq)
         if self.seq is None:
             last = self._settings.value(self.prefix + "last_condition")
             idx = combo.findData(last) if last is not None else -1
-            if idx < 0:  # 저장 없음: 첫 진짜 조건식 (0~3=순위계열,4=구분선,5=첫 조건식)
-                idx = 5 if combo.count() > 5 else 0
+            if idx < 0:  # 저장 없음: 첫 진짜 조건식 (0~4=내장메뉴,5=구분선)
+                idx = 6 if combo.count() > 6 else 0
             combo.setCurrentIndex(idx)  # setCurrentIndex는 activated 안 터짐 -> 수동 등록
             asyncio.ensure_future(self._switch_condition(combo.itemData(idx)))
         else:  # 재조회/재접속: 현재 조건 선택 복원
@@ -131,7 +133,7 @@ class View:
             else:
                 # 영웅문에서 현재 조건식을 삭제한 뒤 목록을 재조회한 경우,
                 # 콤보는 자동으로 0번을 표시하지만 실제 구독은 예전 조건에 남는 문제가 있다.
-                idx = 5 if combo.count() > 5 else 0
+                idx = 6 if combo.count() > 6 else 0
                 combo.setCurrentIndex(idx)
                 asyncio.ensure_future(self._switch_condition(combo.itemData(idx)))
 
@@ -145,9 +147,10 @@ class View:
     async def _switch_condition(self, seq: str):
         if seq != self.seq:  # 조건 변경: 이전 조건 해제 + 이 창 행 전량 정리
             await self.stop()
-        elif seq not in RANK_SEQS:  # 같은 조건 재조회: 행 유지, 스냅샷 diff로만 반영
+        elif seq not in RANK_SEQS and seq != HOLDINGS_SEQ:  # 같은 조건식 재조회
             await self.app.clear_condition_if_sole(self.seq, self)
-        switched = self.screen.set_rank_mode(seq in RANK_SEQS)
+        mode = "rank" if seq in RANK_SEQS else "holdings" if seq == HOLDINGS_SEQ else "normal"
+        switched = self.screen.set_view_mode(mode)
         if seq in RANK_SEQS:  # 기준시간 콤보 내용을 서브모드에 맞게 교체 (계열 간 직접 전환 포함)
             self.screen.set_rank_period(RANK_SUBMODE[seq])
         self.seq = str(seq)
@@ -159,14 +162,26 @@ class View:
         if seq in RANK_SEQS:  # 순위 계열: 서버 조건검색 대신 REST 폴 -> 같은 snapshot 경로
             await self._poll_rank()
             return
+        if seq == HOLDINGS_SEQ:
+            await self._poll_holdings()
+            return
         await self.app.ws.register_condition(seq)
 
     async def stop(self):
         """이 창의 조건/시세 구독 정리 (조건 변경·창 닫기)."""
+        # 이전 조건의 지연 백필이 살아 있으면 새 조건의 _schedule_refresh가 이를 보고
+        # 예약을 생략할 수 있다. 전환 전에 끝내 보유종목 등 새 목록이 반드시 백필되게 한다.
+        if self._refresh_task and not self._refresh_task.done():
+            self._refresh_task.cancel()
+            try:
+                await self._refresh_task
+            except asyncio.CancelledError:
+                pass
+        self._refresh_task = None
         suffix = self._real_suffix()
-        if self.seq is not None:
+        if self.seq is not None and self.seq != HOLDINGS_SEQ:
             await self.app.clear_condition_if_sole(self.seq, self)
-            self.seq = None
+        self.seq = None
         codes = list(self.screen.model.codes)
         for code in codes:
             self.app.queue_real(code, add=False, suffix=suffix)
@@ -202,6 +217,19 @@ class View:
             self.screen.on_tick(r["code"], {"qrank": r["rank"], "qrank_chg": r["rank_chg"],
                                             "name": r["name"]})
 
+    async def _poll_holdings(self):
+        """계좌 보유종목을 조회해 조건검색 그리드와 실시간 시세에 연결."""
+        try:
+            rows = await self.app.rest.holdings()
+        except Exception as e:  # noqa: BLE001
+            log.warning("holdings poll%s: %s", self.prefix or "", e)
+            return
+        self.on_snapshot([r["code"] for r in rows])
+        for r in rows:
+            self.screen.on_tick(r["code"], {"name": r["name"]})
+        # 행 추가 시 예약되는 백필과 별개로 이름 반영 뒤 한 번 더 보장한다.
+        self._schedule_refresh()
+
     # --- 재조회 -----------------------------------------------------------
     def on_refresh(self):
         seq = self.screen.condition_combo.currentData()
@@ -209,8 +237,10 @@ class View:
             asyncio.ensure_future(self._switch_condition(seq))
 
     def _mkey(self, name: str) -> str:
-        """모드별 설정 키 (재조회/간격): 순위 계열이면 rankmode_ 접두 (gui._mkey와 동일 규칙)."""
-        return self.prefix + ("rankmode_" if self.seq in RANK_SEQS else "") + name
+        """화면별 재조회 설정 키 (gui._mkey와 동일 규칙)."""
+        mode_prefix = ("rankmode_" if self.seq in RANK_SEQS else
+                       "holdingsmode_" if self.seq == HOLDINGS_SEQ else "")
+        return self.prefix + mode_prefix + name
 
     def _on_sound(self, on: bool):
         self._settings.setValue(self.prefix + "sound", "true" if on else "false")
@@ -707,7 +737,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self._key = "geometry"  # 순위 모드 전환 시 set_rank_mode가 rank_geometry로 교체
+        self._key = "geometry"  # 화면 전환 시 set_view_mode가 화면별 키로 교체
         self._settings = QSettings("layout.ini", QSettings.IniFormat)
         self._geo_timer = QTimer(self)
         self._geo_timer.setSingleShot(True)

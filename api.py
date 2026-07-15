@@ -161,6 +161,16 @@ class RestClient:
                 "prev_vol": prev_vol,                      # 전일거래량 (역산)
                 "ask_qty": _to_int(r.get("pri_sel_req")),  # 최우선 매도잔량
                 "bid_qty": _to_int(r.get("pri_buy_req")),  # 최우선 매수잔량
+                "ask_price": abs(_to_int(r.get("sel_1th_bid"))),  # 최우선 매도호가
+                "bid_price": abs(_to_int(r.get("buy_1th_bid"))),  # 최우선 매수호가
+                **{f"ask_price{n}": abs(_to_int(r.get(f"sel_{n}th_bid")))
+                   for n in range(2, 6)},
+                **{f"bid_price{n}": abs(_to_int(r.get(f"buy_{n}th_bid")))
+                   for n in range(2, 6)},
+                **{f"ask_qty{n}": _to_int(r.get(f"pri_sel_req{n}"))
+                   for n in range(2, 6)},
+                **{f"bid_qty{n}": _to_int(r.get(f"pri_buy_req{n}"))
+                   for n in range(2, 6)},
                 "open": abs(_to_int(r.get("open_pric"))),  # 시가 (L일봉H 몸통)
                 "low": abs(_to_int(r.get("low_pric"))),    # 당일 저가 (심지)
                 "high": abs(_to_int(r.get("high_pric"))),  # 당일 고가 (심지)
@@ -284,6 +294,32 @@ class RestClient:
             "rank_chg": _to_int(r.get("rank_chg")),
             "time": r.get("tm", ""),
         } for r in d.get("item_inq_rank", [])]
+
+    async def holdings(self) -> list[dict]:
+        """kt00018 계좌평가잔고내역의 보유수량이 있는 국내주식 목록."""
+        body = {"qry_tp": "1", "dmst_stex_tp": "KRX"}
+        out = []
+        cont = ""
+        while True:
+            r = await self._request_raw("kt00018", body, "/api/dostk/acnt", cont)
+            d = r.json()
+            # 국내주식 REST 실응답 컨테이너명. 구 명세의 이름도 호환한다.
+            rows = d.get("acnt_evlt_remn_indv_tot", d.get("stk_acnt_evlt_prst", []))
+            for item in rows:
+                if _to_int(item.get("rmnd_qty")) <= 0:
+                    continue
+                code = (item.get("stk_cd") or "").strip()
+                if code.startswith("A") and len(code) == 7:
+                    code = code[1:]
+                code = code.split("_")[0]
+                if code:
+                    out.append({"code": code, "name": item.get("stk_nm", "")})
+            if r.headers.get("cont-yn", "N").upper() != "Y":
+                break
+            cont = r.headers.get("next-key", "")
+            if not cont:
+                break
+        return out
 
     async def volume_surge(self, tm: str = "60", stex_tp: str = "3",
                            drop_etf: bool = True) -> list[dict]:

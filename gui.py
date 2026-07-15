@@ -5,6 +5,7 @@
 웹소켓 계층은 on_included / on_tick / on_excluded 세 메서드만 호출하면 된다.
 """
 import logging
+import math
 import sys
 import time
 from collections import deque
@@ -21,18 +22,23 @@ from PySide6.QtWidgets import (
 
 log = logging.getLogger("gui")
 
-# 순위/변동: ★조회순위(ka00198) 모드 전용 -> 일반 조건식에선 숨김 (set_rank_mode)
-COLUMNS = ["순위",  "변동",      "등락률", "연상", "종목명", "현재가", "예상체결가", "L일봉H", "예상등락률", "전일거래량", "거래량", "매도잔량", "매수잔량", "예상체결량", "체결/분", "매수%",   "시총(억)", "상한가진입시간"]
-FIELDS  = ["qrank", "qrank_chg", "rate",   "streak", "name",  "price", "exp_price", "bar",    "exp_rate",   "prev_vol", "vol",   "ask_qty",  "bid_qty",  "exp_qty",  "tpm",    "buy_pct", "mcap",   "time"]
+# 순위/변동: ★조회순위(ka00198) 모드 전용 -> 다른 화면에선 숨김 (set_view_mode)
+COLUMNS = ["순위",  "변동",      "등락률", "연상", "종목명", "현재가", "예상체결가", "L일봉H", "예상등락률", "전일거래량", "거래량", "매도잔량", "매수잔량", "예상체결량", "체결/분", "매수%",   "예측", "시총(억)", "상한가진입시간"]
+FIELDS  = ["qrank", "qrank_chg", "rate",   "streak", "name",  "price", "exp_price", "bar",    "exp_rate",   "prev_vol", "vol",   "ask_qty",  "bid_qty",  "exp_qty",  "tpm",    "buy_pct", "predict", "mcap",   "time"]
 # 컬럼은 아니지만 L일봉H 그리기에 필요한 저장 필드 (시/저/고/전일종가/상한/하한)
 # streak(연상)/mcap(시가총액)/tpm(체결/분)은 저장 안 함: 매번 계산
-STORED = (set(FIELDS) - {"streak", "mcap", "tpm", "buy_pct"}) | {"open", "low", "high", "base", "upper", "lower"}
+BOOK_FIELDS = {f"{side}_{kind}{level if level > 1 else ''}"
+               for side in ("ask", "bid") for kind in ("price", "qty")
+               for level in range(1, 6)}
+STORED = (set(FIELDS) - {"streak", "mcap", "tpm", "buy_pct", "predict"}) | {
+    "open", "low", "high", "base", "upper", "lower"} | BOOK_FIELDS
 BAR_COL = FIELDS.index("bar")
 NAME_COL = FIELDS.index("name")
 STREAK_COL = FIELDS.index("streak")
 MCAP_COL = FIELDS.index("mcap")
 TPM_COL = FIELDS.index("tpm")
 BUY_PCT_COL = FIELDS.index("buy_pct")
+PREDICT_COL = FIELDS.index("predict")
 RANK_COLS = (FIELDS.index("qrank"), FIELDS.index("qrank_chg"))
 RANK_PERIODS = {  # 순위 계열 기준시간 콤보: (표시, data). 모드 따라 교체
     "rank":   [("30초", "5"), ("1분", "1"), ("10분", "2"), ("1시간", "3"), ("당일", "4")],  # ka00198 qry_tp
@@ -43,11 +49,11 @@ NXT_ROLE = Qt.UserRole + 2  # NameDelegate에 NXT 종목 여부 전달
 MISU_ROLE = Qt.UserRole + 3  # NameDelegate에 미수가능 여부 전달
 NEW_ROLE = Qt.UserRole + 4  # NameDelegate에 신규상장 단계 전달 (3=당일 2=15일이내 1=30일이내 0=아님)
 TPM_TREND_ROLE = Qt.UserRole + 5  # 체결/분 추세: 최근 10초 속도 vs 이전 50초 (-1/0/+1)
-BUY_TREND_ROLE = Qt.UserRole + 6  # 매수% 추세: 최근 1분 비중 vs 이전 2분 (-1/0/+1)
+BUY_TREND_ROLE = Qt.UserRole + 6  # 매수% 추세: 최근 20초 비중 vs 이전 40초 (-1/0/+1)
 
 LIMIT = 29.5  # 상한/하한 판정 임계 (KRX +-30%)
 # ponytail: 매크로가 2주+로 갈아타면 이 값을 올리거나 금액기준(delta*price)으로 교체
-DESC_FIRST = {"bid_qty", "rate", "price", "exp_price", "exp_rate", "streak", "tpm", "buy_pct", "qrank_chg"}  # 첫 클릭 내림차순 컬럼
+DESC_FIRST = {"bid_qty", "rate", "price", "exp_price", "exp_rate", "streak", "tpm", "buy_pct", "predict", "qrank_chg"}  # 첫 클릭 내림차순 컬럼
 RED  = QColor("#e83030")
 BLUE = QColor("#2050d0")
 PURPLE = QColor("#C080F0")  # 코스닥 종목명
@@ -325,7 +331,8 @@ class StockModel(QAbstractTableModel):
         self.new15: set[str] = set()         # 상장 15일 이내 (좌하단 하늘)
         self.new30: set[str] = set()         # 상장 16~30일 (좌하단 청회)
         self.shares: dict[str, int] = {}     # 상장주식수 ka10099 (main 주입, 시가총액 컬럼)
-        self.ticks: dict[str, deque] = {}    # (체결시각, 부호있는 개별체결량) 최근 180초
+        self.ticks: dict[str, deque] = {}    # (체결시각, 부호있는 개별체결량, 체결가) 최근 60초
+        self.quotes: dict[str, deque] = {}   # (시각, 1~5호가 (매도/매수 가격·잔량)) 최근 15초
 
     # --- 웹소켓/전략 계층이 부르는 API ---------------------------------
     def add_stock(self, code: str, data: dict):
@@ -348,6 +355,7 @@ class StockModel(QAbstractTableModel):
         del self.rows[code]
         self._exp_live.discard(code)
         self.ticks.pop(code, None)
+        self.quotes.pop(code, None)
         self.endRemoveRows()
 
     def set_vi(self, code: str, active: bool, price: int = 0):
@@ -386,22 +394,40 @@ class StockModel(QAbstractTableModel):
             log.info("expOFF %s vol", code)
         dvol = fields.get("vol", 0) - stored["vol"]  # FID 15가 없을 때 체결 틱 폴백
         ticked = tick_qty not in (None, 0) or dvol > 0
+        quote_changed = any(f in fields for f in BOOK_FIELDS)
+        if quote_changed:
+            levels = []
+            for level in range(1, 6):
+                suffix = "" if level == 1 else str(level)
+                names = tuple(f"{side}_{kind}{suffix}" for side, kind in (
+                    ("ask", "price"), ("ask", "qty"), ("bid", "price"), ("bid", "qty")))
+                ap, aq, bp, bq = (int(fields.get(f, stored[f])) for f in names)
+                levels.append((ap, max(0, aq), bp, max(0, bq)))
+            if levels[0][0] and levels[0][2]:
+                qq = self.quotes.setdefault(code, deque())
+                snap = (time.monotonic(), tuple(levels))
+                if not qq or qq[-1][1] != snap[1]:
+                    qq.append(snap)
+                while qq and qq[0][0] < snap[0] - 15:
+                    qq.popleft()
         if ticked:
             dq = self.ticks.setdefault(code, deque())
             now = time.monotonic()
-            dq.append((now, int(tick_qty or 0)))
-            while dq and dq[0][0] < now - 180:
+            dq.append((now, int(tick_qty or 0), int(fields.get("price", stored["price"]))))
+            while dq and dq[0][0] < now - 60:
                 dq.popleft()
-        cols = {TPM_COL, BUY_PCT_COL} if ticked else set()
+        cols = {TPM_COL, BUY_PCT_COL, PREDICT_COL} if ticked else set()
         for f, v in fields.items():
             if stored.get(f) == v:
                 continue
             if f in FIELDS:
                 cols.add(FIELDS.index(f))
             if f == "vol":  # 체결/분 의존
-                cols.update((TPM_COL, BUY_PCT_COL))
+                cols.update((TPM_COL, BUY_PCT_COL, PREDICT_COL))
+            if f in BOOK_FIELDS:
+                cols.add(PREDICT_COL)
             if f in ("price", "open", "low", "high", "base", "upper", "lower"):  # L일봉H 의존
-                cols.add(BAR_COL)
+                cols.update((BAR_COL, PREDICT_COL))
             if f in ("price", "upper", "exp_price"):  # 연상 판정(_at_limit) 의존
                 cols.add(STREAK_COL)
             if f in ("price", "base"):  # 시가총액 의존
@@ -420,7 +446,68 @@ class StockModel(QAbstractTableModel):
     def refresh_tpm(self):
         """최근 체결 지표 감쇠 갱신: 틱이 끊겨도 1초마다 재계산."""
         if self.codes:
-            self.dataChanged.emit(self.index(0, TPM_COL), self.index(len(self.codes) - 1, BUY_PCT_COL))
+            self.dataChanged.emit(self.index(0, TPM_COL), self.index(len(self.codes) - 1, PREDICT_COL))
+
+    @staticmethod
+    def _combined_buy_pct(items):
+        """부호 있는 체결 목록의 수량·건수 통합 매수비중."""
+        buy_qty = sum(q for _, q, _ in items if q > 0)
+        sell_qty = sum(-q for _, q, _ in items if q < 0)
+        buy_count = sum(1 for _, q, _ in items if q > 0)
+        sell_count = sum(1 for _, q, _ in items if q < 0)
+        if not buy_count + sell_count:
+            return None
+        qty_pct = buy_qty / (buy_qty + sell_qty) * 100
+        count_pct = buy_count / (buy_count + sell_count) * 100
+        return qty_pct * 0.7 + count_pct * 0.3 - abs(qty_pct - count_pct) * 0.2
+
+    @classmethod
+    def _prediction_score(cls, items, stored, quotes=()):
+        """최근 10초 동적 OFI·체결흐름·가격반응·가속을 0~100으로 합산."""
+        if len(items) < 5 or items[-1][0] - items[0][0] < 5:
+            return None  # 편입 직후/순간 버스트는 표본 부족으로 표시하지 않음
+        flow = cls._combined_buy_pct(items)
+        cutoff = items[-1][0] - 5
+        recent = [x for x in items if x[0] >= cutoff]
+        previous = [x for x in items if x[0] < cutoff]
+        recent_buys = sum(1 for _, q, _ in recent if q > 0)
+        previous_buys = sum(1 for _, q, _ in previous if q > 0)
+        speed = 50 + (recent_buys - previous_buys) / max(
+            1, recent_buys + previous_buys) * 50
+        quote_items = [x for x in quotes if x[0] >= items[-1][0] - 10]
+        weights = (0.40, 0.25, 0.15, 0.12, 0.08)
+        level_scores = []
+        for level in range(5):
+            ofi, depths = 0, []
+            for prev, cur in zip(quote_items, quote_items[1:]):
+                pa, paq, pb, pbq = prev[1][level]
+                ca, caq, cb, cbq = cur[1][level]
+                if not (pa and pb and ca and cb):
+                    continue
+                bid_flow = cbq if cb > pb else cbq - pbq if cb == pb else -pbq
+                ask_flow = caq if ca < pa else caq - paq if ca == pa else -paq
+                ofi += bid_flow - ask_flow
+                depths.append((paq + pbq + caq + cbq) / 4)
+            avg_depth = sum(depths) / len(depths) if depths else 0
+            level_scores.append(50 + 50 * math.tanh(ofi / avg_depth) if avg_depth else 50)
+        ofi_score = sum(score * weight for score, weight in zip(level_scores, weights))
+        micro_score = 50
+        if quote_items:
+            ask_p, ask_q, bid_p, bid_q = quote_items[-1][1][0]
+            if ask_p > bid_p > 0 and ask_q + bid_q:
+                micro = (ask_p * bid_q + bid_p * ask_q) / (ask_q + bid_q)
+                half_spread = (ask_p - bid_p) / 2
+                micro_score = max(0, min(100, 50 + (micro - (ask_p + bid_p) / 2)
+                                                  / half_spread * 50))
+        first_price, last_price = items[0][2], items[-1][2]
+        if first_price and last_price:
+            change_bp = (last_price - first_price) / first_price * 10_000
+            price_response = max(0, min(100, 50 + change_bp * 2))
+        else:
+            price_response = 50
+        score = (ofi_score * 0.40 + flow * 0.25 + micro_score * 0.15
+                 + price_response * 0.10 + speed * 0.10)
+        return max(0, min(100, score))
 
     # --- Qt 모델 구현 ---------------------------------------------------
     def rowCount(self, parent=QModelIndex()):
@@ -456,8 +543,8 @@ class StockModel(QAbstractTableModel):
         if field == "tpm":  # 체결/분 = 최근 60초 체결 틱수, 매번 계산 (저장 안 함)
             now = time.monotonic()
             dq = self.ticks.get(self.codes[index.row()], ())
-            n = sum(1 for t, _ in dq if t >= now - 60)
-            recent = sum(1 for t, _ in dq if t >= now - 10)
+            n = sum(1 for t, _, _ in dq if t >= now - 60)
+            recent = sum(1 for t, _, _ in dq if t >= now - 10)
             previous = n - recent
             # 최근 10초와 이전 50초를 각각 분당 속도로 환산. 20% 완충 + 최소 표본으로 깜빡임 억제.
             recent_rate, previous_rate = recent * 6, previous * 1.2
@@ -480,36 +567,47 @@ class StockModel(QAbstractTableModel):
                 if role == Qt.FontRole:
                     f = QFont(); f.setBold(True); return f
             return None
-        if field == "buy_pct":  # 최근 3분 체결수량 중 공격적 매수체결 비중
+        if field == "buy_pct":  # 최근 1분 수량 70% + 건수 30% - 불일치 감점
             now = time.monotonic()
             dq = self.ticks.get(self.codes[index.row()], ())
-            current = [(t, q) for t, q in dq if t >= now - 180 and q]
-            buy = sum(q for _, q in current if q > 0)
-            sell = sum(-q for _, q in current if q < 0)
-            total = buy + sell
-            pct = buy / total * 100 if total else 0.0
-            recent = [(t, q) for t, q in current if t >= now - 60]
-            previous = [(t, q) for t, q in current if t < now - 60]
-
-            def ratio(items):
-                b = sum(q for _, q in items if q > 0)
-                s = sum(-q for _, q in items if q < 0)
-                return b / (b + s) * 100 if b + s else None
-
-            rp, pp = ratio(recent), ratio(previous)
+            current = [(t, q, p) for t, q, p in dq if t >= now - 60 and q]
+            recent = [(t, q, p) for t, q, p in current if t >= now - 20]
+            previous = [(t, q, p) for t, q, p in current if t < now - 20]
+            pct = self._combined_buy_pct(current)
+            rp, pp = self._combined_buy_pct(recent), self._combined_buy_pct(previous)
             trend = (1 if len(recent) >= 3 and len(previous) >= 5 and rp is not None and pp is not None and rp > pp + 5
                      else -1 if len(recent) >= 3 and len(previous) >= 5 and rp is not None and pp is not None and rp < pp - 5
                      else 0)
             if role == Qt.DisplayRole:
-                return f"{pct:.0f}%" if total else ""
+                return f"{pct:.0f}%" if pct is not None else ""
             if role == Qt.UserRole:
-                return pct if total else -1
+                return pct if pct is not None else -1
             if role == BUY_TREND_ROLE:
                 return trend
             if role == Qt.TextAlignmentRole:
                 return Qt.AlignRight | Qt.AlignVCenter
-            if role == Qt.ForegroundRole and total:
+            if role == Qt.ForegroundRole and pct is not None:
                 return RED if pct >= 55 else BLUE if pct <= 45 else None
+            return None
+        if field == "predict":  # 향후 수십 초 상승압력 선행점수 (최근 10초)
+            now = time.monotonic()
+            items = [(t, q, p) for t, q, p in self.ticks.get(self.codes[index.row()], ())
+                     if t >= now - 10 and q]
+            score = self._prediction_score(
+                items, stored, self.quotes.get(self.codes[index.row()], ()))
+            if role == Qt.DisplayRole:
+                if score is None:
+                    return ""
+                # 화살표 2칸 + 점수 3칸을 고정해 단계/자릿수 변화 때 좌우로 흔들리지 않게 한다.
+                arrow = "▲▲" if score >= 70 else "▲ " if score >= 60 else \
+                        "▼▼" if score <= 30 else "▼ " if score <= 40 else "－ "
+                return f"{arrow}{score:3.0f}"
+            if role == Qt.UserRole:
+                return score if score is not None else -1
+            if role == Qt.TextAlignmentRole:
+                return Qt.AlignCenter
+            if role == Qt.ForegroundRole and score is not None:
+                return RED if score >= 60 else BLUE if score <= 40 else None
             return None
         if field == "mcap":  # 시가총액(억) = 상장주식수 x 현재가(체결 전엔 전일종가), 매번 계산
             v = self.shares.get(self.codes[index.row()], 0) * (stored["price"] or stored["base"]) // 100_000_000
@@ -749,6 +847,7 @@ class ConditionScreen(QWidget):
         self.table.setColumnWidth(STREAK_COL, 34)
         self.table.setColumnWidth(BAR_COL, 70)
         self.table.setColumnWidth(BUY_PCT_COL, 58)
+        self.table.setColumnWidth(PREDICT_COL, 58)
         self.table.setItemDelegate(PreserveTextColorDelegate(self.table))
         self.table.setItemDelegateForColumn(BAR_COL, BarDelegate(self.table))
         self.table.setItemDelegateForColumn(NAME_COL, NameDelegate(self.table))
@@ -785,9 +884,15 @@ class ConditionScreen(QWidget):
             if sec >= 0:  # 마지막 정렬 컬럼/방향 복원
                 self._sort_col = sec
                 self._sort_order = self.table.horizontalHeader().sortIndicatorOrder()
+        # saveState는 컬럼 수가 달라지면 통째로 복원에 실패한다. 이름별 너비를 다시
+        # 덮어써 새 컬럼이 추가돼도 기존 컬럼 크기는 그대로 유지한다.
+        for col, field in enumerate(FIELDS):
+            width = self._settings.value(self.prefix + "colwidth_" + field)
+            if width is not None:
+                self.table.setColumnWidth(col, int(width))
         self._apply_sort()
-        self._rank_on = None  # 순위 모드 여부 (None=초기)
-        self.set_rank_mode(False)  # 순위/변동 기본 숨김 (★조회순위 선택 시 main이 켬)
+        self._view_mode = None  # normal / rank / holdings (None=초기)
+        self.set_view_mode("normal")  # 순위/변동 기본 숨김
         self.rank_period.activated.connect(self._save_rank_period)
         self.set_rank_period("rank")  # 기본: 조회순위 기준시간 (급증 선택 시 main이 교체)
         if self._settings.value(self.prefix + "limit_sort", "false") == "true":  # 상한가정렬 복원
@@ -821,7 +926,10 @@ class ConditionScreen(QWidget):
         self.count_label.setText(f"종목수: {self.model.rowCount()}")
 
     def _save_layout(self):
-        self._settings.setValue(self.prefix + "header", self.table.horizontalHeader().saveState())
+        header = self.table.horizontalHeader()
+        self._settings.setValue(self.prefix + "header", header.saveState())
+        for col, field in enumerate(FIELDS):
+            self._settings.setValue(self.prefix + "colwidth_" + field, header.sectionSize(col))
         self._settings.sync()  # 강제 종료돼도 디스크에 남게
 
     def _on_cell_clicked(self, index):
@@ -856,19 +964,19 @@ class ConditionScreen(QWidget):
         self._save_timer.start(400)  # 정렬 상태도 기억
 
     def _mkey(self, name: str) -> str:
-        """모드별 설정 키: 순위 모드면 rankmode_ 접두 (창크기/상한정렬/재조회/간격).
-        rank_geometry는 [0198] 창이 써서 rankmode_ 사용."""
-        return self.prefix + ("rankmode_" if self._rank_on else "") + name
+        """화면별 설정 키. 일반 조건식/순위/보유종목 설정을 서로 분리한다."""
+        mode_prefix = {"rank": "rankmode_", "holdings": "holdingsmode_"}.get(
+            self._view_mode, "")
+        return self.prefix + mode_prefix + name
 
-    def set_rank_mode(self, on: bool) -> bool:
-        """★조회순위 모드: 순위/변동 컬럼 + 기준시간 콤보 표시, 일반 조건식이면 숨김.
-        창 크기/상한정렬은 모드별 키로 저장/복원. 실제 전환 여부 반환 (View가 자기 설정 로드용)."""
-        if on == self._rank_on:
+    def set_view_mode(self, mode: str) -> bool:
+        """일반/순위/보유종목 전환 및 화면별 창 크기·상한정렬 복원."""
+        if mode == self._view_mode:
             return False  # 재폴마다 불림 -> 실제 전환에만 동작
-        prev, self._rank_on = self._rank_on, on
+        prev, self._view_mode = self._view_mode, mode
         for c in RANK_COLS:
-            self.table.setColumnHidden(c, not on)
-        self.rank_period.setVisible(on)
+            self.table.setColumnHidden(c, mode != "rank")
+        self.rank_period.setVisible(mode == "rank")
         if prev is None:  # 시작 경로: geometry/설정은 창 클래스와 __init__이 이미 복원
             return True
         w = self.window()
@@ -878,7 +986,7 @@ class ConditionScreen(QWidget):
             geo = self._settings.value(w._key)
             if geo is not None:
                 w.restoreGeometry(geo)
-        self.limit_sort.setChecked(  # 상한가정렬: 새 모드 저장값 로드 (toggled -> 적용+저장)
+        self.limit_sort.setChecked(  # 상한가정렬: 새 화면 저장값 로드
             self._settings.value(self._mkey("limit_sort"), "false") == "true")
         return True
 
