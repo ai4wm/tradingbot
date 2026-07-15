@@ -9,6 +9,7 @@ import math
 import sys
 import time
 from collections import deque
+from dataclasses import dataclass
 
 from PySide6.QtCore import (
     QAbstractTableModel, QModelIndex, QPoint, QRect, QSettings, QSortFilterProxyModel, Qt, QTimer, QUrl,
@@ -40,6 +41,7 @@ TPM_COL = FIELDS.index("tpm")
 BUY_PCT_COL = FIELDS.index("buy_pct")
 PREDICT_COL = FIELDS.index("predict")
 RANK_COLS = (FIELDS.index("qrank"), FIELDS.index("qrank_chg"))
+RANK_DEFAULT_WIDTHS = {RANK_COLS[0]: 42, RANK_COLS[1]: 48}
 RANK_PERIODS = {  # 순위 계열 기준시간 콤보: (표시, data). 모드 따라 교체
     "rank":   [("30초", "5"), ("1분", "1"), ("10분", "2"), ("1시간", "3"), ("당일", "4")],  # ka00198 qry_tp
     "vsurge": [("1분", "1"), ("3분", "3"), ("5분", "5"), ("10분", "10"), ("30분", "30"), ("60분", "60")],  # ka10023 집계분(tm)
@@ -50,6 +52,15 @@ MISU_ROLE = Qt.UserRole + 3  # NameDelegate에 미수가능 여부 전달
 NEW_ROLE = Qt.UserRole + 4  # NameDelegate에 신규상장 단계 전달 (3=당일 2=15일이내 1=30일이내 0=아님)
 TPM_TREND_ROLE = Qt.UserRole + 5  # 체결/분 추세: 최근 10초 속도 vs 이전 50초 (-1/0/+1)
 BUY_TREND_ROLE = Qt.UserRole + 6  # 매수% 추세: 최근 20초 비중 vs 이전 40초 (-1/0/+1)
+
+# 단타 예측: (표시명, 과거 관찰구간(초), 최소 표본기간(초), 모멘텀 스케일(bp),
+#              선행압력/매수흐름/모멘텀/지속성/VWAP/체결가속 가중치, 종합 가중치)
+# 3·5·10분은 예측 목표구간이며, 관찰구간은 각각 1·3·5분이다.
+PREDICT_HORIZONS = (
+    ("3분", 60, 20, 80,  (0.35, 0.25, 0.15, 0.10, 0.05, 0.10), 0.30),
+    ("5분", 180, 60, 150, (0.25, 0.25, 0.20, 0.15, 0.10, 0.05), 0.45),
+    ("10분", 300, 120, 250, (0.15, 0.20, 0.25, 0.20, 0.15, 0.05), 0.25),
+)
 
 LIMIT = 29.5  # 상한/하한 판정 임계 (KRX +-30%)
 # ponytail: 매크로가 2주+로 갈아타면 이 값을 올리거나 금액기준(delta*price)으로 교체
@@ -64,6 +75,22 @@ NEW_MARKS = {3: QColor("#FF3DC8"), 2: QColor("#38B8FF"), 1: QColor("#8098B8")}  
 WHITE = QColor("white")
 TRACK = QColor("#d8d8d8")
 CENTER = QColor("#707070")  # L일봉H 0% 중심선
+
+
+@dataclass(slots=True)
+class PredictionBucket:
+    """종목별 1초 체결 요약. 장기 단타점수 메모리를 종목당 300행으로 제한한다."""
+
+    sec: int
+    buy_qty: int = 0
+    sell_qty: int = 0
+    buy_count: int = 0
+    sell_count: int = 0
+    open_price: int = 0
+    close_price: int = 0
+    traded_value: int = 0
+    traded_qty: int = 0
+    tick_count: int = 0
 
 
 def _draw_selection_lines(painter, rect, palette):
@@ -333,6 +360,8 @@ class StockModel(QAbstractTableModel):
         self.shares: dict[str, int] = {}     # 상장주식수 ka10099 (main 주입, 시가총액 컬럼)
         self.ticks: dict[str, deque] = {}    # (체결시각, 부호있는 개별체결량, 체결가) 최근 60초
         self.quotes: dict[str, deque] = {}   # (시각, 1~5호가 (매도/매수 가격·잔량)) 최근 15초
+        self.prediction_history: dict[str, deque] = {}  # 최근 5분 1초 체결 요약
+        self._prediction_cache: dict[str, tuple] = {}   # 같은 초의 반복 data() 계산 방지
 
     # --- 웹소켓/전략 계층이 부르는 API ---------------------------------
     def add_stock(self, code: str, data: dict):
@@ -356,6 +385,8 @@ class StockModel(QAbstractTableModel):
         self._exp_live.discard(code)
         self.ticks.pop(code, None)
         self.quotes.pop(code, None)
+        self.prediction_history.pop(code, None)
+        self._prediction_cache.pop(code, None)
         self.endRemoveRows()
 
     def set_vi(self, code: str, active: bool, price: int = 0):
@@ -413,9 +444,33 @@ class StockModel(QAbstractTableModel):
         if ticked:
             dq = self.ticks.setdefault(code, deque())
             now = time.monotonic()
-            dq.append((now, int(tick_qty or 0), int(fields.get("price", stored["price"]))))
+            qty = int(tick_qty or 0)
+            price = int(fields.get("price", stored["price"]))
+            dq.append((now, qty, price))
             while dq and dq[0][0] < now - 60:
                 dq.popleft()
+            # 3·5·10분 점수는 원본 틱 대신 1초 요약으로 계산해 종목 수가 많아도
+            # 메모리와 재계산량이 체결 건수에 비례해 폭증하지 않게 한다.
+            history = self.prediction_history.setdefault(code, deque())
+            sec = int(now)
+            if not history or history[-1].sec != sec:
+                history.append(PredictionBucket(sec, open_price=price, close_price=price))
+            bucket = history[-1]
+            if not bucket.open_price and price:
+                bucket.open_price = price
+            bucket.close_price = price or bucket.close_price
+            bucket.tick_count += 1
+            if qty > 0:
+                bucket.buy_qty += qty
+                bucket.buy_count += 1
+            elif qty < 0:
+                bucket.sell_qty += -qty
+                bucket.sell_count += 1
+            if qty and price:
+                bucket.traded_value += abs(qty) * price
+                bucket.traded_qty += abs(qty)
+            while history and history[0].sec <= sec - 300:
+                history.popleft()
         cols = {TPM_COL, BUY_PCT_COL, PREDICT_COL} if ticked else set()
         for f, v in fields.items():
             if stored.get(f) == v:
@@ -463,7 +518,7 @@ class StockModel(QAbstractTableModel):
 
     @classmethod
     def _prediction_score(cls, items, stored, quotes=()):
-        """최근 10초 동적 OFI·체결흐름·가격반응·가속을 0~100으로 합산."""
+        """최근 10초 호가·체결로 단타 계산의 선행압력을 만든다."""
         if len(items) < 5 or items[-1][0] - items[0][0] < 5:
             return None  # 편입 직후/순간 버스트는 표본 부족으로 표시하지 않음
         flow = cls._combined_buy_pct(items)
@@ -509,6 +564,101 @@ class StockModel(QAbstractTableModel):
                  + price_response * 0.10 + speed * 0.10)
         return max(0, min(100, score))
 
+    @staticmethod
+    def _bucket_buy_pct(buckets):
+        """1초 요약 버킷의 수량·건수 통합 매수비중."""
+        buy_qty = sum(b.buy_qty for b in buckets)
+        sell_qty = sum(b.sell_qty for b in buckets)
+        buy_count = sum(b.buy_count for b in buckets)
+        sell_count = sum(b.sell_count for b in buckets)
+        if not buy_count + sell_count or not buy_qty + sell_qty:
+            return None
+        qty_pct = buy_qty / (buy_qty + sell_qty) * 100
+        count_pct = buy_count / (buy_count + sell_count) * 100
+        return qty_pct * 0.7 + count_pct * 0.3 - abs(qty_pct - count_pct) * 0.2
+
+    @classmethod
+    def _horizon_score(cls, history, pressure, now, lookback, min_span,
+                       momentum_scale, weights):
+        """한 예측구간의 흐름·추세 지속성을 0~100 상승압력으로 계산."""
+        cutoff = int(now - lookback)
+        buckets = [b for b in history if b.sec >= cutoff and b.tick_count]
+        if (len(buckets) < 3 or buckets[-1].sec - buckets[0].sec < min_span):
+            return None
+        flow = cls._bucket_buy_pct(buckets)
+        if flow is None:
+            return None
+
+        first_price = next((b.open_price for b in buckets if b.open_price), 0)
+        last_price = next((b.close_price for b in reversed(buckets) if b.close_price), 0)
+        if first_price and last_price:
+            change_bp = (last_price - first_price) / first_price * 10_000
+            momentum = 50 + 50 * math.tanh(change_bp / momentum_scale)
+        else:
+            momentum = 50
+
+        prices = [b.close_price for b in buckets if b.close_price]
+        changes = [cur - prev for prev, cur in zip(prices, prices[1:])]
+        travel = sum(abs(change) for change in changes)
+        persistence = (50 + 50 * (prices[-1] - prices[0]) / travel
+                       if len(prices) >= 2 and travel else 50)
+
+        traded_qty = sum(b.traded_qty for b in buckets)
+        if traded_qty and last_price:
+            vwap = sum(b.traded_value for b in buckets) / traded_qty
+            vwap_bp = (last_price - vwap) / vwap * 10_000
+            vwap_score = 50 + 50 * math.tanh(vwap_bp / max(1, momentum_scale / 2))
+        else:
+            vwap_score = 50
+
+        split = now - lookback / 3
+        recent_ticks = sum(b.tick_count for b in buckets if b.sec >= split)
+        previous_ticks = sum(b.tick_count for b in buckets if b.sec < split)
+        recent_rate = recent_ticks / (lookback / 3)
+        previous_rate = previous_ticks / (lookback * 2 / 3)
+        denom = recent_rate + previous_rate
+        acceleration = (recent_rate - previous_rate) / denom if denom else 0
+        direction = max(-1, min(1, (flow - 50) / 50))
+        acceleration_score = 50 + 50 * acceleration * direction
+
+        components = (pressure, flow, momentum, persistence, vwap_score,
+                      acceleration_score)
+        score = sum(value * weight for value, weight in zip(components, weights))
+        return max(0, min(100, score))
+
+    @classmethod
+    def _multi_horizon_prediction(cls, items, stored, history, quotes=(), now=None):
+        """3·5·10분 상승압력과 5분 중심 종합점수를 반환한다."""
+        now = time.monotonic() if now is None else now
+        recent = [item for item in items if item[0] >= now - 10 and item[1]]
+        pressure = cls._prediction_score(recent, stored, quotes)
+        if pressure is None:
+            return None, (None,) * len(PREDICT_HORIZONS)
+
+        scores = []
+        for _, lookback, min_span, scale, weights, _ in PREDICT_HORIZONS:
+            scores.append(cls._horizon_score(
+                history, pressure, now, lookback, min_span, scale, weights))
+        available = [(score, spec[-1]) for score, spec in zip(scores, PREDICT_HORIZONS)
+                     if score is not None]
+        if not available:
+            return None, tuple(scores)
+        total_weight = sum(weight for _, weight in available)
+        combined = sum(score * weight for score, weight in available) / total_weight
+        return max(0, min(100, combined)), tuple(scores)
+
+    def _prediction_values(self, code, stored, now):
+        """같은 초에는 다중구간 계산 결과를 재사용한다."""
+        stamp = int(now)
+        cached = self._prediction_cache.get(code)
+        if cached and cached[0] == stamp:
+            return cached[1]
+        result = self._multi_horizon_prediction(
+            self.ticks.get(code, ()), stored,
+            self.prediction_history.get(code, ()), self.quotes.get(code, ()), now)
+        self._prediction_cache[code] = (stamp, result)
+        return result
+
     # --- Qt 모델 구현 ---------------------------------------------------
     def rowCount(self, parent=QModelIndex()):
         return len(self.codes)
@@ -517,8 +667,12 @@ class StockModel(QAbstractTableModel):
         return len(COLUMNS)
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
-        if orientation == Qt.Horizontal and role in (Qt.DisplayRole, Qt.ToolTipRole):
-            return COLUMNS[section]  # 툴팁: 칸 좁혀 헤더 글자 잘려도 오버로 확인
+        if orientation == Qt.Horizontal and role == Qt.ToolTipRole:
+            if FIELDS[section] == "predict":
+                return "3·5·10분 단타 상승압력 종합점수 (실제 확률 아님)"
+            return COLUMNS[section]  # 칸 좁혀 헤더 글자 잘려도 오버로 확인
+        if orientation == Qt.Horizontal and role == Qt.DisplayRole:
+            return COLUMNS[section]
         return None
 
     def data(self, index, role=Qt.DisplayRole):
@@ -559,12 +713,16 @@ class StockModel(QAbstractTableModel):
                 return trend
             if role == Qt.TextAlignmentRole:
                 return Qt.AlignRight | Qt.AlignVCenter
-            if n > 500:  # 급증 단계: 500 노랑 / 1000 주황 / 1500 빨강 (볼드)
+            if n >= 100:  # 활동 단계: 보통 회색 / 활발 초록 / 이후 노랑·주황·빨강
                 if role == Qt.BackgroundRole:
+                    if n < 300:
+                        return QColor("#E8ECEF")
+                    if n <= 500:
+                        return QColor("#CDECCF")
                     return QColor("#FFE000") if n <= 1000 else QColor("#FF8C00") if n <= 1500 else RED
                 if role == Qt.ForegroundRole:
                     return WHITE if n > 1500 else QColor("black")
-                if role == Qt.FontRole:
+                if role == Qt.FontRole and n > 500:
                     f = QFont(); f.setBold(True); return f
             return None
         if field == "buy_pct":  # 최근 1분 수량 70% + 건수 30% - 불일치 감점
@@ -589,12 +747,10 @@ class StockModel(QAbstractTableModel):
             if role == Qt.ForegroundRole and pct is not None:
                 return RED if pct >= 55 else BLUE if pct <= 45 else None
             return None
-        if field == "predict":  # 향후 수십 초 상승압력 선행점수 (최근 10초)
+        if field == "predict":  # 3·5·10분 단타 상승압력 종합점수
             now = time.monotonic()
-            items = [(t, q, p) for t, q, p in self.ticks.get(self.codes[index.row()], ())
-                     if t >= now - 10 and q]
-            score = self._prediction_score(
-                items, stored, self.quotes.get(self.codes[index.row()], ()))
+            score, horizon_scores = self._prediction_values(
+                self.codes[index.row()], stored, now)
             if role == Qt.DisplayRole:
                 if score is None:
                     return ""
@@ -604,6 +760,12 @@ class StockModel(QAbstractTableModel):
                 return f"{arrow}{score:3.0f}"
             if role == Qt.UserRole:
                 return score if score is not None else -1
+            if role == Qt.ToolTipRole:
+                parts = [f"{spec[0]} {value:.0f}" if value is not None else f"{spec[0]} 준비중"
+                         for spec, value in zip(PREDICT_HORIZONS, horizon_scores)]
+                combined = f"종합 {score:.0f}" if score is not None else "종합 준비중"
+                return ("단타 상승압력 점수 (확률 아님)\n"
+                        + " | ".join(parts) + "\n" + combined)
             if role == Qt.TextAlignmentRole:
                 return Qt.AlignCenter
             if role == Qt.ForegroundRole and score is not None:
@@ -848,6 +1010,8 @@ class ConditionScreen(QWidget):
         self.table.setColumnWidth(BAR_COL, 70)
         self.table.setColumnWidth(BUY_PCT_COL, 58)
         self.table.setColumnWidth(PREDICT_COL, 58)
+        for col, width in RANK_DEFAULT_WIDTHS.items():
+            self.table.setColumnWidth(col, width)
         self.table.setItemDelegate(PreserveTextColorDelegate(self.table))
         self.table.setItemDelegateForColumn(BAR_COL, BarDelegate(self.table))
         self.table.setItemDelegateForColumn(NAME_COL, NameDelegate(self.table))
@@ -886,10 +1050,23 @@ class ConditionScreen(QWidget):
                 self._sort_order = self.table.horizontalHeader().sortIndicatorOrder()
         # saveState는 컬럼 수가 달라지면 통째로 복원에 실패한다. 이름별 너비를 다시
         # 덮어써 새 컬럼이 추가돼도 기존 컬럼 크기는 그대로 유지한다.
+        removed_bad_width = False
         for col, field in enumerate(FIELDS):
-            width = self._settings.value(self.prefix + "colwidth_" + field)
-            if width is not None:
-                self.table.setColumnWidth(col, int(width))
+            key = self.prefix + "colwidth_" + field
+            width = self._settings.value(key)
+            if width is None:
+                continue
+            try:
+                width = int(width)
+            except (TypeError, ValueError):
+                width = 0
+            if width > 0:
+                self.table.setColumnWidth(col, width)
+            else:  # 구버전이 숨김 컬럼 폭 0을 저장한 값은 즉시 폐기
+                self._settings.remove(key)
+                removed_bad_width = True
+        if removed_bad_width:
+            self._settings.sync()
         self._apply_sort()
         self._view_mode = None  # normal / rank / holdings (None=초기)
         self.set_view_mode("normal")  # 순위/변동 기본 숨김
@@ -929,7 +1106,11 @@ class ConditionScreen(QWidget):
         header = self.table.horizontalHeader()
         self._settings.setValue(self.prefix + "header", header.saveState())
         for col, field in enumerate(FIELDS):
-            self._settings.setValue(self.prefix + "colwidth_" + field, header.sectionSize(col))
+            # 숨김 컬럼은 sectionSize=0이다. 이를 저장하면 순위 화면에서 다시
+            # 표시해도 폭 0으로 남으므로 마지막 정상 너비를 보존한다.
+            if not header.isSectionHidden(col) and header.sectionSize(col) > 0:
+                self._settings.setValue(
+                    self.prefix + "colwidth_" + field, header.sectionSize(col))
         self._settings.sync()  # 강제 종료돼도 디스크에 남게
 
     def _on_cell_clicked(self, index):
@@ -976,6 +1157,11 @@ class ConditionScreen(QWidget):
         prev, self._view_mode = self._view_mode, mode
         for c in RANK_COLS:
             self.table.setColumnHidden(c, mode != "rank")
+        if mode == "rank":
+            # 과거 설정에 숨김 폭 0이 남아 있어도 모든 순위 계열에서 즉시 복구한다.
+            for col, default_width in RANK_DEFAULT_WIDTHS.items():
+                if self.table.columnWidth(col) <= 0:
+                    self.table.setColumnWidth(col, default_width)
         self.rank_period.setVisible(mode == "rank")
         if prev is None:  # 시작 경로: geometry/설정은 창 클래스와 __init__이 이미 복원
             return True
