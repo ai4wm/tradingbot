@@ -52,14 +52,15 @@ MISU_ROLE = Qt.UserRole + 3  # NameDelegate에 미수가능 여부 전달
 NEW_ROLE = Qt.UserRole + 4  # NameDelegate에 신규상장 단계 전달 (3=당일 2=15일이내 1=30일이내 0=아님)
 TPM_TREND_ROLE = Qt.UserRole + 5  # 체결/분 추세: 최근 10초 속도 vs 이전 50초 (-1/0/+1)
 BUY_TREND_ROLE = Qt.UserRole + 6  # 매수% 추세: 최근 20초 비중 vs 이전 40초 (-1/0/+1)
+TPM_PERSIST_ROLE = Qt.UserRole + 7  # 3개 1분 구간 체결 지속력: 둔화(-1)/판단중(0)/유지(+1)
 
 # 단타 예측: (표시명, 과거 관찰구간(초), 최소 표본기간(초), 모멘텀 스케일(bp),
-#              선행압력/매수흐름/모멘텀/지속성/VWAP/체결가속 가중치, 종합 가중치)
+#              선행압력/매수흐름/모멘텀/가격지속/VWAP/체결가속/체결지속 가중치, 종합 가중치)
 # 3·5·10분은 예측 목표구간이며, 관찰구간은 각각 1·3·5분이다.
 PREDICT_HORIZONS = (
-    ("3분", 60, 20, 80,  (0.35, 0.25, 0.15, 0.10, 0.05, 0.10), 0.30),
-    ("5분", 180, 60, 150, (0.25, 0.25, 0.20, 0.15, 0.10, 0.05), 0.45),
-    ("10분", 300, 120, 250, (0.15, 0.20, 0.25, 0.20, 0.15, 0.05), 0.25),
+    ("3분", 60, 20, 80,  (0.30, 0.22, 0.13, 0.08, 0.05, 0.07, 0.15), 0.30),
+    ("5분", 180, 60, 150, (0.22, 0.22, 0.18, 0.12, 0.08, 0.05, 0.13), 0.45),
+    ("10분", 300, 120, 250, (0.13, 0.18, 0.22, 0.17, 0.13, 0.05, 0.12), 0.25),
 )
 
 LIMIT = 29.5  # 상한/하한 판정 임계 (KRX +-30%)
@@ -247,14 +248,17 @@ class NameDelegate(QStyledItemDelegate):
 
 
 class TpmDelegate(QStyledItemDelegate):
-    """체결/분 숫자 오른쪽에 증가=빨강 ▲, 감소=파랑 ▼를 별도 색으로 표시."""
+    """체결/분 숫자 오른쪽에 단기 방향과 장기 지속력 기호를 별도 색으로 표시."""
 
-    def __init__(self, trend_role=TPM_TREND_ROLE, parent=None):
+    def __init__(self, trend_role=TPM_TREND_ROLE, parent=None, persistence_role=None):
         super().__init__(parent)
         self.trend_role = trend_role
+        self.persistence_role = persistence_role
 
     def paint(self, painter, option, index):
         trend = index.data(self.trend_role) or 0
+        persistence = ((index.data(self.persistence_role) or 0)
+                       if self.persistence_role else 0)
         selected = _is_current_row(option, index)
         if not index.data(Qt.DisplayRole):
             opt = QStyleOptionViewItem(option)
@@ -280,8 +284,14 @@ class TpmDelegate(QStyledItemDelegate):
         # 추세가 없어도 삼각형 한 칸을 항상 확보해 숫자가 좌우로 움직이지 않게 한다.
         arrow_w = max(painter.fontMetrics().horizontalAdvance("▲"),
                       painter.fontMetrics().horizontalAdvance("▼")) + 3
-        number_rect = QRect(r.left(), r.top(), max(0, r.width() - arrow_w), r.height())
+        # 지속력 표식은 왼쪽의 작은 도형으로 그려 기존 55px 안팎의 저장된 열 폭에서도
+        # 숫자와 추세 화살표가 잘리거나 좌우로 흔들리지 않게 한다.
+        persistence_w = 8 if self.persistence_role else 0
+        number_rect = QRect(
+            r.left() + persistence_w, r.top(),
+            max(0, r.width() - arrow_w - persistence_w), r.height())
         arrow_rect = QRect(number_rect.right() + 1, r.top(), arrow_w, r.height())
+        persistence_rect = QRect(r.left(), r.top(), persistence_w, r.height())
         painter.setPen(opt.palette.text().color())
         painter.drawText(number_rect, Qt.AlignRight | Qt.AlignVCenter, text)
         if trend:
@@ -290,6 +300,23 @@ class TpmDelegate(QStyledItemDelegate):
             hot_tpm = self.trend_role == TPM_TREND_ROLE and (index.data(Qt.UserRole) or 0) > 1500
             painter.setPen(WHITE if trend > 0 and hot_tpm else RED if trend > 0 else BLUE)
             painter.drawText(arrow_rect, Qt.AlignRight | Qt.AlignVCenter, arrow)
+        if persistence:
+            hot_tpm = (index.data(Qt.UserRole) or 0) > 1500
+            dark = option.palette.base().color().lightness() < 128
+            color = (QColor("#087F23") if persistence > 0
+                     else QColor("#A0A7B4") if dark else QColor("#5E6470"))
+            painter.setPen(WHITE if hot_tpm else color)
+            center = persistence_rect.center()
+            if persistence > 0:
+                painter.setBrush(WHITE if hot_tpm else color)
+                painter.drawEllipse(QRect(center.x() - 2, center.y() - 2, 5, 5))
+            else:
+                painter.setBrush(Qt.NoBrush)
+                painter.drawPolygon(QPolygon([
+                    QPoint(center.x() - 3, center.y() - 2),
+                    QPoint(center.x() + 3, center.y() - 2),
+                    QPoint(center.x(), center.y() + 3),
+                ]))
         if selected:
             _draw_selection_lines(painter, option.rect, option.palette)
         painter.restore()
@@ -361,6 +388,7 @@ class StockModel(QAbstractTableModel):
         self.ticks: dict[str, deque] = {}    # (체결시각, 부호있는 개별체결량, 체결가) 최근 60초
         self.quotes: dict[str, deque] = {}   # (시각, 1~5호가 (매도/매수 가격·잔량)) 최근 15초
         self.prediction_history: dict[str, deque] = {}  # 최근 5분 1초 체결 요약
+        self._activity_since: dict[str, float] = {}     # 3분 지속력의 완전한 관찰 여부
         self._prediction_cache: dict[str, tuple] = {}   # 같은 초의 반복 data() 계산 방지
 
     # --- 웹소켓/전략 계층이 부르는 API ---------------------------------
@@ -372,6 +400,7 @@ class StockModel(QAbstractTableModel):
         self.beginInsertRows(QModelIndex(), row, row)
         self.codes.append(code)
         self.rows[code] = {f: "" if f in ("name", "time") else 0 for f in STORED}
+        self._activity_since[code] = time.monotonic()
         self.endInsertRows()
         self.update_stock(code, data)  # exp 게이트/파생/로그를 신규 행에도 동일 적용
 
@@ -386,6 +415,7 @@ class StockModel(QAbstractTableModel):
         self.ticks.pop(code, None)
         self.quotes.pop(code, None)
         self.prediction_history.pop(code, None)
+        self._activity_since.pop(code, None)
         self._prediction_cache.pop(code, None)
         self.endRemoveRows()
 
@@ -502,6 +532,29 @@ class StockModel(QAbstractTableModel):
         """최근 체결 지표 감쇠 갱신: 틱이 끊겨도 1초마다 재계산."""
         if self.codes:
             self.dataChanged.emit(self.index(0, TPM_COL), self.index(len(self.codes) - 1, PREDICT_COL))
+
+    @staticmethod
+    def _tpm_persistence(history, now, observed_since):
+        """최근/이전/2분 전 체결 건수로 3분 활동 유지 또는 둔화를 판정한다."""
+        sec = int(now)
+        counts = tuple(
+            sum(b.tick_count for b in history
+                if sec - 60 * (offset + 1) < b.sec <= sec - 60 * offset)
+            for offset in range(3)
+        )
+        if now - observed_since < 180:
+            return 0, counts, None
+
+        current, previous, older = counts
+        prior_peak = max(previous, older)
+        retention = current / prior_peak * 100 if prior_peak else None
+        peak = max(counts)
+        continuity = min(counts) / peak if peak else 0
+        if min(counts) >= 100 and continuity >= 0.60:
+            return 1, counts, retention
+        if prior_peak >= 300 and current < previous and current < prior_peak * 0.60:
+            return -1, counts, retention
+        return 0, counts, retention
 
     @staticmethod
     def _combined_buy_pct(items):
@@ -621,9 +674,45 @@ class StockModel(QAbstractTableModel):
         direction = max(-1, min(1, (flow - 50) / 50))
         acceleration_score = 50 + 50 * acceleration * direction
 
+        activity_persistence = cls._activity_persistence_score(
+            buckets, now, direction)
+
         components = (pressure, flow, momentum, persistence, vwap_score,
-                      acceleration_score)
+                      acceleration_score, activity_persistence)
         score = sum(value * weight for value, weight in zip(components, weights))
+        return max(0, min(100, score))
+
+    @staticmethod
+    def _activity_persistence_score(buckets, now, direction):
+        """관찰구간을 3등분해 체결활동의 유지·소멸을 매매 방향과 결합한다."""
+        if not buckets:
+            return 50
+        start = float(buckets[0].sec)
+        span = now - start
+        if span < 60:  # 짧은 순간 버스트를 지속으로 오인하지 않는다.
+            return 50
+        width = span / 3
+        counts = []
+        for part in range(3):
+            lower = start + width * part
+            upper = start + width * (part + 1)
+            counts.append(sum(
+                b.tick_count for b in buckets
+                if b.sec >= lower and (b.sec < upper or part == 2 and b.sec <= now)))
+        rates = [count / width for count in counts]
+        peak_rate = max(rates)
+        if not peak_rate:
+            return 50
+
+        # 300건/분이면 활동도 가중치를 최대로 반영한다. 유지율 60% 미만은
+        # 지속 신호가 아니라 소멸 신호로 뒤집어 매수·매도 방향에 맞게 감점한다.
+        activity_level = min(1, peak_rate * 60 / 300)
+        prior_peak = max(rates[0], rates[1])
+        retention = rates[2] / prior_peak if prior_peak else 1
+        continuity = min(rates) / peak_rate
+        persistence_signal = (continuity if retention >= 0.60
+                              else -(0.60 - retention) / 0.60)
+        score = 50 + 50 * activity_level * persistence_signal * direction
         return max(0, min(100, score))
 
     @classmethod
@@ -668,6 +757,8 @@ class StockModel(QAbstractTableModel):
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
         if orientation == Qt.Horizontal and role == Qt.ToolTipRole:
+            if FIELDS[section] == "tpm":
+                return "최근 60초 체결 건수 (▲/▼ 단기 속도, ● 3분 유지, ▽ 고활성 둔화)"
             if FIELDS[section] == "predict":
                 return "3·5·10분 단타 상승압력 종합점수 (실제 확률 아님)"
             return COLUMNS[section]  # 칸 좁혀 헤더 글자 잘려도 오버로 확인
@@ -696,7 +787,8 @@ class StockModel(QAbstractTableModel):
             return None
         if field == "tpm":  # 체결/분 = 최근 60초 체결 틱수, 매번 계산 (저장 안 함)
             now = time.monotonic()
-            dq = self.ticks.get(self.codes[index.row()], ())
+            code = self.codes[index.row()]
+            dq = self.ticks.get(code, ())
             n = sum(1 for t, _, _ in dq if t >= now - 60)
             recent = sum(1 for t, _, _ in dq if t >= now - 10)
             previous = n - recent
@@ -711,6 +803,20 @@ class StockModel(QAbstractTableModel):
                 return n
             if role == TPM_TREND_ROLE:
                 return trend
+            if role in (TPM_PERSIST_ROLE, Qt.ToolTipRole):
+                persistence, counts, retention = self._tpm_persistence(
+                    self.prediction_history.get(code, ()), now,
+                    self._activity_since.get(code, now))
+                if role == TPM_PERSIST_ROLE:
+                    return persistence
+                current, previous, older = counts
+                if retention is None:
+                    status = "지속력 준비중 (편입 후 3분 필요)"
+                else:
+                    label = "유지 ●" if persistence > 0 else "둔화 ▽" if persistence < 0 else "보통"
+                    status = f"유지율 {retention:.0f}% · {label}"
+                return (f"최근 1분 {current}건 | 이전 1분 {previous}건 | "
+                        f"2분 전 {older}건\n{status}")
             if role == Qt.TextAlignmentRole:
                 return Qt.AlignRight | Qt.AlignVCenter
             if n >= 100:  # 활동 단계: 보통 회색 / 활발 초록 / 이후 노랑·주황·빨강
@@ -1015,7 +1121,9 @@ class ConditionScreen(QWidget):
         self.table.setItemDelegate(PreserveTextColorDelegate(self.table))
         self.table.setItemDelegateForColumn(BAR_COL, BarDelegate(self.table))
         self.table.setItemDelegateForColumn(NAME_COL, NameDelegate(self.table))
-        self.table.setItemDelegateForColumn(TPM_COL, TpmDelegate(TPM_TREND_ROLE, self.table))
+        self.table.setItemDelegateForColumn(
+            TPM_COL, TpmDelegate(
+                TPM_TREND_ROLE, self.table, persistence_role=TPM_PERSIST_ROLE))
         self.table.setItemDelegateForColumn(BUY_PCT_COL, TpmDelegate(BUY_TREND_ROLE, self.table))
         self.table.setSelectionBehavior(QTableView.SelectRows)
         self.table.setSelectionMode(QTableView.NoSelection)  # Windows 네이티브 선택 세로 바 차단
