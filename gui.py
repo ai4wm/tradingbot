@@ -35,6 +35,9 @@ STORED = (set(FIELDS) - {"streak", "mcap", "tpm", "buy_pct", "program", "predict
     "open", "low", "high", "base", "upper", "lower"} | BOOK_FIELDS
 BAR_COL = FIELDS.index("bar")
 NAME_COL = FIELDS.index("name")
+TIME_COL = FIELDS.index("time")
+BID_QTY_COL = FIELDS.index("bid_qty")
+NON_LIMIT_IGNORED_SORT_COLS = {TIME_COL, BID_QTY_COL}
 STREAK_COL = FIELDS.index("streak")
 MCAP_COL = FIELDS.index("mcap")
 TPM_COL = FIELDS.index("tpm")
@@ -394,27 +397,38 @@ class ProgramDelegate(QStyledItemDelegate):
         painter.restore()
 
 
-def _at_limit(d: dict) -> bool:
-    """상한가 상태: 실제(현재가=상한가) 또는 예상(예상등락률≥상한).
-    동시호가 땐 체결 전이라 예상으로, 장중엔 실제로 잡힌다."""
-    return (d["upper"] > 0 and d["price"] == d["upper"]) or (d["exp_price"] > 0 and d["exp_rate"] >= LIMIT)
-
-
-def _eff_rate(d: dict) -> float:
-    """유효 등락률: 예상값이 살아있으면(동시호가/VI/단일가) 예상등락률, 아니면 실제.
-    VI/단일가 종목은 rate가 마지막 체결에 얼어있어 예상으로 비교해야 순위가 맞다."""
-    return d["exp_rate"] if d["exp_price"] else d["rate"]
+def _limit_tier(d: dict) -> int:
+    """상한가정렬 우선순위. 당일 거래량 0은 아직 첫 체결 전인 종목이다."""
+    actual_limit = d["upper"] > 0 and d["price"] == d["upper"]
+    expected_limit = d["exp_price"] > 0 and d["exp_rate"] >= LIMIT
+    if d["vol"] == 0 and expected_limit:
+        return 0 if d["ask_qty"] == 0 else 1
+    if d["vol"] > 0 and d["ask_qty"] == 0:
+        if actual_limit:
+            return 2
+        if expected_limit:
+            return 3
+    return 4
 
 
 class TieredProxy(QSortFilterProxyModel):
     """상한가정렬 모드(limit_mode):
-    상한(실제/예상)&매도잔량0 그룹을 항상 위로 고정하고, 그룹 안은 현재 정렬컬럼으로
-    정렬(아무 컬럼이나 헤더 클릭). 비그룹은 아래에 등락률 내림차순 고정.
+    첫 체결 전 예상상한(매도0 -> 매도있음), 실제 상한, 장중 예상상한 순으로
+    각 그룹을 분리해 위에 고정하고 그룹 안은 현재 정렬컬럼과 정렬방향을 따른다.
     모드 off면 전 컬럼 일반 정렬."""
 
     def __init__(self):
         super().__init__()
         self.limit_mode = False
+        # 상한가진입시간 정렬 중 비상한 그룹이 유지할 마지막 일반 정렬 기준.
+        self._non_limit_sort_col = FIELDS.index("rate")
+        self._non_limit_sort_order = Qt.DescendingOrder
+
+    def sort(self, column, order=Qt.AscendingOrder):
+        if column not in NON_LIMIT_IGNORED_SORT_COLS:
+            self._non_limit_sort_col = column
+            self._non_limit_sort_order = order
+        super().sort(column, order)
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
         # 세로 헤더 = 순위: 프록시 행번호(정렬 순서)로 1..N. 소스 매핑 안 함(편입순서 X).
@@ -427,14 +441,20 @@ class TieredProxy(QSortFilterProxyModel):
             m = self.sourceModel()
             a = m.rows[m.codes[left.row()]]
             b = m.rows[m.codes[right.row()]]
-            ga = _at_limit(a) and a["ask_qty"] == 0
-            gb = _at_limit(b) and b["ask_qty"] == 0
+            ta, tb = _limit_tier(a), _limit_tier(b)
             desc = self.sortOrder() == Qt.DescendingOrder
-            if ga != gb:  # 비그룹은 정렬방향 무관 항상 맨 아래
-                return desc if not ga else (not desc)
-            if not ga:    # 비그룹끼리: 유효 등락률 내림차순 고정(방향 무관)
-                return _eff_rate(a) < _eff_rate(b) if desc else _eff_rate(a) > _eff_rate(b)
-            # 그룹끼리: 현재 정렬컬럼으로 일반 비교
+            if ta != tb:  # 우선순위 그룹 순서는 현재 정렬방향과 무관하게 고정
+                return ta > tb if desc else ta < tb
+            if ta == 4 and left.column() in NON_LIMIT_IGNORED_SORT_COLS:
+                # 진입시간/매수잔량은 비상한 그룹에 적용하지 않고 직전 정렬을 유지한다.
+                fallback_left = m.index(left.row(), self._non_limit_sort_col)
+                fallback_right = m.index(right.row(), self._non_limit_sort_col)
+                reverse = ((self._non_limit_sort_order == Qt.DescendingOrder)
+                           != desc)
+                if reverse:
+                    return super().lessThan(fallback_right, fallback_left)
+                return super().lessThan(fallback_left, fallback_right)
+            # 같은 우선순위 그룹끼리: 현재 정렬컬럼으로 일반 비교
         return super().lessThan(left, right)
 
 
@@ -1284,7 +1304,9 @@ class ConditionScreen(QWidget):
         self.sound_check = QCheckBox("소리")
         self.sound_check.setToolTip("새 종목이 편입되면 소리 알림 (실시간/재조회 모두)")
         self.limit_sort = QCheckBox("상한↑")
-        self.limit_sort.setToolTip("상한(실제/예상)&매도0 종목을 위로 고정, 컬럼 클릭으로 그룹 내 정렬")
+        self.limit_sort.setToolTip(
+            "상한가 우선순위를 위에 고정하고 각 그룹은 선택한 컬럼으로 정렬"
+            " (진입시간·매수잔량은 비상한 종목 제외)")
         self._checkbox_style = VisibleCheckStyle()
         self._checkbox_style.setParent(self)
         for checkbox in (self.auto_refresh, self.auto_remove, self.sound_check, self.limit_sort):
