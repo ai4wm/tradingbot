@@ -445,6 +445,11 @@ class TieredProxy(QSortFilterProxyModel):
             desc = self.sortOrder() == Qt.DescendingOrder
             if ta != tb:  # 우선순위 그룹 순서는 현재 정렬방향과 무관하게 고정
                 return ta > tb if desc else ta < tb
+            if ta == 2 and left.column() == TIME_COL:
+                # 실제 상한가 그룹에서는 진입시간 미수신 종목을 항상 뒤로 보낸다.
+                a_has_time, b_has_time = bool(a["time"]), bool(b["time"])
+                if a_has_time != b_has_time:
+                    return not a_has_time if desc else a_has_time
             if ta == 4 and left.column() in NON_LIMIT_IGNORED_SORT_COLS:
                 # 진입시간/매수잔량은 비상한 그룹에 적용하지 않고 직전 정렬을 유지한다.
                 fallback_left = m.index(left.row(), self._non_limit_sort_col)
