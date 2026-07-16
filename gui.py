@@ -205,7 +205,7 @@ class BarDelegate(QStyledItemDelegate):
         painter.drawLine(x(low), yc, x(high), yc)  # 심지: 저가~고가
         lo, hi = (op, close) if op else (close, close)  # 시가 없으면 종가 마커
         x0, x1 = sorted((x(lo), x(hi)))
-        painter.fillRect(QRect(x0, r.top() + 2, max(2, x1 - x0), r.height() - 4), color)
+        painter.fillRect(QRect(x0, r.top() + 2, max(2, x1 - x0 + 1), r.height() - 4), color)
         painter.restore()
 
 
