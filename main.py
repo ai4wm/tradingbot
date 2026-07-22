@@ -145,8 +145,12 @@ class View:
             asyncio.ensure_future(self._switch_condition(seq))
 
     async def _switch_condition(self, seq: str):
-        if seq != self.seq:  # 조건 변경: 이전 조건 해제 + 이 창 행 전량 정리
+        changed = seq != self.seq
+        if changed:  # 조건 변경: 이전 조건 해제 + 이 창 행 전량 정리
             await self.stop()
+            # 창 닫기와 조건 전환이 겹쳐도 이전 참조수가 새 REG를 삼키지 않게
+            # 다음 묶음에서 서버 등록을 현재 화면 기준으로 전량 재확인한다.
+            self.app.force_real_sync()
         elif seq not in RANK_SEQS and seq != HOLDINGS_SEQ:  # 같은 조건식 재조회
             await self.app.clear_condition_if_sole(self.seq, self)
         mode = "rank" if seq in RANK_SEQS else "holdings" if seq == HOLDINGS_SEQ else "normal"
@@ -357,10 +361,11 @@ class App:
         self._condition_reload_id = 0   # 재조회 타임아웃과 실제 응답의 경합 방지
         self._market = None             # MarketInfo (새 창 모델 주입용)
         self._limit_cnt = None          # 어제까지 연속상한 일수 (연상 컬럼, 시작 시 1회, 일봉 계산)
-        # REG/REMOVE는 0.3초 모아 각 1건으로 (서버 105110 유량거부 방지).
-        # Counter: 두 창이 같은 종목을 등록하면 참조수 2가 되도록 발생 횟수 유지.
-        self._reg_pending = Counter()
-        self._rm_pending = Counter()
+        # 화면 변경을 0.3초 모은 뒤, 현재 보이는 행 전체와 WS 등록 상태를 동기화한다.
+        # 편입/이탈 이벤트 횟수로 참조수를 증감하면 중복 이벤트나 창 전환 경합 때
+        # 실제 화면과 참조수가 어긋날 수 있으므로 화면 모델을 단일 진실로 삼는다.
+        self._real_dirty = False
+        self._real_force_pending = False
         self._reg_task = None
         # 단일가 종목은 WS 무송신(실측 0건) -> REST 3초 폴이 유일한 채널
         self._single_task = None
@@ -555,33 +560,38 @@ class App:
             await self.ws.clear_condition(seq)
 
     def queue_real(self, code: str, add: bool, suffix: str = None):
-        tgt, opp = ((self._reg_pending, self._rm_pending) if add
-                    else (self._rm_pending, self._reg_pending))
-        key = (code, suffix)
-        if opp[key] > 0:  # 같은 창/시장소스에서 편입<->이탈이 겹치면 상쇄
-            opp[key] -= 1
-            if opp[key] == 0:
-                del opp[key]
-        else:
-            tgt[key] += 1
+        # code/add/suffix는 호출부 의미를 드러내기 위해 유지한다. 실제 목표 상태는
+        # 이벤트 횟수가 아니라 활성 창의 model.codes에서 다시 계산한다.
+        self._real_dirty = True
         if not (self._reg_task and not self._reg_task.done()):
             self._reg_task = asyncio.ensure_future(self._flush_real())
 
+    def force_real_sync(self):
+        """조건 전환/창 닫기 뒤 서버 등록도 전량 재확인한다."""
+        self._real_force_pending = True
+        self._real_dirty = True
+        if not (self._reg_task and not self._reg_task.done()):
+            self._reg_task = asyncio.ensure_future(self._flush_real())
+
+    def _desired_real_refs(self) -> Counter:
+        """현재 활성 창의 보이는 행을 (코드, 시장접미사)별 참조수로 만든다."""
+        refs = Counter()
+        for view in self.views:
+            suffix = view._real_suffix()
+            for code in view.screen.model.codes:
+                refs[(code, suffix)] += 1
+        return refs
+
     async def _flush_real(self):
-        await asyncio.sleep(0.3)
-        reg = list(self._reg_pending.elements())  # 발생 횟수 유지 (참조수 = 창 수)
-        rm = list(self._rm_pending.elements())
-        self._reg_pending.clear()
-        self._rm_pending.clear()
-        for items, add in ((rm, False), (reg, True)):
-            by_suffix = {}
-            for code, suffix in items:
-                by_suffix.setdefault(suffix, []).append(code)
-            for suffix, codes in by_suffix.items():
-                if add:
-                    await self.ws.register_real_many(sorted(codes), suffix)
-                else:
-                    await self.ws.remove_real_many(sorted(codes), suffix)
+        while True:
+            await asyncio.sleep(0.3)
+            self._real_dirty = False
+            force = self._real_force_pending
+            self._real_force_pending = False
+            await self.ws.sync_real_refs(self._desired_real_refs(), force=force)
+            # 위 await 중 화면이 다시 바뀌면 dirty가 켜진다. 후속 상태도 빠짐없이 반영한다.
+            if not self._real_dirty and not self._real_force_pending:
+                return
 
     def _on_single_poll(self):
         codes = sorted({c for v in self.views if v.seq != NXT_RATE_SEQ
@@ -679,6 +689,7 @@ class App:
             if v.screen.window() is win:
                 asyncio.ensure_future(v.stop())
                 self.views.remove(v)
+                self.force_real_sync()
         if win in self._extra_windows:
             self._extra_windows.remove(win)
         self._save_window_count()

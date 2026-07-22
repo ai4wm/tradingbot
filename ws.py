@@ -200,6 +200,43 @@ class WSClient:
         if todo:
             await self._send(build_remove([self._registered_item(k) for k in todo], REAL_TYPES))
 
+    async def sync_real_refs(self, desired: dict[tuple[str, str | None], int],
+                             force: bool = False):
+        """활성 화면에서 계산한 목표 참조수와 서버/내부 등록 상태를 일치시킨다.
+
+        중복 조건 이벤트나 창 닫기·전환 경합으로 누적 참조수가 틀어져도 다음
+        동기화에서 복구된다. force는 서버 쪽 구독까지 REMOVE+REG로 재확인한다.
+        """
+        target = {}
+        for key, count in desired.items():
+            if count <= 0:
+                continue
+            if key not in target and len(target) >= config.REAL_REG_LIMIT:
+                log.warning("real-time reg limit %d, skip %s", config.REAL_REG_LIMIT, key[0])
+                continue
+            target[key] = int(count)
+
+        current_keys = set(self._reg_codes)
+        target_keys = set(target)
+        sort_key = lambda k: (k[0], k[1] or "")
+        remove = sorted(current_keys - target_keys, key=sort_key)
+        register = sorted(target_keys - current_keys, key=sort_key)
+        if force:
+            # 내부 카운트가 맞아 보여도 서버 구독이 사라진 경우까지 복구한다.
+            remove = sorted(current_keys, key=sort_key)
+            register = sorted(target_keys, key=sort_key)
+
+        # 연결이 끊긴 순간이어도 재접속의 _resubscribe가 목표 상태를 사용하도록
+        # 송신 전에 내부 상태를 확정한다.
+        self._reg_codes = target
+        if remove:
+            await self._send(build_remove([self._registered_item(k) for k in remove], REAL_TYPES))
+        if register:
+            await self._send(build_reg([self._registered_item(k) for k in register], REAL_TYPES))
+        if force or remove or register:
+            log.info("real sync: refs=%d unique=%d +%d/-%d force=%s",
+                     sum(target.values()), len(target), len(register), len(remove), force)
+
     async def set_real_suffix(self, suffix: str):
         """KRX 전용("") <-> 통합("_AL") 런타임 전환: 기존 등록 전부 갈아끼움."""
         if suffix == self.real_suffix:
