@@ -484,8 +484,9 @@ class App:
             if self._rank is not None:
                 self._rank.set_market(self._market)
             m = self._market
-            log.info("kosdaq %d, single %d, nxt %d, misu %d, admin %d",
-                     len(m.kosdaq), len(m.single), len(m.nxt), len(m.misu), len(m.admin))
+            log.info("kosdaq %d, single %d, liquidation %d, nxt %d, misu %d, admin %d",
+                     len(m.kosdaq), len(m.single), len(m.liquidation),
+                     len(m.nxt), len(m.misu), len(m.admin))
         except Exception as e:  # noqa: BLE001
             log.warning("market_info failed: %s", e)
         try:
@@ -504,9 +505,9 @@ class App:
             m.limit_cnt = self._limit_cnt
         if self._market is None:
             return
-        m.kosdaq, m.single, m.nxt, m.misu, m.admin = (
-            self._market.kosdaq, self._market.single, self._market.nxt,
-            self._market.misu, self._market.admin)
+        m.kosdaq, m.single, m.liquidation, m.nxt, m.misu, m.admin = (
+            self._market.kosdaq, self._market.single, self._market.liquidation,
+            self._market.nxt, self._market.misu, self._market.admin)
         m.new_today, m.new15, m.new30 = (
             self._market.new_today, self._market.new15, self._market.new30)
         m.shares = self._market.shares

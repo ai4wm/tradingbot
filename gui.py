@@ -491,6 +491,7 @@ class StockModel(QAbstractTableModel):
         self._exp_live: set[str] = set()     # 예상 컬럼 표시중
         self.kosdaq: set[str] = set()        # 코스닥 코드 집합 (main이 시작 시 주입)
         self.single: set[str] = set()        # 단일가 매매 종목: 예상값 상시 표시 (main 주입)
+        self.liquidation: set[str] = set()   # 정리매매: 가격제한폭 없음 (main 주입)
         self.nxt: set[str] = set()           # 넥스트레이드(NXT) 거래가능: 좌상단 노랑 삼각형 (main 주입)
         self.misu: set[str] = set()          # 미수가능(증거금<100%): 우상단 녹색 삼각형 (main 주입)
         self.admin: set[str] = set()         # 관리종목: 종목명 경고색 (코스닥보다 우선, main 주입)
@@ -1234,8 +1235,12 @@ class StockModel(QAbstractTableModel):
         rate = stored["rate"]
         er = stored["exp_rate"]
         up, lo, pr, ep = stored["upper"], stored["lower"], stored["price"], stored["exp_price"]
+        code = self.codes[index.row()]
+        # 정리매매는 가격제한폭이 없으므로 API가 명목 상/하한가를 주더라도 배경색을 칠하지 않는다.
+        if code in self.liquidation:
+            is_limit = exp_is_limit = False
         # 상한/하한가 값이 있으면 실제 도달 여부로 판정(29.75%≠30% 오탐 방지), 없으면 rate 폴백
-        if up > 0 and lo > 0:
+        elif up > 0 and lo > 0:
             is_limit = pr >= up or pr <= lo
             exp_is_limit = ep >= up or (ep > 0 and ep <= lo)
         else:
@@ -1248,7 +1253,6 @@ class StockModel(QAbstractTableModel):
                 return RED if er > 0 else BLUE
         if role == Qt.ForegroundRole:
             if field == "name":
-                code = self.codes[index.row()]
                 if code in self.admin:       # 관리종목 = 경고색 (코스닥보다 우선)
                     return ADMIN
                 return PURPLE if code in self.kosdaq else None

@@ -63,6 +63,7 @@ class RankModel(QAbstractTableModel):
         self.nxt: set[str] = set()
         self.misu: set[str] = set()
         self.admin: set[str] = set()
+        self.liquidation: set[str] = set()
         self.new_today: set[str] = set()
         self.new15: set[str] = set()
         self.new30: set[str] = set()
@@ -119,7 +120,9 @@ class RankModel(QAbstractTableModel):
                 return Qt.AlignCenter
             # prev_rate=마지막 스트레치 컬럼: 왼쪽 정렬이라야 데이터가 붙어 창 폭 줄이기 좋음
             return (Qt.AlignLeft if f in ("name", "prev_rate") else Qt.AlignRight) | Qt.AlignVCenter
-        if code in self.new_today:
+        if code in self.liquidation:
+            is_limit = False
+        elif code in self.new_today:
             is_limit = f == "rate" and (-40.0 <= v <= -39.5 or 299.5 <= v <= 300.0)
         else:
             is_limit = f == "rate" and LIMIT <= abs(v) <= 30.0
@@ -270,6 +273,7 @@ class RankScreen(QWidget):
     def set_market(self, market: MarketInfo) -> None:
         self.model.kosdaq, self.model.nxt, self.model.misu, self.model.admin = (
             market.kosdaq, market.nxt, market.misu, market.admin)
+        self.model.liquidation = market.liquidation
         self.model.new_today, self.model.new15, self.model.new30 = (
             market.new_today, market.new15, market.new30)
         if self.model.rows:
@@ -404,6 +408,9 @@ def _demo():
     assert d(0, 3, Qt.ForegroundRole) is BLUE and d(2, 3, Qt.ForegroundRole) is RED
     assert d(3, 4, Qt.BackgroundRole) is RED and d(3, 4, Qt.ForegroundRole) is WHITE  # 상한 배경
     assert d(0, 4, Qt.BackgroundRole) is None  # 일반 등락률은 배경 없음
+    m.liquidation = {"042660"}
+    assert d(3, 4, Qt.BackgroundRole) is None and d(3, 4, Qt.ForegroundRole) is RED
+    m.liquidation.clear()
     m.new_today = {"387690"}
     assert d(4, 4, Qt.BackgroundRole) is None and d(4, 4, Qt.ForegroundRole) is RED
     m.kosdaq, m.nxt, m.misu, m.new_today = {"005930"}, {"005930"}, {"005930"}, {"005930"}

@@ -27,6 +27,7 @@ class MarketInfo:
     """ka10099 종목 분류셋 묶음 (시작 시 1회 조회해 gui 모델에 주입)."""
     kosdaq: set[str] = field(default_factory=set)  # 코스닥 (종목명 보라)
     single: set[str] = field(default_factory=set)  # 단일가 매매 (예상값 상시 표시)
+    liquidation: set[str] = field(default_factory=set)  # 정리매매 (가격제한폭 없음)
     nxt: set[str] = field(default_factory=set)     # 넥스트레이드 거래가능 (좌상단 노랑)
     misu: set[str] = field(default_factory=set)    # 미수가능 (우상단 녹색)
     admin: set[str] = field(default_factory=set)   # 관리종목 (종목명 경고색)
@@ -273,8 +274,11 @@ class RestClient:
                     m.misu.add(code)
                 if "관리종목" in state:
                     m.admin.add(code)
-                if r.get("orderWarning") in ("2", "3"):
+                order_warning = r.get("orderWarning")
+                if order_warning in ("2", "3"):
                     m.single.add(code)
+                    if order_warning == "2":
+                        m.liquidation.add(code)
                 elif (r.get("marketCode") in ("0", "10") and not code.endswith("0")
                         and 0 < shares < 500_000):
                     m.single.add(code)  # 저유동성 우선주
