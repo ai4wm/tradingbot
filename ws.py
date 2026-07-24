@@ -114,12 +114,35 @@ def parse_condition_list(data: list) -> list[tuple[str, str]]:
     return sorted(rows, key=lambda r: int(r[0]) if r[0].isdigit() else 1 << 30)
 
 
+def parse_order_item(item: dict) -> dict:
+    """REAL type=00 주문체결 표준 FID를 주문 엔진용으로 정규화."""
+    values = item.get("values", {})
+
+    def integer(fid):
+        return int(abs(_num(values.get(fid))))
+
+    code = str(values.get("9001") or item.get("item") or "")
+    code = code.split("_")[0].lstrip("A")
+    return {
+        "code": code,
+        "order_no": str(values.get("9203") or "").strip(),
+        "original_order_no": str(values.get("904") or "").strip(),
+        "status": str(values.get("913") or "").strip(),
+        "order_qty": integer("900"),
+        "remaining_qty": integer("902") if "902" in values else None,
+        "fill_id": str(values.get("909") or "").strip(),
+        "fill_price": integer("910"),
+        "fill_qty": integer("911"),
+    }
+
+
 class WSClient:
     def __init__(self):
         self.on_condition_event = None    # (seq, code, is_insert) - 실시간 편입/이탈
         self.on_condition_snapshot = None  # (seq, list[code]) - CNSRREQ 초기 목록
         self.on_real = None               # (code, fields)
         self.on_vi = None                 # (code, active, 발동가) - VI 발동/해제
+        self.on_order = None              # type=00 주문접수/체결/취소
         self.on_condition_list = None     # (list[(seq, name)])
         self._ws = None
         self._token_fn = None            # async () -> token
@@ -260,6 +283,7 @@ class WSClient:
                 raise RuntimeError(f"LOGIN failed: {login}")
             log.info("ws connected + LOGIN ok")
             self._connected.set()
+            await self._send(build_reg([""], ["00"], grp_no="2"))
             await self._resubscribe()
             async for raw in ws:
                 await self._dispatch(json.loads(raw))
@@ -306,6 +330,10 @@ class WSClient:
                 self._count_real(item)
                 if item.get("type") == "02":  # 조건검색 실시간 편입/이탈
                     self._on_real_condition(item)
+                    continue
+                if item.get("type") == "00":
+                    if self.on_order:
+                        self.on_order(parse_order_item(item))
                     continue
                 if item.get("type") == "1h":
                     self._on_vi(item)

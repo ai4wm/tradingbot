@@ -83,6 +83,8 @@ class RestClient:
         self.tokens = TokenManager(self._client)
         self._sem = asyncio.Semaphore(1)  # 동시 1건
         self._last_call = 0.0
+        self._order_sem = asyncio.Semaphore(1)
+        self._last_order_call = 0.0
         # 시세 접미사: "" KRX, "_AL" 통합. watch_info 백필이 WS 통합시세를 KRX 종가로
         # 덮어쓰지 않게 ws.real_suffix와 함께 전환 (ka10095 _AL 실측: NXT 야간가 반영)
         self.suffix = ""
@@ -115,6 +117,54 @@ class RestClient:
 
     async def request(self, api_id: str, body: dict, path: str = "/api/dostk/stkinfo") -> dict:
         return (await self._request_raw(api_id, body, path)).json()
+
+    async def _order_request(self, api_id: str, body: dict) -> dict:
+        """주문 전용 5건/초 제한. 일반 조회 1초 제한과 큐를 분리한다."""
+        import time
+        async with self._order_sem:
+            wait = 0.21 - (time.monotonic() - self._last_order_call)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            token = await self.tokens.token()
+            headers = {
+                "authorization": f"Bearer {token}", "api-id": api_id,
+                "Content-Type": "application/json;charset=UTF-8",
+            }
+            r = await self._client.post(
+                f"{config.HOST}/api/dostk/ordr", json=body, headers=headers)
+            self._last_order_call = time.monotonic()
+        r.raise_for_status()
+        data = r.json()
+        if str(data.get("return_code", "0")) not in ("0", ""):
+            raise RuntimeError(data.get("return_msg") or f"{api_id} 주문 실패")
+        return data
+
+    async def buy_order(self, code: str, qty: int, price: int) -> dict:
+        data = await self._order_request("kt10000", {
+            "dmst_stex_tp": "KRX",
+            "stk_cd": code,
+            "ord_qty": str(int(qty)),
+            "ord_uv": str(int(price)),
+            "trde_tp": "0",
+            "cond_uv": "",
+        })
+        order_no = str(data.get("ord_no") or data.get("order_no") or "")
+        if not order_no:
+            raise RuntimeError("매수 주문번호가 응답에 없습니다")
+        return {"order_no": order_no, "raw": data}
+
+    async def cancel_order(
+            self, code: str, original_order_no: str, qty: int) -> dict:
+        data = await self._order_request("kt10003", {
+            "dmst_stex_tp": "KRX",
+            "orig_ord_no": str(original_order_no),
+            "stk_cd": code,
+            "cncl_qty": str(int(qty)),
+        })
+        return {
+            "order_no": str(data.get("ord_no") or data.get("order_no") or ""),
+            "raw": data,
+        }
 
     async def public_ip(self) -> str:
         """공인 IP (키움 REST는 IP 화이트리스트 -> 바뀌면 접속 차단. 감시용). 실패 시 ''."""
@@ -324,6 +374,51 @@ class RestClient:
             if not cont:
                 break
         return out
+
+    async def account_summary(self) -> dict:
+        """주문 화면용 실계좌 요약.
+
+        kt00018: 추정예탁자산, kt00001: 증거금률별 주문가능금액.
+        미수 미사용 기본값은 100% 증거금 주문가능금액을 사용한다.
+        """
+        evlt = await self._request_raw(
+            "kt00018", {"qry_tp": "1", "dmst_stex_tp": "KRX"}, "/api/dostk/acnt")
+        deposit = await self._request_raw("kt00001", {"qry_tp": "3"}, "/api/dostk/acnt")
+        evlt_data = evlt.json()
+        deposit_data = deposit.json()
+        return {
+            "estimated_assets": _to_int(evlt_data.get("prsm_dpst_aset_amt")),
+            "cash_orderable": _to_int(deposit_data.get("100stk_ord_alow_amt")),
+            "cash_deposit": _to_int(deposit_data.get("entr")),
+            "orderable_by_margin": {
+                rate: _to_int(deposit_data.get(f"{rate}stk_ord_alow_amt"))
+                for rate in (20, 30, 40, 50, 60, 100)
+            },
+        }
+
+    async def orderable_quantity(self, code: str, price: int) -> dict:
+        """kt00011: 선택 종목·주문가격 기준 현금/미수 주문가능수량."""
+        r = await self._request_raw(
+            "kt00011", {"stk_cd": code, "uv": str(int(price))}, "/api/dostk/acnt")
+        data = r.json()
+        applied_text = str(data.get("aplc_rt", "100%"))
+        try:
+            applied_rate = int(applied_text.replace("%", "").strip())
+        except ValueError:
+            applied_rate = 100
+        if applied_rate not in (20, 30, 40, 50, 60, 100):
+            applied_rate = 100
+        prefix = f"profa_{applied_rate}"
+        return {
+            "code": code,
+            "price": int(price),
+            "stock_margin_rate": str(data.get("stk_profa_rt", "")),
+            "applied_margin_rate": applied_rate,
+            "cash_amount": _to_int(data.get("profa_100ord_alow_amt")),
+            "cash_qty": _to_int(data.get("profa_100ord_alowq")),
+            "margin_amount": _to_int(data.get(prefix + "ord_alow_amt")),
+            "margin_qty": _to_int(data.get(prefix + "ord_alowq")),
+        }
 
     async def volume_surge(self, tm: str = "60", stex_tp: str = "3",
                            drop_etf: bool = True) -> list[dict]:

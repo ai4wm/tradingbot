@@ -251,10 +251,20 @@ class RankScreen(QWidget):
         self.period.activated.connect(self._on_period)
         self.interval.valueChanged.connect(self._on_interval)
 
+        # resize/move 이벤트는 restoreGeometry 중에도 올 수 있으므로 저장 타이머를 먼저 만든다.
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.timeout.connect(self._save_layout)
+
+        # WindowStaysOnTopHint는 네이티브 창을 재생성할 수 있다. 저장 크기를 복원한 뒤
+        # 적용하면 geometry가 유실되므로, 숨겨진 초기 상태에서 플래그를 먼저 설정한다.
+        on_top = self._settings.value("rank_on_top", "false") == "true"
+        if on_top:
+            self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        self.on_top_btn.setChecked(on_top)  # 아직 toggled 연결 전이라 재적용되지 않음
+
         geo = self._settings.value("rank_geometry")
-        if geo is not None:
-            self.restoreGeometry(geo)
-        else:
+        if geo is None or not self.restoreGeometry(geo):
             self.resize(440, 560)
         state = self._settings.value("rank_header")
         if state is not None:
@@ -262,12 +272,7 @@ class RankScreen(QWidget):
             # restoreState가 옛 정렬값(가운데)까지 되살림 -> 왼쪽 재적용
             self.table.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.on_top_btn.toggled.connect(self._on_top_toggle)
-        if self._settings.value("rank_on_top", "false") == "true":  # 항상위 복원
-            self.on_top_btn.setChecked(True)  # 창 뜨기 전 = 플래그만 걸림(재생성 튐 없음)
         # 크기/컬럼 변경 시 디바운스 저장 (닫을 때만 저장하면 앱 종료 경로 따라 유실)
-        self._save_timer = QTimer(self)
-        self._save_timer.setSingleShot(True)
-        self._save_timer.timeout.connect(self._save_layout)
         self.table.horizontalHeader().sectionResized.connect(lambda *a: self._save_timer.start(400))
 
     def set_market(self, market: MarketInfo) -> None:

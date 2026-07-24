@@ -16,6 +16,7 @@ from PySide6.QtWidgets import QApplication, QMainWindow
 
 from api import RestClient
 from gui import ConditionScreen
+from order import OrderEngine, split_quantity
 from rank import RankScreen, _beep
 from ws import WSClient
 
@@ -37,6 +38,7 @@ RANK_SUBMODE = {RANK_SEQ: "rank", NXT_RATE_SEQ: "nxt_rate",
                 VSURGE_SEQ: "vsurge", TVAL_SEQ: "tval"}
 RANK_SEQS = set(RANK_SUBMODE)
 RANK_TOP = 20          # 순위 모드 실시간 슬롯 캡 (95한도 공유)
+ORDERABLE_PREFETCH_TOP = 20  # 화면에 정렬된 상위 선조회 수
 THEME_MODES = ("system", "dark", "light")
 THEME_UI = {
     "system": ("🖥", "테마: 시스템 — Windows 설정을 따름"),
@@ -351,6 +353,15 @@ class App:
     def __init__(self, screen: ConditionScreen):
         self.rest = RestClient()
         self.ws = WSClient()
+        self.orders = OrderEngine(self.rest, self._on_order_update)
+        self._orderable_cache: dict[tuple[str, int], dict] = {}
+        self._orderable_tasks: dict[ConditionScreen, asyncio.Task] = {}
+        self._orderable_prefetch_task = None
+        self._orderable_prefetch_failed: dict[tuple[str, int], float] = {}
+        self._orderable_prefetch_timer = QTimer()
+        self._orderable_prefetch_timer.timeout.connect(
+            self._queue_orderable_prefetch)
+        self._orderable_prefetch_timer.start(400)
         self._settings = QSettings("layout.ini", QSettings.IniFormat)
         self._theme_mode = str(self._settings.value("theme_mode", "system"))
         if self._theme_mode not in THEME_MODES:
@@ -361,6 +372,7 @@ class App:
         self._condition_reload_id = 0   # 재조회 타임아웃과 실제 응답의 경합 방지
         self._market = None             # MarketInfo (새 창 모델 주입용)
         self._limit_cnt = None          # 어제까지 연속상한 일수 (연상 컬럼, 시작 시 1회, 일봉 계산)
+        self._account_summary = None     # 주문 툴바 공통 실계좌 요약
         # 화면 변경을 0.3초 모은 뒤, 현재 보이는 행 전체와 WS 등록 상태를 동기화한다.
         # 편입/이탈 이벤트 횟수로 참조수를 증감하면 중복 이벤트나 창 전환 경합 때
         # 실제 화면과 참조수가 어긋날 수 있으므로 화면 모델을 단일 진실로 삼는다.
@@ -390,6 +402,7 @@ class App:
         self.ws.on_condition_snapshot = self._on_condition_snapshot
         self.ws.on_real = self._on_real
         self.ws.on_vi = self._on_vi
+        self.ws.on_order = self.orders.on_order_event
         # 통합(_AL) 시세: 전 창 공통 설정. 첫 REG 전에 접미사 확정돼야 해서 여기서 복원
         if self._settings.value("unified_real", "false") == "true":
             self.ws.real_suffix = self.rest.suffix = "_AL"
@@ -417,6 +430,169 @@ class App:
         screen.reload_btn.clicked.connect(self._reload_conditions)
         screen.rank_btn.clicked.connect(self._on_rank)
         screen.newwin_btn.clicked.connect(self._on_newwin)
+        screen.order_target_selected.connect(
+            lambda code, price, target=screen:
+            self._queue_orderable_quantity(target, code, price))
+        screen.order_requested.connect(
+            lambda code, mode, count, auto, total, price, target=screen:
+            self._submit_order(target, code, mode, count, auto, total, price))
+        screen.cancel_requested.connect(self._cancel_order)
+
+    def _queue_orderable_quantity(
+            self, screen: ConditionScreen, code: str, price: int):
+        key = (code, price)
+        cached = self._orderable_cache.get(key)
+        if cached is not None:
+            screen.set_orderable_quantity(code, price, cached)
+            return
+        # 사용자가 직접 고른 종목은 백그라운드 선조회보다 항상 우선한다.
+        if self._orderable_prefetch_task and not self._orderable_prefetch_task.done():
+            self._orderable_prefetch_task.cancel()
+        previous = self._orderable_tasks.get(screen)
+        if previous and not previous.done():
+            previous.cancel()
+        task = asyncio.ensure_future(
+            self._load_orderable_quantity(screen, code, price))
+        self._orderable_tasks[screen] = task
+
+    async def _load_orderable_quantity(
+            self, screen: ConditionScreen, code: str, price: int):
+        try:
+            detail = await self.rest.orderable_quantity(code, price)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:  # noqa: BLE001
+            log.warning("orderable quantity %s@%s: %s", code, price, e)
+            return
+        else:
+            self._orderable_cache[(code, price)] = detail
+            screen.set_orderable_quantity(code, price, detail)
+        finally:
+            if self._orderable_tasks.get(screen) is asyncio.current_task():
+                self._orderable_tasks.pop(screen, None)
+
+    def _prefetch_candidates(self) -> list[tuple[str, int]]:
+        """각 표에 현재 보이는 정렬 순서 그대로 상위 종목을 모은다."""
+        result = []
+        seen = set()
+        for view in self.views:  # 본창 우선, 이후 추가 창 순서
+            screen = view.screen
+            # 편입 직후 시세가 행마다 순차 도착하는 동안 조회를 시작하면 아래 행의
+            # upper가 먼저 채워져 화면 재정렬 전 순서로 선조회될 수 있다.
+            # 이 창의 상한가 기준값이 전부 준비된 다음 실제 프록시 순위를 읽는다.
+            if screen.model.codes and any(
+                    int(screen.model.rows.get(code, {}).get("upper") or 0) <= 0
+                    for code in screen.model.codes):
+                continue
+            for proxy_row in range(screen.proxy.rowCount()):
+                source = screen.proxy.mapToSource(
+                    screen.proxy.index(proxy_row, 0))
+                if not source.isValid():
+                    continue
+                code = screen.model.codes[source.row()]
+                data = screen.model.rows.get(code, {})
+                upper = int(data.get("upper") or 0)
+                key = (code, upper)
+                if upper <= 0 or key in seen:
+                    continue
+                seen.add(key)
+                result.append(key)
+                if len(result) >= ORDERABLE_PREFETCH_TOP:
+                    return result
+        return result
+
+    def _queue_orderable_prefetch(self):
+        if self._orderable_prefetch_task and not self._orderable_prefetch_task.done():
+            return
+        # 직접 선택한 종목 조회가 진행 중이면 끝날 때까지 양보한다.
+        if any(task and not task.done() for task in self._orderable_tasks.values()):
+            return
+        now = time.monotonic()
+        for key in self._prefetch_candidates():
+            if key in self._orderable_cache:
+                continue
+            if now - self._orderable_prefetch_failed.get(key, 0) < 10:
+                continue
+            code, price = key
+            rank = next((
+                row + 1
+                for view in self.views
+                for row in range(view.screen.proxy.rowCount())
+                if view.screen.model.codes[
+                    view.screen.proxy.mapToSource(
+                        view.screen.proxy.index(row, 0)).row()] == code
+            ), 0)
+            log.info("orderable prefetch start: rank=%s code=%s price=%s",
+                     rank or "-", code, price)
+            self._orderable_prefetch_task = asyncio.ensure_future(
+                self._load_orderable_prefetch(*key))
+            return
+
+    async def _load_orderable_prefetch(self, code: str, price: int):
+        try:
+            detail = await self.rest.orderable_quantity(code, price)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:  # noqa: BLE001
+            self._orderable_prefetch_failed[(code, price)] = time.monotonic()
+            log.warning("orderable prefetch %s@%s: %s", code, price, e)
+        else:
+            self._orderable_cache[(code, price)] = detail
+            self._orderable_prefetch_failed.pop((code, price), None)
+            # 선조회 도중 사용자가 이 종목을 골랐다면 즉시 화면에도 반영한다.
+            for view in self.views:
+                view.screen.set_orderable_quantity(code, price, detail)
+
+    def _submit_order(self, screen: ConditionScreen, code: str, mode: str,
+                      count: int, auto_cancel: bool, total_qty: int, price: int):
+        try:
+            quantities = (
+                [100] * count if mode == "fixed"
+                else split_quantity(total_qty, count))
+            name = screen.model.rows.get(code, {}).get("name") or code
+            self.orders.submit(code, name, price, quantities, auto_cancel)
+        except Exception as e:  # noqa: BLE001
+            screen.set_order_state(code, "오류", f"상태 오류 · {e}", False)
+
+    def _cancel_order(self, code: str):
+        try:
+            self.orders.manual_cancel(code)
+        except Exception as e:  # noqa: BLE001
+            for view in self.views:
+                if code in view.screen.model.rows:
+                    view.screen.set_order_state(
+                        code, "오류", f"상태 취소오류 · {e}", False)
+
+    def _on_order_update(self, batch, state: str):
+        count = len(batch.children)
+        mode = "자" if batch.auto_cancel else "수"
+        if batch.error:
+            compact = "장종료" if "장종료" in batch.error else "오류"
+        elif batch.remaining_qty == 0 and batch.sent_count == count:
+            compact = f"{mode} 완료"
+        elif state.startswith("취소"):
+            compact = f"{mode} 취소"
+        else:
+            compact = f"{mode} {batch.sent_count}/{count}"
+        detail = (
+            f"상태 {state} · {'자동취소' if batch.auto_cancel else '수동취소'}"
+            f" · 전송 {batch.sent_count}/{count}"
+            f" · 체결 {batch.total_filled:,}/{batch.total_requested:,}주"
+            f" · 잔량 {batch.remaining_qty:,}주"
+        )
+        if batch.auto_cancel:
+            detail += f" · 취소 {batch.cancel_count}/{count}"
+        if batch.error:
+            detail += f" · {batch.error}"
+        has_remaining = any(
+            child.order_no and child.remaining_qty > 0 and not child.cancel_sent
+            for child in batch.children)
+        reserved = self.orders.committed_notional()
+        for view in self.views:
+            view.screen.set_order_reserved(reserved)
+            if batch.code in view.screen.model.rows:
+                view.screen.set_order_state(
+                    batch.code, compact, detail, has_remaining)
 
     def _reload_conditions(self):
         """조건 목록 재조회 요청. 응답 전후가 화면에 보이도록 버튼 상태도 갱신한다."""
@@ -477,6 +653,15 @@ class App:
         self.ws_task = asyncio.create_task(self.ws.run(self.rest.tokens.token))
         for _ in range(int(self._settings.value("cond_windows", 0))):
             self._open_window()  # 지난 세션의 추가 창 복원
+        try:
+            self._account_summary = await self.rest.account_summary()
+            for v in self.views:
+                v.screen.set_account_summary(self._account_summary)
+            log.info("account summary loaded: estimated=%s orderable=%s",
+                     self._account_summary["estimated_assets"],
+                     self._account_summary["cash_orderable"])
+        except Exception as e:  # noqa: BLE001
+            log.warning("account summary failed: %s", e)
         try:
             self._market = await self.rest.market_info()
             for v in self.views:
@@ -670,6 +855,8 @@ class App:
         win.setCentralWidget(screen)
         view = View(self, screen)
         self._inject_market(view)
+        if self._account_summary is not None:
+            screen.set_account_summary(self._account_summary)
         self.views.append(view)
         self._wire_extra(screen)
         self._extra_windows.append(win)
@@ -682,12 +869,22 @@ class App:
 
     def _wire_extra(self, screen: ConditionScreen):
         screen.reload_btn.clicked.connect(self._reload_conditions)
+        screen.order_target_selected.connect(
+            lambda code, price, target=screen:
+            self._queue_orderable_quantity(target, code, price))
+        screen.order_requested.connect(
+            lambda code, mode, count, auto, total, price, target=screen:
+            self._submit_order(target, code, mode, count, auto, total, price))
+        screen.cancel_requested.connect(self._cancel_order)
 
     def _on_window_closed(self, win):
         if _SHUTDOWN[0]:  # 앱 종료 동반 닫힘: 창 개수 보존 (재시작 때 복원용)
             return
         for v in list(self.views[1:]):
             if v.screen.window() is win:
+                task = self._orderable_tasks.pop(v.screen, None)
+                if task and not task.done():
+                    task.cancel()
                 asyncio.ensure_future(v.stop())
                 self.views.remove(v)
                 self.force_real_sync()

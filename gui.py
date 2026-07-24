@@ -12,27 +12,28 @@ from collections import deque
 from dataclasses import dataclass
 
 from PySide6.QtCore import (
-    QAbstractTableModel, QModelIndex, QPoint, QRect, QSettings, QSortFilterProxyModel, Qt, QTimer, QUrl,
+    QAbstractTableModel, QModelIndex, QPoint, QRect, QSettings, QSortFilterProxyModel, Qt, QTimer, QUrl, Signal,
 )
 from PySide6.QtGui import QColor, QCursor, QDesktopServices, QFont, QIcon, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QHBoxLayout, QHeaderView, QLabel,
-    QMainWindow, QProxyStyle, QPushButton, QSpinBox, QStyle, QStyledItemDelegate, QStyleOptionViewItem, QTableView, QToolTip,
+    QApplication, QButtonGroup, QCheckBox, QComboBox, QHBoxLayout, QHeaderView, QLabel,
+    QLineEdit, QMainWindow, QProxyStyle, QPushButton, QSpinBox, QStyle, QStyledItemDelegate, QStyleOptionViewItem, QTableView, QToolTip,
     QVBoxLayout, QWidget,
 )
 
 log = logging.getLogger("gui")
 
 # 순위/변동: ★조회순위(ka00198) 모드 전용 -> 다른 화면에선 숨김 (set_view_mode)
-COLUMNS = ["순위",  "변동",      "등락률", "연상", "종목명", "현재가", "예상체결가", "L일봉H", "예상등락률", "전일거래량", "거래량", "매도잔량", "매수잔량", "예상체결량", "체결/분", "시총(억)", "상한가진입시간"]
-FIELDS  = ["qrank", "qrank_chg", "rate",   "streak", "name",  "price", "exp_price", "bar",    "exp_rate",   "prev_vol", "vol",   "ask_qty",  "bid_qty",  "exp_qty",  "tpm",    "mcap",   "time"]
+COLUMNS = ["순위",  "변동",      "등락률", "연상", "종목명", "현재가", "예상체결가", "주문",  "L일봉H", "예상등락률", "전일거래량", "거래량", "매도잔량", "매수잔량", "예상체결량", "체결/분", "프매",    "시총(억)", "상한가진입시간"]
+FIELDS  = ["qrank", "qrank_chg", "rate",   "streak", "name",  "price", "exp_price", "order", "bar",    "exp_rate",   "prev_vol", "vol",   "ask_qty",  "bid_qty",  "exp_qty",  "tpm",    "program", "mcap",   "time"]
 # 컬럼은 아니지만 L일봉H 그리기에 필요한 저장 필드 (시/저/고/전일종가/상한/하한)
-# streak(연상)/mcap(시가총액)/tpm(체결/분)은 저장 안 함: 매번 계산
+# streak(연상)/mcap(시가총액)/tpm(체결/분)/program(프매)은 저장 안 함: 매번 계산
 BOOK_FIELDS = {f"{side}_{kind}{level if level > 1 else ''}"
                for side in ("ask", "bid") for kind in ("price", "qty")
                for level in range(1, 6)}
-STORED = (set(FIELDS) - {"streak", "mcap", "tpm"}) | {
-    "open", "low", "high", "base", "upper", "lower"} | BOOK_FIELDS
+STORED = (set(FIELDS) - {"streak", "mcap", "tpm", "program", "order"}) | {
+    "open", "low", "high", "base", "upper", "lower",
+    "program_net_qty"} | BOOK_FIELDS
 BAR_COL = FIELDS.index("bar")
 NAME_COL = FIELDS.index("name")
 TIME_COL = FIELDS.index("time")
@@ -41,6 +42,8 @@ NON_LIMIT_IGNORED_SORT_COLS = {TIME_COL, BID_QTY_COL}
 STREAK_COL = FIELDS.index("streak")
 MCAP_COL = FIELDS.index("mcap")
 TPM_COL = FIELDS.index("tpm")
+PROGRAM_COL = FIELDS.index("program")
+ORDER_COL = FIELDS.index("order")
 RANK_COLS = (FIELDS.index("qrank"), FIELDS.index("qrank_chg"))
 RANK_DEFAULT_WIDTHS = {RANK_COLS[0]: 42, RANK_COLS[1]: 48}
 RANK_PERIODS = {  # 순위 계열 기준시간 콤보: (표시, data). 모드 따라 교체
@@ -51,11 +54,12 @@ BAR_ROLE = Qt.UserRole + 1  # 델리게이트에 (open, high, low, close, base, 
 NXT_ROLE = Qt.UserRole + 2  # NameDelegate에 NXT 종목 여부 전달
 MISU_ROLE = Qt.UserRole + 3  # NameDelegate에 미수가능 여부 전달
 NEW_ROLE = Qt.UserRole + 4  # NameDelegate에 신규상장 단계 전달 (3=당일 2=15일이내 1=30일이내 0=아님)
-TPM_TREND_ROLE = Qt.UserRole + 5  # 체결/분 추세: 최근 10초 속도 vs 이전 50초 (-1/0/+1)
+TPM_PRICE_DIRECTION_ROLE = Qt.UserRole + 5  # 최근 5초 가격 방향: 하락(-1)/보합(0)/상승(+1)
 BUY_TREND_ROLE = Qt.UserRole + 6  # 매수% 추세: 최근 20초 비중 vs 이전 40초 (-1/0/+1)
-TPM_PERSIST_ROLE = Qt.UserRole + 7  # 3개 1분 구간 체결 지속력: 둔화(-1)/판단중(0)/유지(+1)
-PROGRAM_DIRECTION_ROLE = Qt.UserRole + 8  # 프로그램 수량 방향: 매도(-1)/중립(0)/매수(+1)
-PROGRAM_PERSIST_ROLE = Qt.UserRole + 9  # 프로그램 3분 방향 지속: 둔화(-1)/판단중(0)/유지(+1)
+PROGRAM_DIRECTION_ROLE = Qt.UserRole + 8  # 최근 20초 실제 순매수 변화: 감소(-1)/없음(0)/증가(+1)
+TPM_ALERT_ROLE = Qt.UserRole + 11  # 체결속도 순위 하락(-1)/정상(0)/상승(+1)
+TPM_RANK_CHANGE_ROLE = Qt.UserRole + 12  # 최근 순위 이동 구간의 누적 단계 수
+ORDER_CANCEL_ROLE = Qt.UserRole + 13  # 주문 셀 오른쪽 즉시 잔량취소 영역
 
 # 단타 예측: (표시명, 과거 관찰구간(초), 최소 표본기간(초), 모멘텀 스케일(bp),
 #              선행압력/매수흐름/모멘텀/가격지속/VWAP/체결가속/체결지속 가중치, 종합 가중치)
@@ -66,10 +70,13 @@ PREDICT_HORIZONS = (
     ("10분", 300, 120, 250, (0.13, 0.18, 0.22, 0.17, 0.13, 0.05, 0.12), 0.25),
 )
 PROGRAM_PREDICT_WEIGHTS = (0.10, 0.15, 0.20)  # 3·5·10분 예측에서 프로그램 수급 최대 반영률
+TPM_RANK_FLASH_MIN = 3  # 짧은 이동 잡음은 숫자만 표시하고 3단계부터 점멸
+TPM_RANK_BLINK_SECONDS = 1.5  # 마지막 이동 뒤 이 시간까지만 점멸하고 이후 고정색 유지
+TPM_REFRESH_MS = 500  # 실시간 순위 표본·점멸 갱신 주기
 
 LIMIT = 29.5  # 상한/하한 판정 임계 (KRX +-30%)
 # ponytail: 매크로가 2주+로 갈아타면 이 값을 올리거나 금액기준(delta*price)으로 교체
-DESC_FIRST = {"bid_qty", "rate", "price", "exp_price", "exp_rate", "streak", "tpm", "qrank_chg"}  # 첫 클릭 내림차순 컬럼
+DESC_FIRST = {"bid_qty", "rate", "price", "exp_price", "exp_rate", "streak", "tpm", "program", "qrank_chg"}  # 첫 클릭 내림차순 컬럼
 RED  = QColor("#e83030")
 BLUE = QColor("#2050d0")
 PURPLE = QColor("#C080F0")  # 코스닥 종목명
@@ -80,6 +87,8 @@ NEW_MARKS = {3: QColor("#FF3DC8"), 2: QColor("#38B8FF"), 1: QColor("#8098B8")}  
 WHITE = QColor("white")
 TRACK = QColor("#d8d8d8")
 CENTER = QColor("#707070")  # L일봉H 0% 중심선
+TPM_RANK_UP_FLASH = QColor("#FFF176")  # 체결속도 순위 상승: 밝은 노랑
+TPM_RANK_DOWN_FLASH = QColor("#7667D9")  # 체결속도 순위 하락: 보라
 
 
 @dataclass(slots=True)
@@ -105,6 +114,18 @@ class ProgramBucket:
     sec: int
     buy_qty: int = 0
     sell_qty: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class TpmSnapshot:
+    """체결/분 표시 한 번에 필요한 반초 단위 계산값."""
+
+    count: int
+    price_direction: int
+    rank: int
+    rank_change: int
+    rank_moving: bool
+    blink_on: bool
 
 
 def _draw_selection_lines(painter, rect, palette):
@@ -157,6 +178,40 @@ class PreserveTextColorDelegate(QStyledItemDelegate):
         opt.state &= ~(QStyle.State_Selected | QStyle.State_HasFocus)
         super().paint(painter, opt, index)
         if selected:
+            _draw_selection_lines(painter, option.rect, option.palette)
+
+
+class OrderDelegate(QStyledItemDelegate):
+    """주문 상태 왼쪽 + 종목별 잔량취소 오른쪽."""
+
+    CANCEL_WIDTH = 34
+
+    def paint(self, painter, option, index):
+        if not index.data(ORDER_CANCEL_ROLE):
+            super().paint(painter, option, index)
+            return
+        opt = QStyleOptionViewItem(option)
+        opt.state &= ~(QStyle.State_Selected | QStyle.State_HasFocus)
+        self.initStyleOption(opt, index)
+        text = opt.text
+        opt.text = ""
+        style = opt.widget.style() if opt.widget else QApplication.style()
+        style.drawControl(QStyle.CE_ItemViewItem, opt, painter, opt.widget)
+        r = option.rect
+        cancel_rect = QRect(
+            r.right() - self.CANCEL_WIDTH + 1, r.top(),
+            self.CANCEL_WIDTH, r.height())
+        status_rect = QRect(
+            r.left(), r.top(),
+            max(0, r.width() - self.CANCEL_WIDTH), r.height())
+        painter.save()
+        painter.setPen(opt.palette.text().color())
+        painter.drawText(status_rect, Qt.AlignCenter, text)
+        painter.fillRect(cancel_rect.adjusted(1, 1, -1, -1), QColor("#D85A35"))
+        painter.setPen(WHITE)
+        painter.drawText(cancel_rect, Qt.AlignCenter, "취소")
+        painter.restore()
+        if _is_current_row(option, index):
             _draw_selection_lines(painter, option.rect, option.palette)
 
 
@@ -261,17 +316,15 @@ class NameDelegate(QStyledItemDelegate):
 
 
 class TpmDelegate(QStyledItemDelegate):
-    """체결/분 숫자 오른쪽에 단기 방향과 장기 지속력 기호를 별도 색으로 표시."""
+    """왼쪽에 순위변동, 오른쪽에 체결/분과 최근 5초 가격 방향을 표시."""
 
-    def __init__(self, trend_role=TPM_TREND_ROLE, parent=None, persistence_role=None):
+    def __init__(self, trend_role=TPM_PRICE_DIRECTION_ROLE, parent=None):
         super().__init__(parent)
         self.trend_role = trend_role
-        self.persistence_role = persistence_role
 
     def paint(self, painter, option, index):
         trend = index.data(self.trend_role) or 0
-        persistence = ((index.data(self.persistence_role) or 0)
-                       if self.persistence_role else 0)
+        rank_change = index.data(TPM_RANK_CHANGE_ROLE) or 0
         selected = _is_current_row(option, index)
         if not index.data(Qt.DisplayRole):
             opt = QStyleOptionViewItem(option)
@@ -292,55 +345,46 @@ class TpmDelegate(QStyledItemDelegate):
         else:
             painter.fillRect(option.rect, option.palette.base())
         painter.setFont(opt.font)
-        r = option.rect.adjusted(3, 0, -3, 0)
+        r = option.rect.adjusted(1, 0, -1, 0)
         arrow = "▲" if trend > 0 else "▼"
-        # 추세가 없어도 삼각형 한 칸을 항상 확보해 숫자가 좌우로 움직이지 않게 한다.
+        # 화살표 자리는 항상 확보하되 추가 패딩 없이 숫자에 바로 붙인다.
         arrow_w = max(painter.fontMetrics().horizontalAdvance("▲"),
-                      painter.fontMetrics().horizontalAdvance("▼")) + 3
-        # 지속력 표식은 왼쪽의 작은 도형으로 그려 기존 55px 안팎의 저장된 열 폭에서도
-        # 숫자와 추세 화살표가 잘리거나 좌우로 흔들리지 않게 한다.
-        persistence_w = 8 if self.persistence_role else 0
+                      painter.fontMetrics().horizontalAdvance("▼"))
+        rank_text = f"+{rank_change}" if rank_change > 0 else str(rank_change)
+        rank_font = QFont(opt.font)
+        if rank_font.pointSize() > 0:
+            rank_font.setPointSize(max(7, rank_font.pointSize() - 2))
+        rank_w = 0
+        if rank_change:
+            painter.setFont(rank_font)
+            rank_w = min(22, painter.fontMetrics().horizontalAdvance(rank_text) + 1)
+            rank_rect = QRect(r.left(), r.top(), rank_w, r.height())
+            painter.setPen(RED if rank_change > 0 else BLUE)
+            painter.drawText(rank_rect, Qt.AlignLeft | Qt.AlignVCenter, rank_text)
+            painter.setFont(opt.font)
         number_rect = QRect(
-            r.left() + persistence_w, r.top(),
-            max(0, r.width() - arrow_w - persistence_w), r.height())
+            r.left() + rank_w, r.top(),
+            max(0, r.width() - arrow_w - rank_w), r.height())
         arrow_rect = QRect(number_rect.right() + 1, r.top(), arrow_w, r.height())
-        persistence_rect = QRect(r.left(), r.top(), persistence_w, r.height())
         painter.setPen(opt.palette.text().color())
         painter.drawText(number_rect, Qt.AlignRight | Qt.AlignVCenter, text)
         if trend:
             # 체결/분 1500 초과는 셀 배경도 빨강이라 빨강 ▲가 묻힌다.
             # 이 구간의 증가 ▲만 흰색으로 바꿔 방향과 가독성을 함께 유지한다.
-            hot_tpm = self.trend_role == TPM_TREND_ROLE and (index.data(Qt.UserRole) or 0) > 1500
-            painter.setPen(WHITE if trend > 0 and hot_tpm else RED if trend > 0 else BLUE)
-            painter.drawText(arrow_rect, Qt.AlignRight | Qt.AlignVCenter, arrow)
-        if persistence:
             hot_tpm = (index.data(Qt.UserRole) or 0) > 1500
-            dark = option.palette.base().color().lightness() < 128
-            color = (QColor("#087F23") if persistence > 0
-                     else QColor("#A0A7B4") if dark else QColor("#5E6470"))
-            painter.setPen(WHITE if hot_tpm else color)
-            center = persistence_rect.center()
-            if persistence > 0:
-                painter.setBrush(WHITE if hot_tpm else color)
-                painter.drawEllipse(QRect(center.x() - 2, center.y() - 2, 5, 5))
-            else:
-                painter.setBrush(Qt.NoBrush)
-                painter.drawPolygon(QPolygon([
-                    QPoint(center.x() - 3, center.y() - 2),
-                    QPoint(center.x() + 3, center.y() - 2),
-                    QPoint(center.x(), center.y() + 3),
-                ]))
+            painter.setPen(WHITE if trend > 0 and hot_tpm else RED if trend > 0 else BLUE)
+            painter.drawText(arrow_rect, Qt.AlignLeft | Qt.AlignVCenter, arrow)
         if selected:
             _draw_selection_lines(painter, option.rect, option.palette)
         painter.restore()
 
 
 class ProgramDelegate(QStyledItemDelegate):
-    """프로그램 우세방향·강도와 3분 지속 표식을 고정된 위치에 그린다."""
+    """당일 실제 프로그램 순매수량과 최근 20초 증감 화살표를 그린다."""
 
     def paint(self, painter, option, index):
         direction = index.data(PROGRAM_DIRECTION_ROLE) or 0
-        persistence = index.data(PROGRAM_PERSIST_ROLE) or 0
+        net = index.data(Qt.UserRole) or 0
         selected = _is_current_row(option, index)
         text = index.data(Qt.DisplayRole)
         if not text:
@@ -360,35 +404,18 @@ class ProgramDelegate(QStyledItemDelegate):
         else:
             painter.fillRect(option.rect, option.palette.base())
         painter.setFont(opt.font)
-        r = option.rect.adjusted(3, 0, -3, 0)
-        mark_w = 8
-        arrow_w = max(painter.fontMetrics().horizontalAdvance(c)
-                      for c in ("▲", "▼", "－")) + 2
-        mark_rect = QRect(r.left(), r.top(), mark_w, r.height())
-        arrow_rect = QRect(mark_rect.right() + 1, r.top(), arrow_w, r.height())
-        value_rect = QRect(arrow_rect.right() + 1, r.top(),
-                           max(0, r.right() - arrow_rect.right()), r.height())
-        arrow = "▲" if direction > 0 else "▼" if direction < 0 else "－"
-        color = RED if direction > 0 else BLUE if direction < 0 else opt.palette.text().color()
-        painter.setPen(color)
-        painter.drawText(arrow_rect, Qt.AlignCenter, arrow)
+        r = option.rect.adjusted(1, 0, -1, 0)
+        arrow = "▲" if direction > 0 else "▼"
+        arrow_w = max(painter.fontMetrics().horizontalAdvance("▲"),
+                      painter.fontMetrics().horizontalAdvance("▼"))
+        value_rect = QRect(
+            r.left(), r.top(), max(0, r.width() - arrow_w), r.height())
+        arrow_rect = QRect(value_rect.right() + 1, r.top(), arrow_w, r.height())
+        painter.setPen(RED if net > 0 else BLUE if net < 0 else opt.palette.text().color())
         painter.drawText(value_rect, Qt.AlignRight | Qt.AlignVCenter, str(text))
-        if persistence:
-            dark = option.palette.base().color().lightness() < 128
-            mark_color = (QColor("#087F23") if persistence > 0
-                          else QColor("#A0A7B4") if dark else QColor("#5E6470"))
-            painter.setPen(mark_color)
-            center = mark_rect.center()
-            if persistence > 0:
-                painter.setBrush(mark_color)
-                painter.drawEllipse(QRect(center.x() - 2, center.y() - 2, 5, 5))
-            else:
-                painter.setBrush(Qt.NoBrush)
-                painter.drawPolygon(QPolygon([
-                    QPoint(center.x() - 3, center.y() - 2),
-                    QPoint(center.x() + 3, center.y() - 2),
-                    QPoint(center.x(), center.y() + 3),
-                ]))
+        if direction:
+            painter.setPen(RED if direction > 0 else BLUE)
+            painter.drawText(arrow_rect, Qt.AlignLeft | Qt.AlignVCenter, arrow)
         if selected:
             _draw_selection_lines(painter, option.rect, option.palette)
         painter.restore()
@@ -506,8 +533,14 @@ class StockModel(QAbstractTableModel):
         self.program_history: dict[str, deque] = {}  # 최근 5분 0w 매수/매도수량 차분
         self._program_cumulative: dict[str, tuple] = {}  # 마지막 (매수수량누적, 매도수량누적, 출처)
         self._program_since: dict[str, float] = {}  # 현재 출처 누적값을 관찰하기 시작한 시각
-        self._activity_since: dict[str, float] = {}     # 3분 지속력의 완전한 관찰 여부
+        self._tpm_cache: dict[str, tuple[int, TpmSnapshot]] = {}  # 반초 안의 다중 data() 호출 재사용
+        self._tpm_ranks: dict[str, int] = {}  # 0.5초 전 체결속도 순위
+        self._tpm_rank_moves: dict[str, tuple[int, float]] = {}  # (같은 방향 누적 이동, 마지막 이동시각)
+        self._tpm_rank_universe: frozenset[str] = frozenset()
         self._prediction_cache: dict[str, tuple] = {}   # 같은 초의 반복 data() 계산 방지
+        self.order_target_code = ""       # 주문 컬럼에서 선택한 현재 대상종목
+        self.order_status: dict[str, str] = {}
+        self.order_cancellable: set[str] = set()
 
     # --- 웹소켓/전략 계층이 부르는 API ---------------------------------
     def add_stock(self, code: str, data: dict):
@@ -518,7 +551,6 @@ class StockModel(QAbstractTableModel):
         self.beginInsertRows(QModelIndex(), row, row)
         self.codes.append(code)
         self.rows[code] = {f: "" if f in ("name", "time") else 0 for f in STORED}
-        self._activity_since[code] = time.monotonic()
         self.endInsertRows()
         self.update_stock(code, data)  # exp 게이트/파생/로그를 신규 행에도 동일 적용
 
@@ -536,9 +568,40 @@ class StockModel(QAbstractTableModel):
         self.program_history.pop(code, None)
         self._program_cumulative.pop(code, None)
         self._program_since.pop(code, None)
-        self._activity_since.pop(code, None)
+        self._tpm_cache.pop(code, None)
+        self._tpm_ranks.pop(code, None)
+        self._tpm_rank_moves.pop(code, None)
         self._prediction_cache.pop(code, None)
+        self.order_status.pop(code, None)
+        self.order_cancellable.discard(code)
         self.endRemoveRows()
+
+    def set_order_target(self, code: str):
+        """이전/새 주문 대상 셀만 다시 그린다."""
+        if code == self.order_target_code:
+            return
+        old = self.order_target_code
+        self.order_target_code = code if code in self.rows else ""
+        for changed in (old, self.order_target_code):
+            if changed in self.rows:
+                row = self.codes.index(changed)
+                cell = self.index(row, ORDER_COL)
+                self.dataChanged.emit(cell, cell)
+
+    def set_order_status(self, code: str, text: str, cancellable: bool = False):
+        if code not in self.rows:
+            return
+        if text:
+            self.order_status[code] = text
+        else:
+            self.order_status.pop(code, None)
+        if cancellable:
+            self.order_cancellable.add(code)
+        else:
+            self.order_cancellable.discard(code)
+        row = self.codes.index(code)
+        cell = self.index(row, ORDER_COL)
+        self.dataChanged.emit(cell, cell)
 
     def set_vi(self, code: str, active: bool, price: int = 0):
         if active and price:  # 발동가로 즉시 채움, 이후 틱이 덮어씀
@@ -603,6 +666,7 @@ class StockModel(QAbstractTableModel):
             qty = int(tick_qty or 0)
             price = int(fields.get("price", stored["price"]))
             dq.append((now, qty, price))
+            self._tpm_cache.pop(code, None)
             while dq and dq[0][0] < now - 60:
                 dq.popleft()
             # 3·5·10분 점수는 원본 틱 대신 1초 요약으로 계산해 종목 수가 많아도
@@ -628,6 +692,8 @@ class StockModel(QAbstractTableModel):
             while history and history[0].sec <= sec - 300:
                 history.popleft()
         cols = {TPM_COL} if ticked else set()
+        if program_changed:
+            cols.add(PROGRAM_COL)
         for f, v in fields.items():
             if stored.get(f) == v:
                 continue
@@ -635,6 +701,9 @@ class StockModel(QAbstractTableModel):
                 cols.add(FIELDS.index(f))
             if f == "vol":  # 체결/분 의존
                 cols.add(TPM_COL)
+            if f == "price":  # 체결/분 오른쪽의 최근 5초 가격 방향 의존
+                cols.add(TPM_COL)
+                self._tpm_cache.pop(code, None)
             if f in ("price", "open", "low", "high", "base", "upper", "lower"):  # L일봉H 의존
                 cols.add(BAR_COL)
             if f in ("price", "upper", "exp_price"):  # 연상 판정(_at_limit) 의존
@@ -678,32 +747,82 @@ class StockModel(QAbstractTableModel):
         return True
 
     def refresh_tpm(self):
-        """최근 체결 지표 감쇠 갱신: 틱이 끊겨도 1초마다 재계산."""
+        """체결/분 감쇠와 실시간 순위 이동·점멸을 갱신한다."""
         if self.codes:
-            self.dataChanged.emit(self.index(0, TPM_COL), self.index(len(self.codes) - 1, TPM_COL))
+            self._refresh_tpm_ranks(time.monotonic())
+            self._tpm_cache.clear()
+            self.dataChanged.emit(
+                self.index(0, TPM_COL), self.index(len(self.codes) - 1, TPM_COL))
 
-    @staticmethod
-    def _tpm_persistence(history, now, observed_since):
-        """최근/이전/2분 전 체결 건수로 3분 활동 유지 또는 둔화를 판정한다."""
-        sec = int(now)
-        counts = tuple(
-            sum(b.tick_count for b in history
-                if sec - 60 * (offset + 1) < b.sec <= sec - 60 * offset)
-            for offset in range(3)
+    def refresh_program(self):
+        """프매 흐름을 1초마다 갱신한다."""
+        if self.codes:
+            self.dataChanged.emit(
+                self.index(0, PROGRAM_COL), self.index(len(self.codes) - 1, PROGRAM_COL))
+
+    def _refresh_tpm_ranks(self, now):
+        """체결/분 순위를 0.5초 전과 비교한다. 동률은 직전 순서를 유지한다."""
+        counts = {
+            code: sum(1 for t, _, _ in self.ticks.get(code, ()) if t >= now - 60)
+            for code in self.codes
+        }
+        source_order = {code: position for position, code in enumerate(self.codes, 1)}
+        previous = self._tpm_ranks
+        ordered = sorted(
+            self.codes,
+            key=lambda code: (
+                -counts[code],
+                previous.get(code, len(self.codes) + source_order[code]),
+            ),
         )
-        if now - observed_since < 180:
-            return 0, counts, None
+        current = {code: rank for rank, code in enumerate(ordered, 1)}
+        universe = frozenset(self.codes)
 
-        current, previous, older = counts
-        prior_peak = max(previous, older)
-        retention = current / prior_peak * 100 if prior_peak else None
-        peak = max(counts)
-        continuity = min(counts) / peak if peak else 0
-        if min(counts) >= 100 and continuity >= 0.60:
-            return 1, counts, retention
-        if prior_peak >= 300 and current < previous and current < prior_peak * 0.60:
-            return -1, counts, retention
-        return 0, counts, retention
+        # 편입·이탈만으로 모든 종목의 순위가 밀리는 것은 신호로 사용하지 않는다.
+        if universe != self._tpm_rank_universe or set(previous) != set(current):
+            self._tpm_rank_moves.clear()
+        else:
+            for code, rank in current.items():
+                delta = previous[code] - rank  # 양수=상승, 음수=하락
+                old_delta, last_move = self._tpm_rank_moves.get(code, (0, 0.0))
+                if delta:
+                    same_direction = old_delta and (old_delta > 0) == (delta > 0)
+                    accumulated = old_delta + delta if same_direction else delta
+                    self._tpm_rank_moves[code] = (accumulated, now)
+
+        self._tpm_ranks = current
+        self._tpm_rank_universe = universe
+
+    def _tpm_snapshot(self, code, stored, now):
+        """60초 체결수, 5초 가격방향, 현재 순위와 직전 순위 이동을 계산한다."""
+        stamp = int(now * 2)
+        cached = self._tpm_cache.get(code)
+        if cached and cached[0] == stamp:
+            return cached[1]
+
+        dq = self.ticks.get(code, ())
+        count = sum(1 for t, _, _ in dq if t >= now - 60)
+
+        current_price = int(stored.get("price") or 0)
+        if not current_price:
+            current_price = next((p for _, _, p in reversed(dq) if p), 0)
+        reference_price = next(
+            (p for t, _, p in reversed(dq) if p and t <= now - 5), 0)
+        price_direction = (
+            1 if reference_price and current_price > reference_price
+            else -1 if reference_price and current_price < reference_price
+            else 0
+        )
+        rank_change, last_move = self._tpm_rank_moves.get(code, (0, 0.0))
+        rank_moving = bool(
+            rank_change and now - last_move <= TPM_RANK_BLINK_SECONDS)
+
+        snapshot = TpmSnapshot(
+            count, price_direction, self._tpm_ranks.get(code, 0),
+            rank_change, rank_moving, blink_on=stamp % 2 == 0,
+        )
+        self._tpm_cache[code] = (stamp, snapshot)
+        return snapshot
 
     @staticmethod
     def _program_interval(program_history, market_history, lower, upper):
@@ -724,36 +843,24 @@ class StockModel(QAbstractTableModel):
         return cls._program_interval(
             program_history, market_history, now - lookback, now)
 
-    @classmethod
-    def _program_persistence(cls, program_history, market_history, now, observed_since):
-        """최근 3개 1분 구간의 프로그램 방향 유지 또는 활동 둔화를 판정한다."""
-        stats = tuple(
-            cls._program_interval(
-                program_history, market_history,
-                now - 60 * (offset + 1), now - 60 * offset)
-            for offset in range(3)
-        )
-        if now - observed_since < 180:
-            return 0, stats, None
-
-        current, previous, older = stats
-        directions = tuple(s[3] / s[2] if s[2] else 0 for s in stats)
-        prior_peak = max(previous[2], older[2])
-        retention = current[2] / prior_peak * 100 if prior_peak else None
-        relevant = all(s[5] is not None and s[5] >= 3 for s in stats)
-        same_direction = (all(d >= 0.10 for d in directions)
-                          or all(d <= -0.10 for d in directions))
-        if relevant and same_direction and retention is not None and retention >= 60:
-            return 1, stats, retention
-        prior_participation = max(previous[5] or 0, older[5] or 0)
-        if (prior_peak and prior_participation >= 5 and current[2] < prior_peak * 0.60):
-            return -1, stats, retention
-        return 0, stats, retention
-
     @staticmethod
     def _format_program_qty(value):
         sign = "+" if value > 0 else "-" if value < 0 else ""
         return f"{sign}{abs(value):,}주"
+
+    @staticmethod
+    def _format_program_compact(value):
+        """좁은 컬럼에는 실제 순매수 수량을 만/억 단위로 압축한다."""
+        sign = "+" if value > 0 else "-" if value < 0 else ""
+        absolute = abs(value)
+        if absolute >= 100_000_000:
+            scaled, suffix = absolute / 100_000_000, "억"
+        elif absolute >= 10_000:
+            scaled, suffix = absolute / 10_000, "만"
+        else:
+            return f"{sign}{absolute:,}"
+        digits = 0 if scaled >= 10 or scaled.is_integer() else 1
+        return f"{sign}{scaled:.{digits}f}{suffix}"
 
     @staticmethod
     def _combined_buy_pct(items):
@@ -995,7 +1102,10 @@ class StockModel(QAbstractTableModel):
     def headerData(self, section, orientation, role=Qt.DisplayRole):
         if orientation == Qt.Horizontal and role == Qt.ToolTipRole:
             if FIELDS[section] == "tpm":
-                return "최근 60초 체결 건수 (▲/▼ 단기 속도, ● 3분 유지, ▽ 고활성 둔화)"
+                return ("최근 60초 체결 건수 "
+                        "(왼쪽 +/- 순위변동, 오른쪽 ▲/▼ 최근 5초 가격)")
+            if FIELDS[section] == "program":
+                return "당일 실제 프로그램 순매수 수량 (▲/▼ 최근 20초 순매수 증감)"
             return COLUMNS[section]  # 칸 좁혀 헤더 글자 잘려도 오버로 확인
         if orientation == Qt.Horizontal and role == Qt.DisplayRole:
             return COLUMNS[section]
@@ -1003,7 +1113,40 @@ class StockModel(QAbstractTableModel):
 
     def data(self, index, role=Qt.DisplayRole):
         field = FIELDS[index.column()]
-        stored = self.rows[self.codes[index.row()]]
+        code = self.codes[index.row()]
+        stored = self.rows[code]
+        if field == "order":
+            selected = code == self.order_target_code
+            status = self.order_status.get(code, "")
+            if role == Qt.DisplayRole:
+                return status or ("대상" if selected else "선택")
+            if role == Qt.UserRole:
+                return 1 if selected else 0
+            if role == Qt.TextAlignmentRole:
+                return Qt.AlignCenter
+            failed = status in ("장종료", "오류", "수량부족", "분할부족")
+            if role == Qt.BackgroundRole:
+                if failed:
+                    return RED
+                if status or selected:
+                    return QColor("#FFF176")
+            if role == Qt.ForegroundRole:
+                if failed:
+                    return WHITE
+                if status or selected:
+                    return QColor("#111")
+            if role == Qt.FontRole and (status or selected):
+                font = QFont()
+                font.setBold(True)
+                return font
+            if role == Qt.ToolTipRole:
+                return (
+                    "상태 클릭=대상 선택, 오른쪽 취소=이 종목 잔량 즉시취소"
+                    if code in self.order_cancellable
+                    else "클릭하여 주문 대상종목으로 지정")
+            if role == ORDER_CANCEL_ROLE:
+                return code in self.order_cancellable
+            return None
         if field == "streak":  # 연상 = 어제까지 일수 + (지금 상한이면 1), 매번 계산 (저장 안 함)
             cnt, yclose = self.limit_cnt.get(self.codes[index.row()], (0, 0))
             # +1은 실제 체결 상한(현재가=상한가)만: 예상등락률(동시호가/VI 예상)로는 안 셈.
@@ -1023,48 +1166,64 @@ class StockModel(QAbstractTableModel):
         if field == "tpm":  # 체결/분 = 최근 60초 체결 틱수, 매번 계산 (저장 안 함)
             now = time.monotonic()
             code = self.codes[index.row()]
-            dq = self.ticks.get(code, ())
-            n = sum(1 for t, _, _ in dq if t >= now - 60)
-            recent = sum(1 for t, _, _ in dq if t >= now - 10)
-            previous = n - recent
-            # 최근 10초와 이전 50초를 각각 분당 속도로 환산. 20% 완충 + 최소 표본으로 깜빡임 억제.
-            recent_rate, previous_rate = recent * 6, previous * 1.2
-            trend = (1 if recent >= 3 and recent_rate > previous_rate * 1.2
-                     else -1 if previous >= 5 and recent_rate < previous_rate * 0.8
-                     else 0)
+            snapshot = self._tpm_snapshot(code, stored, now)
+            n = snapshot.count
             if role == Qt.DisplayRole:
                 return str(n) if n else ""
             if role == Qt.UserRole:
                 return n
-            if role == TPM_TREND_ROLE:
-                return trend
-            if role in (TPM_PERSIST_ROLE, Qt.ToolTipRole):
-                persistence, counts, retention = self._tpm_persistence(
-                    self.prediction_history.get(code, ()), now,
-                    self._activity_since.get(code, now))
-                if role == TPM_PERSIST_ROLE:
-                    return persistence
-                current, previous, older = counts
-                if retention is None:
-                    status = "지속력 준비중 (편입 후 3분 필요)"
-                else:
-                    label = "유지 ●" if persistence > 0 else "둔화 ▽" if persistence < 0 else "보통"
-                    status = f"유지율 {retention:.0f}% · {label}"
-                return (f"최근 1분 {current}건 | 이전 1분 {previous}건 | "
-                        f"2분 전 {older}건\n{status}")
+            if role == TPM_PRICE_DIRECTION_ROLE:
+                return snapshot.price_direction
+            if role == TPM_ALERT_ROLE:
+                return 1 if snapshot.rank_change > 0 else -1 if snapshot.rank_change < 0 else 0
+            if role == TPM_RANK_CHANGE_ROLE:
+                return snapshot.rank_change
+            if role == Qt.ToolTipRole:
+                price_label = ("상승 ▲" if snapshot.price_direction > 0
+                               else "하락 ▼" if snapshot.price_direction < 0
+                               else "보합")
+                rank_label = (
+                    f"{snapshot.rank_change:+d}단계"
+                    if snapshot.rank_change else "변동 없음")
+                state_label = (
+                    "이동중" if snapshot.rank_moving
+                    else "상승상태 유지" if snapshot.rank_change > 0
+                    else "하락상태 유지" if snapshot.rank_change < 0
+                    else "대기")
+                return (
+                    f"최근 60초 {n}건 | 체결속도 {snapshot.rank or '-'}위\n"
+                    f"실시간 순위변동 {rank_label} · {state_label} | "
+                    f"가격 5초 {price_label}"
+                )
             if role == Qt.TextAlignmentRole:
                 return Qt.AlignRight | Qt.AlignVCenter
+            base_background = None
             if n >= 100:  # 활동 단계: 보통 회색 / 활발 초록 / 이후 노랑·주황·빨강
-                if role == Qt.BackgroundRole:
-                    if n < 300:
-                        return QColor("#E8ECEF")
-                    if n <= 500:
-                        return QColor("#CDECCF")
-                    return QColor("#FFE000") if n <= 1000 else QColor("#FF8C00") if n <= 1500 else RED
-                if role == Qt.ForegroundRole:
-                    return WHITE if n > 1500 else QColor("black")
-                if role == Qt.FontRole and n > 500:
-                    f = QFont(); f.setBold(True); return f
+                if n < 300:
+                    base_background = QColor("#E8ECEF")
+                elif n <= 500:
+                    base_background = QColor("#CDECCF")
+                else:
+                    base_background = (
+                        QColor("#FFE000") if n <= 1000
+                        else QColor("#FF8C00") if n <= 1500 else RED)
+            rank_highlight = abs(snapshot.rank_change) >= TPM_RANK_FLASH_MIN
+            # 순위 이동 중에는 점멸하고, 멈추면 방향이 바뀔 때까지 같은 색을 고정한다.
+            highlight_on = (
+                rank_highlight
+                and (not snapshot.rank_moving or snapshot.blink_on))
+            if role == Qt.BackgroundRole:
+                if highlight_on:
+                    if snapshot.rank_change > 0:
+                        return TPM_RANK_UP_FLASH
+                    return TPM_RANK_DOWN_FLASH
+                return base_background
+            if role == Qt.ForegroundRole:
+                if highlight_on:
+                    return QColor("black") if snapshot.rank_change > 0 else WHITE
+                return WHITE if n > 1500 else QColor("black") if base_background else None
+            if role == Qt.FontRole and n > 500:
+                f = QFont(); f.setBold(True); return f
             return None
         if field == "buy_pct":  # 최근 1분 수량 70% + 건수 30% - 불일치 감점
             now = time.monotonic()
@@ -1088,55 +1247,48 @@ class StockModel(QAbstractTableModel):
             if role == Qt.ForegroundRole and pct is not None:
                 return RED if pct >= 55 else BLUE if pct <= 45 else None
             return None
-        if field == "program":  # 0w 누적 프로그램매매 수량의 최근 1분 차분
+        if field == "program":  # FID 210 당일 누적 순매수 + 최근 20초 실제 증감
             now = time.monotonic()
             code = self.codes[index.row()]
             program_history = self.program_history.get(code, ())
-            market_history = self.prediction_history.get(code, ())
-            metrics = self._program_metrics(
-                program_history, market_history, now, 60)
-            pct = metrics[4]
-            direction = (1 if pct is not None and pct >= 55
-                         else -1 if pct is not None and pct <= 45 else 0)
-            persistence, _, retention = self._program_persistence(
-                program_history, market_history, now,
-                self._program_since.get(code, now))
+            cumulative = self._program_cumulative.get(code)
+            calculated_net = cumulative[0] - cumulative[1] if cumulative else 0
+            fid_net = int(stored.get("program_net_qty") or 0)
+            net = fid_net if fid_net or not calculated_net else calculated_net
+            recent = self._program_interval(
+                program_history, self.prediction_history.get(code, ()),
+                now - 20, now)
+            recent_net = recent[3]
+            direction = 1 if recent_net > 0 else -1 if recent_net < 0 else 0
             if role == Qt.DisplayRole:
-                return f"{max(pct, 100 - pct):.0f}" if pct is not None else ""
+                return self._format_program_compact(net) if cumulative else ""
             if role == Qt.UserRole:
-                return pct if pct is not None else -1
+                return net
             if role == PROGRAM_DIRECTION_ROLE:
                 return direction
-            if role == PROGRAM_PERSIST_ROLE:
-                return persistence
             if role == Qt.ToolTipRole:
-                lines = ["프로그램매매 주식 수 기준 (0w 누적값 차분)"]
+                if not cumulative:
+                    return "프로그램매매 데이터 대기중"
+                buy, sell = cumulative[0], cumulative[1]
+                lines = [
+                    "당일 프로그램매매 누적 수량 (FID 210)",
+                    f"매수 {buy:,}주 | 매도 {sell:,}주",
+                    f"실제 순매수 {self._format_program_qty(net)}",
+                    f"최근 20초 변화 {self._format_program_qty(recent_net)} "
+                    f"{'▲' if direction > 0 else '▼' if direction < 0 else ''}".rstrip(),
+                ]
                 for label, lookback in (("1분", 60), ("3분", 180), ("5분", 300)):
                     stat = self._program_metrics(
-                        program_history, market_history, now, lookback)
-                    if stat[2]:
-                        participation = (f"참여 {stat[5]:.1f}%"
-                                         if stat[5] is not None else "참여율 준비중")
-                        lines.append(
-                            f"{label} 순매수 {self._format_program_qty(stat[3])} | "
-                            f"매수 {stat[4]:.0f}% | {participation}")
-                    else:
-                        lines.append(f"{label} 준비중")
-                since = self._program_since.get(code)
-                if since is None:
-                    status = "지속력 데이터 대기중"
-                elif now - since < 180:
-                    status = f"지속력 준비중 ({max(0, 180 - int(now - since))}초 남음)"
-                else:
-                    label = "방향 유지 ●" if persistence > 0 else "활동 둔화 ▽" if persistence < 0 else "보통"
-                    status = (f"3분 유지율 {retention:.0f}% · {label}"
-                              if retention is not None else label)
-                lines.append(status)
+                        program_history, self.prediction_history.get(code, ()),
+                        now, lookback)
+                    lines.append(
+                        f"{label} 변화 {self._format_program_qty(stat[3])}"
+                        if stat[2] else f"{label} 변화 없음")
                 return "\n".join(lines)
             if role == Qt.TextAlignmentRole:
                 return Qt.AlignRight | Qt.AlignVCenter
             if role == Qt.ForegroundRole:
-                return RED if direction > 0 else BLUE if direction < 0 else None
+                return RED if net > 0 else BLUE if net < 0 else None
             return None
         if field == "predict":  # 3·5·10분 단타 상승압력 종합점수
             now = time.monotonic()
@@ -1285,6 +1437,10 @@ def _list_reload_icon(style) -> QIcon:
 class ConditionScreen(QWidget):
     """조건검색실시간 화면 하나. 나중에 QMdiArea에 이 위젯을 여러 개 띄우면 다중창."""
 
+    order_target_selected = Signal(str, int)  # 종목코드, 상한가 -> main이 kt00011 조회
+    order_requested = Signal(str, str, int, bool, int, int)
+    cancel_requested = Signal(str)
+
     def __init__(self, prefix: str = "", parent=None):
         super().__init__(parent)
         self.prefix = prefix  # 다중창: 창별 설정 키 접두사 ("", "w2_", ...)
@@ -1371,6 +1527,136 @@ class ConditionScreen(QWidget):
         top.addWidget(self.theme_btn)
         top.addWidget(self.on_top_btn)  # 오른쪽 끝 = 창 크롬(핀) 자리
 
+        # 주문 UI 1단계: 실제 계좌/TR 연결 전 배치와 조작감부터 검증한다.
+        # 계좌·자금 현황줄 — 실제 값은 주문 계층을 붙일 때 갱신한다.
+        self.estimated_asset_value = QLabel("-")
+        self.estimated_asset_value.setMinimumWidth(95)
+        self.account_available_value = QLabel("-")
+        self.account_available_value.setMinimumWidth(85)
+        self.margin_order_check = QCheckBox("미수")
+        self.margin_order_check.setStyle(self._checkbox_style)
+        self.margin_order_check.setToolTip(
+            "체크하면 미수 포함 주문가능금액·수량으로 계산 (현재는 UI만 추가)")
+        self.order_limit_edit = QLineEdit()
+        self.order_limit_edit.setPlaceholderText("자동")
+        self.order_limit_edit.setFixedWidth(110)
+        self.order_limit_edit.setAlignment(Qt.AlignRight)
+        self.order_limit_edit.setToolTip("이번 주문에 사용할 최대금액. 비워두면 계좌 주문가능금액 사용")
+        self.order_limit_edit.textChanged.connect(self._refresh_order_funds_display)
+        self.order_reserved_value = QLabel("0원")
+        self.order_reserved_value.setMinimumWidth(75)
+        self.order_remaining_value = QLabel("-")
+        self.order_remaining_value.setMinimumWidth(85)
+        self.orderable_qty_value = QLabel("-")
+        self.orderable_qty_value.setMinimumWidth(70)
+        self.margin_rate_value = QLabel("증거금 -")
+        self.margin_rate_value.setMinimumWidth(120)
+        self._account_available = 0
+        self._cash_orderable = 0
+        self._misu_orderable = 0
+        self._order_reserved = 0
+        self._order_target_code = ""
+        self._orderable_detail = None
+        self._margin_preferred = False
+        self._margin_auto_change = False
+        self.margin_order_check.toggled.connect(self._on_margin_order_toggled)
+
+        account_bar = QHBoxLayout()
+        account_bar.setSpacing(6)
+        account_bar.addWidget(QLabel("추정자산"))
+        account_bar.addWidget(self.estimated_asset_value)
+        account_bar.addWidget(QLabel("계좌가능"))
+        account_bar.addWidget(self.account_available_value)
+        account_bar.addWidget(self.margin_order_check)
+        account_bar.addWidget(QLabel("사용한도"))
+        account_bar.addWidget(self.order_limit_edit)
+        account_bar.addWidget(QLabel("예약"))
+        account_bar.addWidget(self.order_reserved_value)
+        account_bar.addWidget(QLabel("남은금액"))
+        account_bar.addWidget(self.order_remaining_value)
+        account_bar.addStretch(1)
+
+        # 주문 실행줄 — 종목을 고른 뒤 이 줄에서 분할/취소/주문방식을 즉시 결정한다.
+        self.order_target_value = QLabel("종목을 선택하세요")
+        self.order_target_value.setMinimumWidth(130)
+
+        self.split_group = QButtonGroup(self)
+        self.split_group.setExclusive(True)
+        self.split_buttons = {}
+        for count in range(1, 10):
+            button = QPushButton(str(count))
+            button.setCheckable(True)
+            button.setFixedSize(28, 24)
+            self.split_group.addButton(button, count)
+            self.split_buttons[count] = button
+        self.split_buttons[9].setChecked(True)
+        self.split_group.idClicked.connect(self._on_split_changed)
+
+        self.cancel_group = QButtonGroup(self)
+        self.cancel_group.setExclusive(True)
+        self.auto_cancel_btn = QPushButton("자동취소")
+        self.manual_cancel_btn = QPushButton("수동취소")
+        for button in (self.auto_cancel_btn, self.manual_cancel_btn):
+            button.setCheckable(True)
+            button.setFixedSize(72, 24)
+            self.cancel_group.addButton(button)
+        self.auto_cancel_btn.setChecked(True)
+
+        order_choice_style = (
+            "QPushButton{padding:0px 4px}"
+            "QPushButton:checked{background:#FFF176;color:#111;font-weight:bold;"
+            "border:1px solid #D6A900;padding:0px 4px}"
+        )
+        for button in (*self.split_buttons.values(),
+                       self.auto_cancel_btn, self.manual_cancel_btn):
+            button.setStyleSheet(order_choice_style)
+
+        self.fixed_qty_order_btn = QPushButton("100주씩 주문")
+        self.remaining_order_btn = QPushButton("분할주문")
+        for button in (self.fixed_qty_order_btn, self.remaining_order_btn):
+            button.setFixedHeight(24)
+            button.setEnabled(False)
+            button.setToolTip("주문허용 체크 후 클릭하면 즉시 실제 주문을 전송합니다")
+        self.order_enable_check = QCheckBox("주문허용")
+        self.order_enable_check.setStyle(self._checkbox_style)
+        self.order_enable_check.setToolTip("체크한 동안 주문 버튼이 실제 주문을 전송합니다")
+        self.order_preview_value = QLabel("예상주문  종목을 선택하세요")
+        self.order_preview_value.setTextFormat(Qt.RichText)
+        self.order_preview_value.setMinimumHeight(20)
+        self.order_preview_value.setStyleSheet(
+            "QLabel{padding:1px 5px;border:1px solid #C8C8C8;"
+            "background:#F5F5F5;color:#222}")
+        # 상세상태 문자열은 내부 보관만 하고, 화면 표시는 종목별 주문 컬럼이 담당한다.
+        self.order_status_value = QLabel()
+        self.order_enable_check.toggled.connect(self._refresh_order_actions)
+        self.fixed_qty_order_btn.clicked.connect(
+            lambda: self._request_order("fixed"))
+        self.remaining_order_btn.clicked.connect(
+            lambda: self._request_order("remaining"))
+
+        order_bar = QHBoxLayout()
+        order_bar.setSpacing(4)
+        order_bar.addWidget(QLabel("대상"))
+        order_bar.addWidget(self.order_target_value)
+        order_bar.addWidget(QLabel("주문가능수량"))
+        order_bar.addWidget(self.orderable_qty_value)
+        order_bar.addWidget(self.margin_rate_value)
+        order_bar.addWidget(QLabel("분할"))
+        for count in range(1, 10):
+            order_bar.addWidget(self.split_buttons[count])
+        order_bar.addSpacing(6)
+        order_bar.addWidget(self.auto_cancel_btn)
+        order_bar.addWidget(self.manual_cancel_btn)
+        order_bar.addSpacing(8)
+        order_bar.addWidget(self.order_enable_check)
+        order_bar.addWidget(self.fixed_qty_order_btn)
+        order_bar.addWidget(self.remaining_order_btn)
+        order_bar.addStretch(1)
+
+        order_preview_bar = QHBoxLayout()
+        order_preview_bar.setContentsMargins(0, 0, 0, 0)
+        order_preview_bar.addWidget(self.order_preview_value)
+
         # 그리드
         self.proxy = TieredProxy()
         self.proxy.setSourceModel(self.model)
@@ -1394,7 +1680,10 @@ class ConditionScreen(QWidget):
         self.model.dataChanged.connect(self._on_data_changed)
         self._tpm_timer = QTimer(self)  # 체결/분: 틱 끊겨도 값이 줄어들게 주기 갱신
         self._tpm_timer.timeout.connect(self.model.refresh_tpm)
-        self._tpm_timer.start(1000)
+        self._tpm_timer.start(TPM_REFRESH_MS)
+        self._program_timer = QTimer(self)
+        self._program_timer.timeout.connect(self.model.refresh_program)
+        self._program_timer.start(1000)
         self.table.verticalHeader().setVisible(True)  # 순위(정렬 순서대로 1..N 자동)
         self.table.verticalHeader().setDefaultSectionSize(22)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
@@ -1403,15 +1692,19 @@ class ConditionScreen(QWidget):
         self.table.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.table.setColumnWidth(NAME_COL, 110)
         self.table.setColumnWidth(STREAK_COL, 34)
+        self.table.setColumnWidth(ORDER_COL, 86)
         self.table.setColumnWidth(BAR_COL, 70)
+        self.table.setColumnWidth(PROGRAM_COL, 72)
         for col, width in RANK_DEFAULT_WIDTHS.items():
             self.table.setColumnWidth(col, width)
         self.table.setItemDelegate(PreserveTextColorDelegate(self.table))
         self.table.setItemDelegateForColumn(BAR_COL, BarDelegate(self.table))
         self.table.setItemDelegateForColumn(NAME_COL, NameDelegate(self.table))
+        self.table.setItemDelegateForColumn(ORDER_COL, OrderDelegate(self.table))
         self.table.setItemDelegateForColumn(
-            TPM_COL, TpmDelegate(
-                TPM_TREND_ROLE, self.table, persistence_role=TPM_PERSIST_ROLE))
+            TPM_COL, TpmDelegate(TPM_PRICE_DIRECTION_ROLE, self.table))
+        self.table.setItemDelegateForColumn(
+            PROGRAM_COL, ProgramDelegate(self.table))
         self.table.setSelectionBehavior(QTableView.SelectRows)
         self.table.setSelectionMode(QTableView.NoSelection)  # Windows 네이티브 선택 세로 바 차단
         # 행을 클릭한 뒤 위/아래 화살표로 현재 행을 옮길 수 있게 포커스는 허용한다.
@@ -1427,6 +1720,9 @@ class ConditionScreen(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.addLayout(top)
+        layout.addLayout(account_bar)
+        layout.addLayout(order_bar)
+        layout.addLayout(order_preview_bar)
         layout.addWidget(self.table)
 
         self.model.rowsInserted.connect(self._update_count)
@@ -1462,6 +1758,9 @@ class ConditionScreen(QWidget):
                 removed_bad_width = True
         if removed_bad_width:
             self._settings.sync()
+        # 주문 상태(왼쪽)와 즉시취소(오른쪽)가 함께 보여야 하므로 옛 저장폭보다 우선한다.
+        if self.table.columnWidth(ORDER_COL) < 86:
+            self.table.setColumnWidth(ORDER_COL, 86)
         self._apply_sort()
         self._view_mode = None  # normal / rank / holdings (None=초기)
         self.set_view_mode("normal")  # 순위/변동 기본 숨김
@@ -1482,6 +1781,265 @@ class ConditionScreen(QWidget):
         hdr = self.table.horizontalHeader()
         hdr.sectionResized.connect(lambda *a: self._save_timer.start(400))
         hdr.sectionMoved.connect(lambda *a: self._save_timer.start(400))
+
+    @staticmethod
+    def _money_text(value: int) -> str:
+        return f"{max(0, int(value)):,}원"
+
+    def _refresh_order_funds_display(self):
+        usable = self._usable_order_funds()
+        remaining = max(0, usable - self._order_reserved)
+        self.order_reserved_value.setText(self._money_text(self._order_reserved))
+        self.order_remaining_value.setText(self._money_text(remaining))
+        self._refresh_order_target_display()
+
+    def _usable_order_funds(self) -> int:
+        raw = self.order_limit_edit.text().replace(",", "").replace("원", "").strip()
+        try:
+            manual_limit = max(0, int(raw)) if raw else self._account_available
+        except ValueError:
+            manual_limit = self._account_available
+        return min(self._account_available, manual_limit)
+
+    def _refresh_order_target_display(self):
+        code = self._order_target_code
+        if not code or code not in self.model.rows:
+            self.order_target_value.setText("종목을 선택하세요")
+            self.orderable_qty_value.setText("-")
+            self.orderable_qty_value.setToolTip("주문 대상종목을 선택하세요")
+            self.margin_rate_value.setText("증거금 -")
+            self._refresh_order_actions()
+            return
+        stored = self.model.rows[code]
+        name = stored.get("name") or code
+        upper = int(stored.get("upper") or 0)
+        self.order_target_value.setText(f"{name} ({code})")
+        detail = self._orderable_detail
+        if not upper:
+            self.orderable_qty_value.setText("-")
+            self.orderable_qty_value.setToolTip("상한가 정보 대기중")
+        elif not detail or detail["code"] != code or detail["price"] != upper:
+            self.orderable_qty_value.setText("조회중")
+            self.orderable_qty_value.setToolTip(f"상한가 {upper:,}원 기준 조회중")
+            self.margin_rate_value.setText("증거금 조회중")
+        else:
+            misu = self.margin_order_check.isChecked()
+            api_qty = detail["margin_qty"] if misu else detail["cash_qty"]
+            remaining = max(0, self._usable_order_funds() - self._order_reserved)
+            limited_qty = remaining // upper
+            qty = min(api_qty, limited_qty)
+            self.orderable_qty_value.setText(f"{qty:,}주")
+            mode = (
+                f"미수 적용 {detail['applied_margin_rate']}%"
+                if misu else "현금 100%")
+            self.orderable_qty_value.setToolTip(
+                f"상한가 {upper:,}원 기준 · {mode} · 계좌조회 {api_qty:,}주")
+            stock_rate = detail["stock_margin_rate"]
+            applied_rate = f"{detail['applied_margin_rate']}%"
+            self.margin_rate_value.setText(
+                f"증거금 {stock_rate} / 적용 {applied_rate}"
+                if stock_rate and stock_rate != applied_rate
+                else f"증거금 {applied_rate}")
+        self._refresh_order_actions()
+
+    def _select_order_target(self, code: str):
+        self._order_target_code = code
+        self._orderable_detail = None
+        self.model.set_order_target(code)
+        misu_available = code in self.model.misu
+        self._margin_auto_change = True
+        self.margin_order_check.setChecked(
+            self._margin_preferred if misu_available else False)
+        self._margin_auto_change = False
+        self.margin_order_check.setEnabled(misu_available)
+        self.margin_order_check.setToolTip(
+            "미수 포함 주문가능금액·수량으로 계산"
+            if misu_available else "이 종목은 미수 불가능")
+        self._refresh_order_target_display()
+        upper = int(self.model.rows[code].get("upper") or 0)
+        if upper:
+            self.order_target_selected.emit(code, upper)
+
+    def set_orderable_quantity(self, code: str, price: int, detail: dict):
+        """main의 kt00011 결과. 빠르게 다른 종목을 고른 경우 이전 응답은 폐기."""
+        if code != self._order_target_code:
+            return
+        current_upper = int(self.model.rows.get(code, {}).get("upper") or 0)
+        if price != current_upper:
+            return
+        self._orderable_detail = detail
+        selected_amount = (
+            detail["margin_amount"] if self.margin_order_check.isChecked()
+            else detail["cash_amount"])
+        self._account_available = selected_amount
+        self.account_available_value.setText(self._money_text(selected_amount))
+        self._refresh_order_funds_display()
+
+    def _current_orderable_qty(self) -> int:
+        code = self._order_target_code
+        detail = self._orderable_detail
+        if not code or not detail or detail["code"] != code:
+            return 0
+        upper = int(self.model.rows.get(code, {}).get("upper") or 0)
+        if not upper or detail["price"] != upper:
+            return 0
+        api_qty = (
+            detail["margin_qty"] if self.margin_order_check.isChecked()
+            else detail["cash_qty"])
+        remaining = max(0, self._usable_order_funds() - self._order_reserved)
+        return min(api_qty, remaining // upper)
+
+    def _refresh_order_actions(self, *_):
+        available_qty = self._current_orderable_qty()
+        selected_count = self.split_group.checkedId()
+        fixed_count = min(selected_count, available_qty // 100)
+        remaining_count = (
+            min(selected_count, max(1, available_qty // 100))
+            if available_qty > 0 else 0)
+        common_enabled = (
+            self.order_enable_check.isChecked()
+            and bool(self._order_target_code)
+            and not self.model.order_status.get(self._order_target_code))
+        self.fixed_qty_order_btn.setEnabled(common_enabled and fixed_count > 0)
+        self.remaining_order_btn.setEnabled(common_enabled and remaining_count > 0)
+        self.fixed_qty_order_btn.setText(
+            f"100주씩 주문 ({fixed_count}회)" if fixed_count
+            else "100주씩 주문")
+        self.remaining_order_btn.setText(
+            f"분할주문 ({remaining_count}회)" if remaining_count
+            else "분할주문")
+        self._refresh_order_preview(
+            available_qty, selected_count, fixed_count, remaining_count)
+
+    @staticmethod
+    def _order_slots(actual_count: int, selected_count: int) -> str:
+        filled = (
+            '<span style="color:#18A558;font-weight:bold">■</span>'
+            * actual_count)
+        empty = (
+            '<span style="color:#B8B8B8">□</span>'
+            * max(0, selected_count - actual_count))
+        return filled + empty
+
+    def _refresh_order_preview(
+            self, available_qty: int, selected_count: int,
+            fixed_count: int, remaining_count: int):
+        if not self._order_target_code or not self._orderable_detail:
+            self.order_preview_value.setText("예상주문&nbsp;&nbsp;종목을 선택하거나 조회를 기다리세요")
+            self.order_preview_value.setToolTip("")
+            return
+
+        fixed_total = fixed_count * 100
+        excluded = max(0, available_qty - fixed_total)
+        fixed_slots = self._order_slots(fixed_count, selected_count)
+        if fixed_count:
+            fixed_text = (
+                f"{fixed_slots}&nbsp; 설정 {selected_count}회 → "
+                f"<b>실제 {fixed_count}회</b> · 100주씩 · 총 {fixed_total:,}주")
+            if excluded:
+                fixed_text += f" · <span style='color:#D66A00'>미주문 {excluded:,}주</span>"
+        else:
+            fixed_text = (
+                f"{self._order_slots(0, selected_count)}&nbsp; "
+                "<span style='color:#C62828'>최소 100주 필요</span>")
+
+        if remaining_count:
+            base, extra = divmod(available_qty, remaining_count)
+            per_order = (
+                f"{base + 1:,}/{base:,}주씩" if extra else f"{base:,}주씩")
+            split_text = (
+                f"{self._order_slots(remaining_count, selected_count)}&nbsp; "
+                f"<b>{remaining_count}회</b> · {per_order} · 총 {available_qty:,}주")
+        else:
+            split_text = "주문가능수량 없음"
+
+        self.order_preview_value.setText(
+            f"<b>예상주문</b>&nbsp;&nbsp; 100주씩 {fixed_text}"
+            f"&nbsp;&nbsp;│&nbsp;&nbsp; 분할 {split_text}")
+        self.order_preview_value.setToolTip(
+            "■ 실제 전송되는 주문 · □ 설정했지만 수량 부족으로 전송되지 않는 주문")
+
+    def _request_order(self, mode: str):
+        code = self._order_target_code
+        if not self.order_enable_check.isChecked() or not code:
+            return
+        count = self.split_group.checkedId()
+        available_qty = self._current_orderable_qty()
+        if mode == "fixed":
+            count = min(count, available_qty // 100)
+            total_qty = 100 * count
+            if count < 1:
+                self.model.set_order_status(code, "수량부족")
+                self.order_status_value.setText(
+                    f"상태 수량부족 · 가능 {available_qty:,}주 / 최소 100주")
+                log.info("order blocked %s: available=%d required=100",
+                         code, available_qty)
+                self._refresh_order_actions()
+                return
+        else:
+            count = (
+                min(count, max(1, available_qty // 100))
+                if available_qty > 0 else 0)
+            total_qty = available_qty
+        if total_qty < count:
+            self.model.set_order_status(code, "분할부족")
+            self.order_status_value.setText("상태 분할 횟수보다 가능수량이 적습니다")
+            log.info("order blocked %s: total=%d split=%d", code, total_qty, count)
+            self._refresh_order_actions()
+            return
+        price = int(self.model.rows[code].get("upper") or 0)
+        auto_cancel = self.auto_cancel_btn.isChecked()
+        self.model.set_order_status(code, "대기")
+        self.order_status_value.setText(
+            f"상태 전송대기 · {'자동' if auto_cancel else '수동'} · "
+            f"{count}회 · {total_qty:,}주")
+        self._refresh_order_actions()
+        self.order_requested.emit(
+            code, mode, count, auto_cancel, total_qty, price)
+
+    def _on_split_changed(self, _count: int):
+        code = self._order_target_code
+        if code and self.model.order_status.get(code) in ("수량부족", "분할부족"):
+            self.model.set_order_status(code, "")
+        self._refresh_order_actions()
+
+    def set_order_state(
+            self, code: str, compact: str, detail: str, has_remaining: bool):
+        self.model.set_order_status(code, compact, has_remaining)
+        if code == self._order_target_code:
+            self.order_status_value.setText(detail)
+        self._refresh_order_actions()
+
+    def _on_margin_order_toggled(self, checked: bool):
+        if not self._margin_auto_change:
+            self._margin_preferred = checked
+        detail = self._orderable_detail
+        if detail and detail["code"] == self._order_target_code:
+            self._account_available = (
+                detail["margin_amount"] if checked else detail["cash_amount"])
+        else:
+            self._account_available = (
+                self._misu_orderable if checked else self._cash_orderable)
+        self.account_available_value.setText(self._money_text(self._account_available))
+        self._refresh_order_funds_display()
+
+    def set_account_summary(self, summary: dict):
+        """실계좌 조회값을 주문 자금줄에 표시."""
+        estimated = int(summary.get("estimated_assets", 0) or 0)
+        self._cash_orderable = int(summary.get("cash_orderable", 0) or 0)
+        margin_amounts = summary.get("orderable_by_margin", {})
+        self._misu_orderable = int(
+            margin_amounts.get(20, margin_amounts.get("20", 0)) or 0)
+        self._account_available = (
+            self._misu_orderable if self.margin_order_check.isChecked()
+            else self._cash_orderable)
+        self.estimated_asset_value.setText(self._money_text(estimated))
+        self.account_available_value.setText(self._money_text(self._account_available))
+        self._refresh_order_funds_display()
+
+    def set_order_reserved(self, amount: int):
+        self._order_reserved = max(0, int(amount))
+        self._refresh_order_funds_display()
 
     def _on_unified_style(self, on: bool):
         # 통합 = 노랑 배경(NXT 마크색)에 '통', KRX = 기본 버튼에 'K'
@@ -1509,12 +2067,27 @@ class ConditionScreen(QWidget):
         self._settings.sync()  # 강제 종료돼도 디스크에 남게
 
     def _on_cell_clicked(self, index):
-        """종목명 클릭 -> 종목코드 클립보드 복사."""
-        if index.column() != FIELDS.index("name"):
-            return
-        code = self.model.codes[self.proxy.mapToSource(index).row()]
-        QApplication.clipboard().setText(code)
-        QToolTip.showText(QCursor.pos(), f"{code} 복사됨")
+        """주문 셀=대상 지정, 종목명=종목코드 클립보드 복사."""
+        source = self.proxy.mapToSource(index)
+        code = self.model.codes[source.row()]
+        if index.column() == ORDER_COL:
+            order_status = self.model.order_status.get(code, "")
+            if (order_status in ("장종료", "오류", "수량부족", "분할부족")
+                    or order_status.endswith("완료")):
+                self.model.set_order_status(code, "")
+                self.order_status_value.setText("")
+            if code in self.model.order_cancellable:
+                cell_rect = self.table.visualRect(index)
+                cursor_x = self.table.viewport().mapFromGlobal(QCursor.pos()).x()
+                if cursor_x >= cell_rect.right() - OrderDelegate.CANCEL_WIDTH + 1:
+                    self.model.set_order_status(
+                        code, self.model.order_status.get(code, ""), False)
+                    self.cancel_requested.emit(code)
+                    return
+            self._select_order_target(code)
+        elif index.column() == NAME_COL:
+            QApplication.clipboard().setText(code)
+            QToolTip.showText(QCursor.pos(), f"{code} 복사됨")
 
     def _on_context_menu(self, pos):
         """종목명 우클릭 -> 네이버 종목토론실 브라우저로 열기."""
@@ -1530,6 +2103,8 @@ class ConditionScreen(QWidget):
 
     def _on_header_clicked(self, col: int):
         # 상한가정렬 중에도 헤더 클릭 허용: 그룹 내 정렬 기준이 바뀐다
+        if col == ORDER_COL:  # 주문 컬럼은 정렬이 아니라 대상 선택 전용
+            return
         if col == self._sort_col:  # 같은 컬럼 재클릭 -> 방향 토글
             self._sort_order = (Qt.AscendingOrder if self._sort_order == Qt.DescendingOrder
                                 else Qt.DescendingOrder)
@@ -1638,11 +2213,18 @@ class ConditionScreen(QWidget):
     def on_excluded(self, code: str):
         """조건 이탈 (CNSRREQ D)"""
         if self.auto_remove.isChecked():
+            if code == self._order_target_code:
+                self._order_target_code = ""
+                self.model.set_order_target("")
+                self.margin_order_check.setEnabled(True)
+                self._refresh_order_target_display()
             self.model.remove_stock(code)
 
     def on_tick(self, code: str, fields: dict):
         """실시간 시세 (0B 체결 / 0D 호가)"""
         self.model.update_stock(code, fields)
+        if code == self._order_target_code:
+            self._refresh_order_target_display()
 
 
 def _demo(screen: ConditionScreen):
