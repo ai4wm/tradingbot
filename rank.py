@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """[0198] 실시간 종목조회순위 창. ka00198을 주기 폴링(창이 보일 때만)."""
 import asyncio
+import logging
 import threading
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSettings, Qt, QTimer, QUrl
@@ -14,6 +15,8 @@ from api import MarketInfo
 from gui import (ADMIN, MISU_ROLE, NEW_ROLE, NXT_ROLE, PURPLE, NameDelegate,
                  PreserveTextColorDelegate, VisibleCheckStyle)
 
+log = logging.getLogger("rank")
+
 RED = QColor("#e83030")
 BLUE = QColor("#2050d0")
 WHITE = QColor("white")
@@ -21,6 +24,7 @@ LIMIT = 29.5  # 상/하한 판정 (gui.py와 동일)
 
 COLUMNS = ["순위", "종목명", "변동", "기준시점주가", "기준등락률", "직전대비"]
 FIELDS  = ["rank", "name", "rank_chg", "price", "rate", "prev_rate"]
+RANK_COUNT = 20
 PERIODS = [("30초", "5"), ("1분", "1"), ("10분", "2"), ("1시간", "3"), ("당일누적", "4")]
 
 
@@ -219,7 +223,8 @@ class RankScreen(QWidget):
         self.alert_top.setStyle(self._checkbox_style)
         self.alert_jump.setStyle(self._checkbox_style)
         self.jump_n = QSpinBox()
-        self.jump_n.setRange(1, 19)
+        # 직전 순위가 화면의 20위 밖이면 급상승 폭은 19를 넘을 수 있다.
+        self.jump_n.setRange(1, 9999)
         self.jump_n.setValue(int(self._settings.value("rank_jump_n", 3)))
         self.alert_top.toggled.connect(lambda on: self._save_opt("rank_alert_top", on))
         self.alert_jump.toggled.connect(lambda on: self._save_opt("rank_alert_jump", on))
@@ -230,6 +235,7 @@ class RankScreen(QWidget):
         self._last_tm = ""    # 마지막 판정한 집계 시각
         self._last_alert_signature = None  # 시각이 같아도 순위/변동이 바뀌면 다시 판정
         self._last_codes = []  # 직전 스냅샷 순위순 코드 리스트
+        self._fetching = False  # 타이머·수동조회가 겹치는 중복 요청 방지
 
         bottom = QHBoxLayout()
         bottom.addWidget(self.top_n)
@@ -320,11 +326,40 @@ class RankScreen(QWidget):
         asyncio.ensure_future(self._fetch())
 
     async def _fetch(self):
+        if self._fetching:
+            return
+        self._fetching = True
         try:
             rows = await self.rest.inquiry_rank(self.period.currentData())
         except Exception as e:  # noqa: BLE001
             self.time_label.setText(str(e)[:40])
             return
+        finally:
+            self._fetching = False
+
+        raw_count = len(rows)
+        # 서버가 간헐적으로 순위 번호만 있는 빈 패딩 행이나 일부 행만 반환한다.
+        # 유효 행은 즉시 반영하되 빠진 순위는 직전 스냅샷으로 보존한다.
+        rows = [r for r in rows if (r.get("code") or "").strip()]
+        if len(rows) < RANK_COUNT:
+            log.warning("rank popup incomplete: valid=%d raw=%d expected=%d",
+                        len(rows), raw_count, RANK_COUNT)
+            previous = {
+                r["rank"]: r for r in self.model.rows
+                if 1 <= int(r.get("rank") or 0) <= RANK_COUNT
+            }
+            incoming = {
+                r["rank"]: r for r in rows
+                if 1 <= int(r.get("rank") or 0) <= RANK_COUNT
+            }
+            previous.update(incoming)
+            rows = [previous[rank] for rank in sorted(previous)][:RANK_COUNT]
+            if not rows:
+                self.time_label.setText(f"불완전 {len(rows)}/{RANK_COUNT} · 재조회 대기")
+                return
+        else:
+            rows = rows[:RANK_COUNT]
+
         current = self.table.currentIndex()
         selected_row = current.row() if current.isValid() else -1
         selected_col = current.column() if current.isValid() else 0

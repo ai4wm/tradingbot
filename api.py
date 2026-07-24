@@ -337,6 +337,7 @@ class RestClient:
     async def inquiry_rank(self, qry_tp: str = "5") -> list[dict]:
         """ka00198 실시간 종목조회순위 -> rank.py 필드로 정규화.
         qry_tp: 1=1분 2=10분 3=1시간 4=당일누적 5=30초 (기준 집계기간)."""
+        # ka00198은 순위 성격의 TR이지만 실제 REST 제공 경로는 stkinfo이다.
         d = await self.request("ka00198", {"qry_tp": qry_tp})
         return [{
             "rank": _to_int(r.get("bigd_rank")),
