@@ -26,8 +26,14 @@ FID = {
     "12": "rate",      # 등락율
     "13": "vol",       # 누적거래량
     "15": "tick_qty",  # 개별 체결량 (+매수체결 / -매도체결, 부호 보존)
+    "41": "ask_price",  # 매도호가1
+    "42": "ask_price2", "43": "ask_price3", "44": "ask_price4", "45": "ask_price5",
+    "51": "bid_price",  # 매수호가1
+    "52": "bid_price2", "53": "bid_price3", "54": "bid_price4", "55": "bid_price5",
     "61": "ask_qty",   # 최우선 매도잔량 (0D 매도호가1 잔량)
+    "62": "ask_qty2", "63": "ask_qty3", "64": "ask_qty4", "65": "ask_qty5",
     "71": "bid_qty",   # 최우선 매수잔량 (0D 매수호가1 잔량)
+    "72": "bid_qty2", "73": "bid_qty3", "74": "bid_qty4", "75": "bid_qty5",
     # 예상가: 0D 23/24는 장중에도 값이 바뀌며 옴(상한가 종목 등) -> 표시 ON 신호로 못 씀.
     # gui가 0H/단일가/VI/동시호가REST로 켠 상태에서만 갱신용으로 반영한다.
     "23": "exp_price",
@@ -41,7 +47,16 @@ FID_0H = {
     "13": "exp_qty",
 }
 
-REAL_TYPES = ["0B", "0D", "0H", "1h"]  # 체결 / 호가잔량 / 예상체결 / VI발동해제
+# 0w(종목프로그램매매): 매수/매도수량은 장중 누적값이므로 GUI가 직전값과의
+# 차분만 1·3·5분 흐름으로 사용한다. 같은 FID 번호의 일반 시세 오해석을 막기
+# 위해 0B/0D용 FID와 분리한다.
+FID_0W = {
+    "202": "program_sell_qty",
+    "206": "program_buy_qty",
+    "210": "program_net_qty",
+}
+
+REAL_TYPES = ["0B", "0D", "0H", "0w", "1h"]  # 체결 / 호가 / 예상 / 프로그램 / VI
 
 
 def _num(v):
@@ -68,21 +83,27 @@ def parse_real_item(item: dict) -> tuple[str, dict]:
     통합(_AL)/NXT(_NX) 등록 시 item에 접미사가 붙어 옴 -> 떼서 순수코드로."""
     code = (item.get("item") or "").split("_")[0]
     values = item.get("values", {})
-    table = FID_0H if item.get("type") == "0H" else FID
+    typ = item.get("type")
+    table = FID_0H if typ == "0H" else FID_0W if typ == "0w" else FID
     out = {}
     for fid, raw in values.items():
         field = table.get(fid)
         if not field:
             continue
         n = _num(raw)
-        if field in ("price", "exp_price"):   # 가격류: 부호 제거 + 정수
+        if field in ("price", "exp_price") or "price" in field:  # 가격류
             out[field] = int(abs(n))
-        elif field in ("vol", "tick_qty", "ask_qty", "bid_qty", "exp_qty"):
+        elif (field in ("vol", "tick_qty", "exp_qty") or "qty" in field
+              or field.endswith("_amount")):
             out[field] = int(n)
         else:
             out[field] = n
     if table is FID_0H and out:
         out["exp_hot"] = 1  # 0H는 단일가/VI 국면에만 옴 -> gui가 판정 없이 표시
+    elif table is FID_0W and out:
+        raw_item = item.get("item") or ""
+        out["_program_source"] = ("_NX" if raw_item.endswith("_NX") else
+                                  "_AL" if raw_item.endswith("_AL") else "")
     return code, out
 
 
@@ -93,12 +114,35 @@ def parse_condition_list(data: list) -> list[tuple[str, str]]:
     return sorted(rows, key=lambda r: int(r[0]) if r[0].isdigit() else 1 << 30)
 
 
+def parse_order_item(item: dict) -> dict:
+    """REAL type=00 주문체결 표준 FID를 주문 엔진용으로 정규화."""
+    values = item.get("values", {})
+
+    def integer(fid):
+        return int(abs(_num(values.get(fid))))
+
+    code = str(values.get("9001") or item.get("item") or "")
+    code = code.split("_")[0].lstrip("A")
+    return {
+        "code": code,
+        "order_no": str(values.get("9203") or "").strip(),
+        "original_order_no": str(values.get("904") or "").strip(),
+        "status": str(values.get("913") or "").strip(),
+        "order_qty": integer("900"),
+        "remaining_qty": integer("902") if "902" in values else None,
+        "fill_id": str(values.get("909") or "").strip(),
+        "fill_price": integer("910"),
+        "fill_qty": integer("911"),
+    }
+
+
 class WSClient:
     def __init__(self):
         self.on_condition_event = None    # (seq, code, is_insert) - 실시간 편입/이탈
         self.on_condition_snapshot = None  # (seq, list[code]) - CNSRREQ 초기 목록
         self.on_real = None               # (code, fields)
         self.on_vi = None                 # (code, active, 발동가) - VI 발동/해제
+        self.on_order = None              # type=00 주문접수/체결/취소
         self.on_condition_list = None     # (list[(seq, name)])
         self._ws = None
         self._token_fn = None            # async () -> token
@@ -179,6 +223,43 @@ class WSClient:
         if todo:
             await self._send(build_remove([self._registered_item(k) for k in todo], REAL_TYPES))
 
+    async def sync_real_refs(self, desired: dict[tuple[str, str | None], int],
+                             force: bool = False):
+        """활성 화면에서 계산한 목표 참조수와 서버/내부 등록 상태를 일치시킨다.
+
+        중복 조건 이벤트나 창 닫기·전환 경합으로 누적 참조수가 틀어져도 다음
+        동기화에서 복구된다. force는 서버 쪽 구독까지 REMOVE+REG로 재확인한다.
+        """
+        target = {}
+        for key, count in desired.items():
+            if count <= 0:
+                continue
+            if key not in target and len(target) >= config.REAL_REG_LIMIT:
+                log.warning("real-time reg limit %d, skip %s", config.REAL_REG_LIMIT, key[0])
+                continue
+            target[key] = int(count)
+
+        current_keys = set(self._reg_codes)
+        target_keys = set(target)
+        sort_key = lambda k: (k[0], k[1] or "")
+        remove = sorted(current_keys - target_keys, key=sort_key)
+        register = sorted(target_keys - current_keys, key=sort_key)
+        if force:
+            # 내부 카운트가 맞아 보여도 서버 구독이 사라진 경우까지 복구한다.
+            remove = sorted(current_keys, key=sort_key)
+            register = sorted(target_keys, key=sort_key)
+
+        # 연결이 끊긴 순간이어도 재접속의 _resubscribe가 목표 상태를 사용하도록
+        # 송신 전에 내부 상태를 확정한다.
+        self._reg_codes = target
+        if remove:
+            await self._send(build_remove([self._registered_item(k) for k in remove], REAL_TYPES))
+        if register:
+            await self._send(build_reg([self._registered_item(k) for k in register], REAL_TYPES))
+        if force or remove or register:
+            log.info("real sync: refs=%d unique=%d +%d/-%d force=%s",
+                     sum(target.values()), len(target), len(register), len(remove), force)
+
     async def set_real_suffix(self, suffix: str):
         """KRX 전용("") <-> 통합("_AL") 런타임 전환: 기존 등록 전부 갈아끼움."""
         if suffix == self.real_suffix:
@@ -202,6 +283,7 @@ class WSClient:
                 raise RuntimeError(f"LOGIN failed: {login}")
             log.info("ws connected + LOGIN ok")
             self._connected.set()
+            await self._send(build_reg([""], ["00"], grp_no="2"))
             await self._resubscribe()
             async for raw in ws:
                 await self._dispatch(json.loads(raw))
@@ -249,6 +331,10 @@ class WSClient:
                 if item.get("type") == "02":  # 조건검색 실시간 편입/이탈
                     self._on_real_condition(item)
                     continue
+                if item.get("type") == "00":
+                    if self.on_order:
+                        self.on_order(parse_order_item(item))
+                    continue
                 if item.get("type") == "1h":
                     self._on_vi(item)
                     continue
@@ -289,7 +375,7 @@ class WSClient:
         """처음 보는 (type,fid)를 한 번씩 로그. 매핑여부+샘플값 포함.
         개장 동시호가(08:50~) 때 bot.log 열면 예상체결가 등 UNMAPPED FID를 바로 찾는다."""
         typ = item.get("type", "")
-        table = FID_0H if typ == "0H" else FID
+        table = FID_0H if typ == "0H" else FID_0W if typ == "0w" else FID
         for fid, val in item.get("values", {}).items():
             key = (typ, fid)
             if key in self._seen_fids:
@@ -351,9 +437,23 @@ def _demo():
     assert f["tick_qty"] == -125, f
     _, fe = parse_real_item({"item": "x", "type": "0D", "values": {"23": "+1215", "24": "8,151"}})
     assert fe == {"exp_price": 1215, "exp_qty": 8151}, fe
+    _, book = parse_real_item({"item": "x", "type": "0D", "values": {
+        "41": "1010", "42": "1020", "51": "1000", "52": "990",
+        "61": "100", "62": "200", "71": "300", "72": "400"}})
+    assert book == {"ask_price": 1010, "ask_price2": 1020,
+                    "bid_price": 1000, "bid_price2": 990,
+                    "ask_qty": 100, "ask_qty2": 200,
+                    "bid_qty": 300, "bid_qty2": 400}, book
     # 0H(주식예상체결)는 같은 FID가 다른 의미: 10=예상체결가, 13=예상체결량
     _, fh = parse_real_item({"item": "x", "type": "0H", "values": {"10": "-1215", "13": "8151", "12": "+21.02"}})
     assert fh == {"exp_price": 1215, "exp_qty": 8151, "exp_hot": 1}, fh
+    # 0w(종목프로그램매매)는 누적 매수/매도수량을 별도 필드로 넘긴다.
+    _, fp = parse_real_item({"item": "005930_AL", "type": "0w", "values": {
+        "202": "1,200,000", "206": "2,500,000", "210": "+1,300,000", "10": "99999"}})
+    assert fp == {"program_sell_qty": 1_200_000,
+                  "program_buy_qty": 2_500_000,
+                  "program_net_qty": 1_300_000,
+                  "_program_source": "_AL"}, fp
     # 매핑 없는 FID 무시
     _, f2 = parse_real_item({"item": "x", "values": {"9999": "1"}})
     assert f2 == {}, f2

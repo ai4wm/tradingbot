@@ -16,6 +16,7 @@ from PySide6.QtWidgets import QApplication, QMainWindow
 
 from api import RestClient
 from gui import ConditionScreen
+from order import OrderEngine, split_quantity
 from rank import RankScreen, _beep
 from ws import WSClient
 
@@ -28,6 +29,7 @@ log = logging.getLogger("main")
 
 MAX_WINDOWS = 3  # 실시간 등록 ~100종목 한도 내 (조건당 20~30종목 기준)
 RANK_SEQ = "RANK"      # [순위]조회순위 (ka00198 폴 -> on_snapshot)
+HOLDINGS_SEQ = "HOLDINGS"  # [계좌]보유종목 (kt00018)
 NXT_RATE_SEQ = "NXT_RATE"  # [NXT]등락률순위 (ka10027, NXT 전용)
 VSURGE_SEQ = "VSURGE"  # [급증]거래량급증 (ka10023)
 TVAL_SEQ = "TVAL"      # [대금]거래대금상위 (ka10032)
@@ -36,6 +38,7 @@ RANK_SUBMODE = {RANK_SEQ: "rank", NXT_RATE_SEQ: "nxt_rate",
                 VSURGE_SEQ: "vsurge", TVAL_SEQ: "tval"}
 RANK_SEQS = set(RANK_SUBMODE)
 RANK_TOP = 20          # 순위 모드 실시간 슬롯 캡 (95한도 공유)
+ORDERABLE_PREFETCH_TOP = 20  # 화면에 정렬된 상위 선조회 수
 THEME_MODES = ("system", "dark", "light")
 THEME_UI = {
     "system": ("🖥", "테마: 시스템 — Windows 설정을 따름"),
@@ -105,23 +108,24 @@ class View:
         selected_seq = self.seq
         combo.clear()
         combo.addItem("[순위]조회순위", RANK_SEQ)   # 맨 위 고정: REST 순위 계열
+        combo.addItem("[계좌]보유종목", HOLDINGS_SEQ)
         combo.addItem("[NXT]등락률순위", NXT_RATE_SEQ)
         combo.addItem("[급증]거래량급증", VSURGE_SEQ)
         combo.addItem("[대금]거래대금상위", TVAL_SEQ)
         f = QFont(combo.font())
         f.setBold(True)
-        for i, color in ((0, "#FFDD00"), (1, "#33C24D"),
-                         (2, "#FF8C00"), (3, "#38B8FF")):  # 볼드+색으로 조건식과 구분
+        for i, color in ((0, "#FFDD00"), (1, "#D6A5FF"), (2, "#33C24D"),
+                         (3, "#FF8C00"), (4, "#38B8FF")):  # 볼드+색으로 조건식과 구분
             combo.setItemData(i, f, Qt.FontRole)
             combo.setItemData(i, QColor(color), Qt.ForegroundRole)
-        combo.insertSeparator(4)  # 진짜 조건식과 구분선
+        combo.insertSeparator(5)  # 진짜 조건식과 구분선
         for seq, name in items:
             combo.addItem(name, seq)
         if self.seq is None:
             last = self._settings.value(self.prefix + "last_condition")
             idx = combo.findData(last) if last is not None else -1
-            if idx < 0:  # 저장 없음: 첫 진짜 조건식 (0~3=순위계열,4=구분선,5=첫 조건식)
-                idx = 5 if combo.count() > 5 else 0
+            if idx < 0:  # 저장 없음: 첫 진짜 조건식 (0~4=내장메뉴,5=구분선)
+                idx = 6 if combo.count() > 6 else 0
             combo.setCurrentIndex(idx)  # setCurrentIndex는 activated 안 터짐 -> 수동 등록
             asyncio.ensure_future(self._switch_condition(combo.itemData(idx)))
         else:  # 재조회/재접속: 현재 조건 선택 복원
@@ -131,7 +135,7 @@ class View:
             else:
                 # 영웅문에서 현재 조건식을 삭제한 뒤 목록을 재조회한 경우,
                 # 콤보는 자동으로 0번을 표시하지만 실제 구독은 예전 조건에 남는 문제가 있다.
-                idx = 5 if combo.count() > 5 else 0
+                idx = 6 if combo.count() > 6 else 0
                 combo.setCurrentIndex(idx)
                 asyncio.ensure_future(self._switch_condition(combo.itemData(idx)))
 
@@ -143,11 +147,16 @@ class View:
             asyncio.ensure_future(self._switch_condition(seq))
 
     async def _switch_condition(self, seq: str):
-        if seq != self.seq:  # 조건 변경: 이전 조건 해제 + 이 창 행 전량 정리
+        changed = seq != self.seq
+        if changed:  # 조건 변경: 이전 조건 해제 + 이 창 행 전량 정리
             await self.stop()
-        elif seq not in RANK_SEQS:  # 같은 조건 재조회: 행 유지, 스냅샷 diff로만 반영
+            # 창 닫기와 조건 전환이 겹쳐도 이전 참조수가 새 REG를 삼키지 않게
+            # 다음 묶음에서 서버 등록을 현재 화면 기준으로 전량 재확인한다.
+            self.app.force_real_sync()
+        elif seq not in RANK_SEQS and seq != HOLDINGS_SEQ:  # 같은 조건식 재조회
             await self.app.clear_condition_if_sole(self.seq, self)
-        switched = self.screen.set_rank_mode(seq in RANK_SEQS)
+        mode = "rank" if seq in RANK_SEQS else "holdings" if seq == HOLDINGS_SEQ else "normal"
+        switched = self.screen.set_view_mode(mode)
         if seq in RANK_SEQS:  # 기준시간 콤보 내용을 서브모드에 맞게 교체 (계열 간 직접 전환 포함)
             self.screen.set_rank_period(RANK_SUBMODE[seq])
         self.seq = str(seq)
@@ -159,14 +168,26 @@ class View:
         if seq in RANK_SEQS:  # 순위 계열: 서버 조건검색 대신 REST 폴 -> 같은 snapshot 경로
             await self._poll_rank()
             return
+        if seq == HOLDINGS_SEQ:
+            await self._poll_holdings()
+            return
         await self.app.ws.register_condition(seq)
 
     async def stop(self):
         """이 창의 조건/시세 구독 정리 (조건 변경·창 닫기)."""
+        # 이전 조건의 지연 백필이 살아 있으면 새 조건의 _schedule_refresh가 이를 보고
+        # 예약을 생략할 수 있다. 전환 전에 끝내 보유종목 등 새 목록이 반드시 백필되게 한다.
+        if self._refresh_task and not self._refresh_task.done():
+            self._refresh_task.cancel()
+            try:
+                await self._refresh_task
+            except asyncio.CancelledError:
+                pass
+        self._refresh_task = None
         suffix = self._real_suffix()
-        if self.seq is not None:
+        if self.seq is not None and self.seq != HOLDINGS_SEQ:
             await self.app.clear_condition_if_sole(self.seq, self)
-            self.seq = None
+        self.seq = None
         codes = list(self.screen.model.codes)
         for code in codes:
             self.app.queue_real(code, add=False, suffix=suffix)
@@ -202,6 +223,19 @@ class View:
             self.screen.on_tick(r["code"], {"qrank": r["rank"], "qrank_chg": r["rank_chg"],
                                             "name": r["name"]})
 
+    async def _poll_holdings(self):
+        """계좌 보유종목을 조회해 조건검색 그리드와 실시간 시세에 연결."""
+        try:
+            rows = await self.app.rest.holdings()
+        except Exception as e:  # noqa: BLE001
+            log.warning("holdings poll%s: %s", self.prefix or "", e)
+            return
+        self.on_snapshot([r["code"] for r in rows])
+        for r in rows:
+            self.screen.on_tick(r["code"], {"name": r["name"]})
+        # 행 추가 시 예약되는 백필과 별개로 이름 반영 뒤 한 번 더 보장한다.
+        self._schedule_refresh()
+
     # --- 재조회 -----------------------------------------------------------
     def on_refresh(self):
         seq = self.screen.condition_combo.currentData()
@@ -209,8 +243,10 @@ class View:
             asyncio.ensure_future(self._switch_condition(seq))
 
     def _mkey(self, name: str) -> str:
-        """모드별 설정 키 (재조회/간격): 순위 계열이면 rankmode_ 접두 (gui._mkey와 동일 규칙)."""
-        return self.prefix + ("rankmode_" if self.seq in RANK_SEQS else "") + name
+        """화면별 재조회 설정 키 (gui._mkey와 동일 규칙)."""
+        mode_prefix = ("rankmode_" if self.seq in RANK_SEQS else
+                       "holdingsmode_" if self.seq == HOLDINGS_SEQ else "")
+        return self.prefix + mode_prefix + name
 
     def _on_sound(self, on: bool):
         self._settings.setValue(self.prefix + "sound", "true" if on else "false")
@@ -317,6 +353,15 @@ class App:
     def __init__(self, screen: ConditionScreen):
         self.rest = RestClient()
         self.ws = WSClient()
+        self.orders = OrderEngine(self.rest, self._on_order_update)
+        self._orderable_cache: dict[tuple[str, int], dict] = {}
+        self._orderable_tasks: dict[ConditionScreen, asyncio.Task] = {}
+        self._orderable_prefetch_task = None
+        self._orderable_prefetch_failed: dict[tuple[str, int], float] = {}
+        self._orderable_prefetch_timer = QTimer()
+        self._orderable_prefetch_timer.timeout.connect(
+            self._queue_orderable_prefetch)
+        self._orderable_prefetch_timer.start(400)
         self._settings = QSettings("layout.ini", QSettings.IniFormat)
         self._theme_mode = str(self._settings.value("theme_mode", "system"))
         if self._theme_mode not in THEME_MODES:
@@ -327,10 +372,12 @@ class App:
         self._condition_reload_id = 0   # 재조회 타임아웃과 실제 응답의 경합 방지
         self._market = None             # MarketInfo (새 창 모델 주입용)
         self._limit_cnt = None          # 어제까지 연속상한 일수 (연상 컬럼, 시작 시 1회, 일봉 계산)
-        # REG/REMOVE는 0.3초 모아 각 1건으로 (서버 105110 유량거부 방지).
-        # Counter: 두 창이 같은 종목을 등록하면 참조수 2가 되도록 발생 횟수 유지.
-        self._reg_pending = Counter()
-        self._rm_pending = Counter()
+        self._account_summary = None     # 주문 툴바 공통 실계좌 요약
+        # 화면 변경을 0.3초 모은 뒤, 현재 보이는 행 전체와 WS 등록 상태를 동기화한다.
+        # 편입/이탈 이벤트 횟수로 참조수를 증감하면 중복 이벤트나 창 전환 경합 때
+        # 실제 화면과 참조수가 어긋날 수 있으므로 화면 모델을 단일 진실로 삼는다.
+        self._real_dirty = False
+        self._real_force_pending = False
         self._reg_task = None
         # 단일가 종목은 WS 무송신(실측 0건) -> REST 3초 폴이 유일한 채널
         self._single_task = None
@@ -355,6 +402,7 @@ class App:
         self.ws.on_condition_snapshot = self._on_condition_snapshot
         self.ws.on_real = self._on_real
         self.ws.on_vi = self._on_vi
+        self.ws.on_order = self.orders.on_order_event
         # 통합(_AL) 시세: 전 창 공통 설정. 첫 REG 전에 접미사 확정돼야 해서 여기서 복원
         if self._settings.value("unified_real", "false") == "true":
             self.ws.real_suffix = self.rest.suffix = "_AL"
@@ -382,6 +430,169 @@ class App:
         screen.reload_btn.clicked.connect(self._reload_conditions)
         screen.rank_btn.clicked.connect(self._on_rank)
         screen.newwin_btn.clicked.connect(self._on_newwin)
+        screen.order_target_selected.connect(
+            lambda code, price, target=screen:
+            self._queue_orderable_quantity(target, code, price))
+        screen.order_requested.connect(
+            lambda code, mode, count, auto, total, price, target=screen:
+            self._submit_order(target, code, mode, count, auto, total, price))
+        screen.cancel_requested.connect(self._cancel_order)
+
+    def _queue_orderable_quantity(
+            self, screen: ConditionScreen, code: str, price: int):
+        key = (code, price)
+        cached = self._orderable_cache.get(key)
+        if cached is not None:
+            screen.set_orderable_quantity(code, price, cached)
+            return
+        # 사용자가 직접 고른 종목은 백그라운드 선조회보다 항상 우선한다.
+        if self._orderable_prefetch_task and not self._orderable_prefetch_task.done():
+            self._orderable_prefetch_task.cancel()
+        previous = self._orderable_tasks.get(screen)
+        if previous and not previous.done():
+            previous.cancel()
+        task = asyncio.ensure_future(
+            self._load_orderable_quantity(screen, code, price))
+        self._orderable_tasks[screen] = task
+
+    async def _load_orderable_quantity(
+            self, screen: ConditionScreen, code: str, price: int):
+        try:
+            detail = await self.rest.orderable_quantity(code, price)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:  # noqa: BLE001
+            log.warning("orderable quantity %s@%s: %s", code, price, e)
+            return
+        else:
+            self._orderable_cache[(code, price)] = detail
+            screen.set_orderable_quantity(code, price, detail)
+        finally:
+            if self._orderable_tasks.get(screen) is asyncio.current_task():
+                self._orderable_tasks.pop(screen, None)
+
+    def _prefetch_candidates(self) -> list[tuple[str, int]]:
+        """각 표에 현재 보이는 정렬 순서 그대로 상위 종목을 모은다."""
+        result = []
+        seen = set()
+        for view in self.views:  # 본창 우선, 이후 추가 창 순서
+            screen = view.screen
+            # 편입 직후 시세가 행마다 순차 도착하는 동안 조회를 시작하면 아래 행의
+            # upper가 먼저 채워져 화면 재정렬 전 순서로 선조회될 수 있다.
+            # 이 창의 상한가 기준값이 전부 준비된 다음 실제 프록시 순위를 읽는다.
+            if screen.model.codes and any(
+                    int(screen.model.rows.get(code, {}).get("upper") or 0) <= 0
+                    for code in screen.model.codes):
+                continue
+            for proxy_row in range(screen.proxy.rowCount()):
+                source = screen.proxy.mapToSource(
+                    screen.proxy.index(proxy_row, 0))
+                if not source.isValid():
+                    continue
+                code = screen.model.codes[source.row()]
+                data = screen.model.rows.get(code, {})
+                upper = int(data.get("upper") or 0)
+                key = (code, upper)
+                if upper <= 0 or key in seen:
+                    continue
+                seen.add(key)
+                result.append(key)
+                if len(result) >= ORDERABLE_PREFETCH_TOP:
+                    return result
+        return result
+
+    def _queue_orderable_prefetch(self):
+        if self._orderable_prefetch_task and not self._orderable_prefetch_task.done():
+            return
+        # 직접 선택한 종목 조회가 진행 중이면 끝날 때까지 양보한다.
+        if any(task and not task.done() for task in self._orderable_tasks.values()):
+            return
+        now = time.monotonic()
+        for key in self._prefetch_candidates():
+            if key in self._orderable_cache:
+                continue
+            if now - self._orderable_prefetch_failed.get(key, 0) < 10:
+                continue
+            code, price = key
+            rank = next((
+                row + 1
+                for view in self.views
+                for row in range(view.screen.proxy.rowCount())
+                if view.screen.model.codes[
+                    view.screen.proxy.mapToSource(
+                        view.screen.proxy.index(row, 0)).row()] == code
+            ), 0)
+            log.info("orderable prefetch start: rank=%s code=%s price=%s",
+                     rank or "-", code, price)
+            self._orderable_prefetch_task = asyncio.ensure_future(
+                self._load_orderable_prefetch(*key))
+            return
+
+    async def _load_orderable_prefetch(self, code: str, price: int):
+        try:
+            detail = await self.rest.orderable_quantity(code, price)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:  # noqa: BLE001
+            self._orderable_prefetch_failed[(code, price)] = time.monotonic()
+            log.warning("orderable prefetch %s@%s: %s", code, price, e)
+        else:
+            self._orderable_cache[(code, price)] = detail
+            self._orderable_prefetch_failed.pop((code, price), None)
+            # 선조회 도중 사용자가 이 종목을 골랐다면 즉시 화면에도 반영한다.
+            for view in self.views:
+                view.screen.set_orderable_quantity(code, price, detail)
+
+    def _submit_order(self, screen: ConditionScreen, code: str, mode: str,
+                      count: int, auto_cancel: bool, total_qty: int, price: int):
+        try:
+            quantities = (
+                [100] * count if mode == "fixed"
+                else split_quantity(total_qty, count))
+            name = screen.model.rows.get(code, {}).get("name") or code
+            self.orders.submit(code, name, price, quantities, auto_cancel)
+        except Exception as e:  # noqa: BLE001
+            screen.set_order_state(code, "오류", f"상태 오류 · {e}", False)
+
+    def _cancel_order(self, code: str):
+        try:
+            self.orders.manual_cancel(code)
+        except Exception as e:  # noqa: BLE001
+            for view in self.views:
+                if code in view.screen.model.rows:
+                    view.screen.set_order_state(
+                        code, "오류", f"상태 취소오류 · {e}", False)
+
+    def _on_order_update(self, batch, state: str):
+        count = len(batch.children)
+        mode = "자" if batch.auto_cancel else "수"
+        if batch.error:
+            compact = "장종료" if "장종료" in batch.error else "오류"
+        elif batch.remaining_qty == 0 and batch.sent_count == count:
+            compact = f"{mode} 완료"
+        elif state.startswith("취소"):
+            compact = f"{mode} 취소"
+        else:
+            compact = f"{mode} {batch.sent_count}/{count}"
+        detail = (
+            f"상태 {state} · {'자동취소' if batch.auto_cancel else '수동취소'}"
+            f" · 전송 {batch.sent_count}/{count}"
+            f" · 체결 {batch.total_filled:,}/{batch.total_requested:,}주"
+            f" · 잔량 {batch.remaining_qty:,}주"
+        )
+        if batch.auto_cancel:
+            detail += f" · 취소 {batch.cancel_count}/{count}"
+        if batch.error:
+            detail += f" · {batch.error}"
+        has_remaining = any(
+            child.order_no and child.remaining_qty > 0 and not child.cancel_sent
+            for child in batch.children)
+        reserved = self.orders.committed_notional()
+        for view in self.views:
+            view.screen.set_order_reserved(reserved)
+            if batch.code in view.screen.model.rows:
+                view.screen.set_order_state(
+                    batch.code, compact, detail, has_remaining)
 
     def _reload_conditions(self):
         """조건 목록 재조회 요청. 응답 전후가 화면에 보이도록 버튼 상태도 갱신한다."""
@@ -443,14 +654,24 @@ class App:
         for _ in range(int(self._settings.value("cond_windows", 0))):
             self._open_window()  # 지난 세션의 추가 창 복원
         try:
+            self._account_summary = await self.rest.account_summary()
+            for v in self.views:
+                v.screen.set_account_summary(self._account_summary)
+            log.info("account summary loaded: estimated=%s orderable=%s",
+                     self._account_summary["estimated_assets"],
+                     self._account_summary["cash_orderable"])
+        except Exception as e:  # noqa: BLE001
+            log.warning("account summary failed: %s", e)
+        try:
             self._market = await self.rest.market_info()
             for v in self.views:
                 self._inject_market(v)
             if self._rank is not None:
                 self._rank.set_market(self._market)
             m = self._market
-            log.info("kosdaq %d, single %d, nxt %d, misu %d, admin %d",
-                     len(m.kosdaq), len(m.single), len(m.nxt), len(m.misu), len(m.admin))
+            log.info("kosdaq %d, single %d, liquidation %d, nxt %d, misu %d, admin %d",
+                     len(m.kosdaq), len(m.single), len(m.liquidation),
+                     len(m.nxt), len(m.misu), len(m.admin))
         except Exception as e:  # noqa: BLE001
             log.warning("market_info failed: %s", e)
         try:
@@ -469,9 +690,9 @@ class App:
             m.limit_cnt = self._limit_cnt
         if self._market is None:
             return
-        m.kosdaq, m.single, m.nxt, m.misu, m.admin = (
-            self._market.kosdaq, self._market.single, self._market.nxt,
-            self._market.misu, self._market.admin)
+        m.kosdaq, m.single, m.liquidation, m.nxt, m.misu, m.admin = (
+            self._market.kosdaq, self._market.single, self._market.liquidation,
+            self._market.nxt, self._market.misu, self._market.admin)
         m.new_today, m.new15, m.new30 = (
             self._market.new_today, self._market.new15, self._market.new30)
         m.shares = self._market.shares
@@ -525,33 +746,38 @@ class App:
             await self.ws.clear_condition(seq)
 
     def queue_real(self, code: str, add: bool, suffix: str = None):
-        tgt, opp = ((self._reg_pending, self._rm_pending) if add
-                    else (self._rm_pending, self._reg_pending))
-        key = (code, suffix)
-        if opp[key] > 0:  # 같은 창/시장소스에서 편입<->이탈이 겹치면 상쇄
-            opp[key] -= 1
-            if opp[key] == 0:
-                del opp[key]
-        else:
-            tgt[key] += 1
+        # code/add/suffix는 호출부 의미를 드러내기 위해 유지한다. 실제 목표 상태는
+        # 이벤트 횟수가 아니라 활성 창의 model.codes에서 다시 계산한다.
+        self._real_dirty = True
         if not (self._reg_task and not self._reg_task.done()):
             self._reg_task = asyncio.ensure_future(self._flush_real())
 
+    def force_real_sync(self):
+        """조건 전환/창 닫기 뒤 서버 등록도 전량 재확인한다."""
+        self._real_force_pending = True
+        self._real_dirty = True
+        if not (self._reg_task and not self._reg_task.done()):
+            self._reg_task = asyncio.ensure_future(self._flush_real())
+
+    def _desired_real_refs(self) -> Counter:
+        """현재 활성 창의 보이는 행을 (코드, 시장접미사)별 참조수로 만든다."""
+        refs = Counter()
+        for view in self.views:
+            suffix = view._real_suffix()
+            for code in view.screen.model.codes:
+                refs[(code, suffix)] += 1
+        return refs
+
     async def _flush_real(self):
-        await asyncio.sleep(0.3)
-        reg = list(self._reg_pending.elements())  # 발생 횟수 유지 (참조수 = 창 수)
-        rm = list(self._rm_pending.elements())
-        self._reg_pending.clear()
-        self._rm_pending.clear()
-        for items, add in ((rm, False), (reg, True)):
-            by_suffix = {}
-            for code, suffix in items:
-                by_suffix.setdefault(suffix, []).append(code)
-            for suffix, codes in by_suffix.items():
-                if add:
-                    await self.ws.register_real_many(sorted(codes), suffix)
-                else:
-                    await self.ws.remove_real_many(sorted(codes), suffix)
+        while True:
+            await asyncio.sleep(0.3)
+            self._real_dirty = False
+            force = self._real_force_pending
+            self._real_force_pending = False
+            await self.ws.sync_real_refs(self._desired_real_refs(), force=force)
+            # 위 await 중 화면이 다시 바뀌면 dirty가 켜진다. 후속 상태도 빠짐없이 반영한다.
+            if not self._real_dirty and not self._real_force_pending:
+                return
 
     def _on_single_poll(self):
         codes = sorted({c for v in self.views if v.seq != NXT_RATE_SEQ
@@ -629,6 +855,8 @@ class App:
         win.setCentralWidget(screen)
         view = View(self, screen)
         self._inject_market(view)
+        if self._account_summary is not None:
+            screen.set_account_summary(self._account_summary)
         self.views.append(view)
         self._wire_extra(screen)
         self._extra_windows.append(win)
@@ -641,14 +869,25 @@ class App:
 
     def _wire_extra(self, screen: ConditionScreen):
         screen.reload_btn.clicked.connect(self._reload_conditions)
+        screen.order_target_selected.connect(
+            lambda code, price, target=screen:
+            self._queue_orderable_quantity(target, code, price))
+        screen.order_requested.connect(
+            lambda code, mode, count, auto, total, price, target=screen:
+            self._submit_order(target, code, mode, count, auto, total, price))
+        screen.cancel_requested.connect(self._cancel_order)
 
     def _on_window_closed(self, win):
         if _SHUTDOWN[0]:  # 앱 종료 동반 닫힘: 창 개수 보존 (재시작 때 복원용)
             return
         for v in list(self.views[1:]):
             if v.screen.window() is win:
+                task = self._orderable_tasks.pop(v.screen, None)
+                if task and not task.done():
+                    task.cancel()
                 asyncio.ensure_future(v.stop())
                 self.views.remove(v)
+                self.force_real_sync()
         if win in self._extra_windows:
             self._extra_windows.remove(win)
         self._save_window_count()
@@ -707,7 +946,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self._key = "geometry"  # 순위 모드 전환 시 set_rank_mode가 rank_geometry로 교체
+        self._key = "geometry"  # 화면 전환 시 set_view_mode가 화면별 키로 교체
         self._settings = QSettings("layout.ini", QSettings.IniFormat)
         self._geo_timer = QTimer(self)
         self._geo_timer.setSingleShot(True)

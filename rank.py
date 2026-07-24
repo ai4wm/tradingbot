@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """[0198] 실시간 종목조회순위 창. ka00198을 주기 폴링(창이 보일 때만)."""
 import asyncio
+import logging
 import threading
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSettings, Qt, QTimer, QUrl
@@ -14,6 +15,8 @@ from api import MarketInfo
 from gui import (ADMIN, MISU_ROLE, NEW_ROLE, NXT_ROLE, PURPLE, NameDelegate,
                  PreserveTextColorDelegate, VisibleCheckStyle)
 
+log = logging.getLogger("rank")
+
 RED = QColor("#e83030")
 BLUE = QColor("#2050d0")
 WHITE = QColor("white")
@@ -21,6 +24,7 @@ LIMIT = 29.5  # 상/하한 판정 (gui.py와 동일)
 
 COLUMNS = ["순위", "종목명", "변동", "기준시점주가", "기준등락률", "직전대비"]
 FIELDS  = ["rank", "name", "rank_chg", "price", "rate", "prev_rate"]
+RANK_COUNT = 20
 PERIODS = [("30초", "5"), ("1분", "1"), ("10분", "2"), ("1시간", "3"), ("당일누적", "4")]
 
 
@@ -63,6 +67,7 @@ class RankModel(QAbstractTableModel):
         self.nxt: set[str] = set()
         self.misu: set[str] = set()
         self.admin: set[str] = set()
+        self.liquidation: set[str] = set()
         self.new_today: set[str] = set()
         self.new15: set[str] = set()
         self.new30: set[str] = set()
@@ -119,7 +124,9 @@ class RankModel(QAbstractTableModel):
                 return Qt.AlignCenter
             # prev_rate=마지막 스트레치 컬럼: 왼쪽 정렬이라야 데이터가 붙어 창 폭 줄이기 좋음
             return (Qt.AlignLeft if f in ("name", "prev_rate") else Qt.AlignRight) | Qt.AlignVCenter
-        if code in self.new_today:
+        if code in self.liquidation:
+            is_limit = False
+        elif code in self.new_today:
             is_limit = f == "rate" and (-40.0 <= v <= -39.5 or 299.5 <= v <= 300.0)
         else:
             is_limit = f == "rate" and LIMIT <= abs(v) <= 30.0
@@ -216,7 +223,8 @@ class RankScreen(QWidget):
         self.alert_top.setStyle(self._checkbox_style)
         self.alert_jump.setStyle(self._checkbox_style)
         self.jump_n = QSpinBox()
-        self.jump_n.setRange(1, 19)
+        # 직전 순위가 화면의 20위 밖이면 급상승 폭은 19를 넘을 수 있다.
+        self.jump_n.setRange(1, 9999)
         self.jump_n.setValue(int(self._settings.value("rank_jump_n", 3)))
         self.alert_top.toggled.connect(lambda on: self._save_opt("rank_alert_top", on))
         self.alert_jump.toggled.connect(lambda on: self._save_opt("rank_alert_jump", on))
@@ -227,6 +235,7 @@ class RankScreen(QWidget):
         self._last_tm = ""    # 마지막 판정한 집계 시각
         self._last_alert_signature = None  # 시각이 같아도 순위/변동이 바뀌면 다시 판정
         self._last_codes = []  # 직전 스냅샷 순위순 코드 리스트
+        self._fetching = False  # 타이머·수동조회가 겹치는 중복 요청 방지
 
         bottom = QHBoxLayout()
         bottom.addWidget(self.top_n)
@@ -248,10 +257,20 @@ class RankScreen(QWidget):
         self.period.activated.connect(self._on_period)
         self.interval.valueChanged.connect(self._on_interval)
 
+        # resize/move 이벤트는 restoreGeometry 중에도 올 수 있으므로 저장 타이머를 먼저 만든다.
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.timeout.connect(self._save_layout)
+
+        # WindowStaysOnTopHint는 네이티브 창을 재생성할 수 있다. 저장 크기를 복원한 뒤
+        # 적용하면 geometry가 유실되므로, 숨겨진 초기 상태에서 플래그를 먼저 설정한다.
+        on_top = self._settings.value("rank_on_top", "false") == "true"
+        if on_top:
+            self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        self.on_top_btn.setChecked(on_top)  # 아직 toggled 연결 전이라 재적용되지 않음
+
         geo = self._settings.value("rank_geometry")
-        if geo is not None:
-            self.restoreGeometry(geo)
-        else:
+        if geo is None or not self.restoreGeometry(geo):
             self.resize(440, 560)
         state = self._settings.value("rank_header")
         if state is not None:
@@ -259,17 +278,13 @@ class RankScreen(QWidget):
             # restoreState가 옛 정렬값(가운데)까지 되살림 -> 왼쪽 재적용
             self.table.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.on_top_btn.toggled.connect(self._on_top_toggle)
-        if self._settings.value("rank_on_top", "false") == "true":  # 항상위 복원
-            self.on_top_btn.setChecked(True)  # 창 뜨기 전 = 플래그만 걸림(재생성 튐 없음)
         # 크기/컬럼 변경 시 디바운스 저장 (닫을 때만 저장하면 앱 종료 경로 따라 유실)
-        self._save_timer = QTimer(self)
-        self._save_timer.setSingleShot(True)
-        self._save_timer.timeout.connect(self._save_layout)
         self.table.horizontalHeader().sectionResized.connect(lambda *a: self._save_timer.start(400))
 
     def set_market(self, market: MarketInfo) -> None:
         self.model.kosdaq, self.model.nxt, self.model.misu, self.model.admin = (
             market.kosdaq, market.nxt, market.misu, market.admin)
+        self.model.liquidation = market.liquidation
         self.model.new_today, self.model.new15, self.model.new30 = (
             market.new_today, market.new15, market.new30)
         if self.model.rows:
@@ -311,11 +326,40 @@ class RankScreen(QWidget):
         asyncio.ensure_future(self._fetch())
 
     async def _fetch(self):
+        if self._fetching:
+            return
+        self._fetching = True
         try:
             rows = await self.rest.inquiry_rank(self.period.currentData())
         except Exception as e:  # noqa: BLE001
             self.time_label.setText(str(e)[:40])
             return
+        finally:
+            self._fetching = False
+
+        raw_count = len(rows)
+        # 서버가 간헐적으로 순위 번호만 있는 빈 패딩 행이나 일부 행만 반환한다.
+        # 유효 행은 즉시 반영하되 빠진 순위는 직전 스냅샷으로 보존한다.
+        rows = [r for r in rows if (r.get("code") or "").strip()]
+        if len(rows) < RANK_COUNT:
+            log.warning("rank popup incomplete: valid=%d raw=%d expected=%d",
+                        len(rows), raw_count, RANK_COUNT)
+            previous = {
+                r["rank"]: r for r in self.model.rows
+                if 1 <= int(r.get("rank") or 0) <= RANK_COUNT
+            }
+            incoming = {
+                r["rank"]: r for r in rows
+                if 1 <= int(r.get("rank") or 0) <= RANK_COUNT
+            }
+            previous.update(incoming)
+            rows = [previous[rank] for rank in sorted(previous)][:RANK_COUNT]
+            if not rows:
+                self.time_label.setText(f"불완전 {len(rows)}/{RANK_COUNT} · 재조회 대기")
+                return
+        else:
+            rows = rows[:RANK_COUNT]
+
         current = self.table.currentIndex()
         selected_row = current.row() if current.isValid() else -1
         selected_col = current.column() if current.isValid() else 0
@@ -404,6 +448,9 @@ def _demo():
     assert d(0, 3, Qt.ForegroundRole) is BLUE and d(2, 3, Qt.ForegroundRole) is RED
     assert d(3, 4, Qt.BackgroundRole) is RED and d(3, 4, Qt.ForegroundRole) is WHITE  # 상한 배경
     assert d(0, 4, Qt.BackgroundRole) is None  # 일반 등락률은 배경 없음
+    m.liquidation = {"042660"}
+    assert d(3, 4, Qt.BackgroundRole) is None and d(3, 4, Qt.ForegroundRole) is RED
+    m.liquidation.clear()
     m.new_today = {"387690"}
     assert d(4, 4, Qt.BackgroundRole) is None and d(4, 4, Qt.ForegroundRole) is RED
     m.kosdaq, m.nxt, m.misu, m.new_today = {"005930"}, {"005930"}, {"005930"}, {"005930"}
