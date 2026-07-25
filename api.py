@@ -334,6 +334,149 @@ class RestClient:
                     m.single.add(code)  # 저유동성 우선주
         return m
 
+    async def stock_universe(self) -> list[dict]:
+        """KOSPI/KOSDAQ 전 종목 기본정보. 분석 DB 최초 적재용."""
+        out = []
+        for market_code, market_name in (("0", "KOSPI"), ("10", "KOSDAQ")):
+            d = await self.request("ka10099", {"mrkt_tp": market_code})
+            for row in d.get("list", []):
+                code = (row.get("code") or "").removesuffix("_AL")
+                if not code:
+                    continue
+                item_market_code = str(row.get("marketCode") or market_code)
+                item_market_name = str(row.get("marketName") or "")
+                company_class = str(row.get("companyClassName") or "")
+                if item_market_code == "8":
+                    stock_type = "ETF"
+                elif item_market_code in ("60", "70", "90"):
+                    stock_type = "ETN"
+                elif item_market_code == "6":
+                    stock_type = "REIT"
+                elif item_market_code == "2":
+                    stock_type = "INFRA"
+                elif item_market_code == "4":
+                    stock_type = "MUTUAL_FUND"
+                elif company_class == "스팩":
+                    stock_type = "SPAC"
+                elif company_class == "외국기업":
+                    stock_type = "FOREIGN"
+                elif (row.get("name") or "").endswith(("우", "우B")):
+                    stock_type = "PREFERRED"
+                else:
+                    stock_type = "COMMON"
+                out.append({
+                    "code": code,
+                    "name": row.get("name") or row.get("stk_nm") or "",
+                    "market": market_name,
+                    "stock_type": stock_type,
+                    "sector_name": company_class or item_market_name,
+                    "listed_date": row.get("regDay") or "",
+                    "shares": _to_int(row.get("listCount")),
+                })
+        return out
+
+    async def theme_groups(self) -> list[dict]:
+        """키움 테마 목록(ka90001)을 반환한다."""
+        return await self._theme_pages(
+            "ka90001",
+            {
+                "qry_tp": "0",
+                "stk_cd": "",
+                "date_tp": "1",
+                "thema_nm": "",
+                "flu_pl_amt_tp": "1",
+                "stex_tp": "1",
+            },
+            "thema_grp",
+        )
+
+    async def theme_members(self, theme_code: str) -> list[dict]:
+        """키움 테마 하나의 구성 종목(ka90002)을 반환한다."""
+        return await self._theme_pages(
+            "ka90002",
+            {
+                "date_tp": "1",
+                "thema_grp_cd": str(theme_code),
+                "stex_tp": "1",
+            },
+            "thema_comp_stk",
+        )
+
+    async def _theme_pages(self, api_id: str, body: dict,
+                           list_key: str) -> list[dict]:
+        """키움 테마 TR의 연속조회 페이지를 모두 합친다."""
+        rows = []
+        continuation = ""
+        while True:
+            response = await self._request_raw(
+                api_id, body, "/api/dostk/thme", continuation)
+            data = response.json()
+            if str(data.get("return_code", "0")) not in ("0", ""):
+                raise RuntimeError(
+                    data.get("return_msg") or f"{api_id} 조회 실패")
+            rows.extend(data.get(list_key) or [])
+            if response.headers.get("cont-yn", "").upper() != "Y":
+                break
+            continuation = response.headers.get("next-key", "")
+            if not continuation:
+                break
+        return rows
+
+    async def daily_bars(self, code: str, base_date: str) -> list[dict]:
+        """ka10081 수정주가 일봉을 저장 계층에서 쓰는 공통 필드로 정규화."""
+        d = await self.request(
+            "ka10081",
+            {"stk_cd": code, "base_dt": base_date, "upd_stkpc_tp": "1"},
+            path="/api/dostk/chart",
+        )
+        return [{
+            "date": row.get("dt") or "",
+            "open": abs(_to_int(row.get("open_pric"))),
+            "high": abs(_to_int(row.get("high_pric"))),
+            "low": abs(_to_int(row.get("low_pric"))),
+            "close": abs(_to_int(row.get("cur_prc"))),
+            "volume": abs(_to_int(row.get("trde_qty"))),
+            # ka10081 거래대금은 백만원 단위이므로 DB 공통 단위인 원으로 변환한다.
+            "trading_value": abs(_to_int(row.get("trde_prica"))) * 1_000_000,
+        } for row in d.get("stk_dt_pole_chart_qry", []) if row.get("dt")]
+
+    async def investor_flows(
+        self, code: str, date_from: str, date_to: str
+    ) -> list[dict]:
+        """ka10060: 종목별 일별 투자자 순매수(금액, 백만원)."""
+        body = {
+            "dt": date_to,
+            "stk_cd": code,
+            "amt_qty_tp": "1",
+            "trde_tp": "0",
+            "unit_tp": "1",
+        }
+        rows: list[dict] = []
+        cont = ""
+        while True:
+            response = await self._request_raw(
+                "ka10060", body, "/api/dostk/chart", cont)
+            data = response.json()
+            page = data.get("stk_invsr_orgn_chart", [])
+            rows.extend(row for row in page if row.get("dt"))
+            oldest = min(
+                (str(row.get("dt") or "") for row in page),
+                default="",
+            )
+            next_key = response.headers.get("next-key", "")
+            if (
+                not page
+                or (oldest and oldest <= date_from)
+                or response.headers.get("cont-yn", "").upper() != "Y"
+                or not next_key
+            ):
+                break
+            cont = next_key
+        return [
+            row for row in rows
+            if date_from <= str(row.get("dt") or "") <= date_to
+        ]
+
     async def inquiry_rank(self, qry_tp: str = "5") -> list[dict]:
         """ka00198 실시간 종목조회순위 -> rank.py 필드로 정규화.
         qry_tp: 1=1분 2=10분 3=1시간 4=당일누적 5=30초 (기준 집계기간)."""
@@ -526,6 +669,36 @@ class RestClient:
                 return _hms(entry)
         # 페이지 상한 도달(진입 못 찾음) -> 분봉으로 분단위라도 정확히
         return await self._limit_entry_minute(code, upper)
+
+    async def last_limit_entry_on_date(
+            self, code: str, upper: int, trade_date: str) -> str:
+        """틱의 실제 거래일이 지정일과 일치할 때만 마지막 진입시각을 반환한다."""
+        if not upper:
+            return ""
+        entry, cont = "", ""
+        for _ in range(config.TICK_MAX_PAGES):
+            response = await self._request_raw(
+                "ka10079",
+                {"stk_cd": code, "tic_scope": "1", "upd_stkpc_tp": "1"},
+                "/api/dostk/chart", cont=cont)
+            ticks = response.json().get("stk_tic_chart_qry", [])
+            if not ticks:
+                return ""
+            actual_date = ticks[0].get("cntr_tm", "")[:8]
+            if actual_date != trade_date:
+                return ""
+            for tick in ticks:
+                tick_time = tick.get("cntr_tm", "")
+                if (tick_time[:8] != trade_date
+                        or abs(_to_int(tick.get("cur_prc"))) != upper):
+                    return _hms(entry)
+                entry = tick_time
+            if response.headers.get("cont-yn") != "Y":
+                return _hms(entry)
+            cont = response.headers.get("next-key", "")
+            if not cont:
+                return _hms(entry)
+        return _hms(entry)
 
     async def _limit_entry_minute(self, code: str, upper: int) -> str:
         """분봉(ka10080) 폴백: 초활발 상한이라 틱 페이징이 안 끝날 때 분단위 진입시각."""

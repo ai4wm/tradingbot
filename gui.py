@@ -1497,6 +1497,9 @@ class ConditionScreen(QWidget):
         self.newwin_btn = QPushButton("창+")
         self.newwin_btn.setToolTip("조건검색 창 하나 더 열기 (다른 조건식 동시 감시)")
         self.newwin_btn.setFixedWidth(44)
+        self.analysis_btn = QPushButton("분석")
+        self.analysis_btn.setToolTip("시장·상한가·테마·수급·공시 분석창 열기")
+        self.analysis_btn.setFixedWidth(44)
         self.ip_label = QLabel()  # 공인 IP (App이 메인창만 채움). IP 바뀌면 빨강 강조
         self.ip_label.setVisible(False)
         self.count_label = QLabel("종목수: 0")
@@ -1521,6 +1524,7 @@ class ConditionScreen(QWidget):
         top.addWidget(self.unified_check)
         top.addWidget(self.rank_btn)
         top.addWidget(self.newwin_btn)
+        top.addWidget(self.analysis_btn)
         top.addStretch(1)  # 남는 공간은 오른쪽으로
         top.addWidget(self.ip_label)
         top.addWidget(self.count_label)
