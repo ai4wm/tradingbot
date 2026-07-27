@@ -53,7 +53,7 @@ from analysis_db import (
     news_rows, log_content_request, news_request_count_today,
     save_condition_snapshot, save_condition_snapshot_quotes,
     save_condition_theme_stats, active_theme_labels,
-    recent_condition_snapshots,
+    recent_condition_snapshots, condition_theme_stats,
 )
 from api import RestClient
 from classification_api import ClassificationClient
@@ -2556,6 +2556,7 @@ class AnalysisWindow(QMainWindow):
         ("상한가", "상한가 종목 수집·조회·성과 분석 화면입니다."),
         ("시장 현황", "시장 요약과 주요 지표를 표시합니다."),
         ("테마", "테마 강도와 종목 확산 흐름을 분석합니다."),
+        ("시장테마 브리핑", "조건검색 통합 스냅샷의 테마 확산과 대장을 표시합니다."),
         ("순환매", "테마 순환과 대장주·후발 후보를 분석합니다."),
         ("수급", "투자자별 수급과 거래대금 흐름을 분석합니다."),
         ("공시", "OpenDART 공시와 종목 움직임을 연결합니다."),
@@ -2658,6 +2659,8 @@ class AnalysisWindow(QMainWindow):
                 self._build_disclosure_page(layout)
             elif title == "테마":
                 self._build_theme_page(layout)
+            elif title == "시장테마 브리핑":
+                self._build_market_theme_brief_page(layout)
             elif title == "순환매":
                 self._build_rotation_page(layout)
             elif title == "수급":
@@ -2869,6 +2872,8 @@ class AnalysisWindow(QMainWindow):
             self._refresh_limit_up_table()
         elif title == "테마":
             self._refresh_theme_table()
+        elif title == "시장테마 브리핑":
+            self._refresh_market_theme_brief()
         elif title == "순환매":
             self._refresh_rotation_analysis()
         elif title == "수급":
@@ -4575,6 +4580,80 @@ class AnalysisWindow(QMainWindow):
         table.setColumnWidth(1, min(260, max(140, table.columnWidth(1))))
         table.setColumnWidth(4, 500)
         table.sortItems(0, Qt.SortOrder.AscendingOrder)
+
+    def _build_market_theme_brief_page(self, layout: QVBoxLayout):
+        controls = QHBoxLayout()
+        refresh = QPushButton("최신 스냅샷 조회")
+        refresh.clicked.connect(self._refresh_market_theme_brief)
+        controls.addWidget(refresh)
+        self._market_theme_brief_status = QLabel("저장된 통합 스냅샷 없음")
+        controls.addWidget(self._market_theme_brief_status, 1)
+        layout.addLayout(controls)
+
+        columns = (
+            "순위", "테마", "종목수", "상한가", "평균등락률",
+            "최고등락률", "대장", "대장코드",
+        )
+        table = QTableWidget(0, len(columns))
+        table.setHorizontalHeaderLabels(columns)
+        table.setSortingEnabled(True)
+        table.setAlternatingRowColors(True)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setStretchLastSection(False)
+        self._market_theme_brief_table = table
+        layout.addWidget(table)
+
+    def _refresh_market_theme_brief(self):
+        if not hasattr(self, "_market_theme_brief_table"):
+            return
+        snapshots = [
+            row for row in recent_condition_snapshots(limit=50)
+            if str(row["condition_seq"]).startswith("BATCH:")
+        ]
+        table = self._market_theme_brief_table
+        if not snapshots:
+            table.setRowCount(0)
+            self._market_theme_brief_status.setText("저장된 통합 스냅샷 없음")
+            return
+        latest = snapshots[0]
+        rows = condition_theme_stats(int(latest["snapshot_id"]))
+        table.setSortingEnabled(False)
+        table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            rank = row_index + 1
+            values = (
+                rank,
+                row["theme_name"],
+                int(row["member_count"] or 0),
+                int(row["upper_count"] or 0),
+                float(row["average_rate"] or 0),
+                float(row["top_rate"] or 0),
+                row["leader_stock_name"] or "-",
+                row["leader_stock_code"] or "-",
+            )
+            for column, value in enumerate(values):
+                if column in (0, 2, 3):
+                    item = NumericTableWidgetItem(f"{value:,}", int(value))
+                elif column in (4, 5):
+                    item = NumericTableWidgetItem(f"{value:+.2f}%", float(value))
+                else:
+                    item = QTableWidgetItem(str(value))
+                if column == 1 and rank <= 3:
+                    item.setForeground(QColor("#B8860B"))
+                    item.setFont(QFont(item.font().family(), item.font().pointSize(), QFont.Weight.Bold))
+                if column == 6:
+                    item.setToolTip("스냅샷 시점 등락률이 가장 높은 종목")
+                table.setItem(row_index, column, item)
+        table.setSortingEnabled(True)
+        table.resizeColumnsToContents()
+        table.setColumnWidth(1, max(180, table.columnWidth(1)))
+        table.setColumnWidth(6, max(110, table.columnWidth(6)))
+        self._market_theme_brief_status.setText(
+            f"{latest['captured_at']} · {latest['condition_name']} · "
+            f"종목 {latest['stock_count']:,}개"
+            + (" · 100종목 제한 가능성" if latest["truncated"] else "")
+        )
         self._theme_summary.setText(
             f"현재 테마 {len(rows):,}개 · 종목 연결 {total_members:,}건")
 
