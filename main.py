@@ -478,6 +478,11 @@ class View:
         if (self.app.views and self is self.app.views[0]
                 and self.seq not in RANK_SEQS and self.seq != HOLDINGS_SEQ):
             self._settings.setValue("background_condition_seq", self.seq)
+            condition_name = next(
+                (str(name) for item_seq, name in self.app._cond_items
+                 if str(item_seq) == self.seq), "")
+            if condition_name:
+                self._settings.setValue("background_condition_name", condition_name)
             self._settings.sync()
         if switched:  # 재조회/간격도 모드별 저장 -> 새 모드 값 로드 (시그널이 타이머까지 정리)
             self.screen.refresh_interval.setValue(
@@ -1427,11 +1432,21 @@ class App:
         raw = str(self._settings.value("background_condition_seqs", "") or "")
         configured = [item.strip() for item in raw.split(",") if item.strip()]
         names = {str(seq): str(name) for seq, name in self._cond_items}
+        remembered_name = str(
+            self._settings.value("background_condition_name", "") or ""
+        ).strip()
         remembered = str(
             self._settings.value("background_condition_seq", "")
             or self._settings.value("last_condition", "")
             or ""
         ).strip()
+        # 조건식 순서가 바뀌어 seq가 달라져도 저장된 이름으로 현재 seq를
+        # 다시 찾는다. 이름이 변경된 경우에는 기존 seq를 보조로 사용한다.
+        if not configured and remembered_name:
+            renamed_seq = next(
+                (seq for seq, name in names.items() if name == remembered_name), "")
+            if renamed_seq:
+                remembered = renamed_seq
         if not configured and remembered:
             configured = [remembered]
         if configured:
