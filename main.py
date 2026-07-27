@@ -1548,6 +1548,12 @@ class App:
             # 정규장 시간에는 현재 시각 기준 보완 스냅샷을 한 번 만든다.
             if _is_krx_market_open(now):
                 slot = "START"
+            else:
+                # 15:30 이후에도 KRX 조건검색 일반조회는 최종 편입목록을
+                # 반환할 수 있으므로, NXT 종료 전까지 마감 보완을 허용한다.
+                seconds = now.hour * 3600 + now.minute * 60 + now.second
+                if 15 * 3600 + 30 * 60 <= seconds < 20 * 3600:
+                    slot = "START_AFTER"
         if not slot:
             return
         day_key = now.strftime("%Y%m%d")
