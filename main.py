@@ -786,7 +786,7 @@ class App:
         self._auto_intraday_timer.timeout.connect(self._auto_intraday_collection)
         self._auto_intraday_timer.start(60000)
         QTimer.singleShot(10000, lambda: self._auto_intraday_collection(True))
-        QTimer.singleShot(5000, self._run_background_condition_schedule)
+        QTimer.singleShot(5000, lambda: self._run_background_condition_schedule(True))
         # 공인 IP 감시: 바뀌면 키움 화이트리스트에서 벗어나 API 차단 -> 상단바 경보
         self._public_ip = None
         self._ip_task = None
@@ -1537,12 +1537,17 @@ class App:
                 return label
         return ""
 
-    def _run_background_condition_schedule(self):
+    def _run_background_condition_schedule(self, startup: bool = False):
         """예약 시각에 일반 조건검색을 한 번씩 백그라운드 수집한다."""
         if self._background_condition_task and not self._background_condition_task.done():
             return
         now = datetime.now()
         slot = self._background_condition_slot(now)
+        if startup and not slot:
+            # 앱을 예약 시각 이후에 켜도 오늘 결과가 완전히 비지 않도록
+            # 정규장 시간에는 현재 시각 기준 보완 스냅샷을 한 번 만든다.
+            if _is_krx_market_open(now):
+                slot = "START"
         if not slot:
             return
         day_key = now.strftime("%Y%m%d")
