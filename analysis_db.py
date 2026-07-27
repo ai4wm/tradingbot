@@ -981,9 +981,13 @@ def save_next_day_candidates(snapshot_id: int, candidate_date: str = "",
             scored.append((score, quote, theme_by_code.get(str(quote["stock_code"]), ""),
                            locked, point_up, queue_ratio, entry_by_code.get(str(quote["stock_code"]), ""),
                            " · ".join(reason)))
-        scored.sort(key=lambda item: (-int(item[4]), -int(item[3]), -float(item[5]),
-                                      item[6] or "99:99:99", -item[0],
-                                      str(item[1]["stock_code"])))
+        # 조건검색창의 상한↑ 정렬과 동일한 우선순위:
+        # 점상끼리는 잔량비율, 나머지 상한가는 진입시간이다.
+        scored.sort(key=lambda item: (
+            -int(item[4]), -int(item[3]),
+            -float(item[5]) if item[4] else 0.0,
+            (item[6] or "99:99:99") if not item[4] else "99:99:99",
+            str(item[1]["stock_code"])))
         connection.execute(
             "DELETE FROM next_day_candidates WHERE candidate_date=? AND snapshot_id=?",
             (day, int(snapshot_id)))
@@ -1011,9 +1015,12 @@ def next_day_candidate_rows(candidate_date: str = "", limit: int = 100,
     day = str(candidate_date or datetime.now().astimezone().date())
     with closing(connect(db_path)) as connection:
         rows = connection.execute(
-            """SELECT * FROM next_day_candidates
-               WHERE candidate_date=? ORDER BY rank LIMIT ?""",
-            (day, max(1, int(limit)))).fetchall()
+            """SELECT c.* FROM next_day_candidates c
+               JOIN (SELECT MAX(snapshot_id) AS snapshot_id
+                       FROM next_day_candidates WHERE candidate_date=?) latest
+                 ON latest.snapshot_id=c.snapshot_id
+               WHERE c.candidate_date=? ORDER BY c.rank LIMIT ?""",
+            (day, day, max(1, int(limit)))).fetchall()
     return [dict(row) for row in rows]
 
 
