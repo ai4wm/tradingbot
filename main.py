@@ -1498,15 +1498,34 @@ class App:
     async def _collect_background_condition_targets(
             self, targets: list[tuple[str, str]], slot: str):
         started = time.monotonic()
+        combined_codes = []
+        combined_seen = set()
+        captured_names = []
+        combined_truncated = False
         try:
             for seq, name in targets:
                 try:
-                    await self.collect_condition_snapshot(seq, name, "KRX")
+                    result = await self.collect_condition_snapshot(seq, name, "KRX")
+                    combined_truncated = combined_truncated or result["truncated"]
+                    captured_names.append(name)
+                    for code in result["codes"]:
+                        if code not in combined_seen:
+                            combined_seen.add(code)
+                            combined_codes.append(code)
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:  # noqa: BLE001
                     log.warning("background condition snapshot failed: seq=%s error=%s",
                                 seq, error)
+            if combined_codes:
+                today = datetime.now().strftime("%Y%m%d")
+                batch_seq = f"BATCH:{today}:{slot}"
+                batch_name = "시장테마 브리핑 · " + ", ".join(captured_names)
+                save_condition_snapshot(
+                    batch_seq, batch_name, combined_codes, market="KRX",
+                    truncated=combined_truncated)
+                log.info("background condition batch saved: slot=%s codes=%d "
+                         "sources=%d", slot, len(combined_codes), len(captured_names))
         finally:
             log.info("background condition slot finished: slot=%s targets=%d elapsed=%.2fs",
                      slot, len(targets), time.monotonic() - started)
