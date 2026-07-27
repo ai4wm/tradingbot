@@ -1024,6 +1024,49 @@ def next_day_candidate_rows(candidate_date: str = "", limit: int = 100,
     return [dict(row) for row in rows]
 
 
+def save_condition_limit_quotes(trade_date: str, quotes: list[dict],
+                                db_path: Path = DB_PATH) -> tuple[int, int]:
+    """조건검색 상한가 결과만 일봉·상한가 이벤트로 보완 저장한다."""
+    day = str(trade_date).replace("-", "")
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    prices = []
+    events = []
+    with closing(connect(db_path)) as connection, connection:
+        for quote in quotes:
+            code = str(quote.get("code") or "").strip().upper().lstrip("A")
+            if not code:
+                continue
+            upper = int(quote.get("upper") or 0)
+            price = int(quote.get("price") or 0)
+            if not upper or price < upper:
+                continue
+            connection.execute(
+                "INSERT OR IGNORE INTO stocks(stock_code, stock_name, market, updated_at) "
+                "VALUES (?, ?, '', ?)", (code, str(quote.get("name") or ""), now))
+            prices.append((day, code, int(quote.get("open") or price),
+                           int(quote.get("high") or price), int(quote.get("low") or price),
+                           price, int(quote.get("base") or 0), upper,
+                           int(quote.get("lower") or 0), int(quote.get("vol") or 0),
+                           0, 0, float(quote.get("rate") or 0),
+                           "KIWOOM_CONDITION", now))
+            entry_time = str(quote.get("entry_time") or "") or None
+            events.append((day, code, 1, 1, entry_time, entry_time, None, 1,
+                           "0일 전 상한가 조건검색", 0.8, now))
+        connection.executemany(
+            """INSERT OR REPLACE INTO daily_prices(
+                   trade_date, stock_code, open_price, high_price, low_price,
+                   close_price, prev_close, upper_price, lower_price, volume,
+                   trading_value, market_cap, change_rate, source, collected_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", prices)
+        connection.executemany(
+            """INSERT OR REPLACE INTO limit_up_events(
+                   trade_date, stock_code, closed_at_limit, touched_limit,
+                   first_hit_time, last_entry_time, break_count, consecutive_days,
+                   reason_text, reason_confidence, collected_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", events)
+    return len(prices), len(events)
+
+
 def database_stats(db_path: Path = DB_PATH) -> dict:
     if not db_path.exists():
         return {
