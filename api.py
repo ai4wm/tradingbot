@@ -225,6 +225,10 @@ class RestClient:
                 "price": abs(_to_int(r.get("cur_prc"))),   # 부호 포함 -> abs
                 "rate": _to_float(r.get("flu_rt")),        # 등락율 (부호 유지: 색)
                 "vol": vol,
+                # ka10095 응답의 거래대금은 백만원 단위인 경우가 있어
+                # 일봉 저장 계층과 동일하게 원 단위로 정규화한다.
+                "trading_value": abs(_to_int(r.get("trde_prica"))) * 1_000_000
+                    or abs(_to_int(r.get("cur_prc"))) * vol,
                 "prev_vol": prev_vol,                      # 전일거래량 (역산)
                 "ask_qty": _to_int(r.get("pri_sel_req")),  # 최우선 매도잔량
                 "bid_qty": _to_int(r.get("pri_buy_req")),  # 최우선 매수잔량

@@ -1047,7 +1047,9 @@ def save_condition_limit_quotes(trade_date: str, quotes: list[dict],
                            int(quote.get("high") or price), int(quote.get("low") or price),
                            price, int(quote.get("base") or 0), upper,
                            int(quote.get("lower") or 0), int(quote.get("vol") or 0),
-                           0, 0, float(quote.get("rate") or 0),
+                           int(quote.get("trading_value") or
+                               (price * int(quote.get("vol") or 0))),
+                           0, float(quote.get("rate") or 0),
                            "KIWOOM_CONDITION", now))
             entry_time = str(quote.get("entry_time") or "") or None
             events.append((day, code, 1, 1, entry_time, entry_time, None, 1,
