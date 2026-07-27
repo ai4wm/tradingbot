@@ -4696,6 +4696,7 @@ class AnalysisWindow(QMainWindow):
                     item.setToolTip("스냅샷 시점 등락률이 가장 높은 종목")
                 table.setItem(row_index, column, item)
         table.setSortingEnabled(True)
+        table.sortItems(0, Qt.SortOrder.AscendingOrder)
         table.resizeColumnsToContents()
         table.setColumnWidth(1, max(180, table.columnWidth(1)))
         table.setColumnWidth(6, max(110, table.columnWidth(6)))
