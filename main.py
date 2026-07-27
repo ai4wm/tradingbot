@@ -2168,7 +2168,7 @@ class App:
                 self._set_news_auto_collection)
             self._analysis.new_news_found.connect(self._notify_new_news)
             self._analysis.limit_count_collect_requested.connect(
-                lambda: asyncio.ensure_future(self._refresh_limit_counts_after_close()))
+                self._manual_limit_count_refresh)
         return self._analysis
 
     def _set_news_auto_collection(self, enabled: bool):
@@ -2219,8 +2219,13 @@ class App:
         asyncio.ensure_future(self._refresh_limit_counts_after_close())
         analysis._start_intraday_enrichment(silent=True)
 
+    def _manual_limit_count_refresh(self):
+        log.info("manual limit count refresh requested")
+        asyncio.ensure_future(self._refresh_limit_counts_after_close())
+
     async def _refresh_limit_counts_after_close(self):
         """장 마감 후 틱차트 기반 연상 보완을 기다린 뒤 다시 조회한다."""
+        log.info("limit count refresh waiting: 20s")
         await asyncio.sleep(20)
         try:
             counts = await self.rest.yesterday_limit_counts()
