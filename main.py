@@ -2563,7 +2563,6 @@ class DisclosureDialog(QDialog):
                 item.setData(self.URL_ROLE, row["source_url"])
                 table.setItem(row_index, column, item)
         table.setSortingEnabled(True)
-        table.sortItems(0, Qt.SortOrder.AscendingOrder)
         table.resizeColumnsToContents()
         table.horizontalHeader().setStretchLastSection(True)
         table.cellClicked.connect(self._open_dart)
