@@ -54,6 +54,7 @@ from analysis_db import (
     save_condition_snapshot, save_condition_snapshot_quotes,
     save_condition_theme_stats, active_theme_labels,
     recent_condition_snapshots, condition_theme_stats,
+    save_condition_theme_members, condition_theme_members,
 )
 from api import RestClient
 from classification_api import ClassificationClient
@@ -1411,6 +1412,7 @@ class App:
             key, condition_name, codes, market=market, truncated=len(codes) >= 100)
         quote_rows = []
         theme_stats = []
+        theme_members = []
         try:
             quote_rows = await self.rest.watch_info(codes)
             save_condition_snapshot_quotes(snapshot_id, quote_rows)
@@ -1433,6 +1435,14 @@ class App:
                     reverse=True,
                 )
                 leader_code, leader = leaders[0]
+                for rank, (member_code, member_row) in enumerate(leaders[:3], 1):
+                    theme_members.append({
+                        "theme_name": theme,
+                        "theme_rank": rank,
+                        "stock_code": member_code,
+                        "stock_name": str(member_row.get("name") or ""),
+                        "change_rate": float(member_row.get("rate") or 0),
+                    })
                 upper_count = sum(
                     int(row.get("upper") or 0) > 0
                     and int(row.get("price") or 0) >= int(row.get("upper") or 0)
@@ -1449,6 +1459,7 @@ class App:
                 })
             theme_stats = stats
             save_condition_theme_stats(snapshot_id, stats)
+            save_condition_theme_members(snapshot_id, theme_members)
             log.info("condition theme stats saved: snapshot=%d themes=%d quotes=%d",
                      snapshot_id, len(stats), len(quote_rows))
         except Exception as error:  # noqa: BLE001
@@ -1465,6 +1476,7 @@ class App:
             "quote_count": len(quote_rows),
             "quotes": quote_rows,
             "theme_stats": theme_stats,
+            "theme_members": theme_members,
             "truncated": len(codes) >= 100,
         }
         log.info("background condition snapshot: seq=%s name=%s market=%s "
@@ -1587,6 +1599,7 @@ class App:
                     for theme in labels.get(code, ()):
                         batch_theme_codes.setdefault(theme, []).append(code)
                 batch_rows = []
+                batch_members = []
                 for theme, members in batch_theme_codes.items():
                     rows = [batch_quote_by_code.get(code, {}) for code in members]
                     rates = [float(row.get("rate") or 0) for row in rows]
@@ -1596,6 +1609,14 @@ class App:
                         reverse=True,
                     )
                     leader_code, leader = leaders[0]
+                    for rank, (member_code, member_row) in enumerate(leaders[:3], 1):
+                        batch_members.append({
+                            "theme_name": theme,
+                            "theme_rank": rank,
+                            "stock_code": member_code,
+                            "stock_name": str(member_row.get("name") or ""),
+                            "change_rate": float(member_row.get("rate") or 0),
+                        })
                     batch_rows.append({
                         "theme_name": theme,
                         "member_count": len(members),
@@ -1614,6 +1635,7 @@ class App:
                     batch_id = batch_rows_saved[0]["snapshot_id"]
                     save_condition_snapshot_quotes(batch_id, combined_quotes)
                     save_condition_theme_stats(batch_id, batch_rows)
+                    save_condition_theme_members(batch_id, batch_members)
                 log.info("background condition batch saved: slot=%s codes=%d "
                          "sources=%d", slot, len(combined_codes), len(captured_names))
         finally:
@@ -4592,7 +4614,7 @@ class AnalysisWindow(QMainWindow):
 
         columns = (
             "순위", "테마", "종목수", "상한가", "평균등락률",
-            "최고등락률", "대장", "대장코드",
+            "최고등락률", "대장", "2등주", "3등주", "대장코드",
         )
         table = QTableWidget(0, len(columns))
         table.setHorizontalHeaderLabels(columns)
@@ -4618,6 +4640,10 @@ class AnalysisWindow(QMainWindow):
             return
         latest = snapshots[0]
         rows = condition_theme_stats(int(latest["snapshot_id"]))
+        member_rows = condition_theme_members(int(latest["snapshot_id"]))
+        members_by_theme: dict[str, list[dict]] = {}
+        for member in member_rows:
+            members_by_theme.setdefault(member["theme_name"], []).append(member)
         table.setSortingEnabled(False)
         table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
@@ -4630,6 +4656,10 @@ class AnalysisWindow(QMainWindow):
                 float(row["average_rate"] or 0),
                 float(row["top_rate"] or 0),
                 row["leader_stock_name"] or "-",
+                (members_by_theme.get(row["theme_name"], [{}])[1].get("stock_name")
+                 if len(members_by_theme.get(row["theme_name"], [])) > 1 else "-"),
+                (members_by_theme.get(row["theme_name"], [{}])[2].get("stock_name")
+                 if len(members_by_theme.get(row["theme_name"], [])) > 2 else "-"),
                 row["leader_stock_code"] or "-",
             )
             for column, value in enumerate(values):

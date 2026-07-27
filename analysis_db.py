@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "market_analysis.db"
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 ANALYSIS_STOCK_TYPES = (
     "COMMON", "PREFERRED", "SPAC", "FOREIGN", "REIT", "INFRA",
 )
@@ -574,6 +574,18 @@ CREATE TABLE IF NOT EXISTS condition_theme_stats (
         ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS condition_theme_members (
+    snapshot_id INTEGER NOT NULL,
+    theme_name TEXT NOT NULL,
+    theme_rank INTEGER NOT NULL,
+    stock_code TEXT NOT NULL,
+    stock_name TEXT NOT NULL DEFAULT '',
+    change_rate REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (snapshot_id, theme_name, theme_rank),
+    FOREIGN KEY (snapshot_id) REFERENCES condition_snapshot_runs(snapshot_id)
+        ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_daily_prices_code_date
     ON daily_prices(stock_code, trade_date);
 CREATE INDEX IF NOT EXISTS idx_limit_up_events_date
@@ -590,6 +602,8 @@ CREATE INDEX IF NOT EXISTS idx_condition_snapshot_members_code
     ON condition_snapshot_members(stock_code, snapshot_id);
 CREATE INDEX IF NOT EXISTS idx_condition_theme_stats_snapshot
     ON condition_theme_stats(snapshot_id, top_rate DESC);
+CREATE INDEX IF NOT EXISTS idx_condition_theme_members_snapshot
+    ON condition_theme_members(snapshot_id, theme_name, theme_rank);
 CREATE INDEX IF NOT EXISTS idx_theme_daily_stats_source_date
     ON theme_daily_stats(source, trade_date);
 CREATE INDEX IF NOT EXISTS idx_rotation_signals_source_date_score
@@ -810,6 +824,40 @@ def condition_theme_stats(snapshot_id: int, db_path: Path = DB_PATH) -> list[dic
                WHERE snapshot_id = ?
                ORDER BY upper_count DESC, top_rate DESC, member_count DESC""",
             (int(snapshot_id),),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def save_condition_theme_members(snapshot_id: int, members: list[dict],
+                                 db_path: Path = DB_PATH) -> int:
+    """테마별 등락률 상위 종목(대장·2등·3등)을 저장한다."""
+    rows = []
+    for item in members:
+        theme = str(item.get("theme_name") or "").strip()
+        code = str(item.get("stock_code") or "").strip().upper().lstrip("A")
+        if not theme or not code:
+            continue
+        rows.append((
+            int(snapshot_id), theme, int(item.get("theme_rank") or 0), code,
+            str(item.get("stock_name") or ""), float(item.get("change_rate") or 0),
+        ))
+    with closing(connect(db_path)) as connection:
+        with connection:
+            connection.executemany(
+                """INSERT OR REPLACE INTO condition_theme_members(
+                       snapshot_id, theme_name, theme_rank, stock_code,
+                       stock_name, change_rate)
+                   VALUES (?, ?, ?, ?, ?, ?)""", rows)
+    return len(rows)
+
+
+def condition_theme_members(snapshot_id: int, db_path: Path = DB_PATH) -> list[dict]:
+    with closing(connect(db_path)) as connection:
+        rows = connection.execute(
+            """SELECT theme_name, theme_rank, stock_code, stock_name, change_rate
+               FROM condition_theme_members
+               WHERE snapshot_id = ?
+               ORDER BY theme_name, theme_rank""", (int(snapshot_id),)
         ).fetchall()
     return [dict(row) for row in rows]
 
