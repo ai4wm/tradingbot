@@ -17,6 +17,8 @@ APPKEY = os.getenv("KIWOOM_APPKEY", "")
 SECRETKEY = os.getenv("KIWOOM_SECRETKEY", "")
 DART_API_KEY = os.getenv("DART_API_KEY", "")
 KRX_API_KEY = os.getenv("KRX_API_KEY", "")
+NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID", "")
+NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET", "")
 
 REAL_REG_LIMIT = 95  # 실시간 등록 종목 수 상한
 REST_RATE_LIMIT = 1.0  # 초당 REST 호출 수 (TR당 1req/s)

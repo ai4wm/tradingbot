@@ -41,6 +41,7 @@ class OrderBatch:
     children: list[ChildOrder] = field(init=False)
     sent_count: int = 0
     error: str = ""
+    stop_requested: bool = False
 
     def __post_init__(self):
         self.children = [ChildOrder(q) for q in self.quantities]
@@ -98,25 +99,49 @@ class OrderEngine:
         self._notify(batch, "대기")
         return batch
 
-    def manual_cancel(self, code: str):
+    def stop_local_submissions(self, code: str):
+        """아직 서버에 나가지 않은 앱 매수를 중단한다.
+
+        서버에 접수된 주문의 취소 여부는 계좌 미체결 조회가 단일 기준이다.
+        """
         batch = self.batches.get(code)
         if not batch:
-            raise ValueError("취소할 주문이 없습니다")
-        queued = 0
+            return
+        batch.stop_requested = True
         for child in batch.children:
-            if child.order_no and child.remaining_qty > 0 and not child.cancel_sent:
-                child.cancel_sent = True
-                self._put(0, "cancel", batch, child)
-                queued += 1
-        if not queued:
-            raise ValueError("취소할 잔량이 없습니다")
-        self._notify(batch, "취소대기")
+            if not child.order_no:
+                child.remaining_qty = 0
+                child.done = True
+        self._notify(batch, "전송중단")
+
+    def cancel_submitted_children(self, code: str) -> tuple[int, int]:
+        """이 앱이 이미 접수한 분할 주문번호를 직접 취소 대기열에 넣는다.
+
+        주문 셀의 취소 버튼은 앱 주문에만 표시되므로, 계좌 미체결 조회 결과가
+        늦거나 일부만 반환되어도 이미 알고 있는 분할 주문번호를 빠뜨리면 안 된다.
+        """
+        batch = self.batches.get(code)
+        if not batch:
+            return 0, 0
+        self.stop_local_submissions(code)
+        count = qty = 0
+        for child in batch.children:
+            if (not child.order_no or child.remaining_qty <= 0
+                    or child.cancel_sent):
+                continue
+            child.cancel_sent = True
+            count += 1
+            qty += child.remaining_qty
+            self._put(0, "cancel", batch, child)
+        if count:
+            self._notify(batch, "취소대기")
+        return count, qty
 
     async def _worker(self):
         while not self._queue.empty():
             _, _, action, batch, child = await self._queue.get()
             try:
-                if action == "buy" and batch.error:
+                if action == "buy" and (batch.error or batch.stop_requested):
                     child.remaining_qty = 0
                     child.done = True
                     continue
@@ -128,15 +153,16 @@ class OrderEngine:
                     if child.order_no:
                         self._by_order_no[child.order_no] = (batch, child)
                     self._notify(batch, "전송")
-                else:
+                elif action == "cancel":
                     await self.rest.cancel_order(
                         batch.code, child.order_no, child.remaining_qty)
                     self._notify(batch, "취소전송")
             except Exception as exc:  # noqa: BLE001
-                batch.error = str(exc)
                 if action == "cancel":
                     child.cancel_sent = False
-                else:
+                    batch.error = str(exc)
+                elif action == "buy":
+                    batch.error = str(exc)
                     # 첫 매수 거절 뒤 같은 분할묶음의 나머지 주문은 전송하지 않는다.
                     for pending in batch.children:
                         if not pending.order_no:
@@ -177,10 +203,8 @@ class OrderEngine:
         status = str(event.get("status") or "")
         if child.remaining_qty == 0 or "취소" in status or "완료" in status:
             child.done = True
-        if (batch.auto_cancel and child.filled_qty >= 100
-                and child.remaining_qty > 0 and not child.cancel_sent):
-            child.cancel_sent = True
-            self._put(0, "cancel", batch, child)
+        # 자동취소 판단은 앱/영웅문 주문을 구분하지 않고 계좌 미체결
+        # 스냅샷(ka10075)을 기준으로 App이 수행한다.
         self._notify(batch, "체결")
 
     def _notify(self, batch: OrderBatch, state: str):

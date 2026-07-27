@@ -7,3 +7,12 @@ layout.ini
 data/*.db
 data/*.db-shm
 data/*.db-wal
+data/models/
+data/web_profile/
+data/sounds/
+data/prediction_*.out
+data/prediction_*.err
+data/walkforward_*.out
+data/walkforward_*.err
+data/walkforward_*_report.json
+data/walkforward_*_report.md

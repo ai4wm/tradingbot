@@ -133,6 +133,10 @@ def parse_order_item(item: dict) -> dict:
         "fill_id": str(values.get("909") or "").strip(),
         "fill_price": integer("910"),
         "fill_qty": integer("911"),
+        "side": (
+            "buy" if "매수" in str(values.get("905") or "")
+            else "sell" if "매도" in str(values.get("905") or "")
+            else ""),
     }
 
 

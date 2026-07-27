@@ -1,11 +1,18 @@
 # -*- coding: utf-8 -*-
 """[0198] 실시간 종목조회순위 창. ka00198을 주기 폴링(창이 보일 때만)."""
 import asyncio
+import io
 import logging
-import threading
+import math
+import struct
+import subprocess
+import wave
+from pathlib import Path
+import winsound
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSettings, Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QCursor, QDesktopServices
+from PySide6.QtMultimedia import QSoundEffect
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QHBoxLayout, QHeaderView, QLabel, QPushButton,
     QSpinBox, QTableView, QToolTip, QVBoxLayout, QWidget,
@@ -41,22 +48,106 @@ def _alert_kind(prev_codes: list, rows: list[dict], top_on: bool, jump_on: bool,
 
 
 TONES = {  # (주파수Hz, 길이ms) 나열 -> 멜로디. 시스템 테마 무관하게 또렷한 전용음
-    # 1위 변경(가장 중요): 도-미-솔↑ 상승 팡파레, 마지막 음 길게 -> 확실히 각인 (jump와 확 구분)
+    # 수정 전 원본: 도-미-솔로 올라가며 마지막 음이 길게 남는 순위변화음
     "top":  [(1047, 130), (1319, 130), (1568, 420)],
-    "jump": [(1100, 1000)],  # 급상승: 이 PC에서 실제 확인한 1초 긴 단일음
+    "jump": [(1100, 1000)],  # 급상승: 띠—— 긴 단일음
     "in":   [(784, 140), (1047, 140), (1319, 280)],  # 조건 편입: 뚜-뚜-띠~↑ (3음 차임, 길고 또렷)
+    "balance1": [(880, 180), (880, 180)],  # 잔량 1단계: 주의
+    "balance2": [(988, 160), (784, 260)],  # 잔량 2단계: 50% 보호매도
+    "balance3": [(659, 150), (523, 150), (392, 420)],  # 잔량 3단계: 전량 정리
+}
+
+
+def _tone_wav(tones, sample_rate: int = 44100) -> bytes:
+    """winsound.Beep에 가까운 강한 전자음을 16비트 mono WAV로 만든다."""
+    frames = bytearray()
+    amplitude = 0.88 * 32767
+    for tone_index, (frequency, duration_ms) in enumerate(tones):
+        sample_count = max(1, int(sample_rate * duration_ms / 1000))
+        fade_count = max(1, min(int(sample_rate * 0.002), sample_count // 4))
+        for index in range(sample_count):
+            envelope = min(
+                1.0,
+                index / fade_count,
+                (sample_count - 1 - index) / fade_count,
+            )
+            phase = math.sin(
+                2 * math.pi * frequency * index / sample_rate)
+            # Beep의 단단한 버저 질감에 가깝게 사각파를 사용한다.
+            sample = int(
+                amplitude * max(0.0, envelope)
+                * (1.0 if phase >= 0 else -1.0))
+            frames.extend(struct.pack("<h", sample))
+        if tone_index < len(tones) - 1:
+            frames.extend(b"\x00\x00" * int(sample_rate * 0.025))
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(frames)
+    return output.getvalue()
+
+
+_SOUND_EFFECTS = {}
+KIWOOM_ALERT_FILES = {
+    "balance1": Path(r"C:\KiwoomHero4\sound\sound7.wav"),
+    "balance2": Path(r"C:\KiwoomHero4\sound\매도주문체결4.wav"),
+    "balance3": Path(r"C:\KiwoomHero4\sound\매도주문체결4.wav"),
 }
 
 
 def _beep(kind: str):
-    def play():
+    """서명된 PowerShell의 Console.Beep으로 수정 전 Windows 원음을 재생한다."""
+    kiwoom_sound = KIWOOM_ALERT_FILES.get(kind)
+    if kiwoom_sound and kiwoom_sound.is_file():
         try:
-            import winsound
-            for freq, ms in TONES[kind]:
-                winsound.Beep(freq, ms)
-        except Exception:  # noqa: BLE001
-            QApplication.beep()
-    threading.Thread(target=play, daemon=True).start()  # Beep은 블로킹 -> 스레드에서
+            winsound.PlaySound(
+                str(kiwoom_sound),
+                winsound.SND_FILENAME | winsound.SND_ASYNC)
+            return
+        except Exception as error:  # noqa: BLE001
+            log.warning(
+                "Kiwoom WAV failed; trying generated tone: kind=%s error=%s",
+                kind, error)
+    try:
+        command = ";".join(
+            f"[Console]::Beep({frequency},{duration_ms})"
+            for frequency, duration_ms in TONES[kind]
+        )
+        subprocess.Popen(
+            [
+                "powershell.exe", "-NoProfile", "-NonInteractive",
+                "-WindowStyle", "Hidden", "-Command", command,
+            ],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        return
+    except Exception as error:  # noqa: BLE001
+        log.warning(
+            "Console.Beep start failed; trying Qt tone: kind=%s error=%s",
+            kind, error)
+    try:
+        # PowerShell 실행까지 막힌 환경에서만 Qt WAV를 조용한 대체재로 쓴다.
+        effect = _SOUND_EFFECTS.get(kind)
+        if effect is None:
+            sound_dir = Path(__file__).resolve().parent / "data" / "sounds"
+            sound_dir.mkdir(parents=True, exist_ok=True)
+            sound_path = sound_dir / f"{kind}.wav"
+            wav_data = _tone_wav(TONES[kind])
+            if not sound_path.exists() or sound_path.read_bytes() != wav_data:
+                sound_path.write_bytes(wav_data)
+            effect = QSoundEffect(QApplication.instance())
+            effect.setSource(QUrl.fromLocalFile(str(sound_path)))
+            effect.setLoopCount(1)
+            effect.setVolume(1.0)
+            _SOUND_EFFECTS[kind] = effect
+        if effect.isPlaying():
+            effect.stop()
+        effect.play()
+    except Exception as error:  # noqa: BLE001
+        # 실패 시 Windows 기본 경고음으로 대체하지 않는다.
+        log.warning("Qt tone playback failed: kind=%s error=%s", kind, error)
 
 
 class RankModel(QAbstractTableModel):
@@ -378,6 +469,9 @@ class RankScreen(QWidget):
                                self.alert_jump.isChecked(), self.jump_n.value(),
                                int(self.top_n.currentText()))
             if kind:
+                log.info(
+                    "rank alert: kind=%s top_n=%s jump_n=%d",
+                    kind, self.top_n.currentText(), self.jump_n.value())
                 _beep(kind)
             self._last_tm = t
             self._last_alert_signature = signature

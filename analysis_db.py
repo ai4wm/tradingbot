@@ -13,7 +13,7 @@ from pathlib import Path
 
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "market_analysis.db"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 7
 ANALYSIS_STOCK_TYPES = (
     "COMMON", "PREFERRED", "SPAC", "FOREIGN", "REIT", "INFRA",
 )
@@ -161,6 +161,314 @@ CREATE TABLE IF NOT EXISTS post_event_performance (
         REFERENCES limit_up_events(trade_date, stock_code)
 );
 
+CREATE TABLE IF NOT EXISTS theme_daily_stats (
+    trade_date TEXT NOT NULL,
+    theme_id INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    limit_up_count INTEGER NOT NULL DEFAULT 0,
+    unique_stock_count INTEGER NOT NULL DEFAULT 0,
+    trading_value INTEGER NOT NULL DEFAULT 0,
+    leader_stock_code TEXT,
+    calculated_at TEXT NOT NULL,
+    PRIMARY KEY (trade_date, theme_id, source),
+    FOREIGN KEY (theme_id) REFERENCES themes(theme_id)
+);
+
+CREATE TABLE IF NOT EXISTS theme_rotation_signals (
+    as_of_date TEXT NOT NULL,
+    theme_id INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    phase TEXT NOT NULL DEFAULT '',
+    rotation_score REAL NOT NULL DEFAULT 0,
+    member_count INTEGER NOT NULL DEFAULT 0,
+    events_5d INTEGER NOT NULL DEFAULT 0,
+    events_20d INTEGER NOT NULL DEFAULT 0,
+    events_60d INTEGER NOT NULL DEFAULT 0,
+    stocks_20d INTEGER NOT NULL DEFAULT 0,
+    active_days_20d INTEGER NOT NULL DEFAULT 0,
+    days_since_last INTEGER,
+    average_rate REAL,
+    trading_value INTEGER,
+    value_ratio REAL,
+    overheat_penalty REAL NOT NULL DEFAULT 0,
+    reason_text TEXT NOT NULL DEFAULT '',
+    calculated_at TEXT NOT NULL,
+    PRIMARY KEY (as_of_date, theme_id, source),
+    FOREIGN KEY (theme_id) REFERENCES themes(theme_id)
+);
+
+CREATE TABLE IF NOT EXISTS stock_leader_scores (
+    as_of_date TEXT NOT NULL,
+    theme_id INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    stock_code TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT '',
+    leader_score REAL NOT NULL DEFAULT 0,
+    follower_score REAL NOT NULL DEFAULT 0,
+    events_5d INTEGER NOT NULL DEFAULT 0,
+    events_20d INTEGER NOT NULL DEFAULT 0,
+    events_60d INTEGER NOT NULL DEFAULT 0,
+    last_limit_date TEXT,
+    change_rate REAL,
+    trading_value INTEGER,
+    value_ratio REAL,
+    calculated_at TEXT NOT NULL,
+    PRIMARY KEY (as_of_date, theme_id, source, stock_code),
+    FOREIGN KEY (theme_id) REFERENCES themes(theme_id),
+    FOREIGN KEY (stock_code) REFERENCES stocks(stock_code)
+);
+
+CREATE TABLE IF NOT EXISTS prediction_model_runs (
+    model_run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    model_name TEXT NOT NULL,
+    feature_version TEXT NOT NULL,
+    train_from TEXT NOT NULL,
+    train_to TEXT NOT NULL,
+    test_from TEXT,
+    test_to TEXT,
+    train_samples INTEGER NOT NULL DEFAULT 0,
+    train_positives INTEGER NOT NULL DEFAULT 0,
+    test_samples INTEGER NOT NULL DEFAULT 0,
+    test_positives INTEGER NOT NULL DEFAULT 0,
+    metrics_json TEXT NOT NULL DEFAULT '{}',
+    model_path TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS stock_predictions (
+    as_of_date TEXT NOT NULL,
+    stock_code TEXT NOT NULL,
+    horizon_days INTEGER NOT NULL DEFAULT 1,
+    model_run_id INTEGER NOT NULL,
+    probability REAL NOT NULL,
+    probability_rank INTEGER NOT NULL,
+    feature_version TEXT NOT NULL,
+    reason_text TEXT NOT NULL DEFAULT '',
+    calculated_at TEXT NOT NULL,
+    PRIMARY KEY (as_of_date, stock_code, horizon_days, model_run_id),
+    FOREIGN KEY (stock_code) REFERENCES stocks(stock_code),
+    FOREIGN KEY (model_run_id)
+        REFERENCES prediction_model_runs(model_run_id)
+);
+
+CREATE TABLE IF NOT EXISTS content_sources (
+    source_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_code TEXT NOT NULL UNIQUE,
+    content_kind TEXT NOT NULL DEFAULT '',
+    access_mode TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 0,
+    policy_url TEXT NOT NULL DEFAULT '',
+    robots_checked_at TEXT,
+    daily_request_limit INTEGER,
+    retention_policy TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS realtime_watchlist (
+    stock_code TEXT PRIMARY KEY,
+    watch_scope TEXT NOT NULL DEFAULT 'ALWAYS',
+    source_context TEXT NOT NULL DEFAULT 'MANUAL',
+    note TEXT NOT NULL DEFAULT '',
+    added_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    last_news_checked_at TEXT,
+    FOREIGN KEY (stock_code) REFERENCES stocks(stock_code)
+);
+
+CREATE TABLE IF NOT EXISTS news_items (
+    news_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id INTEGER NOT NULL,
+    source_item_key TEXT NOT NULL,
+    canonical_url TEXT NOT NULL DEFAULT '',
+    original_url TEXT NOT NULL DEFAULT '',
+    naver_url TEXT NOT NULL DEFAULT '',
+    publisher TEXT NOT NULL DEFAULT '',
+    published_at_source TEXT,
+    first_collected_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    market_session TEXT NOT NULL DEFAULT '',
+    current_title TEXT NOT NULL DEFAULT '',
+    current_summary TEXT NOT NULL DEFAULT '',
+    current_content_hash TEXT NOT NULL DEFAULT '',
+    duplicate_cluster_key TEXT NOT NULL DEFAULT '',
+    modified_count INTEGER NOT NULL DEFAULT 0,
+    removal_status TEXT NOT NULL DEFAULT 'ACTIVE',
+    missing_since TEXT,
+    removed_at TEXT,
+    UNIQUE (source_id, source_item_key),
+    FOREIGN KEY (source_id) REFERENCES content_sources(source_id)
+);
+
+CREATE TABLE IF NOT EXISTS news_item_versions (
+    news_id INTEGER NOT NULL,
+    version_no INTEGER NOT NULL,
+    observed_at TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    summary TEXT NOT NULL DEFAULT '',
+    content_hash TEXT NOT NULL DEFAULT '',
+    change_type TEXT NOT NULL DEFAULT 'CREATED',
+    PRIMARY KEY (news_id, version_no),
+    FOREIGN KEY (news_id) REFERENCES news_items(news_id)
+);
+
+CREATE TABLE IF NOT EXISTS news_stock_maps (
+    news_id INTEGER NOT NULL,
+    stock_code TEXT NOT NULL,
+    match_method TEXT NOT NULL DEFAULT 'QUERY_STOCK',
+    matched_text TEXT NOT NULL DEFAULT '',
+    confidence REAL,
+    is_primary INTEGER NOT NULL DEFAULT 0,
+    mapped_at TEXT NOT NULL,
+    PRIMARY KEY (news_id, stock_code),
+    FOREIGN KEY (news_id) REFERENCES news_items(news_id),
+    FOREIGN KEY (stock_code) REFERENCES stocks(stock_code)
+);
+
+CREATE TABLE IF NOT EXISTS news_material_labels (
+    news_id INTEGER NOT NULL,
+    material_type TEXT NOT NULL,
+    confidence REAL,
+    classifier_version TEXT NOT NULL DEFAULT 'rules_v1',
+    classified_at TEXT NOT NULL,
+    PRIMARY KEY (news_id, material_type, classifier_version),
+    FOREIGN KEY (news_id) REFERENCES news_items(news_id)
+);
+
+CREATE TABLE IF NOT EXISTS discussion_posts (
+    post_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id INTEGER NOT NULL,
+    source_post_key TEXT NOT NULL,
+    stock_code TEXT NOT NULL,
+    published_at_source TEXT,
+    first_collected_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    author_key_hash TEXT NOT NULL DEFAULT '',
+    current_text_hash TEXT NOT NULL DEFAULT '',
+    normalized_text_hash TEXT NOT NULL DEFAULT '',
+    simhash64 TEXT NOT NULL DEFAULT '',
+    modified_count INTEGER NOT NULL DEFAULT 0,
+    removal_status TEXT NOT NULL DEFAULT 'ACTIVE',
+    missing_since TEXT,
+    removed_at TEXT,
+    UNIQUE (source_id, source_post_key),
+    FOREIGN KEY (source_id) REFERENCES content_sources(source_id),
+    FOREIGN KEY (stock_code) REFERENCES stocks(stock_code)
+);
+
+CREATE TABLE IF NOT EXISTS discussion_post_versions (
+    post_id INTEGER NOT NULL,
+    version_no INTEGER NOT NULL,
+    observed_at TEXT NOT NULL,
+    text_hash TEXT NOT NULL DEFAULT '',
+    simhash64 TEXT NOT NULL DEFAULT '',
+    change_type TEXT NOT NULL DEFAULT 'CREATED',
+    PRIMARY KEY (post_id, version_no),
+    FOREIGN KEY (post_id) REFERENCES discussion_posts(post_id)
+);
+
+CREATE TABLE IF NOT EXISTS discussion_metrics (
+    bucket_at TEXT NOT NULL,
+    stock_code TEXT NOT NULL,
+    window_minutes INTEGER NOT NULL,
+    mention_count INTEGER NOT NULL DEFAULT 0,
+    unique_author_count INTEGER NOT NULL DEFAULT 0,
+    similar_repeat_count INTEGER NOT NULL DEFAULT 0,
+    similar_repeat_rate REAL,
+    edited_count INTEGER NOT NULL DEFAULT 0,
+    removed_count INTEGER NOT NULL DEFAULT 0,
+    mention_acceleration REAL,
+    calculated_at TEXT NOT NULL,
+    PRIMARY KEY (bucket_at, stock_code, window_minutes),
+    FOREIGN KEY (stock_code) REFERENCES stocks(stock_code)
+);
+
+CREATE TABLE IF NOT EXISTS content_request_logs (
+    request_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id INTEGER NOT NULL,
+    requested_at TEXT NOT NULL,
+    query_text TEXT NOT NULL DEFAULT '',
+    stock_code TEXT,
+    http_status INTEGER,
+    received_count INTEGER NOT NULL DEFAULT 0,
+    new_count INTEGER NOT NULL DEFAULT 0,
+    elapsed_ms INTEGER,
+    quota_used INTEGER,
+    quota_remaining INTEGER,
+    error_text TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (source_id) REFERENCES content_sources(source_id),
+    FOREIGN KEY (stock_code) REFERENCES stocks(stock_code)
+);
+
+CREATE TABLE IF NOT EXISTS market_daily_features (
+    trade_date TEXT NOT NULL,
+    market TEXT NOT NULL,
+    stock_count INTEGER NOT NULL DEFAULT 0,
+    rising_count INTEGER NOT NULL DEFAULT 0,
+    falling_count INTEGER NOT NULL DEFAULT 0,
+    rise_ratio REAL,
+    average_rate REAL,
+    trading_value INTEGER,
+    limit_up_count INTEGER NOT NULL DEFAULT 0,
+    preferred_limit_up_count INTEGER NOT NULL DEFAULT 0,
+    calculated_at TEXT NOT NULL,
+    PRIMARY KEY (trade_date, market)
+);
+
+CREATE TABLE IF NOT EXISTS market_index_prices (
+    trade_date TEXT NOT NULL,
+    index_code TEXT NOT NULL,
+    market TEXT NOT NULL,
+    open_value REAL,
+    high_value REAL,
+    low_value REAL,
+    close_value REAL,
+    volume INTEGER,
+    trading_value INTEGER,
+    source TEXT NOT NULL DEFAULT 'KIWOOM',
+    collected_at TEXT NOT NULL,
+    PRIMARY KEY (trade_date, index_code)
+);
+
+CREATE TABLE IF NOT EXISTS market_investor_flows (
+    trade_date TEXT NOT NULL,
+    market TEXT NOT NULL,
+    industry_code TEXT NOT NULL,
+    industry_name TEXT NOT NULL DEFAULT '',
+    change_rate REAL,
+    volume INTEGER,
+    securities_net_amount_million INTEGER,
+    insurance_net_amount_million INTEGER,
+    investment_trust_net_amount_million INTEGER,
+    bank_net_amount_million INTEGER,
+    merchant_bank_net_amount_million INTEGER,
+    fund_net_amount_million INTEGER,
+    other_corporation_net_amount_million INTEGER,
+    individual_net_amount_million INTEGER,
+    foreign_net_amount_million INTEGER,
+    domestic_foreign_net_amount_million INTEGER,
+    national_net_amount_million INTEGER,
+    private_fund_net_amount_million INTEGER,
+    institution_net_amount_million INTEGER,
+    source TEXT NOT NULL DEFAULT 'KIWOOM',
+    collected_at TEXT NOT NULL,
+    PRIMARY KEY (trade_date, market, industry_code)
+);
+
+CREATE TABLE IF NOT EXISTS external_market_ticks (
+    indicator_code TEXT NOT NULL,
+    indicator_name TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    value REAL NOT NULL,
+    previous_close REAL,
+    change_rate REAL,
+    currency TEXT NOT NULL DEFAULT '',
+    exchange_name TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL,
+    collected_at TEXT NOT NULL,
+    PRIMARY KEY (indicator_code, observed_at, source)
+);
+
 CREATE TABLE IF NOT EXISTS collection_runs (
     run_id INTEGER PRIMARY KEY AUTOINCREMENT,
     data_type TEXT NOT NULL,
@@ -185,6 +493,34 @@ CREATE INDEX IF NOT EXISTS idx_disclosure_ranges_stock_dates
     ON disclosure_collection_ranges(stock_code, date_from, date_to);
 CREATE INDEX IF NOT EXISTS idx_collection_runs_type_started
     ON collection_runs(data_type, started_at);
+CREATE INDEX IF NOT EXISTS idx_theme_daily_stats_source_date
+    ON theme_daily_stats(source, trade_date);
+CREATE INDEX IF NOT EXISTS idx_rotation_signals_source_date_score
+    ON theme_rotation_signals(source, as_of_date, rotation_score);
+CREATE INDEX IF NOT EXISTS idx_stock_leader_theme_date
+    ON stock_leader_scores(theme_id, source, as_of_date);
+CREATE INDEX IF NOT EXISTS idx_stock_predictions_date_rank
+    ON stock_predictions(as_of_date, horizon_days, probability_rank);
+CREATE INDEX IF NOT EXISTS idx_news_items_published
+    ON news_items(published_at_source DESC);
+CREATE INDEX IF NOT EXISTS idx_news_stock_maps_code
+    ON news_stock_maps(stock_code, news_id);
+CREATE INDEX IF NOT EXISTS idx_news_duplicate_cluster
+    ON news_items(duplicate_cluster_key);
+CREATE INDEX IF NOT EXISTS idx_discussion_posts_code_published
+    ON discussion_posts(stock_code, published_at_source DESC);
+CREATE INDEX IF NOT EXISTS idx_discussion_metrics_code_bucket
+    ON discussion_metrics(stock_code, bucket_at DESC);
+CREATE INDEX IF NOT EXISTS idx_content_request_logs_source_time
+    ON content_request_logs(source_id, requested_at DESC);
+CREATE INDEX IF NOT EXISTS idx_market_daily_features_market_date
+    ON market_daily_features(market, trade_date);
+CREATE INDEX IF NOT EXISTS idx_market_index_prices_market_date
+    ON market_index_prices(market, trade_date);
+CREATE INDEX IF NOT EXISTS idx_market_investor_flows_market_date
+    ON market_investor_flows(market, trade_date);
+CREATE INDEX IF NOT EXISTS idx_external_market_ticks_latest
+    ON external_market_ticks(indicator_code, observed_at DESC);
 """
 
 
@@ -210,6 +546,33 @@ def initialize(db_path: Path = DB_PATH) -> Path:
                     "INSERT INTO schema_info(version, applied_at) VALUES (?, ?)",
                     (SCHEMA_VERSION, now),
                 )
+            connection.executemany(
+                """INSERT OR IGNORE INTO content_sources(
+                       source_code, content_kind, access_mode, enabled,
+                       policy_url, robots_checked_at, daily_request_limit,
+                       retention_policy, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    (
+                        "NAVER_SEARCH_NEWS", "NEWS", "OFFICIAL_API", 1,
+                        "https://developers.naver.com/docs/serviceapi/"
+                        "search/news/news.md",
+                        now, 25000,
+                        "API 약관 범위 내 메타데이터·파생값 보관", now,
+                    ),
+                    (
+                        "NAVER_FINANCE_NEWS", "NEWS", "MANUAL_WEBVIEW", 0,
+                        "https://finance.naver.com/robots.txt",
+                        now, None, "자동수집 금지·사용자 웹뷰 열람 전용", now,
+                    ),
+                    (
+                        "NAVER_FINANCE_BOARD", "DISCUSSION",
+                        "MANUAL_WEBVIEW", 0,
+                        "https://finance.naver.com/robots.txt",
+                        now, None, "자동수집 금지·사용자 웹뷰 열람 전용", now,
+                    ),
+                ),
+            )
     return db_path
 
 
@@ -225,9 +588,13 @@ def database_stats(db_path: Path = DB_PATH) -> dict:
             "disclosures": 0,
             "themes": 0,
             "stock_themes": 0,
+            "market_index_prices": 0,
+            "market_investor_flows": 0,
+            "external_market_ticks": 0,
             "last_trade_date": "",
             "last_run": "",
         }
+    initialize(db_path)
     with closing(connect(db_path)) as connection:
         result = {
             "exists": True,
@@ -244,6 +611,15 @@ def database_stats(db_path: Path = DB_PATH) -> dict:
         result["last_trade_date"] = connection.execute(
             "SELECT MAX(trade_date) FROM daily_prices"
         ).fetchone()[0] or ""
+        result["market_index_prices"] = connection.execute(
+            "SELECT COUNT(*) FROM market_index_prices"
+        ).fetchone()[0]
+        result["market_investor_flows"] = connection.execute(
+            "SELECT COUNT(*) FROM market_investor_flows"
+        ).fetchone()[0]
+        result["external_market_ticks"] = connection.execute(
+            "SELECT COUNT(*) FROM external_market_ticks"
+        ).fetchone()[0]
         row = connection.execute(
             """SELECT data_type, status, started_at
                FROM collection_runs ORDER BY run_id DESC LIMIT 1"""
@@ -253,6 +629,298 @@ def database_stats(db_path: Path = DB_PATH) -> dict:
             if row else ""
         )
         return result
+
+
+def save_market_index_prices(rows: list[dict],
+                             db_path: Path = DB_PATH) -> int:
+    """키움 업종 일봉을 코스피·코스닥 지수 원천 데이터로 저장한다."""
+    if not rows:
+        return 0
+    initialize(db_path)
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    values = [
+        (
+            str(row.get("date") or ""),
+            str(row.get("index_code") or ""),
+            str(row.get("market") or ""),
+            row.get("open"),
+            row.get("high"),
+            row.get("low"),
+            row.get("close"),
+            int(row.get("volume") or 0),
+            int(row.get("trading_value") or 0),
+            str(row.get("source") or "KIWOOM"),
+            now,
+        )
+        for row in rows
+        if row.get("date") and row.get("index_code")
+    ]
+    if not values:
+        return 0
+    with closing(connect(db_path)) as connection, connection:
+        connection.executemany(
+            """INSERT INTO market_index_prices(
+                   trade_date, index_code, market, open_value, high_value,
+                   low_value, close_value, volume, trading_value, source,
+                   collected_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(trade_date, index_code) DO UPDATE SET
+                   market=excluded.market,
+                   open_value=excluded.open_value,
+                   high_value=excluded.high_value,
+                   low_value=excluded.low_value,
+                   close_value=excluded.close_value,
+                   volume=excluded.volume,
+                   trading_value=excluded.trading_value,
+                   source=excluded.source,
+                   collected_at=excluded.collected_at""",
+            values,
+        )
+    return len(values)
+
+
+def market_index_coverage(db_path: Path = DB_PATH) -> list[dict]:
+    """저장된 시장 지수별 건수와 날짜 범위를 반환한다."""
+    if not db_path.exists():
+        return []
+    initialize(db_path)
+    with closing(connect(db_path)) as connection:
+        rows = connection.execute(
+            """SELECT index_code, market, COUNT(*) AS row_count,
+                      MIN(trade_date) AS date_from,
+                      MAX(trade_date) AS date_to
+                 FROM market_index_prices
+                GROUP BY index_code, market
+                ORDER BY index_code"""
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def save_market_investor_flows(rows: list[dict],
+                               db_path: Path = DB_PATH) -> int:
+    """키움 시장·업종별 투자자 순매수를 백만원 단위로 저장한다."""
+    if not rows:
+        return 0
+    initialize(db_path)
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    fields = (
+        "securities", "insurance", "investment_trust", "bank",
+        "merchant_bank", "fund", "other_corporation", "individual",
+        "foreign", "domestic_foreign", "national", "private_fund",
+        "institution",
+    )
+    values = []
+    for row in rows:
+        trade_date = str(row.get("date") or "")
+        market = str(row.get("market") or "")
+        industry_code = str(row.get("industry_code") or "")
+        if not trade_date or not market or not industry_code:
+            continue
+        values.append((
+            trade_date,
+            market,
+            industry_code,
+            str(row.get("industry_name") or ""),
+            row.get("change_rate"),
+            int(row.get("volume") or 0),
+            *(int(row.get(f"{field}_net_amount_million") or 0)
+              for field in fields),
+            str(row.get("source") or "KIWOOM"),
+            now,
+        ))
+    if not values:
+        return 0
+    with closing(connect(db_path)) as connection, connection:
+        connection.executemany(
+            """INSERT INTO market_investor_flows(
+                   trade_date, market, industry_code, industry_name,
+                   change_rate, volume,
+                   securities_net_amount_million,
+                   insurance_net_amount_million,
+                   investment_trust_net_amount_million,
+                   bank_net_amount_million,
+                   merchant_bank_net_amount_million,
+                   fund_net_amount_million,
+                   other_corporation_net_amount_million,
+                   individual_net_amount_million,
+                   foreign_net_amount_million,
+                   domestic_foreign_net_amount_million,
+                   national_net_amount_million,
+                   private_fund_net_amount_million,
+                   institution_net_amount_million,
+                   source, collected_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       ?, ?, ?, ?)
+               ON CONFLICT(trade_date, market, industry_code) DO UPDATE SET
+                   industry_name=excluded.industry_name,
+                   change_rate=excluded.change_rate,
+                   volume=excluded.volume,
+                   securities_net_amount_million=
+                       excluded.securities_net_amount_million,
+                   insurance_net_amount_million=
+                       excluded.insurance_net_amount_million,
+                   investment_trust_net_amount_million=
+                       excluded.investment_trust_net_amount_million,
+                   bank_net_amount_million=
+                       excluded.bank_net_amount_million,
+                   merchant_bank_net_amount_million=
+                       excluded.merchant_bank_net_amount_million,
+                   fund_net_amount_million=
+                       excluded.fund_net_amount_million,
+                   other_corporation_net_amount_million=
+                       excluded.other_corporation_net_amount_million,
+                   individual_net_amount_million=
+                       excluded.individual_net_amount_million,
+                   foreign_net_amount_million=
+                       excluded.foreign_net_amount_million,
+                   domestic_foreign_net_amount_million=
+                       excluded.domestic_foreign_net_amount_million,
+                   national_net_amount_million=
+                       excluded.national_net_amount_million,
+                   private_fund_net_amount_million=
+                       excluded.private_fund_net_amount_million,
+                   institution_net_amount_million=
+                       excluded.institution_net_amount_million,
+                   source=excluded.source,
+                   collected_at=excluded.collected_at""",
+            values,
+        )
+    return len(values)
+
+
+def pending_market_investor_flow_requests(
+    date_from: str, date_to: str, db_path: Path = DB_PATH,
+) -> list[tuple[str, str]]:
+    """거래일별로 아직 저장되지 않은 KOSPI·KOSDAQ 요청만 반환한다."""
+    initialize(db_path)
+    with closing(connect(db_path)) as connection:
+        trade_dates = [
+            row[0] for row in connection.execute(
+                """SELECT DISTINCT trade_date
+                     FROM daily_prices
+                    WHERE trade_date BETWEEN ? AND ?
+                    ORDER BY trade_date""",
+                (date_from, date_to),
+            ).fetchall()
+        ]
+        completed = {
+            (row["trade_date"], row["market"])
+            for row in connection.execute(
+                """SELECT trade_date, market
+                     FROM market_investor_flows
+                    WHERE trade_date BETWEEN ? AND ?
+                    GROUP BY trade_date, market
+                   HAVING COUNT(*)>0""",
+                (date_from, date_to),
+            ).fetchall()
+        }
+    return [
+        (trade_date, market)
+        for trade_date in trade_dates
+        for market in ("KOSPI", "KOSDAQ")
+        if (trade_date, market) not in completed
+    ]
+
+
+def market_investor_flow_coverage(db_path: Path = DB_PATH) -> list[dict]:
+    """시장별 수급 저장 건수와 날짜 범위를 반환한다."""
+    if not db_path.exists():
+        return []
+    initialize(db_path)
+    with closing(connect(db_path)) as connection:
+        rows = connection.execute(
+            """SELECT market, COUNT(*) AS row_count,
+                      COUNT(DISTINCT trade_date) AS date_count,
+                      MIN(trade_date) AS date_from,
+                      MAX(trade_date) AS date_to
+                 FROM market_investor_flows
+                GROUP BY market
+                ORDER BY market"""
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def save_external_market_quotes(
+    rows: list[dict], db_path: Path = DB_PATH,
+) -> int:
+    """해외지표 현재값을 원본 시각과 실제 수집시각을 분리해 저장한다."""
+    if not rows:
+        return 0
+    initialize(db_path)
+    collected_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    values = [
+        (
+            str(row.get("indicator_code") or ""),
+            str(row.get("indicator_name") or ""),
+            str(row.get("symbol") or ""),
+            str(row.get("observed_at") or ""),
+            float(row.get("value")),
+            (
+                float(row["previous_close"])
+                if row.get("previous_close") is not None else None
+            ),
+            (
+                float(row["change_rate"])
+                if row.get("change_rate") is not None else None
+            ),
+            str(row.get("currency") or ""),
+            str(row.get("exchange") or ""),
+            str(row.get("source") or "YAHOO_CHART"),
+            collected_at,
+        )
+        for row in rows
+        if row.get("indicator_code")
+        and row.get("observed_at")
+        and row.get("value") is not None
+    ]
+    if not values:
+        return 0
+    with closing(connect(db_path)) as connection, connection:
+        connection.executemany(
+            """INSERT INTO external_market_ticks(
+                   indicator_code, indicator_name, symbol, observed_at,
+                   value, previous_close, change_rate, currency,
+                   exchange_name, source, collected_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(indicator_code, observed_at, source) DO UPDATE SET
+                   indicator_name=excluded.indicator_name,
+                   symbol=excluded.symbol,
+                   value=excluded.value,
+                   previous_close=excluded.previous_close,
+                   change_rate=excluded.change_rate,
+                   currency=excluded.currency,
+                   exchange_name=excluded.exchange_name,
+                   collected_at=excluded.collected_at""",
+            values,
+        )
+    return len(values)
+
+
+def latest_external_market_quotes(
+    db_path: Path = DB_PATH,
+) -> list[dict]:
+    """지표별 원본 게시시각이 가장 최근인 한 행을 반환한다."""
+    if not db_path.exists():
+        return []
+    initialize(db_path)
+    with closing(connect(db_path)) as connection:
+        rows = connection.execute(
+            """WITH ranked AS (
+                   SELECT *,
+                          ROW_NUMBER() OVER (
+                              PARTITION BY indicator_code
+                              ORDER BY observed_at DESC, collected_at DESC
+                          ) AS rn
+                     FROM external_market_ticks
+               )
+               SELECT indicator_code, indicator_name, symbol, observed_at,
+                      value, previous_close, change_rate, currency,
+                      exchange_name, source, collected_at
+                 FROM ranked
+                WHERE rn=1
+                ORDER BY indicator_code"""
+        ).fetchall()
+        return [dict(row) for row in rows]
 
 
 def save_stock_history(
@@ -454,7 +1122,7 @@ def krx_collected_dates(date_from: str, date_to: str,
 
 
 def sync_stock_catalog(stocks: list[dict], db_path: Path = DB_PATH) -> int:
-    """최신 종목 목록의 유형/시장 정보를 기존 원천 데이터에 덧붙인다."""
+    """최신 종목 목록을 동기화해 신규 상장 종목도 분석 DB에 추가한다."""
     if not stocks or not db_path.exists():
         return 0
     now = datetime.now().astimezone().isoformat(timespec="seconds")
@@ -469,10 +1137,17 @@ def sync_stock_catalog(stocks: list[dict], db_path: Path = DB_PATH) -> int:
     ]
     with closing(connect(db_path)) as connection, connection:
         connection.executemany(
-            """UPDATE stocks SET stock_name=?, market=?, stock_type=?,
-                      sector_name=?, listed_date=?, shares_outstanding=?,
-                      updated_at=?
-               WHERE stock_code=?""",
+            """INSERT INTO stocks(
+                   stock_name, market, stock_type, sector_name, listed_date,
+                   shares_outstanding, updated_at, stock_code)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(stock_code) DO UPDATE SET
+                   stock_name=excluded.stock_name, market=excluded.market,
+                   stock_type=excluded.stock_type,
+                   sector_name=excluded.sector_name,
+                   listed_date=excluded.listed_date,
+                   shares_outstanding=excluded.shares_outstanding,
+                   updated_at=excluded.updated_at""",
             rows,
         )
     return len(rows)
@@ -616,11 +1291,526 @@ def theme_summary_rows(query: str = "", db_path: Path = DB_PATH) -> list[dict]:
         return [dict(row) for row in rows]
 
 
+def rebuild_rotation_analysis(as_of_date: str = "", source: str = "NAVER",
+                              db_path: Path = DB_PATH) -> dict:
+    """현재 테마 분류와 저장된 일봉으로 순환매 후보 스냅샷을 계산한다.
+
+    과거 시점의 실제 테마 구성원이 아니라 현재 유효한 구성원을 과거 일봉에
+    연결하는 1차 분석이다. 결과를 원천 테이블과 분리해 반복 검증할 수 있게 한다.
+    """
+    initialize(db_path)
+    source = str(source or "NAVER").upper()
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    with closing(connect(db_path)) as connection, connection:
+        if as_of_date:
+            row = connection.execute(
+                "SELECT MAX(trade_date) FROM daily_prices WHERE trade_date<=?",
+                (as_of_date,),
+            ).fetchone()
+        else:
+            row = connection.execute(
+                "SELECT MAX(trade_date) FROM daily_prices"
+            ).fetchone()
+        as_of_date = (row[0] if row else "") or ""
+        if not as_of_date:
+            return {"as_of_date": "", "source": source, "themes": 0,
+                    "stocks": 0}
+
+        dates = [
+            row[0] for row in connection.execute(
+                """SELECT DISTINCT trade_date FROM daily_prices
+                   WHERE trade_date<=? ORDER BY trade_date DESC LIMIT 61""",
+                (as_of_date,),
+            ).fetchall()
+        ]
+        if not dates:
+            return {"as_of_date": "", "source": source, "themes": 0,
+                    "stocks": 0}
+
+        def cutoff(days: int) -> str:
+            return dates[min(days - 1, len(dates) - 1)]
+
+        cutoff_5 = cutoff(5)
+        cutoff_20 = cutoff(20)
+        cutoff_60 = cutoff(60)
+        recent_price_dates = dates[:min(6, len(dates))]
+        recent_price_cutoff = recent_price_dates[-1]
+        date_position = {date: index for index, date in enumerate(dates)}
+
+        membership_rows = connection.execute(
+            """SELECT DISTINCT st.theme_id, st.stock_code, t.theme_name
+                 FROM stock_themes st
+                 JOIN themes t ON t.theme_id=st.theme_id
+                WHERE st.source=? AND st.valid_to IS NULL
+                ORDER BY st.theme_id, st.stock_code""",
+            (source,),
+        ).fetchall()
+        members: dict[int, set[str]] = {}
+        theme_names: dict[int, str] = {}
+        all_codes: set[str] = set()
+        for member in membership_rows:
+            theme_id = int(member["theme_id"])
+            code = member["stock_code"]
+            members.setdefault(theme_id, set()).add(code)
+            theme_names[theme_id] = member["theme_name"]
+            all_codes.add(code)
+        if not members:
+            return {"as_of_date": as_of_date, "source": source, "themes": 0,
+                    "stocks": 0}
+
+        event_rows = connection.execute(
+            """WITH membership AS (
+                   SELECT DISTINCT theme_id, stock_code
+                     FROM stock_themes
+                    WHERE source=? AND valid_to IS NULL
+               )
+               SELECT m.theme_id, e.trade_date, e.stock_code,
+                      COALESCE(p.trading_value, 0) AS trading_value
+                 FROM membership m
+                 JOIN limit_up_events e ON e.stock_code=m.stock_code
+                 JOIN daily_prices p
+                   ON p.trade_date=e.trade_date AND p.stock_code=e.stock_code
+                WHERE e.trade_date<=?
+                ORDER BY e.trade_date, m.theme_id, e.stock_code""",
+            (source, as_of_date),
+        ).fetchall()
+        events_by_theme: dict[int, list[dict]] = {}
+        events_by_stock: dict[tuple[int, str], list[dict]] = {}
+        daily_groups: dict[tuple[str, int], list[dict]] = {}
+        for event_row in event_rows:
+            event = dict(event_row)
+            theme_id = int(event["theme_id"])
+            events_by_theme.setdefault(theme_id, []).append(event)
+            events_by_stock.setdefault(
+                (theme_id, event["stock_code"]), []).append(event)
+            daily_groups.setdefault(
+                (event["trade_date"], theme_id), []).append(event)
+
+        stock_price_rows = connection.execute(
+            """WITH member_codes AS (
+                   SELECT DISTINCT stock_code FROM stock_themes
+                    WHERE source=? AND valid_to IS NULL
+               )
+               SELECT p.trade_date, p.stock_code, p.change_rate,
+                      COALESCE(p.trading_value, 0) AS trading_value
+                 FROM daily_prices p
+                 JOIN member_codes m ON m.stock_code=p.stock_code
+                WHERE p.trade_date BETWEEN ? AND ?""",
+            (source, recent_price_cutoff, as_of_date),
+        ).fetchall()
+        prices: dict[str, dict[str, dict]] = {}
+        for price_row in stock_price_rows:
+            prices.setdefault(price_row["stock_code"], {})[
+                price_row["trade_date"]] = dict(price_row)
+
+        connection.execute(
+            "DELETE FROM theme_daily_stats WHERE source=?",
+            (source,),
+        )
+        daily_values = []
+        for (trade_date, theme_id), grouped_events in daily_groups.items():
+            leader = max(
+                grouped_events,
+                key=lambda item: int(item["trading_value"] or 0),
+            )
+            daily_values.append((
+                trade_date, theme_id, source, len(grouped_events),
+                len({item["stock_code"] for item in grouped_events}),
+                sum(int(item["trading_value"] or 0)
+                    for item in grouped_events),
+                leader["stock_code"], now,
+            ))
+        connection.executemany(
+            """INSERT INTO theme_daily_stats(
+                   trade_date, theme_id, source, limit_up_count,
+                   unique_stock_count, trading_value, leader_stock_code,
+                   calculated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            daily_values,
+        )
+
+        def bounded(value: float, low: float, high: float) -> float:
+            return max(low, min(high, value))
+
+        signal_values = []
+        signal_scores: dict[int, float] = {}
+        signal_phases: dict[int, str] = {}
+        for theme_id, theme_members in members.items():
+            theme_events = events_by_theme.get(theme_id, [])
+            recent_60 = [
+                event for event in theme_events
+                if event["trade_date"] >= cutoff_60
+            ]
+            recent_20 = [
+                event for event in recent_60
+                if event["trade_date"] >= cutoff_20
+            ]
+            recent_5 = [
+                event for event in recent_20
+                if event["trade_date"] >= cutoff_5
+            ]
+            previous_15 = [
+                event for event in recent_20
+                if event["trade_date"] < cutoff_5
+            ]
+            older_40 = [
+                event for event in recent_60
+                if event["trade_date"] < cutoff_20
+            ]
+            stocks_5 = {event["stock_code"] for event in recent_5}
+            stocks_20 = {event["stock_code"] for event in recent_20}
+            active_days_20 = {
+                event["trade_date"] for event in recent_20
+            }
+            last_date = (
+                max((event["trade_date"] for event in theme_events),
+                    default="")
+            )
+            days_since_last = (
+                date_position.get(last_date, 999) if last_date else 999
+            )
+
+            latest_rates = []
+            latest_value = 0
+            previous_totals = {date: 0 for date in recent_price_dates[1:]}
+            for code in theme_members:
+                code_prices = prices.get(code, {})
+                latest = code_prices.get(as_of_date)
+                if latest:
+                    latest_rates.append(float(latest["change_rate"] or 0))
+                    latest_value += int(latest["trading_value"] or 0)
+                for date in previous_totals:
+                    previous = code_prices.get(date)
+                    if previous:
+                        previous_totals[date] += int(
+                            previous["trading_value"] or 0)
+            average_rate = (
+                sum(latest_rates) / len(latest_rates)
+                if latest_rates else 0.0
+            )
+            previous_average_value = (
+                sum(previous_totals.values()) / len(previous_totals)
+                if previous_totals else 0
+            )
+            value_ratio = (
+                latest_value / previous_average_value
+                if previous_average_value else 0.0
+            )
+
+            breadth_5 = (
+                len(stocks_5) / len(theme_members) if theme_members else 0
+            )
+            recent_rate = len(recent_5) / 5
+            previous_rate = len(previous_15) / 15
+            acceleration = (
+                recent_rate / previous_rate if previous_rate > 0
+                else (2.0 if recent_5 else 0.0)
+            )
+            recency_points = (
+                max(0.0, 20.0 - days_since_last * 4.0)
+                if days_since_last < 999 else 0.0
+            )
+            activity_points = min(20.0, len(recent_5) * 4.0)
+            breadth_points = min(15.0, breadth_5 * 75.0)
+            acceleration_points = (
+                min(15.0, 5.0 + max(0.0, acceleration - 1.0) * 5.0)
+                if recent_5 else 0.0
+            )
+            momentum_points = bounded(average_rate, 0.0, 5.0) * 2.0
+            value_points = bounded((value_ratio - 1.0) * 7.5, 0.0, 10.0)
+            persistence_points = min(10.0, len(active_days_20) * 2.0)
+            overheat_penalty = 0.0
+            if breadth_5 >= 0.20:
+                overheat_penalty += min(10.0, breadth_5 * 25.0)
+            if average_rate >= 10:
+                overheat_penalty += min(10.0, (average_rate - 8.0) / 2.0)
+            score = bounded(
+                recency_points + activity_points + breadth_points
+                + acceleration_points + momentum_points + value_points
+                + persistence_points - overheat_penalty,
+                0.0, 100.0,
+            )
+
+            if recent_5 and previous_15 == [] and older_40:
+                phase = "재점화"
+            elif (len(recent_5) >= 5 and breadth_5 >= 0.12) \
+                    or average_rate >= 10:
+                phase = "과열"
+            elif recent_5 and not previous_15:
+                phase = "초기"
+            elif len(recent_5) >= 2 and acceleration >= 1.2:
+                phase = "확산"
+            elif not recent_5 and recent_20:
+                phase = "소멸"
+            elif not recent_20 and (average_rate > 1.0 or value_ratio >= 1.5):
+                phase = "대기"
+            else:
+                phase = "관찰"
+
+            reason_parts = []
+            if recent_5:
+                reason_parts.append(
+                    f"5일 상한가 {len(recent_5)}건/"
+                    f"{len(stocks_5)}종목")
+            if acceleration >= 1.2:
+                reason_parts.append(f"확산속도 {acceleration:.1f}배")
+            if value_ratio >= 1.2:
+                reason_parts.append(f"거래대금 {value_ratio:.1f}배")
+            if average_rate > 0:
+                reason_parts.append(f"당일 평균 {average_rate:+.1f}%")
+            if not reason_parts:
+                reason_parts.append("뚜렷한 초기 신호 없음")
+            if overheat_penalty:
+                reason_parts.append(f"과열감점 {overheat_penalty:.0f}")
+
+            signal_scores[theme_id] = score
+            signal_phases[theme_id] = phase
+            signal_values.append((
+                as_of_date, theme_id, source, phase, round(score, 2),
+                len(theme_members), len(recent_5), len(recent_20),
+                len(recent_60), len(stocks_20), len(active_days_20),
+                None if days_since_last >= 999 else days_since_last,
+                round(average_rate, 4), latest_value,
+                round(value_ratio, 4), round(overheat_penalty, 2),
+                " · ".join(reason_parts), now,
+            ))
+
+        connection.execute(
+            """DELETE FROM theme_rotation_signals
+               WHERE as_of_date=? AND source=?""",
+            (as_of_date, source),
+        )
+        connection.executemany(
+            """INSERT INTO theme_rotation_signals(
+                   as_of_date, theme_id, source, phase, rotation_score,
+                   member_count, events_5d, events_20d, events_60d,
+                   stocks_20d, active_days_20d, days_since_last,
+                   average_rate, trading_value, value_ratio,
+                   overheat_penalty, reason_text, calculated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            signal_values,
+        )
+
+        stock_values = []
+        for theme_id, theme_members in members.items():
+            scored = []
+            for code in theme_members:
+                stock_events = events_by_stock.get((theme_id, code), [])
+                recent_60 = [
+                    event for event in stock_events
+                    if event["trade_date"] >= cutoff_60
+                ]
+                recent_20 = [
+                    event for event in recent_60
+                    if event["trade_date"] >= cutoff_20
+                ]
+                recent_5 = [
+                    event for event in recent_20
+                    if event["trade_date"] >= cutoff_5
+                ]
+                last_date = max(
+                    (event["trade_date"] for event in stock_events),
+                    default="",
+                )
+                code_prices = prices.get(code, {})
+                latest = code_prices.get(as_of_date, {})
+                change_rate = float(latest.get("change_rate") or 0)
+                trading_value = int(latest.get("trading_value") or 0)
+                previous_values = [
+                    int(code_prices.get(date, {}).get("trading_value") or 0)
+                    for date in recent_price_dates[1:]
+                    if code_prices.get(date)
+                ]
+                previous_average = (
+                    sum(previous_values) / len(previous_values)
+                    if previous_values else 0
+                )
+                stock_value_ratio = (
+                    trading_value / previous_average
+                    if previous_average else 0.0
+                )
+                stock_days_since = (
+                    date_position.get(last_date, 999)
+                    if last_date else 999
+                )
+                leader_score = bounded(
+                    len(recent_5) * 25.0 + len(recent_20) * 7.0
+                    + len(recent_60) * 1.5
+                    + (max(0.0, 20.0 - stock_days_since * 3.0)
+                       if stock_days_since < 999 else 0.0)
+                    + bounded(change_rate, 0.0, 10.0)
+                    + bounded((stock_value_ratio - 1.0) * 5.0, 0.0, 10.0),
+                    0.0, 100.0,
+                )
+                follower_score = bounded(
+                    signal_scores.get(theme_id, 0.0) * (
+                        0.55 if not recent_20 else 0.35)
+                    + bounded(change_rate, 0.0, 8.0) * 2.0
+                    + bounded((stock_value_ratio - 1.0) * 10.0, 0.0, 25.0)
+                    + (12.0 if not recent_20 and
+                       signal_phases.get(theme_id) in
+                       ("초기", "확산", "재점화") else 0.0)
+                    + (8.0 if not recent_5 and recent_20 else 0.0),
+                    0.0, 100.0,
+                )
+                scored.append({
+                    "code": code,
+                    "events_5": len(recent_5),
+                    "events_20": len(recent_20),
+                    "events_60": len(recent_60),
+                    "last_date": last_date,
+                    "change_rate": change_rate,
+                    "trading_value": trading_value,
+                    "value_ratio": stock_value_ratio,
+                    "leader_score": leader_score,
+                    "follower_score": follower_score,
+                })
+            leader_code = ""
+            active_scored = [
+                item for item in scored if item["events_20"] > 0
+            ]
+            if active_scored:
+                leader_code = max(
+                    active_scored,
+                    key=lambda item: (
+                        item["leader_score"], item["trading_value"]),
+                )["code"]
+            for item in scored:
+                if item["code"] == leader_code:
+                    role = "대장주"
+                elif item["events_5"] > 0:
+                    role = "선도주"
+                elif item["events_20"] == 0 and (
+                        item["change_rate"] > 0
+                        or item["value_ratio"] >= 1.2):
+                    role = "후발 후보"
+                elif item["events_20"] == 0:
+                    role = "미발동"
+                else:
+                    role = "재점화 관찰"
+                stock_values.append((
+                    as_of_date, theme_id, source, item["code"], role,
+                    round(item["leader_score"], 2),
+                    round(item["follower_score"], 2),
+                    item["events_5"], item["events_20"],
+                    item["events_60"], item["last_date"] or None,
+                    round(item["change_rate"], 4),
+                    item["trading_value"],
+                    round(item["value_ratio"], 4), now,
+                ))
+
+        connection.execute(
+            """DELETE FROM stock_leader_scores
+               WHERE as_of_date=? AND source=?""",
+            (as_of_date, source),
+        )
+        connection.executemany(
+            """INSERT INTO stock_leader_scores(
+                   as_of_date, theme_id, source, stock_code, role,
+                   leader_score, follower_score, events_5d, events_20d,
+                   events_60d, last_limit_date, change_rate, trading_value,
+                   value_ratio, calculated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            stock_values,
+        )
+        return {
+            "as_of_date": as_of_date,
+            "source": source,
+            "themes": len(signal_values),
+            "stocks": len(stock_values),
+        }
+
+
+def rotation_signal_rows(as_of_date: str, source: str = "NAVER",
+                         db_path: Path = DB_PATH) -> list[dict]:
+    if not db_path.exists():
+        return []
+    with closing(connect(db_path)) as connection:
+        rows = connection.execute(
+            """SELECT r.*, t.theme_name
+                 FROM theme_rotation_signals r
+                 JOIN themes t ON t.theme_id=r.theme_id
+                WHERE r.as_of_date=? AND r.source=?
+                  AND (r.rotation_score>0 OR r.events_20d>0)
+                ORDER BY r.rotation_score DESC, r.events_5d DESC,
+                         r.trading_value DESC""",
+            (as_of_date, source.upper()),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def rotation_theme_daily_rows(theme_id: int, source: str, as_of_date: str,
+                              trading_days: int = 120,
+                              db_path: Path = DB_PATH) -> list[dict]:
+    if not db_path.exists():
+        return []
+    with closing(connect(db_path)) as connection:
+        cutoff_row = connection.execute(
+            """SELECT MIN(trade_date) FROM (
+                   SELECT DISTINCT trade_date FROM daily_prices
+                    WHERE trade_date<=? ORDER BY trade_date DESC LIMIT ?)""",
+            (as_of_date, int(trading_days)),
+        ).fetchone()
+        cutoff_date = (cutoff_row[0] if cutoff_row else "") or "00000000"
+        rows = connection.execute(
+            """SELECT d.trade_date, d.limit_up_count, d.unique_stock_count,
+                      d.trading_value, d.leader_stock_code,
+                      COALESCE(s.stock_name, '') AS leader_stock_name,
+                      COALESCE((
+                          SELECT GROUP_CONCAT(stock_name, ', ')
+                            FROM (
+                                SELECT DISTINCT sx.stock_name AS stock_name
+                                  FROM stock_themes stx
+                                  JOIN limit_up_events ex
+                                    ON ex.stock_code=stx.stock_code
+                                  JOIN stocks sx
+                                    ON sx.stock_code=ex.stock_code
+                                 WHERE stx.theme_id=d.theme_id
+                                   AND stx.source=d.source
+                                   AND stx.valid_to IS NULL
+                                   AND ex.trade_date=d.trade_date
+                                 ORDER BY sx.stock_name
+                            )
+                      ), '') AS event_stocks
+                 FROM theme_daily_stats d
+                 LEFT JOIN stocks s ON s.stock_code=d.leader_stock_code
+                WHERE d.theme_id=? AND d.source=?
+                  AND d.trade_date BETWEEN ? AND ?
+                ORDER BY d.trade_date DESC""",
+            (int(theme_id), source.upper(), cutoff_date, as_of_date),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def rotation_stock_rows(as_of_date: str, theme_id: int,
+                        source: str = "NAVER",
+                        db_path: Path = DB_PATH) -> list[dict]:
+    if not db_path.exists():
+        return []
+    with closing(connect(db_path)) as connection:
+        rows = connection.execute(
+            """SELECT r.*, s.stock_name, s.market
+                 FROM stock_leader_scores r
+                 JOIN stocks s ON s.stock_code=r.stock_code
+                WHERE r.as_of_date=? AND r.theme_id=? AND r.source=?
+                ORDER BY CASE r.role WHEN '대장주' THEN 1
+                                     WHEN '선도주' THEN 2
+                                     WHEN '후발 후보' THEN 3
+                                     WHEN '재점화 관찰' THEN 4 ELSE 5 END,
+                         CASE WHEN r.role IN ('대장주', '선도주')
+                              THEN r.leader_score ELSE r.follower_score END DESC,
+                         r.trading_value DESC""",
+            (as_of_date, int(theme_id), source.upper()),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
 def market_dashboard(db_path: Path = DB_PATH) -> dict:
     """최근 거래일 기준 시장 요약·테마·주도주·상한가·수급을 반환한다."""
     empty = {
         "trade_date": "", "markets": [], "themes": [],
         "leaders": [], "limit_ups": [], "flows": [],
+        "indices": [], "market_flows": [], "external": [],
     }
     if not db_path.exists():
         return empty
@@ -712,6 +1902,82 @@ def market_dashboard(db_path: Path = DB_PATH) -> dict:
                     ORDER BY net DESC LIMIT 15""",
                 (flow_date,),
             ).fetchall()
+        indices = connection.execute(
+            """WITH ranked AS (
+                   SELECT trade_date, index_code, market, close_value,
+                          trading_value, collected_at,
+                          ROW_NUMBER() OVER (
+                              PARTITION BY index_code
+                              ORDER BY trade_date DESC
+                          ) AS rn
+                     FROM market_index_prices
+                    WHERE trade_date<=?
+               )
+               SELECT index_code, market,
+                      MAX(CASE WHEN rn=1 THEN trade_date END) AS trade_date,
+                      MAX(CASE WHEN rn=1 THEN close_value END) AS close_value,
+                      MAX(CASE WHEN rn=2 THEN close_value END) AS previous_close,
+                      MAX(CASE WHEN rn=1 THEN trading_value END)
+                          AS trading_value,
+                      MAX(CASE WHEN rn=1 THEN collected_at END) AS collected_at
+                 FROM ranked
+                WHERE rn<=2
+                GROUP BY index_code, market
+                ORDER BY index_code""",
+            (trade_date,),
+        ).fetchall()
+        index_rows = []
+        for row in indices:
+            item = dict(row)
+            close_value = float(item["close_value"] or 0)
+            previous_close = float(item["previous_close"] or 0)
+            item["change_rate"] = (
+                round((close_value - previous_close) * 100 / previous_close, 2)
+                if previous_close else None
+            )
+            index_rows.append(item)
+        market_flows = connection.execute(
+            """WITH aggregate_flows AS (
+                   SELECT trade_date, market, industry_name,
+                          foreign_net_amount_million AS foreign_net,
+                          institution_net_amount_million AS institution_net,
+                          individual_net_amount_million AS individual_net,
+                          national_net_amount_million AS national_net,
+                          collected_at
+                     FROM market_investor_flows
+                    WHERE trade_date<=?
+                      AND ((market='KOSPI' AND industry_code='001')
+                        OR (market='KOSDAQ' AND industry_code='101'))
+               ),
+               ranked AS (
+                   SELECT *,
+                          ROW_NUMBER() OVER (
+                              PARTITION BY market ORDER BY trade_date DESC
+                          ) AS rn
+                     FROM aggregate_flows
+               )
+               SELECT market,
+                      MAX(CASE WHEN rn=1 THEN trade_date END) AS trade_date,
+                      MAX(CASE WHEN rn=1 THEN industry_name END)
+                          AS industry_name,
+                      MAX(CASE WHEN rn=1 THEN foreign_net END) AS foreign_net,
+                      MAX(CASE WHEN rn=1 THEN institution_net END)
+                          AS institution_net,
+                      MAX(CASE WHEN rn=1 THEN individual_net END)
+                          AS individual_net,
+                      MAX(CASE WHEN rn=1 THEN national_net END)
+                          AS national_net,
+                      SUM(CASE WHEN rn<=5 THEN foreign_net ELSE 0 END)
+                          AS foreign_5d,
+                      SUM(CASE WHEN rn<=20 THEN foreign_net ELSE 0 END)
+                          AS foreign_20d,
+                      MAX(CASE WHEN rn=1 THEN collected_at END) AS collected_at
+                 FROM ranked
+                WHERE rn<=20
+                GROUP BY market
+                ORDER BY market""",
+            (trade_date,),
+        ).fetchall()
         return {
             "trade_date": trade_date,
             "flow_date": flow_date or "",
@@ -720,6 +1986,9 @@ def market_dashboard(db_path: Path = DB_PATH) -> dict:
             "leaders": [dict(row) for row in leaders],
             "limit_ups": [dict(row) for row in limit_ups],
             "flows": [dict(row) for row in flows],
+            "indices": index_rows,
+            "market_flows": [dict(row) for row in market_flows],
+            "external": latest_external_market_quotes(db_path),
         }
 
 
@@ -1320,3 +2589,437 @@ def save_disclosures(stock_code: str, corp_code: str, rows: list[dict],
             values,
         )
         return connection.total_changes - before
+
+
+def resolve_analysis_stock(query: str,
+                           db_path: Path = DB_PATH) -> dict | None:
+    """종목코드 또는 종목명으로 감시목록에 추가할 한 종목을 찾는다."""
+    query = str(query or "").strip()
+    if not query or not db_path.exists():
+        return None
+    with closing(connect(db_path)) as connection:
+        row = connection.execute(
+            """SELECT stock_code, stock_name, market, stock_type
+               FROM stocks
+               WHERE stock_code=? OR stock_name=?
+               ORDER BY CASE WHEN stock_code=? THEN 0 ELSE 1 END
+               LIMIT 1""",
+            (query, query, query),
+        ).fetchone()
+        if row is None:
+            row = connection.execute(
+                """SELECT stock_code, stock_name, market, stock_type
+                   FROM stocks
+                   WHERE stock_code LIKE ? OR stock_name LIKE ?
+                   ORDER BY CASE
+                       WHEN stock_code LIKE ? THEN 0
+                       WHEN stock_name LIKE ? THEN 1 ELSE 2 END,
+                       stock_name
+                   LIMIT 1""",
+                (f"{query}%", f"%{query}%", f"{query}%", f"{query}%"),
+            ).fetchone()
+        return dict(row) if row else None
+
+
+def realtime_watch_codes(db_path: Path = DB_PATH) -> set[str]:
+    initialize(db_path)
+    with closing(connect(db_path)) as connection:
+        return {
+            str(row[0]) for row in connection.execute(
+                "SELECT stock_code FROM realtime_watchlist"
+            ).fetchall()
+        }
+
+
+def set_realtime_watch(stock_code: str, enabled: bool,
+                       source_context: str = "MANUAL",
+                       stock_name: str = "",
+                       db_path: Path = DB_PATH) -> bool:
+    """영구 실시간 감시 종목을 추가하거나 제거한다."""
+    initialize(db_path)
+    stock_code = str(stock_code or "").strip()
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    with closing(connect(db_path)) as connection, connection:
+        if not enabled:
+            connection.execute(
+                "DELETE FROM realtime_watchlist WHERE stock_code=?",
+                (stock_code,),
+            )
+            return False
+        exists = connection.execute(
+            "SELECT 1 FROM stocks WHERE stock_code=?", (stock_code,)
+        ).fetchone()
+        if not exists:
+            # 조건검색에는 막 상장된 종목도 즉시 나타날 수 있다. 화면에서 받은
+            # 종목명으로 최소 카탈로그 행을 만들어 감시를 막지 않고, 이후 전체
+            # 종목목록 동기화가 시장·유형 등 상세 정보를 채운다.
+            stock_name = str(stock_name or "").strip()
+            if not stock_name:
+                raise ValueError(f"등록되지 않은 종목코드입니다: {stock_code}")
+            connection.execute(
+                """INSERT INTO stocks(stock_code, stock_name, updated_at)
+                   VALUES (?, ?, ?)""",
+                (stock_code, stock_name, now),
+            )
+        current_count = int(connection.execute(
+            "SELECT COUNT(*) FROM realtime_watchlist"
+        ).fetchone()[0])
+        already = connection.execute(
+            "SELECT 1 FROM realtime_watchlist WHERE stock_code=?",
+            (stock_code,),
+        ).fetchone()
+        if current_count >= 80 and not already:
+            raise ValueError("실시간 감시 종목은 최대 80개까지 등록할 수 있습니다.")
+        connection.execute(
+            """INSERT INTO realtime_watchlist(
+                   stock_code, watch_scope, source_context, note,
+                   added_at, updated_at)
+               VALUES (?, 'ALWAYS', ?, '', ?, ?)
+               ON CONFLICT(stock_code) DO UPDATE SET
+                   source_context=excluded.source_context,
+                   updated_at=excluded.updated_at""",
+            (stock_code, str(source_context or "MANUAL"), now, now),
+        )
+        return True
+
+
+def realtime_watch_rows(db_path: Path = DB_PATH) -> list[dict]:
+    initialize(db_path)
+    with closing(connect(db_path)) as connection:
+        rows = connection.execute(
+            """SELECT w.stock_code, s.stock_name, s.market, s.stock_type,
+                      w.watch_scope, w.source_context, w.added_at,
+                      w.updated_at, w.last_news_checked_at,
+                      COUNT(m.news_id) AS news_count,
+                      MAX(n.published_at_source) AS latest_news_at
+               FROM realtime_watchlist w
+               JOIN stocks s ON s.stock_code=w.stock_code
+               LEFT JOIN news_stock_maps m ON m.stock_code=w.stock_code
+               LEFT JOIN news_items n ON n.news_id=m.news_id
+                    AND (
+                        m.match_method<>'QUERY_STOCK'
+                        OR INSTR(
+                            LOWER(n.current_title || ' ' ||
+                                  n.current_summary),
+                            LOWER(m.matched_text)
+                        )>0
+                    )
+               GROUP BY w.stock_code
+               ORDER BY w.added_at ASC, s.stock_name""",
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def _market_session(published_at: str) -> str:
+    try:
+        value = datetime.fromisoformat(str(published_at or ""))
+        hour_minute = value.hour * 60 + value.minute
+    except ValueError:
+        return ""
+    if hour_minute < 9 * 60:
+        return "장전"
+    if hour_minute <= 15 * 60 + 30:
+        return "장중"
+    return "장후"
+
+
+def save_news_items(stock_code: str, stock_name: str, rows: list[dict],
+                    db_path: Path = DB_PATH) -> dict:
+    """공식 뉴스 검색 결과와 변경 버전·종목매핑·재료분류를 저장한다."""
+    initialize(db_path)
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    result = {
+        "received": len(rows), "new": 0, "updated": 0,
+        "new_ids": [],
+    }
+    with closing(connect(db_path)) as connection, connection:
+        source_row = connection.execute(
+            """SELECT source_id FROM content_sources
+               WHERE source_code='NAVER_SEARCH_NEWS'"""
+        ).fetchone()
+        if source_row is None:
+            raise RuntimeError("네이버 뉴스 원천 정보가 없습니다.")
+        source_id = int(source_row["source_id"])
+        for item in rows:
+            source_key = str(item.get("source_item_key") or "")
+            if not source_key:
+                continue
+            existing = connection.execute(
+                """SELECT news_id, current_content_hash, modified_count
+                   FROM news_items
+                   WHERE source_id=? AND source_item_key=?""",
+                (source_id, source_key),
+            ).fetchone()
+            published = str(item.get("published_at_source") or "")
+            values = (
+                str(item.get("canonical_url") or ""),
+                str(item.get("original_url") or ""),
+                str(item.get("naver_url") or ""),
+                str(item.get("publisher") or ""),
+                published or None,
+                now,
+                _market_session(published),
+                str(item.get("title") or ""),
+                str(item.get("summary") or ""),
+                str(item.get("current_hash") or ""),
+                str(item.get("duplicate_key") or ""),
+            )
+            if existing is None:
+                cursor = connection.execute(
+                    """INSERT INTO news_items(
+                           source_id, source_item_key, canonical_url,
+                           original_url, naver_url, publisher,
+                           published_at_source, first_collected_at,
+                           last_seen_at, market_session, current_title,
+                           current_summary, current_content_hash,
+                           duplicate_cluster_key)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        source_id, source_key, *values[:6], now,
+                        *values[6:],
+                    ),
+                )
+                news_id = int(cursor.lastrowid)
+                connection.execute(
+                    """INSERT INTO news_item_versions(
+                           news_id, version_no, observed_at, title, summary,
+                           content_hash, change_type)
+                       VALUES (?, 1, ?, ?, ?, ?, 'CREATED')""",
+                    (
+                        news_id, now, item.get("title") or "",
+                        item.get("summary") or "",
+                        item.get("current_hash") or "",
+                    ),
+                )
+                result["new"] += 1
+                result["new_ids"].append(news_id)
+            else:
+                news_id = int(existing["news_id"])
+                changed = (
+                    str(existing["current_content_hash"] or "")
+                    != str(item.get("current_hash") or ""))
+                connection.execute(
+                    """UPDATE news_items SET
+                           canonical_url=?, original_url=?, naver_url=?,
+                           publisher=?, published_at_source=?,
+                           last_seen_at=?, market_session=?, current_title=?,
+                           current_summary=?, current_content_hash=?,
+                           duplicate_cluster_key=?, removal_status='ACTIVE',
+                           missing_since=NULL, removed_at=NULL,
+                           modified_count=modified_count+?
+                       WHERE news_id=?""",
+                    (*values, int(changed), news_id),
+                )
+                if changed:
+                    version_no = int(connection.execute(
+                        """SELECT COALESCE(MAX(version_no), 0)+1
+                           FROM news_item_versions WHERE news_id=?""",
+                        (news_id,),
+                    ).fetchone()[0])
+                    connection.execute(
+                        """INSERT INTO news_item_versions(
+                               news_id, version_no, observed_at, title,
+                               summary, content_hash, change_type)
+                           VALUES (?, ?, ?, ?, ?, ?, 'EDITED')""",
+                        (
+                            news_id, version_no, now,
+                            item.get("title") or "",
+                            item.get("summary") or "",
+                            item.get("current_hash") or "",
+                        ),
+                    )
+                    result["updated"] += 1
+            text = f"{item.get('title') or ''} {item.get('summary') or ''}"
+            confidence = 0.9 if stock_name and stock_name in text else 0.5
+            connection.execute(
+                """INSERT INTO news_stock_maps(
+                       news_id, stock_code, match_method, matched_text,
+                       confidence, is_primary, mapped_at)
+                   VALUES (?, ?, 'QUERY_STOCK', ?, ?, 1, ?)
+                   ON CONFLICT(news_id, stock_code) DO UPDATE SET
+                       matched_text=excluded.matched_text,
+                       confidence=MAX(news_stock_maps.confidence,
+                                      excluded.confidence),
+                       mapped_at=excluded.mapped_at""",
+                (news_id, stock_code, stock_name, confidence, now),
+            )
+            connection.execute(
+                """INSERT INTO news_material_labels(
+                       news_id, material_type, confidence,
+                       classifier_version, classified_at)
+                   VALUES (?, ?, ?, 'rules_v1', ?)
+                   ON CONFLICT(news_id, material_type, classifier_version)
+                   DO UPDATE SET confidence=excluded.confidence,
+                                 classified_at=excluded.classified_at""",
+                (
+                    news_id, item.get("material_type") or "기타",
+                    float(item.get("material_confidence") or 0), now,
+                ),
+            )
+        connection.execute(
+            """UPDATE realtime_watchlist
+               SET last_news_checked_at=?, updated_at=updated_at
+               WHERE stock_code=?""",
+            (now, stock_code),
+        )
+    return result
+
+
+def reconcile_news_search_results(
+        stock_code: str, rows: list[dict],
+        db_path: Path = DB_PATH) -> dict:
+    """이번 공식 검색 범위 안에서 이전 기사가 사라졌는지 추적한다.
+
+    검색 API 상위 100건 밖으로 밀린 기사를 오판하지 않도록 이번 응답의
+    가장 오래된 게시시각 이후 기사만 비교한다. 검색에서 빠진 상태는 실제
+    원문 삭제가 확정된 것이 아니므로 MISSING으로 보존한다.
+    """
+    if not rows:
+        return {"active": 0, "missing": 0}
+    returned_keys = {
+        str(row.get("source_item_key") or "")
+        for row in rows if row.get("source_item_key")
+    }
+    published_values = sorted(
+        str(row.get("published_at_source") or "")
+        for row in rows if row.get("published_at_source")
+    )
+    if not returned_keys or not published_values:
+        return {"active": 0, "missing": 0}
+    oldest_published = published_values[0]
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    initialize(db_path)
+    with closing(connect(db_path)) as connection, connection:
+        source_row = connection.execute(
+            """SELECT source_id FROM content_sources
+               WHERE source_code='NAVER_SEARCH_NEWS'"""
+        ).fetchone()
+        if source_row is None:
+            return {"active": 0, "missing": 0}
+        candidates = connection.execute(
+            """SELECT DISTINCT n.news_id, n.source_item_key
+                 FROM news_items n
+                 JOIN news_stock_maps m ON m.news_id=n.news_id
+                WHERE n.source_id=? AND m.stock_code=?
+                  AND n.published_at_source>=?
+                  AND (
+                      SELECT COUNT(*) FROM news_stock_maps all_maps
+                      WHERE all_maps.news_id=n.news_id
+                  )=1""",
+            (int(source_row["source_id"]), str(stock_code), oldest_published),
+        ).fetchall()
+        active_ids = [
+            int(row["news_id"]) for row in candidates
+            if str(row["source_item_key"]) in returned_keys
+        ]
+        missing_ids = [
+            int(row["news_id"]) for row in candidates
+            if str(row["source_item_key"]) not in returned_keys
+        ]
+        if active_ids:
+            placeholders = ",".join("?" for _ in active_ids)
+            connection.execute(
+                f"""UPDATE news_items
+                       SET removal_status='ACTIVE', missing_since=NULL,
+                           removed_at=NULL
+                     WHERE news_id IN ({placeholders})""",
+                active_ids,
+            )
+        if missing_ids:
+            placeholders = ",".join("?" for _ in missing_ids)
+            connection.execute(
+                f"""UPDATE news_items
+                       SET removal_status='MISSING',
+                           missing_since=COALESCE(missing_since, ?)
+                     WHERE news_id IN ({placeholders})
+                       AND removal_status<>'REMOVED'""",
+                (now, *missing_ids),
+            )
+        return {
+            "active": len(active_ids),
+            "missing": len(missing_ids),
+        }
+
+
+def news_rows(stock_code: str = "", limit: int = 300,
+              db_path: Path = DB_PATH) -> list[dict]:
+    initialize(db_path)
+    stock_code = str(stock_code or "").strip()
+    relevance = """(
+        m.match_method<>'QUERY_STOCK'
+        OR INSTR(
+            LOWER(n.current_title || ' ' || n.current_summary),
+            LOWER(m.matched_text)
+        )>0
+    )"""
+    where = (
+        f"WHERE m.stock_code=? AND {relevance}"
+        if stock_code else f"WHERE {relevance}"
+    )
+    params = (stock_code, int(limit)) if stock_code else (int(limit),)
+    with closing(connect(db_path)) as connection:
+        rows = connection.execute(
+            f"""SELECT n.news_id, m.stock_code, s.stock_name,
+                       n.published_at_source, n.first_collected_at,
+                       n.last_seen_at, n.market_session, n.publisher,
+                       n.current_title, n.current_summary, n.original_url,
+                       n.naver_url, n.modified_count, n.removal_status,
+                       COALESCE((
+                           SELECT material_type
+                           FROM news_material_labels l
+                           WHERE l.news_id=n.news_id
+                           ORDER BY l.confidence DESC LIMIT 1
+                       ), '기타') AS material_type,
+                       (
+                           SELECT COUNT(*) FROM news_items d
+                           WHERE d.duplicate_cluster_key=
+                                 n.duplicate_cluster_key
+                       ) AS duplicate_count,
+                       m.confidence AS mapping_confidence
+                FROM news_stock_maps m
+                JOIN news_items n ON n.news_id=m.news_id
+                JOIN stocks s ON s.stock_code=m.stock_code
+                {where}
+                ORDER BY n.published_at_source DESC, n.news_id DESC
+                LIMIT ?""",
+            params,
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def log_content_request(stock_code: str, query_text: str, http_status: int,
+                        received_count: int, new_count: int,
+                        elapsed_ms: int, error_text: str = "",
+                        db_path: Path = DB_PATH):
+    initialize(db_path)
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    with closing(connect(db_path)) as connection, connection:
+        source_id = connection.execute(
+            """SELECT source_id FROM content_sources
+               WHERE source_code='NAVER_SEARCH_NEWS'"""
+        ).fetchone()[0]
+        connection.execute(
+            """INSERT INTO content_request_logs(
+                   source_id, requested_at, query_text, stock_code,
+                   http_status, received_count, new_count, elapsed_ms,
+                   error_text)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                source_id, now, query_text, stock_code,
+                int(http_status), int(received_count), int(new_count),
+                int(elapsed_ms), str(error_text or ""),
+            ),
+        )
+
+
+def news_request_count_today(db_path: Path = DB_PATH) -> int:
+    initialize(db_path)
+    today = datetime.now().astimezone().date().isoformat()
+    with closing(connect(db_path)) as connection:
+        return int(connection.execute(
+            """SELECT COUNT(*) FROM content_request_logs l
+               JOIN content_sources s ON s.source_id=l.source_id
+               WHERE s.source_code='NAVER_SEARCH_NEWS'
+                 AND SUBSTR(l.requested_at, 1, 10)=?""",
+            (today,),
+        ).fetchone()[0])

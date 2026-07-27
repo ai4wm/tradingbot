@@ -140,7 +140,23 @@ class RestClient:
         return data
 
     async def buy_order(self, code: str, qty: int, price: int) -> dict:
+        """국내주식 시장가 매수. price는 주문가능수량·예약금 계산용이다."""
         data = await self._order_request("kt10000", {
+            "dmst_stex_tp": "KRX",
+            "stk_cd": code,
+            "ord_qty": str(int(qty)),
+            "ord_uv": "",
+            "trde_tp": "3",  # 시장가
+            "cond_uv": "",
+        })
+        order_no = str(data.get("ord_no") or data.get("order_no") or "")
+        if not order_no:
+            raise RuntimeError("매수 주문번호가 응답에 없습니다")
+        return {"order_no": order_no, "raw": data}
+
+    async def sell_order(self, code: str, qty: int, price: int) -> dict:
+        """KRX 보통 지정가 매도. 보호매도는 상한가 가격만 전달한다."""
+        data = await self._order_request("kt10001", {
             "dmst_stex_tp": "KRX",
             "stk_cd": code,
             "ord_qty": str(int(qty)),
@@ -150,7 +166,7 @@ class RestClient:
         })
         order_no = str(data.get("ord_no") or data.get("order_no") or "")
         if not order_no:
-            raise RuntimeError("매수 주문번호가 응답에 없습니다")
+            raise RuntimeError("매도 주문번호가 응답에 없습니다")
         return {"order_no": order_no, "raw": data}
 
     async def cancel_order(
@@ -440,6 +456,144 @@ class RestClient:
             "trading_value": abs(_to_int(row.get("trde_prica"))) * 1_000_000,
         } for row in d.get("stk_dt_pole_chart_qry", []) if row.get("dt")]
 
+    async def market_index_daily(
+        self, index_code: str, date_from: str, date_to: str
+    ) -> list[dict]:
+        """ka20006 코스피·코스닥 지수 일봉을 날짜 범위로 조회한다.
+
+        index_code는 001(KOSPI 종합) 또는 101(KOSDAQ 종합)이다. 키움이
+        지수값을 소수점 제거 100배 정수로 주므로 실제 지수값으로 환산한다.
+        """
+        markets = {"001": "KOSPI", "101": "KOSDAQ"}
+        if index_code not in markets:
+            raise ValueError(f"지원하지 않는 시장 지수 코드: {index_code}")
+        body = {"inds_cd": index_code, "base_dt": date_to}
+        rows: list[dict] = []
+        continuation = ""
+        seen_keys: set[str] = set()
+        while True:
+            response = await self._request_raw(
+                "ka20006", body, "/api/dostk/chart", continuation)
+            data = response.json()
+            if str(data.get("return_code", "0")) not in ("0", ""):
+                raise RuntimeError(
+                    data.get("return_msg") or "ka20006 지수 일봉 조회 실패")
+            page = data.get("inds_dt_pole_qry") or []
+            for row in page:
+                trade_date = str(row.get("dt") or "")
+                if not date_from <= trade_date <= date_to:
+                    continue
+                rows.append({
+                    "date": trade_date,
+                    "index_code": index_code,
+                    "market": markets[index_code],
+                    "open": abs(_to_int(row.get("open_pric"))) / 100.0,
+                    "high": abs(_to_int(row.get("high_pric"))) / 100.0,
+                    "low": abs(_to_int(row.get("low_pric"))) / 100.0,
+                    "close": abs(_to_int(row.get("cur_prc"))) / 100.0,
+                    "volume": abs(_to_int(row.get("trde_qty"))),
+                    "trading_value": (
+                        abs(_to_int(row.get("trde_prica"))) * 1_000_000
+                    ),
+                    "source": "KIWOOM",
+                })
+            oldest = min(
+                (str(row.get("dt") or "") for row in page
+                 if row.get("dt")),
+                default="",
+            )
+            next_key = response.headers.get("next-key", "")
+            if (
+                not page
+                or (oldest and oldest <= date_from)
+                or response.headers.get("cont-yn", "").upper() != "Y"
+                or not next_key
+                or next_key in seen_keys
+            ):
+                break
+            seen_keys.add(next_key)
+            continuation = next_key
+        return sorted(
+            {row["date"]: row for row in rows}.values(),
+            key=lambda row: row["date"],
+        )
+
+    async def market_investor_flows(
+        self, market: str, trade_date: str
+    ) -> list[dict]:
+        """ka10051 시장·업종별 투자자 순매수 금액을 조회한다.
+
+        금액 조회 응답은 억원 단위이므로 기존 DB 수급 단위인 백만원으로
+        환산한다. market은 KOSPI 또는 KOSDAQ이다.
+        """
+        market_codes = {"KOSPI": "0", "KOSDAQ": "1"}
+        market = str(market or "").upper()
+        if market not in market_codes:
+            raise ValueError(f"지원하지 않는 시장: {market}")
+        body = {
+            "mrkt_tp": market_codes[market],
+            "amt_qty_tp": "0",
+            "base_dt": trade_date,
+            "stex_tp": "1",
+        }
+        key_map = {
+            "sc_netprps": "securities",
+            "insrnc_netprps": "insurance",
+            "invtrt_netprps": "investment_trust",
+            "bank_netprps": "bank",
+            "jnsinkm_netprps": "merchant_bank",
+            "endw_netprps": "fund",
+            "etc_corp_netprps": "other_corporation",
+            "ind_netprps": "individual",
+            "frgnr_netprps": "foreign",
+            "native_trmt_frgnr_netprps": "domestic_foreign",
+            "natn_netprps": "national",
+            "samo_fund_netprps": "private_fund",
+            "orgn_netprps": "institution",
+        }
+        rows: list[dict] = []
+        continuation = ""
+        seen_keys: set[str] = set()
+        while True:
+            response = await self._request_raw(
+                "ka10051", body, "/api/dostk/sect", continuation)
+            data = response.json()
+            if str(data.get("return_code", "0")) not in ("0", ""):
+                raise RuntimeError(
+                    data.get("return_msg")
+                    or "ka10051 시장수급 조회 실패")
+            for row in data.get("inds_netprps") or []:
+                industry_code = str(row.get("inds_cd") or "").strip()
+                if not industry_code:
+                    continue
+                normalized = {
+                    "date": trade_date,
+                    "market": market,
+                    "industry_code": industry_code,
+                    "industry_name": str(
+                        row.get("inds_nm") or "").strip(),
+                    "change_rate": _to_float(row.get("flu_rt")),
+                    "volume": abs(_to_int(row.get("trde_qty"))),
+                    "source": "KIWOOM",
+                }
+                for source_key, field in key_map.items():
+                    normalized[f"{field}_net_amount_million"] = (
+                        _to_int(row.get(source_key)) * 100
+                    )
+                rows.append(normalized)
+            next_key = response.headers.get("next-key", "")
+            if (
+                response.headers.get("cont-yn", "").upper() != "Y"
+                or not next_key
+                or next_key in seen_keys
+            ):
+                break
+            seen_keys.add(next_key)
+            continuation = next_key
+        return list({
+            row["industry_code"]: row for row in rows
+        }.values())
+
     async def investor_flows(
         self, code: str, date_from: str, date_to: str
     ) -> list[dict]:
@@ -495,6 +649,13 @@ class RestClient:
 
     async def holdings(self) -> list[dict]:
         """kt00018 계좌평가잔고내역의 보유수량이 있는 국내주식 목록."""
+        return [
+            {"code": row["code"], "name": row["name"]}
+            for row in await self.holding_positions()
+        ]
+
+    async def holding_positions(self) -> list[dict]:
+        """kt00018의 실제 보유수량과 현재 매매가능수량을 반환한다."""
         body = {"qry_tp": "1", "dmst_stex_tp": "KRX"}
         out = []
         cont = ""
@@ -511,13 +672,105 @@ class RestClient:
                     code = code[1:]
                 code = code.split("_")[0]
                 if code:
-                    out.append({"code": code, "name": item.get("stk_nm", "")})
+                    held = max(0, _to_int(item.get("rmnd_qty")))
+                    # 매매가능수량은 기존 미체결 매도분을 제외하므로 청산 주문에는
+                    # 보유수량보다 이 값을 우선한다.
+                    sellable = max(0, _to_int(item.get("trde_able_qty")))
+                    out.append({
+                        "code": code,
+                        "name": item.get("stk_nm", ""),
+                        "held_qty": held,
+                        "sellable_qty": sellable,
+                    })
             if r.headers.get("cont-yn", "N").upper() != "Y":
                 break
             cont = r.headers.get("next-key", "")
             if not cont:
                 break
         return out
+
+    async def holding_position(self, code: str) -> dict:
+        code = str(code).strip().split("_")[0].removeprefix("A")
+        return next((
+            row for row in await self.holding_positions()
+            if row["code"] == code
+        ), {"code": code, "name": "", "held_qty": 0, "sellable_qty": 0})
+
+    async def open_buy_orders(self, code: str) -> list[dict]:
+        """ka10075로 해당 종목의 계좌 전체 미체결 매수주문을 조회한다."""
+        code = str(code).strip().split("_")[0].removeprefix("A")
+        body = {
+            "all_stk_tp": "1",  # 종목
+            "trde_tp": "2",     # 매수
+            "stk_cd": code,
+            "stex_tp": "0",     # 통합
+        }
+        out = []
+        cont = ""
+        while True:
+            response = await self._request_raw(
+                "ka10075", body, "/api/dostk/acnt", cont)
+            data = response.json()
+            for item in data.get("oso", []):
+                remaining = max(0, _to_int(item.get("oso_qty")))
+                order_no = str(item.get("ord_no") or "").strip()
+                row_code = str(item.get("stk_cd") or code)
+                row_code = row_code.split("_")[0].removeprefix("A")
+                if order_no and remaining > 0 and row_code == code:
+                    ordered = max(0, _to_int(item.get("ord_qty")))
+                    out.append({
+                        "code": code,
+                        "order_no": order_no,
+                        "order_qty": ordered,
+                        "remaining_qty": remaining,
+                        "filled_qty": max(0, ordered - remaining),
+                    })
+            if response.headers.get("cont-yn", "N").upper() != "Y":
+                break
+            cont = response.headers.get("next-key", "")
+            if not cont:
+                break
+        return out
+
+    async def cancel_open_buy_orders(self, code: str) -> tuple[int, int]:
+        """주문 출처와 무관하게 해당 종목의 계좌 미체결 매수를 전부 취소한다."""
+        orders = await self.open_buy_orders(code)
+        sent = 0
+        qty = 0
+        for order in orders:
+            await self.cancel_order(
+                order["code"], order["order_no"], order["remaining_qty"])
+            sent += 1
+            qty += order["remaining_qty"]
+        return sent, qty
+
+    async def cancel_open_buy_order(
+            self, code: str, order_no: str) -> tuple[int, int]:
+        """해당 주문번호의 남은 계좌 미체결 매수만 취소한다."""
+        target_order_no = str(order_no or "").strip()
+        if not target_order_no:
+            return 0, 0
+        for order in await self.open_buy_orders(code):
+            if order["order_no"] == target_order_no:
+                qty = order["remaining_qty"]
+                await self.cancel_order(order["code"], target_order_no, qty)
+                return 1, qty
+        return 0, 0
+
+    async def cancel_filled_buy_orders(
+            self, code: str, minimum_filled: int = 100) -> tuple[int, int]:
+        """실제 계좌 누적체결량이 기준 이상인 미체결 매수주문만 취소한다."""
+        orders = await self.open_buy_orders(code)
+        targets = [
+            order for order in orders
+            if order["filled_qty"] >= max(1, int(minimum_filled))
+        ]
+        qty = 0
+        for order in targets:
+            await self.cancel_order(
+                order["code"], order["order_no"], order["remaining_qty"])
+            qty += order["remaining_qty"]
+        return len(targets), qty
 
     async def account_summary(self) -> dict:
         """주문 화면용 실계좌 요약.
@@ -530,10 +783,26 @@ class RestClient:
         deposit = await self._request_raw("kt00001", {"qry_tp": "3"}, "/api/dostk/acnt")
         evlt_data = evlt.json()
         deposit_data = deposit.json()
+
+        def optional_amount(*keys):
+            """실제 응답에 포함된 금액만 반환해 누락값을 0원으로 오인하지 않는다."""
+            for key in keys:
+                if key in deposit_data and deposit_data.get(key) not in (None, ""):
+                    return _to_int(deposit_data.get(key))
+            return None
+
         return {
             "estimated_assets": _to_int(evlt_data.get("prsm_dpst_aset_amt")),
             "cash_orderable": _to_int(deposit_data.get("100stk_ord_alow_amt")),
             "cash_deposit": _to_int(deposit_data.get("entr")),
+            "withdrawable": optional_amount("pymn_alow_amt"),
+            # 계좌/서비스에 따라 매도담보대출 인출가능금액 필드가 생략될 수
+            # 있으므로 확인된 응답 키만 사용하고 없으면 UI에 '-'로 표시한다.
+            "loan_withdrawable": optional_amount(
+                "lnd_pymn_alow_amt",
+                "loan_pymn_alow_amt",
+                "sell_coll_lnd_alow_amt",
+            ),
             "orderable_by_margin": {
                 rate: _to_int(deposit_data.get(f"{rate}stk_ord_alow_amt"))
                 for rate in (20, 30, 40, 50, 60, 100)
@@ -541,27 +810,73 @@ class RestClient:
         }
 
     async def orderable_quantity(self, code: str, price: int) -> dict:
-        """kt00011: 선택 종목·주문가격 기준 현금/미수 주문가능수량."""
+        """kt00011: 선택 종목·주문가격 기준 현금/미수 주문가능수량.
+
+        kt00011은 증거금률별 주문가능수량 조회다. kt00010(주문인출가능금액)을
+        쓰면 수량 응답 필드가 없어 주문가능수량을 표시할 수 없다.
+        """
         r = await self._request_raw(
-            "kt00011", {"stk_cd": code, "uv": str(int(price))}, "/api/dostk/acnt")
+            "kt00011",
+            {
+                "stk_cd": code,
+                "uv": str(int(price)),
+            },
+            "/api/dostk/acnt",
+        )
         data = r.json()
-        applied_text = str(data.get("aplc_rt", "100%"))
-        try:
-            applied_rate = int(applied_text.replace("%", "").strip())
-        except ValueError:
-            applied_rate = 100
+        if str(data.get("return_code", "0")) not in ("0", ""):
+            raise RuntimeError(
+                data.get("return_msg") or "kt00010 주문가능수량 조회 실패")
+
+        def first_value(*keys):
+            for key in keys:
+                if key in data and data[key] not in (None, ""):
+                    return data[key]
+            return None
+
+        cash_amount = first_value(
+            "profa_100ord_alow_amt", "100ord_alow_amt",
+            "100stk_ord_alow_amt",
+        )
+        cash_qty = first_value(
+            "profa_100ord_alowq", "100ord_alowq", "100stk_ord_alowq",
+        )
+        if cash_amount is None or cash_qty is None:
+            missing = []
+            if cash_amount is None:
+                missing.append("100% 주문가능금액")
+            if cash_qty is None:
+                missing.append("100% 주문가능수량")
+            raise ValueError(
+                f"kt00010 주문가능수량 응답 필드 누락: {', '.join(missing)}")
+        applied_text = str(first_value("aplc_rt", "stk_profa_rt") or "100")
+        rate_digits = "".join(character for character in applied_text
+                              if character.isdigit())
+        applied_rate = int(rate_digits or 100)
         if applied_rate not in (20, 30, 40, 50, 60, 100):
             applied_rate = 100
         prefix = f"profa_{applied_rate}"
+        margin_amount = first_value(
+            prefix + "ord_alow_amt",
+            f"{applied_rate}ord_alow_amt",
+            f"{applied_rate}stk_ord_alow_amt",
+        )
+        margin_qty = first_value(
+            prefix + "ord_alowq",
+            f"{applied_rate}ord_alowq",
+            f"{applied_rate}stk_ord_alowq",
+        )
         return {
             "code": code,
             "price": int(price),
             "stock_margin_rate": str(data.get("stk_profa_rt", "")),
             "applied_margin_rate": applied_rate,
-            "cash_amount": _to_int(data.get("profa_100ord_alow_amt")),
-            "cash_qty": _to_int(data.get("profa_100ord_alowq")),
-            "margin_amount": _to_int(data.get(prefix + "ord_alow_amt")),
-            "margin_qty": _to_int(data.get(prefix + "ord_alowq")),
+            "cash_amount": _to_int(cash_amount),
+            "cash_qty": _to_int(cash_qty),
+            "margin_amount": _to_int(
+                margin_amount if margin_amount is not None else cash_amount),
+            "margin_qty": _to_int(
+                margin_qty if margin_qty is not None else cash_qty),
         }
 
     async def volume_surge(self, tm: str = "60", stex_tp: str = "3",
