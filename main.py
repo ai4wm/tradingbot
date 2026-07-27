@@ -2167,6 +2167,8 @@ class App:
             self._analysis.news_auto_changed.connect(
                 self._set_news_auto_collection)
             self._analysis.new_news_found.connect(self._notify_new_news)
+            self._analysis.limit_count_collect_requested.connect(
+                lambda: asyncio.ensure_future(self._refresh_limit_counts_after_close()))
         return self._analysis
 
     def _set_news_auto_collection(self, enabled: bool):
@@ -2214,7 +2216,22 @@ class App:
             return
         self._settings.setValue(key, today)
         self._settings.sync()
+        asyncio.ensure_future(self._refresh_limit_counts_after_close())
         analysis._start_intraday_enrichment(silent=True)
+
+    async def _refresh_limit_counts_after_close(self):
+        """장 마감 후 틱차트 기반 연상 보완을 기다린 뒤 다시 조회한다."""
+        await asyncio.sleep(20)
+        try:
+            counts = await self.rest.yesterday_limit_counts()
+            self._limit_cnt = counts
+            for view in self.views:
+                self._inject_market(view)
+            if self._analysis is not None:
+                self._analysis._refresh_limit_up_table()
+            log.info("post-close limit counts refreshed: %d", len(counts))
+        except Exception as error:  # noqa: BLE001
+            log.warning("post-close limit count refresh failed: %s", error)
 
     def _on_newwin(self):
         if len(self.views) >= MAX_WINDOWS:
@@ -2588,6 +2605,7 @@ class AnalysisWindow(QMainWindow):
     watchlist_changed = Signal()
     news_auto_changed = Signal(bool)
     new_news_found = Signal(int)
+    limit_count_collect_requested = Signal()
 
     TABS = (
         ("실시간 뉴스·종토방", "직접 등록한 종목의 뉴스와 웹페이지를 확인합니다."),
@@ -5323,6 +5341,8 @@ class AnalysisWindow(QMainWindow):
         disclosure_btn.clicked.connect(self._open_selected_disclosures)
         self._dart_btn = QPushButton("DART 공시 수집")
         self._dart_btn.clicked.connect(self._start_dart_collection)
+        limit_refresh_btn = QPushButton("연상 재수집")
+        limit_refresh_btn.clicked.connect(self.limit_count_collect_requested.emit)
         controls.addWidget(QLabel("기간"))
         controls.addWidget(self._limit_from)
         controls.addWidget(QLabel("~"))
@@ -5330,6 +5350,7 @@ class AnalysisWindow(QMainWindow):
         controls.addWidget(refresh)
         controls.addWidget(disclosure_btn)
         controls.addWidget(self._dart_btn)
+        controls.addWidget(limit_refresh_btn)
         controls.addStretch(1)
         layout.addLayout(controls)
 
