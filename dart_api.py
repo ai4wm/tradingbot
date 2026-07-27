@@ -60,5 +60,31 @@ class DartClient:
                 return out
             page += 1
 
+    async def largest_shareholders(
+        self, corp_code: str, business_year: str,
+    ) -> list[dict]:
+        """사업보고서의 최대주주 현황을 가져온다.
+
+        최대주주명이 상장 종목명과 일치할 때만 지주사·자회사 관계 후보로 쓴다.
+        """
+        response = await self._client.get(
+            f"{self.BASE}/hyslrSttus.json",
+            params={
+                "crtfc_key": self.api_key,
+                "corp_code": corp_code,
+                "bsns_year": str(business_year),
+                "reprt_code": "11011",  # 사업보고서
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+        if data.get("status") == "013":
+            return []
+        if data.get("status") != "000":
+            raise RuntimeError(
+                f"OpenDART {data.get('status')}: "
+                f"{data.get('message', '조회 실패')}")
+        return list(data.get("list") or [])
+
     async def close(self):
         await self._client.aclose()

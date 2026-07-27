@@ -71,6 +71,7 @@ PROGRAM_DIRECTION_ROLE = Qt.UserRole + 8  # 최근 20초 실제 순매수 변화
 TPM_ALERT_ROLE = Qt.UserRole + 11  # 체결속도 순위 하락(-1)/정상(0)/상승(+1)
 TPM_RANK_CHANGE_ROLE = Qt.UserRole + 12  # 최근 순위 이동 구간의 누적 단계 수
 ORDER_CANCEL_ROLE = Qt.UserRole + 13  # 주문 셀 오른쪽 즉시 잔량취소 영역
+THEME_LEADER_ROLE = Qt.UserRole + 14  # 테마정렬에서 각 묶음의 첫 대장 종목
 
 # 단타 예측: (표시명, 과거 관찰구간(초), 최소 표본기간(초), 모멘텀 스케일(bp),
 #              선행압력/매수흐름/모멘텀/가격지속/VWAP/체결가속/체결지속 가중치, 종합 가중치)
@@ -102,6 +103,19 @@ TPM_RANK_UP_FLASH = QColor("#FFF176")  # 체결속도 순위 상승: 밝은 노�
 TPM_RANK_DOWN_FLASH = QColor("#7667D9")  # 체결속도 순위 하락: 보라
 WATCH_BG = QColor("#FFD54F")  # 실시간 뉴스 감시: 연상 셀 배경
 WATCH_TEXT = QColor("#111111")
+THEME_LEADER = QColor("#F4B400")  # 테마 대장 표시: 등락률 색과 분리한 금색
+
+
+def _theme_family(theme: str) -> str:
+    """세부 테마명이 달라도 같은 AI 흐름으로 묶을 보수적 계열명."""
+    value = str(theme or "").casefold()
+    # 백신 테마의 '신종플루, AI 등'은 인공지능 계열로 오인하지 않는다.
+    if "신종플루" in value:
+        return ""
+    if ("인공지능" in value or "ai 챗봇" in value
+            or "피지컬 ai" in value or "온디바이스 ai" in value):
+        return "AI·인공지능"
+    return ""
 
 
 @dataclass(slots=True)
@@ -290,10 +304,27 @@ class NameDelegate(QStyledItemDelegate):
         opt.text = ""
         style = opt.widget.style() if opt.widget else QApplication.style()
         style.drawControl(QStyle.CE_ItemViewItem, opt, painter, opt.widget)
-        text_rect = style.subElementRect(QStyle.SE_ItemViewItemText, opt, opt.widget).adjusted(3, 0, -2, 0)
+        leader = bool(index.data(THEME_LEADER_ROLE))
+        text_rect = style.subElementRect(
+            QStyle.SE_ItemViewItemText, opt, opt.widget).adjusted(3, 0, -2, 0)
         painter.save()
         painter.setClipRect(option.rect)
-        painter.setFont(opt.font)
+        if leader:
+            # 대장이 곧 다음 테마 묶음의 시작점이므로, 행 전체를 칠하지 않고
+            # 종목명 왼쪽 금색선과 ★만으로 명확히 구분한다.
+            painter.fillRect(QRect(
+                option.rect.left(), option.rect.top(), 4, option.rect.height()),
+                THEME_LEADER)
+            leader_font = QFont(opt.font)
+            leader_font.setBold(True)
+            painter.setFont(leader_font)
+            painter.setPen(THEME_LEADER)
+            marker_rect = QRect(
+                text_rect.left() + 3, text_rect.top(), 12, text_rect.height())
+            painter.drawText(marker_rect, Qt.AlignLeft | Qt.AlignVCenter, "★")
+            text_rect.adjust(15, 0, 0, 0)
+        else:
+            painter.setFont(opt.font)
         painter.setPen(opt.palette.text().color())
         painter.drawText(text_rect, Qt.AlignLeft | Qt.AlignVCenter | Qt.TextSingleLine, text)
         painter.restore()
@@ -470,10 +501,140 @@ class TieredProxy(QSortFilterProxyModel):
     def __init__(self):
         super().__init__()
         self.limit_mode = False
+        self.theme_mode = False
+        self.theme_labels: dict[str, tuple[str, ...]] = {}
+        self.relation_groups: dict[str, tuple[str, ...]] = {}
+        self._theme_sort_keys: dict[str, tuple] = {}
         self._opening_auction = _in_opening_auction()
         # 상한가진입시간 정렬 중 비상한 그룹이 유지할 마지막 일반 정렬 기준.
         self._non_limit_sort_col = FIELDS.index("rate")
         self._non_limit_sort_order = Qt.DescendingOrder
+
+    def set_theme_labels(self, labels: dict[str, tuple[str, ...]]):
+        """실시간 조건검색용 종목별 테마 연결표를 갱신한다."""
+        self.theme_labels = {
+            str(code).removesuffix("_AL"): tuple(names)
+            for code, names in labels.items() if names
+        }
+        self.invalidate()
+
+    def set_relation_groups(self, groups: dict[str, tuple[str, ...]]):
+        """자체 테마가 없는 종목을 보완할 관계 종목표를 설정한다."""
+        self.relation_groups = {
+            str(name): tuple(str(code).removesuffix("_AL") for code in codes)
+            for name, codes in groups.items() if len(codes) >= 2
+        }
+        self.invalidate()
+
+    @staticmethod
+    def _theme_entry_time(row: dict) -> int:
+        digits = "".join(character for character in str(row.get("time") or "")
+                         if character.isdigit())
+        return int(digits or "999999")
+
+    @staticmethod
+    def _theme_at_limit(row: dict) -> bool:
+        return int(row.get("upper") or 0) > 0 and (
+            int(row.get("price") or 0) >= int(row.get("upper") or 0))
+
+    def _refresh_theme_sort_keys(self):
+        """테마 강도와 테마 안 종목 순서를 현재 조건검색 행으로 계산한다."""
+        self._theme_sort_keys = {}
+        model = self.sourceModel()
+        if model is None or not hasattr(model, "rows"):
+            return
+        if not self.theme_mode:
+            if getattr(model, "theme_leaders", set()):
+                model.theme_leaders = set()
+                if model.codes:
+                    model.dataChanged.emit(
+                        model.index(0, NAME_COL),
+                        model.index(len(model.codes) - 1, NAME_COL),
+                    )
+            return
+        groups: dict[tuple[str, str], list[str]] = {}
+        for code in model.codes:
+            for theme in self.theme_labels.get(code.removesuffix("_AL"), ()):
+                groups.setdefault(("theme", theme), []).append(code)
+                family = _theme_family(theme)
+                if family:
+                    groups.setdefault(("theme_family", family), []).append(code)
+
+        # 관계 그룹은 둘 이상이 현재 조건검색에 동시에 있을 때만 적용한다.
+        # 단, 자체 테마가 있는 종목의 분류를 덮어쓰지는 않는다.
+        relations_by_code: dict[str, list[tuple[str, str]]] = {}
+        for name, members in self.relation_groups.items():
+            present = [code for code in model.codes if code.removesuffix("_AL") in members]
+            if len(present) < 2:
+                continue
+            group = ("relation", name)
+            groups[group] = present
+            for code in present:
+                relations_by_code.setdefault(code, []).append(group)
+
+        # 상한가 진입 테마는 가장 이른 진입시각이 우선이며, 나머지 테마는
+        # 현재 조건검색 종목 중 최고 등락률이 높은 순서로 배치한다.
+        strengths: dict[tuple[str, str], tuple] = {}
+        for group, codes in groups.items():
+            rows = [model.rows[code] for code in codes]
+            limit_times = [self._theme_entry_time(row) for row in rows
+                           if self._theme_at_limit(row)]
+            top_rate = max(float(row.get("rate") or 0) for row in rows)
+            strengths[group] = (
+                0 if limit_times else 1,
+                min(limit_times) if limit_times else 999999,
+                -top_rate,
+                -len(codes),
+                f"{group[0]}:{group[1]}",
+            )
+
+        grouped_codes: dict[str, list[str]] = {}
+        for code in model.codes:
+            row = model.rows[code]
+            relation_candidates = relations_by_code.get(code, ())
+            theme_candidates = [
+                ("theme", name)
+                for name in self.theme_labels.get(code.removesuffix("_AL"), ())
+            ]
+            family_candidates = []
+            for name in self.theme_labels.get(code.removesuffix("_AL"), ()):
+                family = _theme_family(name)
+                if family:
+                    family_candidates.append(("theme_family", family))
+            # 종목 자체의 테마를 관계 묶음보다 우선한다. 관계정보는 자체
+            # 테마가 없는 종목을 보완할 때만 사용해, 계열사 때문에 다른
+            # 종목의 AI/의료 등 세부 테마가 섞이지 않게 한다.
+            candidates = family_candidates or theme_candidates or relation_candidates
+            group = min(candidates, key=lambda item: strengths.get(
+                item, (2, 999999, 0, 0, item[1]))) if candidates else ("none", "미분류")
+            theme_strength = strengths.get(
+                group, (2, 999999, 0, 0, group[1]))
+            at_limit = self._theme_at_limit(row)
+            self._theme_sort_keys[code] = (
+                theme_strength,
+                0 if at_limit else 1,
+                self._theme_entry_time(row) if at_limit else 999999,
+                -float(row.get("rate") or 0),
+                str(row.get("name") or ""),
+                code,
+            )
+            if group[0] != "none":
+                grouped_codes.setdefault(f"{group[0]}:{group[1]}", []).append(code)
+
+        # 현재 검색 결과에 2종목 이상 모인 그룹만 '대장'을 표시한다.
+        # 단독 테마 종목은 대장이라기보다 미분류/개별 테마 종목이므로
+        # 별표를 붙이지 않는다.
+        leaders = {
+            min(codes, key=lambda code: self._theme_sort_keys[code])
+            for codes in grouped_codes.values() if len(codes) >= 2
+        }
+        if getattr(model, "theme_leaders", set()) != leaders:
+            model.theme_leaders = leaders
+            if model.codes:
+                model.dataChanged.emit(
+                    model.index(0, NAME_COL),
+                    model.index(len(model.codes) - 1, NAME_COL),
+                )
 
     def sort(self, column, order=Qt.AscendingOrder):
         self._opening_auction = _in_opening_auction()
@@ -484,6 +645,7 @@ class TieredProxy(QSortFilterProxyModel):
 
     def invalidate(self):
         self._opening_auction = _in_opening_auction()
+        self._refresh_theme_sort_keys()
         super().invalidate()
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
@@ -493,6 +655,27 @@ class TieredProxy(QSortFilterProxyModel):
         return super().headerData(section, orientation, role)
 
     def lessThan(self, left, right):
+        if self.theme_mode:
+            model = self.sourceModel()
+            left_code = model.codes[left.row()]
+            right_code = model.codes[right.row()]
+            left_key = self._theme_sort_keys.get(left_code, ())
+            right_key = self._theme_sort_keys.get(right_code, ())
+            # 편입 직후 테마/시세 백필 전에는 키가 아직 없다. 빈 키를
+            # 일반 키와 직접 비교하면 정렬방향에 따라 새 행이 맨 위로
+            # 튀므로, 키가 없는 행은 백필 전까지 항상 아래에 둔다.
+            left_missing = not left_key
+            right_missing = not right_key
+            if left_missing != right_missing:
+                if left_missing:
+                    return self.sortOrder() == Qt.DescendingOrder
+                return self.sortOrder() != Qt.DescendingOrder
+            if left_missing:
+                return left_code < right_code
+            # 테마 강도 순서는 헤더의 오름/내림 토글과 무관하게 고정한다.
+            # Qt는 내림차순일 때 lessThan 결과를 뒤집으므로 반대로 비교한다.
+            return (left_key > right_key if self.sortOrder() == Qt.DescendingOrder
+                    else left_key < right_key)
         if self.limit_mode:
             m = self.sourceModel()
             a = m.rows[m.codes[left.row()]]
@@ -537,6 +720,10 @@ class StockModel(QAbstractTableModel):
         self.admin: set[str] = set()         # 관리종목: 종목명 경고색 (코스닥보다 우선, main 주입)
         self.limit_cnt: dict[str, tuple[int, int]] = {}  # (어제까지 연속상한 일수, 어제 종가) (main 주입, 연상 컬럼)
         self.watched: set[str] = set()     # 실시간 뉴스 감시 종목 (main 주입)
+        self.theme_labels: dict[str, tuple[str, ...]] = {}
+        self.relation_labels: dict[str, tuple[str, ...]] = {}
+        self.relation_evidence: dict[str, tuple[str, ...]] = {}
+        self.theme_leaders: set[str] = set()
         self.new_today: set[str] = set()     # 상장 당일 (main 주입, 좌하단 마젠타)
         self.new15: set[str] = set()         # 상장 15일 이내 (좌하단 하늘)
         self.new30: set[str] = set()         # 상장 16~30일 (좌하단 청회)
@@ -1149,6 +1336,45 @@ class StockModel(QAbstractTableModel):
     def columnCount(self, parent=QModelIndex()):
         return len(COLUMNS)
 
+    def set_theme_labels(self, labels: dict[str, tuple[str, ...]]):
+        """종목명 셀의 테마 안내와 테마 정렬이 공유하는 연결표를 설정한다."""
+        self.theme_labels = {
+            str(code).removesuffix("_AL"): tuple(names)
+            for code, names in labels.items() if names
+        }
+        if self.codes:
+            self.dataChanged.emit(
+                self.index(0, NAME_COL),
+                self.index(len(self.codes) - 1, NAME_COL),
+            )
+
+    def set_relation_groups(self, groups: dict[str, tuple[str, ...]]):
+        """종목명 도구설명에 표시할 최대주주·계열 등 관계 묶음을 설정한다."""
+        labels: dict[str, list[str]] = {}
+        for group, codes in groups.items():
+            for code in codes:
+                labels.setdefault(str(code).removesuffix("_AL"), []).append(group)
+        self.relation_labels = {
+            code: tuple(names) for code, names in labels.items()
+        }
+        if self.codes:
+            self.dataChanged.emit(
+                self.index(0, NAME_COL),
+                self.index(len(self.codes) - 1, NAME_COL),
+            )
+
+    def set_relation_evidence(self, evidence: dict[str, tuple[str, ...]]):
+        """DART 최대주주 관계의 지분율·보고서 근거를 종목명 도구설명에 반영한다."""
+        self.relation_evidence = {
+            str(code).removesuffix("_AL"): tuple(values)
+            for code, values in evidence.items() if values
+        }
+        if self.codes:
+            self.dataChanged.emit(
+                self.index(0, NAME_COL),
+                self.index(len(self.codes) - 1, NAME_COL),
+            )
+
     def headerData(self, section, orientation, role=Qt.DisplayRole):
         if orientation == Qt.Horizontal and role == Qt.ToolTipRole:
             if FIELDS[section] == "rate":
@@ -1528,9 +1754,22 @@ class StockModel(QAbstractTableModel):
             code = self.codes[index.row()]
             return (3 if code in self.new_today else 2 if code in self.new15
                     else 1 if code in self.new30 else 0)
+        if role == THEME_LEADER_ROLE:
+            return self.codes[index.row()] in self.theme_leaders
         if role == Qt.ToolTipRole and field == "name":  # 모서리 삼각형 설명
             code = self.codes[index.row()]
             parts = []
+            themes = self.theme_labels.get(code.removesuffix("_AL"), ())
+            if themes:
+                parts.append("테마: " + " · ".join(themes))
+            relations = self.relation_labels.get(code.removesuffix("_AL"), ())
+            if relations:
+                parts.append("관계 묶음: " + " · ".join(relations))
+            evidence = self.relation_evidence.get(code.removesuffix("_AL"), ())
+            if evidence:
+                parts.append("DART 근거: " + "\n".join(evidence))
+            if code in self.theme_leaders:
+                parts.append("★ 현재 테마 대장")
             if code in self.nxt:
                 parts.append("좌상단 노랑 = NXT 거래가능")
             if code in self.misu:
@@ -1938,6 +2177,7 @@ class ConditionScreen(QWidget):
     watch_toggled = Signal(str, bool)
     analysis_stock_requested = Signal(str)
     market_overview_requested = Signal()
+    relation_collection_requested = Signal(object)
 
     def __init__(self, prefix: str = "", parent=None):
         super().__init__(parent)
@@ -1979,9 +2219,19 @@ class ConditionScreen(QWidget):
         self.limit_sort.setToolTip(
             "상한가 우선순위를 위에 고정하고 각 그룹은 선택한 컬럼으로 정렬"
             " (진입시간·매수잔량은 비상한 종목 제외)")
+        self.theme_sort = QCheckBox("테마정렬")
+        self.theme_sort.setToolTip(
+            "테마별로 묶어 정렬 · 상한가 진입이 빠른 테마 우선, "
+            "그 외는 테마 내 최고 등락률 순 · 테마 안에서는 상한가 진입시각과 등락률 순")
+        self.relation_collect_btn = QPushButton("관계수집")
+        self.relation_collect_btn.setFixedWidth(66)
+        self.relation_collect_btn.setToolTip(
+            "현재 조건검색 종목의 DART 최대주주 관계를 수집해 테마정렬에 반영")
         self._checkbox_style = VisibleCheckStyle()
         self._checkbox_style.setParent(self)
-        for checkbox in (self.auto_refresh, self.auto_remove, self.sound_check, self.limit_sort):
+        for checkbox in (
+                self.auto_refresh, self.auto_remove, self.sound_check,
+                self.limit_sort, self.theme_sort):
             checkbox.setStyle(self._checkbox_style)
         self.unified_check = QPushButton("K")  # KRX<->통합(_AL) 시세 전환 토글, 전 창 공통 (main이 배선)
         self.unified_check.setCheckable(True)
@@ -2019,6 +2269,8 @@ class ConditionScreen(QWidget):
         top.addWidget(self.auto_remove)
         top.addWidget(self.sound_check)
         top.addWidget(self.limit_sort)
+        top.addWidget(self.theme_sort)
+        top.addWidget(self.relation_collect_btn)
         top.addWidget(self.unified_check)
         top.addWidget(self.rank_btn)
         top.addWidget(self.newwin_btn)
@@ -2207,6 +2459,8 @@ class ConditionScreen(QWidget):
         hdr0.sectionClicked.connect(self._on_header_clicked)
         self._sort_col, self._sort_order = FIELDS.index("rate"), Qt.DescendingOrder  # 기본 등락률 내림차순
         self.limit_sort.toggled.connect(self._on_limit_sort)
+        self.theme_sort.toggled.connect(self._on_theme_sort)
+        self.relation_collect_btn.clicked.connect(self._request_relation_collection)
         # 상한가정렬은 그룹 판정이 정렬컬럼 밖의 값(상한/매도잔량/예상등락률)이라 Qt 자동재정렬이
         # 안 걸림 -> 데이터 변경 시 직접 재정렬. 스로틀: 실행중이면 리셋 안 함(디바운스로 하면
         # 틱이 200ms보다 자주 오는 장중엔 계속 리셋돼 영영 안 불림 = 재정렬 멈춤 버그).
@@ -2214,6 +2468,8 @@ class ConditionScreen(QWidget):
         self._resort_timer.setSingleShot(True)
         self._resort_timer.timeout.connect(self.proxy.invalidate)
         self.model.dataChanged.connect(self._on_data_changed)
+        self.model.rowsInserted.connect(self._on_data_changed)
+        self.model.rowsRemoved.connect(self._on_data_changed)
         self._tpm_timer = QTimer(self)  # 체결/분: 틱 끊겨도 값이 줄어들게 주기 갱신
         self._tpm_timer.timeout.connect(self.model.refresh_tpm)
         self._tpm_timer.start(TPM_REFRESH_MS)
@@ -2326,6 +2582,8 @@ class ConditionScreen(QWidget):
         self.set_rank_period("rank")  # 기본: 조회순위 기준시간 (급증 선택 시 main이 교체)
         if self._settings.value(self.prefix + "limit_sort", "false") == "true":  # 상한가정렬 복원
             self.limit_sort.setChecked(True)
+        if self._settings.value(self.prefix + "theme_sort", "false") == "true":
+            self.theme_sort.setChecked(True)
         self.auto_remove.setChecked(  # 자동삭제 복원 (기본 켜짐)
             self._settings.value(self.prefix + "auto_remove", "true") == "true")
         self.auto_remove.toggled.connect(self._save_auto_remove)
@@ -2710,7 +2968,7 @@ class ConditionScreen(QWidget):
 
     def _on_data_changed(self, *a):
         # 스로틀: 이미 대기중이면 리셋하지 않음 -> 틱이 몰려도 200ms마다 반드시 재정렬됨
-        if self.limit_sort.isChecked() and not self._resort_timer.isActive():
+        if (self.limit_sort.isChecked() or self.theme_sort.isChecked()) and not self._resort_timer.isActive():
             self._resort_timer.start(200)
 
     def _update_count(self):
@@ -2955,6 +3213,8 @@ class ConditionScreen(QWidget):
                 w.restoreGeometry(geo)
         self.limit_sort.setChecked(  # 상한가정렬: 새 화면 저장값 로드
             self._settings.value(self._mkey("limit_sort"), "false") == "true")
+        self.theme_sort.setChecked(
+            self._settings.value(self._mkey("theme_sort"), "false") == "true")
         return True
 
     def set_ip(self, ip: str, changed: bool):
@@ -2998,10 +3258,56 @@ class ConditionScreen(QWidget):
         self._settings.sync()
 
     def _on_limit_sort(self, on: bool):
+        if on and self.theme_sort.isChecked():
+            self.theme_sort.setChecked(False)
         self.proxy.limit_mode = on
         self.proxy.invalidate()  # 모드 전환 즉시 재정렬 (정렬컬럼/방향은 그대로)
         self._settings.setValue(self._mkey("limit_sort"), "true" if on else "false")
         self._settings.sync()
+
+    def _on_theme_sort(self, on: bool):
+        """실시간 조건검색을 현재 강한 테마 흐름으로 묶어 정렬한다."""
+        if on and self.limit_sort.isChecked():
+            self.limit_sort.setChecked(False)
+        if on:
+            try:
+                # GUI 모듈을 DB 초기화와 분리하기 위해 실제 사용 시점에만 불러온다.
+                from analysis_db import (
+                    active_relation_groups, active_theme_labels,
+                    dart_relation_evidence_labels,
+                )
+                labels = active_theme_labels()
+                relation_groups = active_relation_groups()
+                relation_evidence = dart_relation_evidence_labels()
+            except Exception as error:  # noqa: BLE001
+                log.warning("theme labels unavailable: %s", error)
+                labels = {}
+                relation_groups = {}
+                relation_evidence = {}
+            self.model.set_theme_labels(labels)
+            self.model.set_relation_groups(relation_groups)
+            self.model.set_relation_evidence(relation_evidence)
+            self.proxy.set_theme_labels(labels)
+            self.proxy.set_relation_groups(relation_groups)
+            if not labels:
+                QToolTip.showText(
+                    QCursor.pos(),
+                    "저장된 테마 분류가 없어 미분류 종목은 등락률 순으로 표시합니다.",
+                    self.theme_sort,
+                )
+        self.proxy.theme_mode = on
+        self.proxy.invalidate()
+        self._settings.setValue(self._mkey("theme_sort"), "true" if on else "false")
+        self._settings.sync()
+
+    def _request_relation_collection(self):
+        """현재 화면의 조건검색 종목만 DART 관계 수집 대상으로 넘긴다."""
+        self.relation_collection_requested.emit(list(self.model.codes))
+
+    def refresh_theme_sort(self):
+        """새로 저장된 관계 데이터를 현재 테마정렬 화면에 즉시 반영한다."""
+        if self.theme_sort.isChecked():
+            self._on_theme_sort(True)
 
     def _apply_on_top(self, on: bool):
         w = self.window()  # central widget이라 최상위 QMainWindow

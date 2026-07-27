@@ -7,16 +7,23 @@
 from __future__ import annotations
 
 import sqlite3
+import re
 from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
 
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "market_analysis.db"
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 10
 ANALYSIS_STOCK_TYPES = (
     "COMMON", "PREFERRED", "SPAC", "FOREIGN", "REIT", "INFRA",
 )
+DEFAULT_RELATION_GROUPS = (
+    # 최대주주·계열 관계는 일반 테마보다 신뢰도가 높아 조건검색에서 같은
+    # 묶음으로 보존한다. 이후 우선주·보통주, 지주사 관계도 여기에 추가한다.
+    ("셀바스 그룹", "PARENT_SUBSIDIARY", 100, ("108860", "208370")),
+)
+PREFERRED_SUFFIX_RE = re.compile(r"(?:\d+)?우(?:[A-Z])?$")
 
 
 SCHEMA = """
@@ -126,6 +133,44 @@ CREATE TABLE IF NOT EXISTS stock_themes (
     PRIMARY KEY (stock_code, theme_id, valid_from),
     FOREIGN KEY (stock_code) REFERENCES stocks(stock_code),
     FOREIGN KEY (theme_id) REFERENCES themes(theme_id)
+);
+
+CREATE TABLE IF NOT EXISTS stock_relation_groups (
+    relation_group_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_name TEXT NOT NULL UNIQUE,
+    relation_type TEXT NOT NULL DEFAULT '',
+    priority INTEGER NOT NULL DEFAULT 100,
+    source TEXT NOT NULL DEFAULT 'CURATED',
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS stock_relation_members (
+    relation_group_id INTEGER NOT NULL,
+    stock_code TEXT NOT NULL,
+    PRIMARY KEY (relation_group_id, stock_code),
+    FOREIGN KEY (relation_group_id)
+        REFERENCES stock_relation_groups(relation_group_id)
+);
+
+CREATE TABLE IF NOT EXISTS dart_relation_checks (
+    stock_code TEXT PRIMARY KEY,
+    business_year TEXT NOT NULL,
+    result TEXT NOT NULL DEFAULT '',
+    checked_at TEXT NOT NULL,
+    FOREIGN KEY (stock_code) REFERENCES stocks(stock_code)
+);
+
+CREATE TABLE IF NOT EXISTS dart_relation_evidence (
+    child_stock_code TEXT PRIMARY KEY,
+    parent_stock_code TEXT NOT NULL,
+    shareholder_name TEXT NOT NULL,
+    share_ratio TEXT NOT NULL DEFAULT '',
+    share_count TEXT NOT NULL DEFAULT '',
+    business_year TEXT NOT NULL,
+    receipt_no TEXT NOT NULL DEFAULT '',
+    checked_at TEXT NOT NULL,
+    FOREIGN KEY (child_stock_code) REFERENCES stocks(stock_code),
+    FOREIGN KEY (parent_stock_code) REFERENCES stocks(stock_code)
 );
 
 CREATE TABLE IF NOT EXISTS investor_flows (
@@ -499,6 +544,8 @@ CREATE INDEX IF NOT EXISTS idx_rotation_signals_source_date_score
     ON theme_rotation_signals(source, as_of_date, rotation_score);
 CREATE INDEX IF NOT EXISTS idx_stock_leader_theme_date
     ON stock_leader_scores(theme_id, source, as_of_date);
+CREATE INDEX IF NOT EXISTS idx_relation_members_stock
+    ON stock_relation_members(stock_code, relation_group_id);
 CREATE INDEX IF NOT EXISTS idx_stock_predictions_date_rank
     ON stock_predictions(as_of_date, horizon_days, probability_rank);
 CREATE INDEX IF NOT EXISTS idx_news_items_published
@@ -573,6 +620,23 @@ def initialize(db_path: Path = DB_PATH) -> Path:
                     ),
                 ),
             )
+            for group_name, relation_type, priority, stock_codes in DEFAULT_RELATION_GROUPS:
+                connection.execute(
+                    """INSERT OR IGNORE INTO stock_relation_groups(
+                           group_name, relation_type, priority, source, updated_at)
+                       VALUES (?, ?, ?, 'CURATED', ?)""",
+                    (group_name, relation_type, priority, now),
+                )
+                group_id = connection.execute(
+                    """SELECT relation_group_id FROM stock_relation_groups
+                       WHERE group_name=?""", (group_name,)
+                ).fetchone()[0]
+                connection.executemany(
+                    """INSERT OR IGNORE INTO stock_relation_members(
+                           relation_group_id, stock_code)
+                       VALUES (?, ?)""",
+                    ((group_id, code) for code in stock_codes),
+                )
     return db_path
 
 
@@ -1289,6 +1353,259 @@ def theme_summary_rows(query: str = "", db_path: Path = DB_PATH) -> list[dict]:
             (query, f"%{query}%", f"%{query}%", f"%{query}%"),
         ).fetchall()
         return [dict(row) for row in rows]
+
+
+def active_theme_labels(db_path: Path = DB_PATH) -> dict[str, tuple[str, ...]]:
+    """현재 유효한 종목별 테마명을 출처 우선순위대로 반환한다.
+
+    조건검색 실시간 정렬은 네이버 테마를 기본 분류로 쓰되, 네이버에 없는
+    종목은 키움 등 수집된 보조 출처의 테마로 묶는다. 한 종목의 복수 테마는
+    모두 보존하며 화면에서 현재 가장 강한 묶음을 대표 테마로 선택한다.
+    """
+    if not db_path.exists():
+        return {}
+    with closing(connect(db_path)) as connection:
+        rows = connection.execute(
+            """SELECT st.stock_code, t.theme_name, st.source
+                 FROM stock_themes st
+                 JOIN themes t ON t.theme_id=st.theme_id
+                WHERE st.valid_to IS NULL
+                  AND TRIM(t.theme_name)<>''
+                ORDER BY st.stock_code,
+                    CASE st.source
+                        WHEN 'NAVER' THEN 0
+                        WHEN 'KIWOOM' THEN 1
+                        WHEN 'WICS' THEN 2
+                        WHEN 'KRX' THEN 3
+                        WHEN 'DART' THEN 4
+                        ELSE 9
+                    END,
+                    t.theme_name""",
+        ).fetchall()
+    result: dict[str, list[str]] = {}
+    for row in rows:
+        code = str(row["stock_code"] or "").removesuffix("_AL")
+        theme = str(row["theme_name"] or "").strip()
+        if code and theme and theme not in result.setdefault(code, []):
+            result[code].append(theme)
+    return {code: tuple(themes) for code, themes in result.items()}
+
+
+def active_relation_groups(db_path: Path = DB_PATH) -> dict[str, tuple[str, ...]]:
+    """조건검색에서 우선 묶을 명확한 관계 종목 그룹을 반환한다.
+
+    수동 등록한 계열·지분 관계와 함께, 종목유형이 우선주인 종목을 이름으로
+    본주에 자동 연결한다. 본주 종목명이 실제 카탈로그에 있을 때만 추가한다.
+    """
+    initialize(db_path)
+    with closing(connect(db_path)) as connection:
+        rows = connection.execute(
+            """SELECT g.group_name, m.stock_code
+                 FROM stock_relation_groups g
+                 JOIN stock_relation_members m
+                   ON m.relation_group_id=g.relation_group_id
+                ORDER BY g.priority, g.group_name, m.stock_code""",
+        ).fetchall()
+        stock_rows = connection.execute(
+            """SELECT stock_code, stock_name, stock_type
+                 FROM stocks
+                WHERE stock_type IN ('COMMON', 'PREFERRED')""",
+        ).fetchall()
+    result: dict[str, list[str]] = {}
+    for row in rows:
+        group = str(row["group_name"] or "").strip()
+        code = str(row["stock_code"] or "").removesuffix("_AL")
+        if group and code:
+            result.setdefault(group, []).append(code)
+    common_codes = {
+        str(row["stock_name"] or "").strip(): str(row["stock_code"] or "")
+        for row in stock_rows if row["stock_type"] == "COMMON"
+    }
+    preferred_groups: dict[str, list[str]] = {}
+    for row in stock_rows:
+        if row["stock_type"] != "PREFERRED":
+            continue
+        name = str(row["stock_name"] or "").strip()
+        base_name = PREFERRED_SUFFIX_RE.sub("", name)
+        common_code = common_codes.get(base_name)
+        preferred_code = str(row["stock_code"] or "")
+        if not base_name or not common_code or not preferred_code:
+            continue
+        preferred_groups.setdefault(base_name, [common_code]).append(preferred_code)
+    for base_name, codes in preferred_groups.items():
+        result.setdefault(f"{base_name} 우선주·본주", []).extend(codes)
+    return {
+        group: tuple(dict.fromkeys(codes)) for group, codes in result.items()
+        if len(set(codes)) >= 2
+    }
+
+
+def _normalized_company_name(value: str) -> str:
+    """DART 법인명과 거래소 종목명을 비교하기 위한 보수적 정규화."""
+    value = str(value or "").casefold()
+    value = value.replace("주식회사", "").replace("(주)", "").replace("㈜", "")
+    value = value.replace("에이아이", "ai")
+    return re.sub(r"[^0-9a-z가-힣]", "", value)
+
+
+def save_dart_parent_relations(
+    parent_evidence_by_child: dict[str, str | dict], db_path: Path = DB_PATH,
+) -> tuple[int, int]:
+    """DART 최대주주가 상장사인 경우에만 관계와 확인 근거를 저장한다."""
+    if not parent_evidence_by_child:
+        return 0, 0
+    initialize(db_path)
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    with closing(connect(db_path)) as connection, connection:
+        names: dict[str, tuple[str, str]] = {}
+        for row in connection.execute(
+                "SELECT stock_code, stock_name FROM stocks").fetchall():
+            normalized = _normalized_company_name(row["stock_name"])
+            if normalized and normalized not in names:
+                names[normalized] = (row["stock_code"], row["stock_name"])
+        grouped: dict[tuple[str, str], set[str]] = {}
+        matched_evidence: list[tuple[str, str, str, str, str, str, str]] = []
+        for child_code, source in parent_evidence_by_child.items():
+            evidence = source if isinstance(source, dict) else {"name": source}
+            parent_name = str(evidence.get("name") or "").strip()
+            parent = names.get(_normalized_company_name(parent_name))
+            if not parent or parent[0] == child_code:
+                continue
+            grouped.setdefault(parent, set()).add(str(child_code))
+            matched_evidence.append((
+                str(child_code), parent[0], parent_name,
+                str(evidence.get("share_ratio") or "").strip(),
+                str(evidence.get("share_count") or "").strip(),
+                str(evidence.get("business_year") or "").strip(),
+                str(evidence.get("receipt_no") or "").strip(),
+            ))
+
+        groups = members = 0
+        for (parent_code, parent_name), child_codes in grouped.items():
+            group_name = f"{parent_name} 그룹"
+            connection.execute(
+                """INSERT INTO stock_relation_groups(
+                       group_name, relation_type, priority, source, updated_at)
+                   VALUES (?, 'PARENT_SUBSIDIARY', 90, 'DART', ?)
+                   ON CONFLICT(group_name) DO UPDATE SET
+                       relation_type=excluded.relation_type,
+                       priority=excluded.priority, source=excluded.source,
+                       updated_at=excluded.updated_at""",
+                (group_name, now),
+            )
+            group_id = connection.execute(
+                "SELECT relation_group_id FROM stock_relation_groups "
+                "WHERE group_name=?", (group_name,)
+            ).fetchone()[0]
+            codes = {parent_code, *child_codes}
+            connection.executemany(
+                """INSERT OR IGNORE INTO stock_relation_members(
+                       relation_group_id, stock_code) VALUES (?, ?)""",
+                ((group_id, code) for code in codes),
+            )
+            groups += 1
+            members += len(codes)
+        if matched_evidence:
+            connection.executemany(
+                """INSERT INTO dart_relation_evidence(
+                       child_stock_code, parent_stock_code, shareholder_name,
+                       share_ratio, share_count, business_year, receipt_no, checked_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(child_stock_code) DO UPDATE SET
+                       parent_stock_code=excluded.parent_stock_code,
+                       shareholder_name=excluded.shareholder_name,
+                       share_ratio=excluded.share_ratio,
+                       share_count=excluded.share_count,
+                       business_year=excluded.business_year,
+                       receipt_no=excluded.receipt_no,
+                       checked_at=excluded.checked_at""",
+                [(*row, now) for row in matched_evidence],
+            )
+    return groups, members
+
+
+def dart_relation_evidence_labels(
+    db_path: Path = DB_PATH,
+) -> dict[str, tuple[str, ...]]:
+    """종목명 도구설명에 표시할 DART 최대주주 관계의 확인 근거를 반환한다."""
+    initialize(db_path)
+    with closing(connect(db_path)) as connection:
+        rows = connection.execute(
+            """SELECT child_stock_code, shareholder_name, share_ratio,
+                      share_count, business_year, receipt_no
+                 FROM dart_relation_evidence
+                ORDER BY child_stock_code""",
+        ).fetchall()
+    labels: dict[str, list[str]] = {}
+    for row in rows:
+        code = str(row["child_stock_code"] or "")
+        shareholder = str(row["shareholder_name"] or "").strip()
+        if not code or not shareholder:
+            continue
+        parts = [f"{shareholder} 최대주주"]
+        ratio = str(row["share_ratio"] or "").strip()
+        if ratio:
+            parts.append(f"지분율 {ratio}%")
+        shares = str(row["share_count"] or "").strip()
+        if shares:
+            parts.append(f"보유주식 {shares}주")
+        year = str(row["business_year"] or "").strip()
+        if year:
+            parts.append(f"{year} 사업보고서")
+        receipt = str(row["receipt_no"] or "").strip()
+        if receipt:
+            parts.append(f"접수번호 {receipt}")
+        labels.setdefault(code, []).append(" · ".join(parts))
+    return {code: tuple(values) for code, values in labels.items()}
+
+
+def pending_dart_relation_checks(
+    stock_codes: list[str] | tuple[str, ...] | set[str], business_year: str,
+    db_path: Path = DB_PATH,
+) -> list[str]:
+    """해당 사업연도에 최대주주 관계를 아직 확인하지 않은 종목만 반환한다."""
+    codes = list(dict.fromkeys(
+        str(code or "").removesuffix("_AL").strip() for code in stock_codes
+        if str(code or "").strip()))
+    if not codes:
+        return []
+    initialize(db_path)
+    placeholders = ",".join("?" for _ in codes)
+    with closing(connect(db_path)) as connection:
+        checked = {
+            str(row["stock_code"])
+            for row in connection.execute(
+                f"""SELECT stock_code FROM dart_relation_checks
+                      WHERE business_year=? AND stock_code IN ({placeholders})""",
+                (str(business_year), *codes),
+            ).fetchall()
+        }
+    return [code for code in codes if code not in checked]
+
+
+def save_dart_relation_checks(
+    results: dict[str, str], business_year: str, db_path: Path = DB_PATH,
+) -> int:
+    """DART 최대주주 조회 성공 여부를 저장해 자동수집 중복을 막는다."""
+    if not results:
+        return 0
+    initialize(db_path)
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    values = [
+        (str(code).removesuffix("_AL"), str(business_year), str(result), now)
+        for code, result in results.items() if str(code or "").strip()
+    ]
+    with closing(connect(db_path)) as connection, connection:
+        cursor = connection.executemany(
+            """INSERT INTO dart_relation_checks(
+                   stock_code, business_year, result, checked_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(stock_code) DO UPDATE SET
+                   business_year=excluded.business_year,
+                   result=excluded.result, checked_at=excluded.checked_at""",
+            values,
+        )
+        return cursor.rowcount
 
 
 def rebuild_rotation_analysis(as_of_date: str = "", source: str = "NAVER",
@@ -2599,7 +2916,7 @@ def resolve_analysis_stock(query: str,
         return None
     with closing(connect(db_path)) as connection:
         row = connection.execute(
-            """SELECT stock_code, stock_name, market, stock_type
+            """SELECT stock_code, stock_name, market, stock_type, dart_corp_code
                FROM stocks
                WHERE stock_code=? OR stock_name=?
                ORDER BY CASE WHEN stock_code=? THEN 0 ELSE 1 END
@@ -2608,7 +2925,7 @@ def resolve_analysis_stock(query: str,
         ).fetchone()
         if row is None:
             row = connection.execute(
-                """SELECT stock_code, stock_name, market, stock_type
+                """SELECT stock_code, stock_name, market, stock_type, dart_corp_code
                    FROM stocks
                    WHERE stock_code LIKE ? OR stock_name LIKE ?
                    ORDER BY CASE

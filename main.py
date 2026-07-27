@@ -31,6 +31,8 @@ from PySide6.QtWidgets import (
 from analysis_db import (
     DB_PATH, database_stats, initialize, save_stock_history, start_collection,
     update_collection, limit_up_rows, limit_up_stocks, save_dart_corp_codes,
+    save_dart_parent_relations,
+    pending_dart_relation_checks, save_dart_relation_checks,
     sync_stock_catalog, save_krx_market_day, krx_collected_dates,
     pending_intraday_events, save_last_entry_time,
     save_disclosures, disclosure_rows, disclosure_list_rows,
@@ -322,6 +324,39 @@ def _market_session_states(now: datetime) -> tuple[str, str, str]:
     return krx, nxt, ""
 
 
+def _is_krx_market_open(now: datetime | None = None) -> bool:
+    """조건검색 자동 관계수집을 허용할 KRX 장중(09:00~15:30)인지 반환한다."""
+    now = now or datetime.now()
+    if _krx_holiday_reason(now.date()):
+        return False
+    seconds = now.hour * 3600 + now.minute * 60 + now.second
+    return 9 * 3600 <= seconds < 15 * 3600 + 30 * 60
+
+
+def _largest_shareholder_evidence(
+    shareholders: list[dict], business_year: str,
+) -> dict[str, str]:
+    """DART 최대주주 현황에서 관계 저장·표시에 쓸 원문 근거를 추린다."""
+    row = next((
+        item for item in shareholders
+        if str(item.get("relate") or "").strip() == "최대주주"
+        and str(item.get("nm") or "").strip()
+    ), None)
+    if row is None:
+        return {}
+    return {
+        "name": str(row.get("nm") or "").strip(),
+        "share_ratio": str(
+            row.get("trmend_posesn_stock_qota_rt")
+            or row.get("bsis_posesn_stock_qota_rt") or "").strip(),
+        "share_count": str(
+            row.get("trmend_posesn_stock_co")
+            or row.get("bsis_posesn_stock_co") or "").strip(),
+        "business_year": str(business_year),
+        "receipt_no": str(row.get("rcept_no") or "").strip(),
+    }
+
+
 def _apply_theme(app: QApplication, mode: str):
     scheme = {"dark": Qt.ColorScheme.Dark, "light": Qt.ColorScheme.Light}.get(
         mode, Qt.ColorScheme.Unknown)
@@ -563,6 +598,7 @@ class View:
                 self.screen.model.set_account_auto_cancel_armed(code, True)
             self.app.queue_real(code, add=True, suffix=self._real_suffix())
         if new - cur:
+            self.app.queue_condition_relation_autocollect(new - cur, self.screen)
             self._schedule_refresh()
             self._maybe_beep()
         log.info("snapshot%s: %d codes (+%d/-%d) %s", self.prefix or " ",
@@ -574,6 +610,7 @@ class View:
             if code in self.app._account_auto_cancel_armed:
                 self.screen.model.set_account_auto_cancel_armed(code, True)
             self.app.queue_real(code, add=True, suffix=self._real_suffix())
+            self.app.queue_condition_relation_autocollect({code}, self.screen)
             self._schedule_refresh()
             self._maybe_beep()
         else:
@@ -640,6 +677,12 @@ class App:
         self._orderable_prefetch_task = None
         self._orderable_prefetch_failed: dict[tuple[str, int], float] = {}
         self._orderable_prefetch_blocked_date = ""
+        self._condition_relation_task = None
+        self._condition_relation_pending: set[str] = set()
+        self._condition_relation_timer = QTimer()
+        self._condition_relation_timer.setSingleShot(True)
+        self._condition_relation_timer.timeout.connect(
+            self._run_condition_relation_collection)
         self._orderable_prefetch_timer = QTimer()
         self._orderable_prefetch_timer.timeout.connect(
             self._queue_orderable_prefetch)
@@ -786,6 +829,12 @@ class App:
             lambda code, target=screen:
             self._open_condition_analysis_stock(target, code))
         screen.market_overview_requested.connect(self._open_market_status)
+        screen.relation_collection_requested.connect(
+            lambda codes, target=screen:
+            self._start_condition_relation_collection(target, codes))
+        screen.theme_sort.toggled.connect(
+            lambda on, target=screen:
+            self._on_theme_sort_relation_autocollect(target, on))
 
     def _sync_order_enabled(
             self, enabled: bool, source: ConditionScreen | None = None):
@@ -1952,6 +2001,185 @@ class App:
             lambda code, target=screen:
             self._open_condition_analysis_stock(target, code))
         screen.market_overview_requested.connect(self._open_market_status)
+        screen.relation_collection_requested.connect(
+            lambda codes, target=screen:
+            self._start_condition_relation_collection(target, codes))
+        screen.theme_sort.toggled.connect(
+            lambda on, target=screen:
+            self._on_theme_sort_relation_autocollect(target, on))
+
+    def _set_relation_collection_state(self, text: str, enabled: bool):
+        """모든 조건검색 창에 관계수집 작업 상태를 동일하게 표시한다."""
+        for view in self.views:
+            button = view.screen.relation_collect_btn
+            button.setText(text)
+            button.setEnabled(enabled)
+
+    @staticmethod
+    def _show_nonmodal_message(
+        parent: QWidget, title: str, text: str,
+        icon: QMessageBox.Icon = QMessageBox.Icon.Information,
+    ):
+        """비동기 작업 중 Qt 중첩 이벤트 루프를 만들지 않는 알림창."""
+        box = QMessageBox(parent)
+        box.setIcon(icon)
+        box.setWindowTitle(title)
+        box.setText(text)
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        box.open()
+
+    def _start_condition_relation_collection(
+        self, screen: ConditionScreen, codes: object,
+    ):
+        """현재 조건검색 결과로만 DART 최대주주 관계 수집을 시작한다."""
+        if not config.DART_API_KEY:
+            QMessageBox.warning(
+                screen, "관계수집", ".env에 DART_API_KEY가 설정되지 않았습니다.")
+            return
+        if self._condition_relation_task and not self._condition_relation_task.done():
+            return
+        stock_codes = list(dict.fromkeys(
+            str(code or "").removesuffix("_AL").strip()
+            for code in codes if str(code or "").strip()))
+        if not stock_codes:
+            QMessageBox.information(
+                screen, "관계수집", "현재 조건검색에 수집할 종목이 없습니다.")
+            return
+        self._set_relation_collection_state("수집중", False)
+        self._condition_relation_task = asyncio.ensure_future(
+            self._collect_condition_relations(screen, stock_codes, announce=True))
+
+    def _on_theme_sort_relation_autocollect(
+        self, screen: ConditionScreen, on: bool,
+    ):
+        if on:
+            self.queue_condition_relation_autocollect(
+                set(screen.model.codes), screen)
+
+    def queue_condition_relation_autocollect(
+        self, codes: set[str], screen: ConditionScreen,
+    ):
+        """새 편입을 모아 이미 확인되지 않은 종목의 관계만 자동 수집한다."""
+        if (not config.DART_API_KEY or not screen.theme_sort.isChecked()
+                or not _is_krx_market_open()):
+            return
+        self._condition_relation_pending.update(
+            str(code or "").removesuffix("_AL").strip()
+            for code in codes if str(code or "").strip())
+        if self._condition_relation_pending and not self._condition_relation_timer.isActive():
+            # 관계 분류는 체결·주문 경로가 아니므로 편입 흐름을 충분히 모아
+            # DART 요청 횟수를 낮춘 뒤 처리한다.
+            self._condition_relation_timer.start(60000)
+
+    def _run_condition_relation_collection(self):
+        if self._condition_relation_task and not self._condition_relation_task.done():
+            return
+        pending = self._condition_relation_pending
+        self._condition_relation_pending = set()
+        if not _is_krx_market_open():
+            return
+        active_codes = {
+            code for view in self.views if view.screen.theme_sort.isChecked()
+            for code in view.screen.model.codes
+        }
+        pending &= active_codes
+        if not pending:
+            return
+        relation_year = str(datetime.now().year - 1)
+        stock_codes = pending_dart_relation_checks(pending, relation_year)
+        if not stock_codes:
+            return
+        self._set_relation_collection_state("자동수집", False)
+        self._condition_relation_task = asyncio.ensure_future(
+            self._collect_condition_relations(
+                self.views[0].screen, stock_codes, announce=False))
+
+    async def _collect_condition_relations(
+        self, screen: ConditionScreen, stock_codes: list[str], announce: bool,
+    ):
+        """조건검색 종목의 최대주주가 상장사인 관계만 저장한다."""
+        client = DartClient(config.DART_API_KEY)
+        parent_evidence_by_child: dict[str, dict[str, str]] = {}
+        checked_results: dict[str, str] = {}
+        errors = missing_catalog = missing_corp = 0
+        relation_year = str(datetime.now().year - 1)
+        try:
+            targets = []
+            missing_corp_codes = []
+            for stock_code in stock_codes:
+                stock = resolve_analysis_stock(stock_code)
+                if stock is None:
+                    missing_catalog += 1
+                    continue
+                corp_code = str(stock.get("dart_corp_code") or "").strip()
+                if not corp_code:
+                    missing_corp_codes.append(stock_code)
+                    continue
+                targets.append((stock_code, corp_code))
+            if missing_corp_codes:
+                # 이미 DB에 기업코드가 있으면 이 대용량 목록 요청은 생략한다.
+                # 신규 상장 등 코드가 비어 있는 종목이 처음 들어왔을 때만 갱신한다.
+                self._set_relation_collection_state("코드조회", False)
+                mapping = await client.corp_codes()
+                save_dart_corp_codes(mapping)
+                for stock_code in missing_corp_codes:
+                    stock = resolve_analysis_stock(stock_code)
+                    corp_code = str((stock or {}).get("dart_corp_code") or "").strip()
+                    if corp_code:
+                        targets.append((stock_code, corp_code))
+                    else:
+                        missing_corp += 1
+            for index, (stock_code, corp_code) in enumerate(targets, 1):
+                self._set_relation_collection_state(
+                    f"{index}/{len(targets)}", False)
+                try:
+                    shareholders = await client.largest_shareholders(
+                        corp_code, relation_year)
+                    evidence = _largest_shareholder_evidence(
+                        shareholders, relation_year)
+                    if evidence:
+                        parent_evidence_by_child[stock_code] = evidence
+                        checked_results[stock_code] = "MAX_SHAREHOLDER"
+                    else:
+                        checked_results[stock_code] = "NO_MAX_SHAREHOLDER"
+                except Exception as error:  # noqa: BLE001
+                    errors += 1
+                    log.warning("condition relation %s: %s", stock_code, error)
+                # 자동 편입이 한꺼번에 들어와도 DART 요청을 폭주시키지 않는다.
+                await asyncio.sleep(0.2)
+            relation_groups, relation_members = save_dart_parent_relations(
+                parent_evidence_by_child)
+            save_dart_relation_checks(checked_results, relation_year)
+            for view in self.views:
+                view.screen.refresh_theme_sort()
+            detail = (
+                f"조건검색 {len(stock_codes):,}종목 중 {len(targets):,}종목을 조회했습니다.\n"
+                f"상장사 최대주주 관계 {relation_groups:,}묶음 / {relation_members:,}종목을 저장했고 "
+                "테마정렬에 반영했습니다."
+            )
+            extras = []
+            if missing_catalog:
+                extras.append(f"카탈로그 없음 {missing_catalog:,}")
+            if missing_corp:
+                extras.append(f"기업코드 없음 {missing_corp:,}")
+            if errors:
+                extras.append(f"오류 {errors:,}")
+            if extras:
+                detail += "\n" + " · ".join(extras)
+            if announce:
+                self._show_nonmodal_message(screen, "관계수집 완료", detail)
+        except Exception as error:  # noqa: BLE001
+            log.exception("condition relationship collection failed")
+            self._show_nonmodal_message(
+                screen, "관계수집", f"수집에 실패했습니다.\n{error}",
+                QMessageBox.Icon.Warning)
+        finally:
+            await client.close()
+            self._set_relation_collection_state("관계수집", True)
+            self._condition_relation_task = None
+            if self._condition_relation_pending:
+                self._condition_relation_timer.start(0)
 
     def _on_window_closed(self, win):
         if _SHUTDOWN[0]:  # 앱 종료 동반 닫힘: 창 개수 보존 (재시작 때 복원용)
@@ -4863,6 +5091,8 @@ class AnalysisWindow(QMainWindow):
         date_from, date_to = self._limit_dates()
         client = DartClient(config.DART_API_KEY)
         saved = errors = 0
+        parent_evidence_by_child: dict[str, dict[str, str]] = {}
+        relation_year = str(datetime.now().year - 1)
         try:
             self._limit_summary.setText("DART 기업코드 목록을 불러오는 중…")
             mapping = await client.corp_codes()
@@ -4893,6 +5123,12 @@ class AnalysisWindow(QMainWindow):
                         stock["stock_code"], corp_code, rows)
                     mark_disclosure_range_collected(
                         stock["stock_code"], date_from, date_to)
+                    shareholders = await client.largest_shareholders(
+                        corp_code, relation_year)
+                    evidence = _largest_shareholder_evidence(
+                        shareholders, relation_year)
+                    if evidence:
+                        parent_evidence_by_child[stock["stock_code"]] = evidence
                 except Exception as error:  # noqa: BLE001
                     errors += 1
                     log.warning("DART %s: %s", stock["stock_code"], error)
@@ -4902,6 +5138,11 @@ class AnalysisWindow(QMainWindow):
                     f"· 기업코드 없음 {missing_corp:,}종목 "
                     f"· 오류 {errors:,}건")
                 await asyncio.sleep(0)
+            relation_groups, relation_members = save_dart_parent_relations(
+                parent_evidence_by_child)
+            self._limit_summary.setText(
+                f"DART 완료 · 공시 {saved:,}건 · 관계 {relation_groups:,}묶음/"
+                f"{relation_members:,}종목 · 오류 {errors:,}건")
         except Exception as error:  # noqa: BLE001
             log.exception("DART collection failed")
             self._show_async_error(
