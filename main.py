@@ -2217,8 +2217,6 @@ class App:
     def _ensure_analysis_window(self):
         if self._analysis is None:
             self._analysis = AnalysisWindow(self.rest)
-            self._analysis.condition_limit_collect_requested.connect(
-                lambda: asyncio.ensure_future(self._collect_zero_day_limit_condition()))
             self._analysis.watchlist_changed.connect(
                 self._sync_realtime_watch_models)
             self._analysis.news_auto_changed.connect(
@@ -2645,7 +2643,6 @@ class AnalysisWindow(QMainWindow):
     watchlist_changed = Signal()
     news_auto_changed = Signal(bool)
     new_news_found = Signal(int)
-    condition_limit_collect_requested = Signal()
 
     TABS = (
         ("실시간 뉴스·종토방", "직접 등록한 종목의 뉴스와 웹페이지를 확인합니다."),
@@ -5755,9 +5752,6 @@ class AnalysisWindow(QMainWindow):
         self._date_to.setDisplayFormat("yyyy-MM-dd")
         self._krx_btn = QPushButton("KRX 상한가 수집")
         self._krx_btn.clicked.connect(self._start_krx_collection)
-        condition_limit_btn = QPushButton("조건 상한가 재수집")
-        condition_limit_btn.clicked.connect(
-            self.condition_limit_collect_requested.emit)
         self._kiwoom_limit_btn = QPushButton("키움 상한가 수집")
         self._kiwoom_limit_btn.clicked.connect(self._start_history_collection)
         self._market_index_btn = QPushButton("키움 시장지수 수집")
@@ -5783,7 +5777,6 @@ class AnalysisWindow(QMainWindow):
         range_row.addWidget(QLabel("~"))
         range_row.addWidget(self._date_to)
         range_row.addWidget(self._krx_btn)
-        range_row.addWidget(condition_limit_btn)
         range_row.addWidget(self._kiwoom_limit_btn)
         range_row.addWidget(self._market_index_btn)
         range_row.addStretch(1)
