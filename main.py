@@ -56,7 +56,6 @@ from analysis_db import (
     recent_condition_snapshots, condition_theme_stats,
     save_condition_theme_members, condition_theme_members,
     save_next_day_candidates, next_day_candidate_rows,
-    save_condition_limit_quotes,
 )
 from api import RestClient
 from classification_api import ClassificationClient
@@ -1580,14 +1579,10 @@ class App:
         captured_names = []
         combined_truncated = False
         combined_quotes = []
-        zero_day_result = None
         try:
             for seq, name in targets:
                 try:
                     result = await self.collect_condition_snapshot(seq, name, "KRX")
-                    if ("상한가" in name and
-                            ("0일" in name or "0" in name)):
-                        zero_day_result = result
                     combined_truncated = combined_truncated or result["truncated"]
                     captured_names.append(name)
                     combined_quotes.extend(result.get("quotes", ()))
@@ -1659,59 +1654,9 @@ class App:
                              batch_id, candidate_count)
                 log.info("background condition batch saved: slot=%s codes=%d "
                          "sources=%d", slot, len(combined_codes), len(captured_names))
-            log.info("zero-day condition hook: slot=%s result=%s",
-                     slot, bool(zero_day_result))
-            if slot in ("15:20", "START_AFTER"):
-                await self._collect_zero_day_limit_condition(zero_day_result)
         finally:
             log.info("background condition slot finished: slot=%s targets=%d elapsed=%.2fs",
                      slot, len(targets), time.monotonic() - started)
-
-    async def _collect_zero_day_limit_condition(self, result: dict | None = None):
-        """장 마감 후 '0일 전 상한가' 조건식 결과만 보완 저장한다."""
-        item = next((item for item in self._cond_items
-                     if "상한가" in str(item[1]) and
-                     ("0일" in str(item[1]) or "0" in str(item[1]))), None)
-        if item is None:
-            item = next((item for item in self._cond_items
-                         if str(item[0]) == "14"), None)
-        if not item:
-            log.info("zero-day limit condition skipped: condition not found")
-            return
-        seq, name = str(item[0]), str(item[1])
-        try:
-            if result:
-                codes = result.get("codes", [])
-                quotes = result.get("quotes", [])
-            else:
-                codes = await self.ws.request_condition_once(seq)
-                quotes = await self.rest.watch_info(codes, exp=False)
-            trade_date = datetime.now().strftime("%Y%m%d")
-            for quote in quotes:
-                upper = int(quote.get("upper") or 0)
-                if not upper or int(quote.get("price") or 0) < upper:
-                    continue
-                try:
-                    quote["entry_time"] = await self.rest.last_limit_entry_on_date(
-                        str(quote.get("code") or ""), upper, trade_date)
-                except Exception as error:  # noqa: BLE001
-                    log.debug("zero-day entry time unavailable code=%s error=%s",
-                              quote.get("code"), error)
-            quotes.sort(key=lambda quote: (
-                -int(int(quote.get("upper") or 0) > 0
-                     and int(quote.get("price") or 0) >= int(quote.get("upper") or 0)
-                     and int(quote.get("open") or 0) == int(quote.get("upper") or 0)
-                     and int(quote.get("low") or 0) == int(quote.get("upper") or 0)),
-                -(int(quote.get("bid_qty") or 0) /
-                  max(int(quote.get("vol") or 0), 1)),
-                str(quote.get("entry_time") or "99:99:99"),
-            ))
-            saved, events = save_condition_limit_quotes(
-                trade_date, quotes)
-            log.info("zero-day limit condition saved: seq=%s codes=%d events=%d",
-                     seq, len(codes), events)
-        except Exception as error:  # noqa: BLE001
-            log.warning("zero-day limit condition failed: %s", error)
 
     # --- 웹소켓 콜백 라우팅 -------------------------------------------------
     def _on_condition_list(self, items):
