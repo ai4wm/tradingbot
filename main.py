@@ -1579,10 +1579,13 @@ class App:
         captured_names = []
         combined_truncated = False
         combined_quotes = []
+        zero_day_result = None
         try:
             for seq, name in targets:
                 try:
                     result = await self.collect_condition_snapshot(seq, name, "KRX")
+                    if "0일" in name and "상한가" in name:
+                        zero_day_result = result
                     combined_truncated = combined_truncated or result["truncated"]
                     captured_names.append(name)
                     combined_quotes.extend(result.get("quotes", ()))
@@ -1655,12 +1658,12 @@ class App:
                 log.info("background condition batch saved: slot=%s codes=%d "
                          "sources=%d", slot, len(combined_codes), len(captured_names))
             if slot in ("15:20", "START_AFTER"):
-                await self._collect_zero_day_limit_condition()
+                await self._collect_zero_day_limit_condition(zero_day_result)
         finally:
             log.info("background condition slot finished: slot=%s targets=%d elapsed=%.2fs",
                      slot, len(targets), time.monotonic() - started)
 
-    async def _collect_zero_day_limit_condition(self):
+    async def _collect_zero_day_limit_condition(self, result: dict | None = None):
         """장 마감 후 '0일 전 상한가' 조건식 결과만 보완 저장한다."""
         item = next((item for item in self._cond_items
                      if "0일" in str(item[1]) and "상한가" in str(item[1])), None)
@@ -1669,8 +1672,12 @@ class App:
             return
         seq, name = str(item[0]), str(item[1])
         try:
-            codes = await self.ws.request_condition_once(seq)
-            quotes = await self.rest.watch_info(codes, exp=False)
+            if result:
+                codes = result.get("codes", [])
+                quotes = result.get("quotes", [])
+            else:
+                codes = await self.ws.request_condition_once(seq)
+                quotes = await self.rest.watch_info(codes, exp=False)
             trade_date = datetime.now().strftime("%Y%m%d")
             for quote in quotes:
                 upper = int(quote.get("upper") or 0)
