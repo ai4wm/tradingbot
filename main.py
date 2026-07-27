@@ -1390,6 +1390,7 @@ class App:
         m = view.screen.model
         if self._limit_cnt is not None:
             m.limit_cnt = self._limit_cnt
+            m.refresh_streaks()
         if self._market is None:
             return
         m.kosdaq, m.single, m.liquidation, m.nxt, m.misu, m.admin = (

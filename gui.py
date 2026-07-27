@@ -813,6 +813,16 @@ class StockModel(QAbstractTableModel):
                 cell = self.index(row, STREAK_COL)
                 self.dataChanged.emit(cell, cell)
 
+    def refresh_streaks(self):
+        """연상 보완 조회가 끝난 뒤 현재 행의 연상 셀을 다시 그린다."""
+        if not self.codes:
+            return
+        self.dataChanged.emit(
+            self.index(0, STREAK_COL),
+            self.index(len(self.codes) - 1, STREAK_COL),
+            [Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.ForegroundRole,
+             Qt.ItemDataRole.BackgroundRole])
+
     def set_order_status(self, code: str, text: str, cancellable: bool = False):
         if code not in self.rows:
             return
