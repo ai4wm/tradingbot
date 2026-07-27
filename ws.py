@@ -144,6 +144,7 @@ class WSClient:
     def __init__(self):
         self.on_condition_event = None    # (seq, code, is_insert) - 실시간 편입/이탈
         self.on_condition_snapshot = None  # (seq, list[code]) - CNSRREQ 초기 목록
+        self.on_condition_once = None      # (seq, list[code]) - 일반 1회 조회
         self.on_real = None               # (code, fields)
         self.on_vi = None                 # (code, active, 발동가) - VI 발동/해제
         self.on_order = None              # type=00 주문접수/체결/취소
@@ -151,6 +152,7 @@ class WSClient:
         self._ws = None
         self._token_fn = None            # async () -> token
         self._active_seqs: set[str] = set()  # 등록된 조건식들 (창마다 1개, 재등록용)
+        self._condition_once_waiters: dict[str, list[asyncio.Future]] = {}
         # (순수코드, 명시 접미사) -> 참조수. suffix=None은 전역 KRX/통합 설정을 따르고,
         # "_NX"는 NXT 전용 창이라 전역 설정이 바뀌어도 그대로 유지한다.
         self._reg_codes: dict[tuple[str, str | None], int] = {}
@@ -183,6 +185,28 @@ class WSClient:
     async def register_condition(self, seq: str):
         self._active_seqs.add(str(seq))
         await self._send({"trnm": "CNSRREQ", "seq": seq, "search_type": "1", "stex_tp": "K"})
+
+    async def request_condition_once(self, seq: str, timeout: float = 30.0) -> list[str]:
+        """조건검색 일반(ka10172)을 1회 요청한다.
+
+        실시간 조건식(_active_seqs)에 등록하지 않으며, 결과도 본창의
+        on_condition_snapshot으로 라우팅하지 않는다. 같은 조건식의
+        동시 요청은 대기열로 받아 요청 순서대로 결과를 돌려준다.
+        """
+        key = str(seq)
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self._condition_once_waiters.setdefault(key, []).append(future)
+        await self._send({"trnm": "CNSRREQ", "seq": key,
+                          "search_type": "0", "stex_tp": "K"})
+        try:
+            return await asyncio.wait_for(future, timeout)
+        finally:
+            waiters = self._condition_once_waiters.get(key, [])
+            if future in waiters:
+                waiters.remove(future)
+            if not waiters:
+                self._condition_once_waiters.pop(key, None)
 
     async def clear_condition(self, seq: str):
         if str(seq) in self._active_seqs:
@@ -414,17 +438,29 @@ class WSClient:
         """CNSRREQ 응답 = 현재 편입 전체 스냅샷. 통째로 넘겨 diff는 main이 한다
         (행 삭제/재생성 없이 편입/이탈만 반영 -> 예상값 등 실시간 상태 유지).
         실시간 편입/이탈은 REAL type=02(_on_real_condition)로 따로 옴."""
-        if not self.on_condition_snapshot:
-            return
         seq = str(msg.get("seq", ""))
         if not seq and len(self._active_seqs) == 1:  # 응답에 seq 없으면 단일 등록으로 판정
             seq = next(iter(self._active_seqs))
+        if not seq and len(self._condition_once_waiters) == 1:
+            # 일반 1회 조회 응답이 seq를 생략하는 서버 응답도 안전하게 매칭한다.
+            seq = next(iter(self._condition_once_waiters))
         codes = []
         for item in msg.get("data") or []:
             code = (item.get("9001") or item.get("jmcode") or item.get("item") or "").lstrip("A")
             if code:
                 codes.append(code)
-        self.on_condition_snapshot(seq, codes)
+        once_waiters = self._condition_once_waiters.get(seq)
+        if once_waiters:
+            future = once_waiters.pop(0)
+            if not once_waiters:
+                self._condition_once_waiters.pop(seq, None)
+            if not future.done():
+                future.set_result(codes)
+            if self.on_condition_once:
+                self.on_condition_once(seq, codes)
+            return
+        if self.on_condition_snapshot:
+            self.on_condition_snapshot(seq, codes)
 
 
 def _demo():

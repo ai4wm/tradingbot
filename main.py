@@ -51,6 +51,7 @@ from analysis_db import (
     resolve_analysis_stock, realtime_watch_codes, set_realtime_watch,
     realtime_watch_rows, save_news_items, reconcile_news_search_results,
     news_rows, log_content_request, news_request_count_today,
+    save_condition_snapshot,
 )
 from api import RestClient
 from classification_api import ClassificationClient
@@ -1370,6 +1371,34 @@ class App:
         m.new_today, m.new15, m.new30 = (
             self._market.new_today, self._market.new15, self._market.new30)
         m.shares = self._market.shares
+
+    async def collect_condition_snapshot(self, seq: str, condition_name: str = "",
+                                         market: str = "KRX") -> dict:
+        """화면 없이 조건검색 일반 조회를 수행하고 결과만 DB에 저장한다.
+
+        실시간 조건식 등록 목록이나 ConditionScreen 모델을 건드리지 않으므로
+        본창의 편입·이탈·정렬·주문 상태와 독립적이다. 시간대 예약은 후속
+        시장테마 브리핑 단계에서 이 메서드를 호출해 구성한다.
+        """
+        key = str(seq)
+        started = time.monotonic()
+        codes = await self.ws.request_condition_once(key)
+        snapshot_id = save_condition_snapshot(
+            key, condition_name, codes, market=market, truncated=len(codes) >= 100)
+        result = {
+            "snapshot_id": snapshot_id,
+            "condition_seq": key,
+            "condition_name": condition_name,
+            "market": market,
+            "codes": codes,
+            "stock_count": len(codes),
+            "truncated": len(codes) >= 100,
+        }
+        log.info("background condition snapshot: seq=%s name=%s market=%s "
+                 "codes=%d truncated=%s elapsed=%.2fs",
+                 key, condition_name, market, len(codes), result["truncated"],
+                 time.monotonic() - started)
+        return result
 
     # --- 웹소켓 콜백 라우팅 -------------------------------------------------
     def _on_condition_list(self, items):

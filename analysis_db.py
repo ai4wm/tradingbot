@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "market_analysis.db"
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 ANALYSIS_STOCK_TYPES = (
     "COMMON", "PREFERRED", "SPAC", "FOREIGN", "REIT", "INFRA",
 )
@@ -528,6 +528,25 @@ CREATE TABLE IF NOT EXISTS collection_runs (
     finished_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS condition_snapshot_runs (
+    snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    condition_seq TEXT NOT NULL,
+    condition_name TEXT NOT NULL DEFAULT '',
+    market TEXT NOT NULL DEFAULT 'KRX',
+    captured_at TEXT NOT NULL,
+    stock_count INTEGER NOT NULL DEFAULT 0,
+    truncated INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS condition_snapshot_members (
+    snapshot_id INTEGER NOT NULL,
+    stock_code TEXT NOT NULL,
+    position INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (snapshot_id, stock_code),
+    FOREIGN KEY (snapshot_id) REFERENCES condition_snapshot_runs(snapshot_id)
+        ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_daily_prices_code_date
     ON daily_prices(stock_code, trade_date);
 CREATE INDEX IF NOT EXISTS idx_limit_up_events_date
@@ -538,6 +557,10 @@ CREATE INDEX IF NOT EXISTS idx_disclosure_ranges_stock_dates
     ON disclosure_collection_ranges(stock_code, date_from, date_to);
 CREATE INDEX IF NOT EXISTS idx_collection_runs_type_started
     ON collection_runs(data_type, started_at);
+CREATE INDEX IF NOT EXISTS idx_condition_snapshots_seq_time
+    ON condition_snapshot_runs(condition_seq, captured_at DESC);
+CREATE INDEX IF NOT EXISTS idx_condition_snapshot_members_code
+    ON condition_snapshot_members(stock_code, snapshot_id);
 CREATE INDEX IF NOT EXISTS idx_theme_daily_stats_source_date
     ON theme_daily_stats(source, trade_date);
 CREATE INDEX IF NOT EXISTS idx_rotation_signals_source_date_score
@@ -638,6 +661,66 @@ def initialize(db_path: Path = DB_PATH) -> Path:
                     ((group_id, code) for code in stock_codes),
                 )
     return db_path
+
+
+def save_condition_snapshot(condition_seq: str, condition_name: str,
+                            codes: list[str], captured_at: str | None = None,
+                            market: str = "KRX", truncated: bool = False,
+                            db_path: Path = DB_PATH) -> int:
+    """화면 없이 조회한 조건검색 결과와 순서를 저장한다.
+
+    종목 자체의 시세·테마는 별도 원천 테이블에서 관리하므로 이 단계에서는
+    조건식 결과와 조회 시각만 보존한다. 최대 100종목 제한에 걸린 경우
+    ``truncated``를 표시해 후속 구간분할 수집이 가능하도록 한다.
+    """
+    timestamp = captured_at or datetime.now().astimezone().isoformat(timespec="seconds")
+    normalized = []
+    seen = set()
+    for code in codes:
+        value = str(code or "").strip().upper().lstrip("A")
+        if value and value not in seen:
+            seen.add(value)
+            normalized.append(value)
+    with closing(connect(db_path)) as connection:
+        with connection:
+            cursor = connection.execute(
+                """INSERT INTO condition_snapshot_runs(
+                       condition_seq, condition_name, market, captured_at,
+                       stock_count, truncated)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (str(condition_seq), str(condition_name or ""), str(market or "KRX"),
+                 timestamp, len(normalized), int(bool(truncated))),
+            )
+            snapshot_id = int(cursor.lastrowid)
+            connection.executemany(
+                """INSERT INTO condition_snapshot_members(
+                       snapshot_id, stock_code, position)
+                   VALUES (?, ?, ?)""",
+                [(snapshot_id, code, position)
+                 for position, code in enumerate(normalized, 1)],
+            )
+    return snapshot_id
+
+
+def recent_condition_snapshots(condition_seq: str | None = None, limit: int = 20,
+                               db_path: Path = DB_PATH) -> list[dict]:
+    """최근 조건검색 일반조회 요약을 반환한다."""
+    clauses = []
+    params: list = []
+    if condition_seq is not None:
+        clauses.append("condition_seq = ?")
+        params.append(str(condition_seq))
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    params.append(max(1, int(limit)))
+    with closing(connect(db_path)) as connection:
+        rows = connection.execute(
+            f"""SELECT snapshot_id, condition_seq, condition_name, market,
+                       captured_at, stock_count, truncated
+                FROM condition_snapshot_runs{where}
+                ORDER BY captured_at DESC, snapshot_id DESC LIMIT ?""",
+            params,
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def database_stats(db_path: Path = DB_PATH) -> dict:
