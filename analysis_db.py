@@ -1440,6 +1440,30 @@ def save_stock_history(
                    source=excluded.source, collected_at=excluded.collected_at""",
             price_rows,
         )
+        # 저장 직전 이전 거래일 이벤트와 연결해 연속 상한가 일수를 계산한다.
+        corrected_events = []
+        for trade_date, code, closed, touched, _streak, collected in event_rows:
+            previous_date = connection.execute(
+                """SELECT MAX(trade_date) FROM daily_prices
+                   WHERE stock_code=? AND trade_date<?""",
+                (code, trade_date),
+            ).fetchone()[0]
+            previous_streak = 0
+            if previous_date:
+                previous_streak = int(connection.execute(
+                    """SELECT consecutive_days FROM limit_up_events
+                       WHERE stock_code=? AND trade_date=?""",
+                    (code, previous_date),
+                ).fetchone()[0] or 0) if connection.execute(
+                    """SELECT 1 FROM limit_up_events
+                       WHERE stock_code=? AND trade_date=?""",
+                    (code, previous_date),
+                ).fetchone() else 0
+            corrected_events.append((
+                trade_date, code, closed, touched,
+                previous_streak + 1 if previous_streak else 1, collected,
+            ))
+        event_rows = corrected_events
         connection.executemany(
             """INSERT INTO limit_up_events(
                    trade_date, stock_code, closed_at_limit, touched_limit,
