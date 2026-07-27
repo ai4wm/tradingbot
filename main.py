@@ -1584,7 +1584,8 @@ class App:
             for seq, name in targets:
                 try:
                     result = await self.collect_condition_snapshot(seq, name, "KRX")
-                    if "0일" in name and "상한가" in name:
+                    if ("상한가" in name and
+                            ("0일" in name or "0" in name)):
                         zero_day_result = result
                     combined_truncated = combined_truncated or result["truncated"]
                     captured_names.append(name)
@@ -1657,6 +1658,8 @@ class App:
                              batch_id, candidate_count)
                 log.info("background condition batch saved: slot=%s codes=%d "
                          "sources=%d", slot, len(combined_codes), len(captured_names))
+            log.info("zero-day condition hook: slot=%s result=%s",
+                     slot, bool(zero_day_result))
             if slot in ("15:20", "START_AFTER"):
                 await self._collect_zero_day_limit_condition(zero_day_result)
         finally:
@@ -1666,7 +1669,11 @@ class App:
     async def _collect_zero_day_limit_condition(self, result: dict | None = None):
         """장 마감 후 '0일 전 상한가' 조건식 결과만 보완 저장한다."""
         item = next((item for item in self._cond_items
-                     if "0일" in str(item[1]) and "상한가" in str(item[1])), None)
+                     if "상한가" in str(item[1]) and
+                     ("0일" in str(item[1]) or "0" in str(item[1]))), None)
+        if item is None:
+            item = next((item for item in self._cond_items
+                         if str(item[0]) == "14"), None)
         if not item:
             log.info("zero-day limit condition skipped: condition not found")
             return
