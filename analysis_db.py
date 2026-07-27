@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "market_analysis.db"
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 ANALYSIS_STOCK_TYPES = (
     "COMMON", "PREFERRED", "SPAC", "FOREIGN", "REIT", "INFRA",
 )
@@ -586,6 +586,25 @@ CREATE TABLE IF NOT EXISTS condition_theme_members (
         ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS next_day_candidates (
+    candidate_date TEXT NOT NULL,
+    snapshot_id INTEGER NOT NULL,
+    stock_code TEXT NOT NULL,
+    stock_name TEXT NOT NULL DEFAULT '',
+    score REAL NOT NULL DEFAULT 0,
+    rank INTEGER NOT NULL DEFAULT 0,
+    locked_limit INTEGER NOT NULL DEFAULT 0,
+    change_rate REAL NOT NULL DEFAULT 0,
+    volume INTEGER NOT NULL DEFAULT 0,
+    theme_name TEXT NOT NULL DEFAULT '',
+    reason_text TEXT NOT NULL DEFAULT '',
+    outcome TEXT NOT NULL DEFAULT '',
+    evaluated_at TEXT,
+    PRIMARY KEY (candidate_date, snapshot_id, stock_code),
+    FOREIGN KEY (snapshot_id) REFERENCES condition_snapshot_runs(snapshot_id)
+        ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_daily_prices_code_date
     ON daily_prices(stock_code, trade_date);
 CREATE INDEX IF NOT EXISTS idx_limit_up_events_date
@@ -859,6 +878,90 @@ def condition_theme_members(snapshot_id: int, db_path: Path = DB_PATH) -> list[d
                WHERE snapshot_id = ?
                ORDER BY theme_name, theme_rank""", (int(snapshot_id),)
         ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def save_next_day_candidates(snapshot_id: int, candidate_date: str = "",
+                             db_path: Path = DB_PATH) -> int:
+    """스냅샷에서 다음 거래일 관찰 후보를 추출해 저장한다.
+
+    현재 단계는 예측모델이 아니라 재현 가능한 규칙 점수다. 상한가 잠김을
+    최우선으로 두고, 등락률과 테마 대장 여부를 보조점수로 반영한다.
+    """
+    initialize(db_path)
+    day = str(candidate_date or datetime.now().astimezone().date())
+    with closing(connect(db_path)) as connection, connection:
+        quotes = [dict(row) for row in connection.execute(
+            """SELECT stock_code, stock_name, price, change_rate, volume,
+                      upper_price
+                 FROM condition_snapshot_quotes WHERE snapshot_id=?""",
+            (int(snapshot_id),)).fetchall()]
+        if not quotes:
+            return 0
+        members = [dict(row) for row in connection.execute(
+            """SELECT theme_name, theme_rank, stock_code
+                 FROM condition_theme_members WHERE snapshot_id=?
+                 ORDER BY theme_rank""", (int(snapshot_id),)).fetchall()]
+        theme_by_code: dict[str, str] = {}
+        rank_by_code: dict[str, int] = {}
+        for row in members:
+            code = str(row["stock_code"])
+            rank = int(row["theme_rank"] or 99)
+            if code not in rank_by_code or rank < rank_by_code[code]:
+                rank_by_code[code] = rank
+                theme_by_code[code] = str(row["theme_name"] or "")
+        scored = []
+        for quote in quotes:
+            price = int(quote["price"] or 0)
+            upper = int(quote["upper_price"] or 0)
+            rate = float(quote["change_rate"] or 0)
+            locked = bool(upper and price >= upper)
+            if not locked and rate < 15.0:
+                continue
+            score = (60.0 if locked else 0.0)
+            score += min(25.0, max(0.0, rate) * 0.85)
+            if rank_by_code.get(str(quote["stock_code"]), 99) == 1:
+                score += 10.0
+            if int(quote["volume"] or 0) > 0:
+                score += 5.0
+            reason = []
+            if locked:
+                reason.append("점상/상한가 잠김")
+            else:
+                reason.append(f"강한 등락률 {rate:+.1f}%")
+            if rank_by_code.get(str(quote["stock_code"]), 99) == 1:
+                reason.append("테마 대장")
+            scored.append((score, quote, theme_by_code.get(str(quote["stock_code"]), ""),
+                           locked, " · ".join(reason)))
+        scored.sort(key=lambda item: (-item[0], -float(item[1]["change_rate"] or 0),
+                                      str(item[1]["stock_code"])))
+        connection.execute(
+            "DELETE FROM next_day_candidates WHERE candidate_date=? AND snapshot_id=?",
+            (day, int(snapshot_id)))
+        rows = []
+        for rank, (score, quote, theme, locked, reason) in enumerate(scored, 1):
+            rows.append((day, int(snapshot_id), quote["stock_code"],
+                         quote["stock_name"], round(score, 2), rank, int(locked),
+                         float(quote["change_rate"] or 0), int(quote["volume"] or 0),
+                         theme, reason))
+        connection.executemany(
+            """INSERT INTO next_day_candidates(
+                   candidate_date, snapshot_id, stock_code, stock_name, score,
+                   rank, locked_limit, change_rate, volume, theme_name, reason_text)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", rows)
+        return len(rows)
+
+
+def next_day_candidate_rows(candidate_date: str = "", limit: int = 100,
+                            db_path: Path = DB_PATH) -> list[dict]:
+    if not db_path.exists():
+        return []
+    day = str(candidate_date or datetime.now().astimezone().date())
+    with closing(connect(db_path)) as connection:
+        rows = connection.execute(
+            """SELECT * FROM next_day_candidates
+               WHERE candidate_date=? ORDER BY rank LIMIT ?""",
+            (day, max(1, int(limit)))).fetchall()
     return [dict(row) for row in rows]
 
 

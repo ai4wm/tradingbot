@@ -55,6 +55,7 @@ from analysis_db import (
     save_condition_theme_stats, active_theme_labels,
     recent_condition_snapshots, condition_theme_stats,
     save_condition_theme_members, condition_theme_members,
+    save_next_day_candidates, next_day_candidate_rows,
 )
 from api import RestClient
 from classification_api import ClassificationClient
@@ -1647,6 +1648,9 @@ class App:
                     save_condition_snapshot_quotes(batch_id, combined_quotes)
                     save_condition_theme_stats(batch_id, batch_rows)
                     save_condition_theme_members(batch_id, batch_members)
+                    candidate_count = save_next_day_candidates(batch_id)
+                    log.info("next-day candidates saved: snapshot=%d count=%d",
+                             batch_id, candidate_count)
                 log.info("background condition batch saved: slot=%s codes=%d "
                          "sources=%d", slot, len(combined_codes), len(captured_names))
         finally:
@@ -2590,6 +2594,7 @@ class AnalysisWindow(QMainWindow):
         ("시장 현황", "시장 요약과 주요 지표를 표시합니다."),
         ("테마", "테마 강도와 종목 확산 흐름을 분석합니다."),
         ("시장테마 브리핑", "조건검색 통합 스냅샷의 테마 확산과 대장을 표시합니다."),
+        ("다음날 후보", "전일 강세·점상 종목을 다음 거래일 관찰 후보로 정리합니다."),
         ("순환매", "테마 순환과 대장주·후발 후보를 분석합니다."),
         ("수급", "투자자별 수급과 거래대금 흐름을 분석합니다."),
         ("공시", "OpenDART 공시와 종목 움직임을 연결합니다."),
@@ -2694,6 +2699,8 @@ class AnalysisWindow(QMainWindow):
                 self._build_theme_page(layout)
             elif title == "시장테마 브리핑":
                 self._build_market_theme_brief_page(layout)
+            elif title == "다음날 후보":
+                self._build_next_day_candidate_page(layout)
             elif title == "순환매":
                 self._build_rotation_page(layout)
             elif title == "수급":
@@ -2907,6 +2914,8 @@ class AnalysisWindow(QMainWindow):
             self._refresh_theme_table()
         elif title == "시장테마 브리핑":
             self._refresh_market_theme_brief()
+        elif title == "다음날 후보":
+            self._refresh_next_day_candidates()
         elif title == "순환매":
             self._refresh_rotation_analysis()
         elif title == "수급":
@@ -4716,6 +4725,65 @@ class AnalysisWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"네이버 테마 열기: {item.text()} (no={source_code})", 5000)
             QDesktopServices.openUrl(url)
+
+    def _build_next_day_candidate_page(self, layout: QVBoxLayout):
+        controls = QHBoxLayout()
+        refresh = QPushButton("최신 후보 조회")
+        refresh.clicked.connect(self._refresh_next_day_candidates)
+        controls.addWidget(refresh)
+        self._next_day_candidate_status = QLabel("저장된 후보 없음")
+        controls.addWidget(self._next_day_candidate_status, 1)
+        layout.addLayout(controls)
+        notice = QLabel(
+            "규칙 점수: 점상/상한가 잠김을 최우선으로 하고 등락률·테마 대장 여부를 반영합니다. "
+            "예측 확정값이 아니라 다음 거래일 검증용 후보입니다.")
+        notice.setWordWrap(True)
+        notice.setStyleSheet("QLabel { color: #d9b36c; padding: 2px 4px; }")
+        layout.addWidget(notice)
+        columns = ("순위", "종목명", "코드", "후보점수", "등락률", "테마",
+                   "상태", "판단 근거")
+        table = QTableWidget(0, len(columns))
+        table.setHorizontalHeaderLabels(columns)
+        table.setSortingEnabled(True)
+        table.setAlternatingRowColors(True)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setStretchLastSection(True)
+        self._next_day_candidate_table = table
+        layout.addWidget(table, 1)
+
+    def _refresh_next_day_candidates(self):
+        if not hasattr(self, "_next_day_candidate_table"):
+            return
+        rows = next_day_candidate_rows(limit=100)
+        table = self._next_day_candidate_table
+        table.setSortingEnabled(False)
+        table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            values = (int(row["rank"] or 0), row["stock_name"] or "-",
+                      row["stock_code"], float(row["score"] or 0),
+                      float(row["change_rate"] or 0), row["theme_name"] or "-",
+                      "점상/상한" if row["locked_limit"] else "강세",
+                      row["reason_text"] or "-")
+            for column, value in enumerate(values):
+                if column in (0,):
+                    item = NumericTableWidgetItem(f"{value:,}", int(value))
+                elif column in (3, 4):
+                    item = NumericTableWidgetItem(
+                        f"{value:+.2f}%" if column == 4 else f"{value:.1f}",
+                        float(value))
+                else:
+                    item = QTableWidgetItem(str(value))
+                if column == 6 and row["locked_limit"]:
+                    item.setForeground(QColor("#ff6b6b"))
+                    item.setFont(QFont(item.font().family(), item.font().pointSize(),
+                                       QFont.Weight.Bold))
+                table.setItem(row_index, column, item)
+        table.setSortingEnabled(True)
+        table.resizeColumnsToContents()
+        table.setColumnWidth(5, max(160, table.columnWidth(5)))
+        self._next_day_candidate_status.setText(
+            f"오늘 후보 {len(rows):,}개 · 점수는 다음 거래일 결과와 비교해 검증합니다.")
 
     def _build_rotation_page(self, layout: QVBoxLayout):
         controls = QHBoxLayout()
