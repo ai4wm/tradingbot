@@ -51,7 +51,9 @@ from analysis_db import (
     resolve_analysis_stock, realtime_watch_codes, set_realtime_watch,
     realtime_watch_rows, save_news_items, reconcile_news_search_results,
     news_rows, log_content_request, news_request_count_today,
-    save_condition_snapshot,
+    save_condition_snapshot, save_condition_snapshot_quotes,
+    save_condition_theme_stats, active_theme_labels,
+    recent_condition_snapshots,
 )
 from api import RestClient
 from classification_api import ClassificationClient
@@ -1407,6 +1409,52 @@ class App:
         codes = await self.ws.request_condition_once(key)
         snapshot_id = save_condition_snapshot(
             key, condition_name, codes, market=market, truncated=len(codes) >= 100)
+        quote_rows = []
+        theme_stats = []
+        try:
+            quote_rows = await self.rest.watch_info(codes)
+            save_condition_snapshot_quotes(snapshot_id, quote_rows)
+            labels = active_theme_labels()
+            quote_by_code = {
+                str(row.get("code") or "").removeprefix("A"): row
+                for row in quote_rows
+            }
+            theme_codes: dict[str, list[str]] = {}
+            for code in codes:
+                for theme in labels.get(code, ()):
+                    theme_codes.setdefault(theme, []).append(code)
+            stats = []
+            for theme, members in theme_codes.items():
+                rows = [quote_by_code.get(code, {}) for code in members]
+                rates = [float(row.get("rate") or 0) for row in rows]
+                leaders = sorted(
+                    zip(members, rows),
+                    key=lambda item: (float(item[1].get("rate") or 0), item[0]),
+                    reverse=True,
+                )
+                leader_code, leader = leaders[0]
+                upper_count = sum(
+                    int(row.get("upper") or 0) > 0
+                    and int(row.get("price") or 0) >= int(row.get("upper") or 0)
+                    for row in rows
+                )
+                stats.append({
+                    "theme_name": theme,
+                    "member_count": len(members),
+                    "upper_count": upper_count,
+                    "average_rate": sum(rates) / len(rates) if rates else 0,
+                    "top_rate": max(rates) if rates else 0,
+                    "leader_stock_code": leader_code,
+                    "leader_stock_name": str(leader.get("name") or ""),
+                })
+            theme_stats = stats
+            save_condition_theme_stats(snapshot_id, stats)
+            log.info("condition theme stats saved: snapshot=%d themes=%d quotes=%d",
+                     snapshot_id, len(stats), len(quote_rows))
+        except Exception as error:  # noqa: BLE001
+            # 조건검색 결과 자체는 보존하고, 시세/테마 보강 실패만 경고한다.
+            log.warning("condition snapshot enrichment failed: snapshot=%d error=%s",
+                        snapshot_id, error)
         result = {
             "snapshot_id": snapshot_id,
             "condition_seq": key,
@@ -1414,6 +1462,9 @@ class App:
             "market": market,
             "codes": codes,
             "stock_count": len(codes),
+            "quote_count": len(quote_rows),
+            "quotes": quote_rows,
+            "theme_stats": theme_stats,
             "truncated": len(codes) >= 100,
         }
         log.info("background condition snapshot: seq=%s name=%s market=%s "
@@ -1502,12 +1553,14 @@ class App:
         combined_seen = set()
         captured_names = []
         combined_truncated = False
+        combined_quotes = []
         try:
             for seq, name in targets:
                 try:
                     result = await self.collect_condition_snapshot(seq, name, "KRX")
                     combined_truncated = combined_truncated or result["truncated"]
                     captured_names.append(name)
+                    combined_quotes.extend(result.get("quotes", ()))
                     for code in result["codes"]:
                         if code not in combined_seen:
                             combined_seen.add(code)
@@ -1524,6 +1577,43 @@ class App:
                 save_condition_snapshot(
                     batch_seq, batch_name, combined_codes, market="KRX",
                     truncated=combined_truncated)
+                batch_quote_by_code = {
+                    str(row.get("code") or "").removeprefix("A"): row
+                    for row in combined_quotes
+                }
+                batch_theme_codes: dict[str, list[str]] = {}
+                labels = active_theme_labels()
+                for code in combined_codes:
+                    for theme in labels.get(code, ()):
+                        batch_theme_codes.setdefault(theme, []).append(code)
+                batch_rows = []
+                for theme, members in batch_theme_codes.items():
+                    rows = [batch_quote_by_code.get(code, {}) for code in members]
+                    rates = [float(row.get("rate") or 0) for row in rows]
+                    leaders = sorted(
+                        zip(members, rows),
+                        key=lambda item: (float(item[1].get("rate") or 0), item[0]),
+                        reverse=True,
+                    )
+                    leader_code, leader = leaders[0]
+                    batch_rows.append({
+                        "theme_name": theme,
+                        "member_count": len(members),
+                        "upper_count": sum(
+                            int(row.get("upper") or 0) > 0
+                            and int(row.get("price") or 0) >= int(row.get("upper") or 0)
+                            for row in rows),
+                        "average_rate": sum(rates) / len(rates) if rates else 0,
+                        "top_rate": max(rates) if rates else 0,
+                        "leader_stock_code": leader_code,
+                        "leader_stock_name": str(leader.get("name") or ""),
+                    })
+                # 통합 스냅샷은 방금 삽입된 마지막 배치 행을 찾아 연결한다.
+                batch_rows_saved = recent_condition_snapshots(batch_seq, limit=1)
+                if batch_rows_saved:
+                    batch_id = batch_rows_saved[0]["snapshot_id"]
+                    save_condition_snapshot_quotes(batch_id, combined_quotes)
+                    save_condition_theme_stats(batch_id, batch_rows)
                 log.info("background condition batch saved: slot=%s codes=%d "
                          "sources=%d", slot, len(combined_codes), len(captured_names))
         finally:

@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "market_analysis.db"
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 ANALYSIS_STOCK_TYPES = (
     "COMMON", "PREFERRED", "SPAC", "FOREIGN", "REIT", "INFRA",
 )
@@ -547,6 +547,33 @@ CREATE TABLE IF NOT EXISTS condition_snapshot_members (
         ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS condition_snapshot_quotes (
+    snapshot_id INTEGER NOT NULL,
+    stock_code TEXT NOT NULL,
+    stock_name TEXT NOT NULL DEFAULT '',
+    price INTEGER NOT NULL DEFAULT 0,
+    change_rate REAL NOT NULL DEFAULT 0,
+    volume INTEGER NOT NULL DEFAULT 0,
+    upper_price INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (snapshot_id, stock_code),
+    FOREIGN KEY (snapshot_id) REFERENCES condition_snapshot_runs(snapshot_id)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS condition_theme_stats (
+    snapshot_id INTEGER NOT NULL,
+    theme_name TEXT NOT NULL,
+    member_count INTEGER NOT NULL DEFAULT 0,
+    upper_count INTEGER NOT NULL DEFAULT 0,
+    average_rate REAL NOT NULL DEFAULT 0,
+    top_rate REAL NOT NULL DEFAULT 0,
+    leader_stock_code TEXT,
+    leader_stock_name TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (snapshot_id, theme_name),
+    FOREIGN KEY (snapshot_id) REFERENCES condition_snapshot_runs(snapshot_id)
+        ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_daily_prices_code_date
     ON daily_prices(stock_code, trade_date);
 CREATE INDEX IF NOT EXISTS idx_limit_up_events_date
@@ -561,6 +588,8 @@ CREATE INDEX IF NOT EXISTS idx_condition_snapshots_seq_time
     ON condition_snapshot_runs(condition_seq, captured_at DESC);
 CREATE INDEX IF NOT EXISTS idx_condition_snapshot_members_code
     ON condition_snapshot_members(stock_code, snapshot_id);
+CREATE INDEX IF NOT EXISTS idx_condition_theme_stats_snapshot
+    ON condition_theme_stats(snapshot_id, top_rate DESC);
 CREATE INDEX IF NOT EXISTS idx_theme_daily_stats_source_date
     ON theme_daily_stats(source, trade_date);
 CREATE INDEX IF NOT EXISTS idx_rotation_signals_source_date_score
@@ -719,6 +748,68 @@ def recent_condition_snapshots(condition_seq: str | None = None, limit: int = 20
                 FROM condition_snapshot_runs{where}
                 ORDER BY captured_at DESC, snapshot_id DESC LIMIT ?""",
             params,
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def save_condition_snapshot_quotes(snapshot_id: int, quotes: list[dict],
+                                   db_path: Path = DB_PATH) -> int:
+    """조건검색 스냅샷 시점의 간단한 시세 요약을 저장한다."""
+    rows = []
+    for quote in quotes:
+        code = str(quote.get("code") or "").strip().upper().lstrip("A")
+        if not code:
+            continue
+        rows.append((
+            int(snapshot_id), code, str(quote.get("name") or ""),
+            int(quote.get("price") or 0), float(quote.get("rate") or 0),
+            int(quote.get("vol") or 0), int(quote.get("upper") or 0),
+        ))
+    with closing(connect(db_path)) as connection:
+        with connection:
+            connection.executemany(
+                """INSERT OR REPLACE INTO condition_snapshot_quotes(
+                       snapshot_id, stock_code, stock_name, price, change_rate,
+                       volume, upper_price)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""", rows)
+    return len(rows)
+
+
+def save_condition_theme_stats(snapshot_id: int, stats: list[dict],
+                               db_path: Path = DB_PATH) -> int:
+    """스냅샷 종목과 현재 테마 연결표를 테마별 집계로 저장한다."""
+    rows = []
+    for item in stats:
+        theme = str(item.get("theme_name") or "").strip()
+        if not theme:
+            continue
+        rows.append((
+            int(snapshot_id), theme, int(item.get("member_count") or 0),
+            int(item.get("upper_count") or 0), float(item.get("average_rate") or 0),
+            float(item.get("top_rate") or 0),
+            str(item.get("leader_stock_code") or ""),
+            str(item.get("leader_stock_name") or ""),
+        ))
+    with closing(connect(db_path)) as connection:
+        with connection:
+            connection.executemany(
+                """INSERT OR REPLACE INTO condition_theme_stats(
+                       snapshot_id, theme_name, member_count, upper_count,
+                       average_rate, top_rate, leader_stock_code, leader_stock_name)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", rows)
+    return len(rows)
+
+
+def condition_theme_stats(snapshot_id: int, db_path: Path = DB_PATH) -> list[dict]:
+    """저장된 조건검색 스냅샷의 테마 집계를 반환한다."""
+    with closing(connect(db_path)) as connection:
+        rows = connection.execute(
+            """SELECT theme_name, member_count, upper_count, average_rate,
+                      top_rate, leader_stock_code, leader_stock_name
+               FROM condition_theme_stats
+               WHERE snapshot_id = ?
+               ORDER BY upper_count DESC, top_rate DESC, member_count DESC""",
+            (int(snapshot_id),),
         ).fetchall()
     return [dict(row) for row in rows]
 
