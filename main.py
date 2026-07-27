@@ -4740,8 +4740,8 @@ class AnalysisWindow(QMainWindow):
         notice.setWordWrap(True)
         notice.setStyleSheet("QLabel { color: #d9b36c; padding: 2px 4px; }")
         layout.addWidget(notice)
-        columns = ("순위", "종목명", "코드", "후보점수", "등락률", "테마",
-                   "상태", "판단 근거")
+        columns = ("순위", "종목명", "코드", "후보점수", "등락률",
+                   "잔량/거래량", "진입시간", "테마", "상태", "판단 근거")
         table = QTableWidget(0, len(columns))
         table.setHorizontalHeaderLabels(columns)
         table.setSortingEnabled(True)
@@ -4762,26 +4762,27 @@ class AnalysisWindow(QMainWindow):
         for row_index, row in enumerate(rows):
             values = (int(row["rank"] or 0), row["stock_name"] or "-",
                       row["stock_code"], float(row["score"] or 0),
-                      float(row["change_rate"] or 0), row["theme_name"] or "-",
-                      "점상/상한" if row["locked_limit"] else "강세",
+                      float(row["change_rate"] or 0), float(row["queue_ratio"] or 0),
+                      row["entry_time"] or "-", row["theme_name"] or "-",
+                      "점상" if row.get("point_up") else ("상한가" if row["locked_limit"] else "강세"),
                       row["reason_text"] or "-")
             for column, value in enumerate(values):
                 if column in (0,):
                     item = NumericTableWidgetItem(f"{value:,}", int(value))
-                elif column in (3, 4):
+                elif column in (3, 4, 5):
                     item = NumericTableWidgetItem(
-                        f"{value:+.2f}%" if column == 4 else f"{value:.1f}",
+                        f"{value:+.2f}%" if column == 4 else f"{value:.2f}",
                         float(value))
                 else:
                     item = QTableWidgetItem(str(value))
-                if column == 6 and row["locked_limit"]:
+                if column == 8 and row["locked_limit"]:
                     item.setForeground(QColor("#ff6b6b"))
                     item.setFont(QFont(item.font().family(), item.font().pointSize(),
                                        QFont.Weight.Bold))
                 table.setItem(row_index, column, item)
         table.setSortingEnabled(True)
         table.resizeColumnsToContents()
-        table.setColumnWidth(5, max(160, table.columnWidth(5)))
+        table.setColumnWidth(7, max(160, table.columnWidth(7)))
         self._next_day_candidate_status.setText(
             f"오늘 후보 {len(rows):,}개 · 점수는 다음 거래일 결과와 비교해 검증합니다.")
 

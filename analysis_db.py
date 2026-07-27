@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "market_analysis.db"
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 ANALYSIS_STOCK_TYPES = (
     "COMMON", "PREFERRED", "SPAC", "FOREIGN", "REIT", "INFRA",
 )
@@ -554,6 +554,9 @@ CREATE TABLE IF NOT EXISTS condition_snapshot_quotes (
     price INTEGER NOT NULL DEFAULT 0,
     change_rate REAL NOT NULL DEFAULT 0,
     volume INTEGER NOT NULL DEFAULT 0,
+    buy_queue INTEGER NOT NULL DEFAULT 0,
+    open_price INTEGER NOT NULL DEFAULT 0,
+    low_price INTEGER NOT NULL DEFAULT 0,
     upper_price INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (snapshot_id, stock_code),
     FOREIGN KEY (snapshot_id) REFERENCES condition_snapshot_runs(snapshot_id)
@@ -594,8 +597,12 @@ CREATE TABLE IF NOT EXISTS next_day_candidates (
     score REAL NOT NULL DEFAULT 0,
     rank INTEGER NOT NULL DEFAULT 0,
     locked_limit INTEGER NOT NULL DEFAULT 0,
+    point_up INTEGER NOT NULL DEFAULT 0,
     change_rate REAL NOT NULL DEFAULT 0,
     volume INTEGER NOT NULL DEFAULT 0,
+    buy_queue INTEGER NOT NULL DEFAULT 0,
+    queue_ratio REAL NOT NULL DEFAULT 0,
+    entry_time TEXT NOT NULL DEFAULT '',
     theme_name TEXT NOT NULL DEFAULT '',
     reason_text TEXT NOT NULL DEFAULT '',
     outcome TEXT NOT NULL DEFAULT '',
@@ -670,6 +677,31 @@ def initialize(db_path: Path = DB_PATH) -> Path:
     with closing(connect(db_path)) as connection:
         with connection:
             connection.executescript(SCHEMA)
+            candidate_columns = {
+                row[1] for row in connection.execute(
+                    "PRAGMA table_info(next_day_candidates)").fetchall()
+            }
+            for column, definition in (
+                    ("buy_queue", "INTEGER NOT NULL DEFAULT 0"),
+                    ("queue_ratio", "REAL NOT NULL DEFAULT 0"),
+                    ("point_up", "INTEGER NOT NULL DEFAULT 0"),
+                    ("entry_time", "TEXT NOT NULL DEFAULT ''")):
+                if column not in candidate_columns:
+                    connection.execute(
+                        f"ALTER TABLE next_day_candidates ADD COLUMN {column} {definition}")
+            quote_columns = {
+                row[1] for row in connection.execute(
+                    "PRAGMA table_info(condition_snapshot_quotes)").fetchall()
+            }
+            if "buy_queue" not in quote_columns:
+                connection.execute(
+                    "ALTER TABLE condition_snapshot_quotes ADD COLUMN "
+                    "buy_queue INTEGER NOT NULL DEFAULT 0")
+            for column, definition in (("open_price", "INTEGER NOT NULL DEFAULT 0"),
+                                       ("low_price", "INTEGER NOT NULL DEFAULT 0")):
+                if column not in quote_columns:
+                    connection.execute(
+                        f"ALTER TABLE condition_snapshot_quotes ADD COLUMN {column} {definition}")
             row = connection.execute(
                 "SELECT version FROM schema_info ORDER BY rowid DESC LIMIT 1"
             ).fetchone()
@@ -796,15 +828,17 @@ def save_condition_snapshot_quotes(snapshot_id: int, quotes: list[dict],
         rows.append((
             int(snapshot_id), code, str(quote.get("name") or ""),
             int(quote.get("price") or 0), float(quote.get("rate") or 0),
-            int(quote.get("vol") or 0), int(quote.get("upper") or 0),
+            int(quote.get("vol") or 0), int(quote.get("bid_qty") or 0),
+            int(quote.get("open") or 0), int(quote.get("low") or 0),
+            int(quote.get("upper") or 0),
         ))
     with closing(connect(db_path)) as connection:
         with connection:
             connection.executemany(
                 """INSERT OR REPLACE INTO condition_snapshot_quotes(
                        snapshot_id, stock_code, stock_name, price, change_rate,
-                       volume, upper_price)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""", rows)
+                       volume, buy_queue, open_price, low_price, upper_price)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", rows)
     return len(rows)
 
 
@@ -893,7 +927,7 @@ def save_next_day_candidates(snapshot_id: int, candidate_date: str = "",
     with closing(connect(db_path)) as connection, connection:
         quotes = [dict(row) for row in connection.execute(
             """SELECT stock_code, stock_name, price, change_rate, volume,
-                      upper_price
+                      upper_price, open_price, low_price
                  FROM condition_snapshot_quotes WHERE snapshot_id=?""",
             (int(snapshot_id),)).fetchall()]
         if not quotes:
@@ -910,45 +944,63 @@ def save_next_day_candidates(snapshot_id: int, candidate_date: str = "",
             if code not in rank_by_code or rank < rank_by_code[code]:
                 rank_by_code[code] = rank
                 theme_by_code[code] = str(row["theme_name"] or "")
+        entry_rows = connection.execute(
+            """SELECT stock_code, last_entry_time FROM limit_up_events
+               WHERE trade_date=?""", (day.replace('-', ''),)).fetchall()
+        entry_by_code = {str(row["stock_code"]): str(row["last_entry_time"] or "")
+                         for row in entry_rows}
         scored = []
         for quote in quotes:
             price = int(quote["price"] or 0)
             upper = int(quote["upper_price"] or 0)
             rate = float(quote["change_rate"] or 0)
+            volume = int(quote["volume"] or 0)
+            buy_queue = int(quote.get("buy_queue") or 0)
             locked = bool(upper and price >= upper)
+            point_up = bool(locked and int(quote["open_price"] or 0) == upper
+                            and int(quote["low_price"] or 0) == upper)
             if not locked and rate < 15.0:
                 continue
-            score = (60.0 if locked else 0.0)
+            score = (70.0 if point_up else 50.0 if locked else 0.0)
+            queue_ratio = buy_queue / max(volume, 1)
             score += min(25.0, max(0.0, rate) * 0.85)
+            score += min(30.0, queue_ratio * 2.0)
             if rank_by_code.get(str(quote["stock_code"]), 99) == 1:
                 score += 10.0
-            if int(quote["volume"] or 0) > 0:
+            if volume > 0:
                 score += 5.0
             reason = []
-            if locked:
-                reason.append("점상/상한가 잠김")
+            if point_up:
+                reason.append("점상")
+            elif locked:
+                reason.append("상한가 잠김")
             else:
                 reason.append(f"강한 등락률 {rate:+.1f}%")
             if rank_by_code.get(str(quote["stock_code"]), 99) == 1:
                 reason.append("테마 대장")
             scored.append((score, quote, theme_by_code.get(str(quote["stock_code"]), ""),
-                           locked, " · ".join(reason)))
-        scored.sort(key=lambda item: (-item[0], -float(item[1]["change_rate"] or 0),
+                           locked, point_up, queue_ratio, entry_by_code.get(str(quote["stock_code"]), ""),
+                           " · ".join(reason)))
+        scored.sort(key=lambda item: (-int(item[4]), -int(item[3]), -float(item[5]),
+                                      item[6] or "99:99:99", -item[0],
                                       str(item[1]["stock_code"])))
         connection.execute(
             "DELETE FROM next_day_candidates WHERE candidate_date=? AND snapshot_id=?",
             (day, int(snapshot_id)))
         rows = []
-        for rank, (score, quote, theme, locked, reason) in enumerate(scored, 1):
+        for rank, (score, quote, theme, locked, point_up, queue_ratio, entry_time, reason) in enumerate(scored, 1):
             rows.append((day, int(snapshot_id), quote["stock_code"],
                          quote["stock_name"], round(score, 2), rank, int(locked),
-                         float(quote["change_rate"] or 0), int(quote["volume"] or 0),
-                         theme, reason))
+                         int(point_up), float(quote["change_rate"] or 0),
+                         int(quote["volume"] or 0), int(quote.get("buy_queue") or 0),
+                         round(queue_ratio, 4),
+                         entry_time, theme, reason))
         connection.executemany(
             """INSERT INTO next_day_candidates(
                    candidate_date, snapshot_id, stock_code, stock_name, score,
-                   rank, locked_limit, change_rate, volume, theme_name, reason_text)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", rows)
+                   rank, locked_limit, point_up, change_rate, volume, buy_queue, queue_ratio,
+                   entry_time, theme_name, reason_text)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", rows)
         return len(rows)
 
 
