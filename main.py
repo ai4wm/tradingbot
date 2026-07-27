@@ -473,6 +473,12 @@ class View:
         if seq in RANK_SEQS:  # 기준시간 콤보 내용을 서브모드에 맞게 교체 (계열 간 직접 전환 포함)
             self.screen.set_rank_period(RANK_SUBMODE[seq])
         self.seq = str(seq)
+        # 본창에서 선택한 일반 조건식은 창을 닫거나 다른 화면을 보더라도
+        # 백그라운드 수집 대상으로 기억한다. 순위/보유종목 메뉴는 제외한다.
+        if (self.app.views and self is self.app.views[0]
+                and self.seq not in RANK_SEQS and self.seq != HOLDINGS_SEQ):
+            self._settings.setValue("background_condition_seq", self.seq)
+            self._settings.sync()
         if switched:  # 재조회/간격도 모드별 저장 -> 새 모드 값 로드 (시그널이 타이머까지 정리)
             self.screen.refresh_interval.setValue(
                 int(self._settings.value(self._mkey("refresh_interval"), 3)))
@@ -684,6 +690,16 @@ class App:
         self._condition_relation_timer.setSingleShot(True)
         self._condition_relation_timer.timeout.connect(
             self._run_condition_relation_collection)
+        # 화면과 분리된 조건검색 일반조회 예약. 기본은 현재 본창의 일반
+        # 조건식 1개를 사용하고, QSettings에 seq를 콤마로 지정하면 그 목록을
+        # 순차 조회한다. 결과는 DB 스냅샷으로만 저장한다.
+        self._background_condition_task = None
+        self._background_condition_slots: set[tuple[str, str]] = set()
+        self._background_condition_timer = QTimer()
+        self._background_condition_timer.setInterval(30000)
+        self._background_condition_timer.timeout.connect(
+            self._run_background_condition_schedule)
+        self._background_condition_timer.start()
         self._orderable_prefetch_timer = QTimer()
         self._orderable_prefetch_timer.timeout.connect(
             self._queue_orderable_prefetch)
@@ -762,6 +778,7 @@ class App:
         self._auto_intraday_timer.timeout.connect(self._auto_intraday_collection)
         self._auto_intraday_timer.start(60000)
         QTimer.singleShot(10000, lambda: self._auto_intraday_collection(True))
+        QTimer.singleShot(5000, self._run_background_condition_schedule)
         # 공인 IP 감시: 바뀌면 키움 화이트리스트에서 벗어나 API 차단 -> 상단바 경보
         self._public_ip = None
         self._ip_task = None
@@ -1399,6 +1416,85 @@ class App:
                  key, condition_name, market, len(codes), result["truncated"],
                  time.monotonic() - started)
         return result
+
+    def _background_condition_targets(self) -> list[tuple[str, str]]:
+        """예약 수집 대상 조건식을 반환한다.
+
+        ``background_condition_seqs``가 비어 있으면 현재 열려 있는 일반
+        조건검색을 사용한다. 순위/보유종목 메뉴는 조건식 스냅샷 대상에서
+        제외한다.
+        """
+        raw = str(self._settings.value("background_condition_seqs", "") or "")
+        configured = [item.strip() for item in raw.split(",") if item.strip()]
+        names = {str(seq): str(name) for seq, name in self._cond_items}
+        remembered = str(
+            self._settings.value("background_condition_seq", "")
+            or self._settings.value("last_condition", "")
+            or ""
+        ).strip()
+        if not configured and remembered:
+            configured = [remembered]
+        if configured:
+            return [(seq, names.get(seq, seq)) for seq in dict.fromkeys(configured)]
+        # 기본은 첫 번째 본창의 현재 조건식 하나만 사용한다. 추가 창까지
+        # 자동으로 합치면 사용자가 의도하지 않은 조건식이 함께 수집될 수
+        # 있으므로, 여러 조건식은 설정값으로 명시한 경우에만 허용한다.
+        view = self.views[0] if self.views else None
+        seq = str(view.seq or "") if view else ""
+        if not seq or seq in RANK_SEQS or seq == HOLDINGS_SEQ:
+            return []
+        return [(seq, names.get(seq, seq))]
+
+    @staticmethod
+    def _background_condition_slot(now: datetime) -> str:
+        """현재 시각이 예약 조회 구간이면 슬롯명을, 아니면 빈 값을 반환한다."""
+        if _krx_holiday_reason(now.date()):
+            return ""
+        minute = now.hour * 60 + now.minute
+        # 30초 타이머가 한 번 놓쳐도 2분 창 안에서 한 번만 실행한다.
+        for label, target in (("0930", 9 * 60 + 30),
+                              ("1100", 11 * 60),
+                              ("1520", 15 * 60 + 20)):
+            if target <= minute <= target + 1:
+                return label
+        return ""
+
+    def _run_background_condition_schedule(self):
+        """예약 시각에 일반 조건검색을 한 번씩 백그라운드 수집한다."""
+        if self._background_condition_task and not self._background_condition_task.done():
+            return
+        now = datetime.now()
+        slot = self._background_condition_slot(now)
+        if not slot:
+            return
+        day_key = now.strftime("%Y%m%d")
+        marker = (day_key, slot)
+        if marker in self._background_condition_slots:
+            return
+        targets = self._background_condition_targets()
+        if not targets:
+            log.info("background condition snapshot skipped: no target condition")
+            self._background_condition_slots.add(marker)
+            return
+        self._background_condition_slots.add(marker)
+        self._background_condition_task = asyncio.ensure_future(
+            self._collect_background_condition_targets(targets, slot))
+
+    async def _collect_background_condition_targets(
+            self, targets: list[tuple[str, str]], slot: str):
+        started = time.monotonic()
+        try:
+            for seq, name in targets:
+                try:
+                    await self.collect_condition_snapshot(seq, name, "KRX")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:  # noqa: BLE001
+                    log.warning("background condition snapshot failed: seq=%s error=%s",
+                                seq, error)
+        finally:
+            log.info("background condition slot finished: slot=%s targets=%d elapsed=%.2fs",
+                     slot, len(targets), time.monotonic() - started)
 
     # --- 웹소켓 콜백 라우팅 -------------------------------------------------
     def _on_condition_list(self, items):
