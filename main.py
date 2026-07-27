@@ -2650,6 +2650,7 @@ class AnalysisWindow(QMainWindow):
         ("테마", "테마 강도와 종목 확산 흐름을 분석합니다."),
         ("시장테마 브리핑", "조건검색 통합 스냅샷의 테마 확산과 대장을 표시합니다."),
         ("다음날 후보", "전일 강세·점상 종목을 다음 거래일 관찰 후보로 정리합니다."),
+        ("점상 체결 분석", "점상 종목의 장 시작 후 거래량과 체결 집중도를 분석합니다."),
         ("순환매", "테마 순환과 대장주·후발 후보를 분석합니다."),
         ("수급", "투자자별 수급과 거래대금 흐름을 분석합니다."),
         ("공시", "OpenDART 공시와 종목 움직임을 연결합니다."),
@@ -2756,6 +2757,8 @@ class AnalysisWindow(QMainWindow):
                 self._build_market_theme_brief_page(layout)
             elif title == "다음날 후보":
                 self._build_next_day_candidate_page(layout)
+            elif title == "점상 체결 분석":
+                self._build_point_lock_analysis_page(layout)
             elif title == "순환매":
                 self._build_rotation_page(layout)
             elif title == "수급":
@@ -2971,6 +2974,8 @@ class AnalysisWindow(QMainWindow):
             self._refresh_market_theme_brief()
         elif title == "다음날 후보":
             self._refresh_next_day_candidates()
+        elif title == "점상 체결 분석":
+            self._refresh_point_lock_analysis()
         elif title == "순환매":
             self._refresh_rotation_analysis()
         elif title == "수급":
@@ -4842,6 +4847,49 @@ class AnalysisWindow(QMainWindow):
         table.setColumnWidth(7, max(160, table.columnWidth(7)))
         self._next_day_candidate_status.setText(
             f"오늘 후보 {len(rows):,}개 · 점수는 다음 거래일 결과와 비교해 검증합니다.")
+
+    def _build_point_lock_analysis_page(self, layout: QVBoxLayout):
+        self._point_lock_status = QLabel()
+        layout.addWidget(self._point_lock_status)
+        notice = QLabel(
+            "점상 체결 분석 기준: 장 시작 후 매수잔량 감소는 정상 현상으로 제외하고, "
+            "거래량·체결 집중도·대량 매도 후 상한가 유지 여부만 판단합니다.")
+        notice.setWordWrap(True)
+        notice.setStyleSheet("QLabel { color: #d9b36c; padding: 4px; }")
+        layout.addWidget(notice)
+        columns = ("순서", "관찰 항목", "판단 기준", "해석")
+        table = QTableWidget(0, len(columns))
+        table.setHorizontalHeaderLabels(columns)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setAlternatingRowColors(True)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setStretchLastSection(True)
+        self._point_lock_table = table
+        layout.addWidget(table, 1)
+        self._refresh_point_lock_analysis()
+
+    def _refresh_point_lock_analysis(self):
+        if not hasattr(self, "_point_lock_table"):
+            return
+        rows = (
+            (1, "장 시작 후 매수잔량", "감소 여부", "정상 현상이므로 판단 지표에서 제외"),
+            (2, "거래량", "평소 대비 급증 여부", "매도 압력 유입을 확인"),
+            (3, "체결 집중도", "짧은 구간 대량 체결", "상한가 이탈 위험 신호"),
+            (4, "대량 매도 후 가격", "상한가 유지 여부", "유지하면 흡수력 강함"),
+            (5, "최종 판정", "거래량 급증 + 상한가 유지", "점상 강도 우수"),
+        )
+        table = self._point_lock_table
+        table.setRowCount(len(rows))
+        for row_index, values in enumerate(rows):
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                if column == 0:
+                    item = NumericTableWidgetItem(str(value), int(value))
+                table.setItem(row_index, column, item)
+        table.resizeColumnsToContents()
+        table.setColumnWidth(2, max(260, table.columnWidth(2)))
+        self._point_lock_status.setText(
+            f"점상 체결 판단 기준 · {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 저장")
 
     def _build_rotation_page(self, layout: QVBoxLayout):
         controls = QHBoxLayout()
