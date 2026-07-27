@@ -5752,6 +5752,8 @@ class AnalysisWindow(QMainWindow):
         self._date_to.setDisplayFormat("yyyy-MM-dd")
         self._krx_btn = QPushButton("KRX 상한가 수집")
         self._krx_btn.clicked.connect(self._start_krx_collection)
+        self._krx_force = QCheckBox("강제 재수집")
+        self._krx_force.setToolTip("이미 저장된 날짜도 KRX에서 다시 받아 덮어씁니다.")
         self._kiwoom_limit_btn = QPushButton("키움 상한가 수집")
         self._kiwoom_limit_btn.clicked.connect(self._start_history_collection)
         self._market_index_btn = QPushButton("키움 시장지수 수집")
@@ -5777,6 +5779,7 @@ class AnalysisWindow(QMainWindow):
         range_row.addWidget(QLabel("~"))
         range_row.addWidget(self._date_to)
         range_row.addWidget(self._krx_btn)
+        range_row.addWidget(self._krx_force)
         range_row.addWidget(self._kiwoom_limit_btn)
         range_row.addWidget(self._market_index_btn)
         range_row.addStretch(1)
@@ -6289,15 +6292,17 @@ class AnalysisWindow(QMainWindow):
         self._date_to.setEnabled(False)
         self._collection_task = asyncio.ensure_future(
             self._collect_krx(
-                date_from.toString("yyyyMMdd"), date_to.toString("yyyyMMdd")))
+                date_from.toString("yyyyMMdd"), date_to.toString("yyyyMMdd"),
+                self._krx_force.isChecked()))
 
-    async def _collect_krx(self, date_from: str, date_to: str):
+    async def _collect_krx(self, date_from: str, date_to: str,
+                           force: bool = False):
         run_id = start_collection("KRX_DAILY_LIMIT_UP", date_from, date_to)
         processed = saved = events = errors = 0
         status, message = "COMPLETED", ""
         client = KrxClient(config.KRX_API_KEY)
         try:
-            done_dates = krx_collected_dates(date_from, date_to)
+            done_dates = set() if force else krx_collected_dates(date_from, date_to)
             start = QDate.fromString(date_from, "yyyyMMdd")
             end = QDate.fromString(date_to, "yyyyMMdd")
             dates = []
