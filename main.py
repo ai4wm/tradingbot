@@ -499,6 +499,20 @@ class View:
         if seq == HOLDINGS_SEQ:
             await self._poll_holdings()
             return
+        # 조건식 실시간 등록은 서버가 조건번호별로 하나만 유지한다. 같은 조건을
+        # 두 번째 창에서 다시 CNSRREQ하면 일부 응답이 빈 스냅샷으로 와서, seq가
+        # 같은 모든 창의 목록을 지우는 문제가 있다. 이미 등록된 조건은 현재 창의
+        # 목록을 즉시 복제하고 이후 편입/이탈 이벤트를 함께 받는다.
+        peer = next(
+            (view for view in self.app.views
+             if view is not self and view.seq == self.seq),
+            None,
+        )
+        if peer is not None and self.seq in self.app.ws._active_seqs:
+            self.on_snapshot(list(peer.screen.model.codes))
+            log.info("condition shared%s: seq=%s copied=%d", self.prefix or " ",
+                     self.seq, len(peer.screen.model.codes))
+            return
         await self.app.ws.register_condition(seq)
 
     async def stop(self):
