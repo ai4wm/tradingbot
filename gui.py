@@ -72,6 +72,8 @@ TPM_ALERT_ROLE = Qt.UserRole + 11  # 체결속도 순위 하락(-1)/정상(0)/�
 TPM_RANK_CHANGE_ROLE = Qt.UserRole + 12  # 최근 순위 이동 구간의 누적 단계 수
 ORDER_CANCEL_ROLE = Qt.UserRole + 13  # 주문 셀 오른쪽 즉시 잔량취소 영역
 THEME_LEADER_ROLE = Qt.UserRole + 14  # 테마정렬에서 각 묶음의 첫 대장 종목
+THEME_SINGLETON_ROLE = Qt.UserRole + 15  # 현재 조건검색에서 단독인 테마 종목
+THEME_COLOR_ROLE = Qt.UserRole + 16  # 테마정렬에서 종목명 셀 왼쪽 세로바 색
 
 # 단타 예측: (표시명, 과거 관찰구간(초), 최소 표본기간(초), 모멘텀 스케일(bp),
 #              선행압력/매수흐름/모멘텀/가격지속/VWAP/체결가속/체결지속 가중치, 종합 가중치)
@@ -104,11 +106,35 @@ TPM_RANK_DOWN_FLASH = QColor("#7667D9")  # 체결속도 순위 하락: 보라
 WATCH_BG = QColor("#FFD54F")  # 실시간 뉴스 감시: 연상 셀 배경
 WATCH_TEXT = QColor("#111111")
 THEME_LEADER = QColor("#F4B400")  # 테마 대장 표시: 등락률 색과 분리한 금색
+THEME_SINGLETON = QColor("#90A4AE")  # 단독 테마 표시: 대장과 구분하는 회색
+THEME_SINGLETON_BAR = QColor("#455A64")  # 단독 테마 전용 세로바: 어두운 청회색
+THEME_DIVIDER = QColor("#00C2A8")  # 테마 묶음 행 구분선: 다크 화면에서도 선명한 청록
+THEME_GROUP_COLORS = (
+    QColor("#00C2A8"), QColor("#F4B400"), QColor("#9B7BFF"),
+    QColor("#FF6E8A"), QColor("#4FC3F7"), QColor("#8BC34A"),
+)
+
+
+def _theme_group_color(group: tuple[str, str]) -> QColor | None:
+    """같은 테마는 항상 같은 색, 다음 테마는 팔레트의 다음 계열 색으로 표시한다."""
+    if not group or group[0] == "none":
+        return None
+    # Python hash는 실행마다 달라지므로 종목 순서/재시작과 무관한 문자 합산값을 쓴다.
+    value = sum((position + 1) * ord(character)
+                for position, character in enumerate(f"{group[0]}:{group[1]}"))
+    return THEME_GROUP_COLORS[value % len(THEME_GROUP_COLORS)]
 
 
 def _theme_family(theme: str) -> str:
-    """세부 테마명이 달라도 같은 AI 흐름으로 묶을 보수적 계열명."""
+    """자동 수집된 세부 테마만 보수적으로 상위 계열로 묶는다."""
     value = str(theme or "").casefold()
+    # 수동 등록한 AI·챗봇·피지컬AI는 서로 다른 수급 테마다.
+    # 이들을 하나로 합치면 피지컬AI/로봇 장세에서 일반 AI 종목이 섞인다.
+    if value in {
+        "인공지능(ai)", "ai 챗봇(챗gpt 등)",
+        "피지컬 ai/휴머노이드 로봇",
+    }:
+        return ""
     # 백신 테마의 '신종플루, AI 등'은 인공지능 계열로 오인하지 않는다.
     if "신종플루" in value:
         return ""
@@ -116,6 +142,17 @@ def _theme_family(theme: str) -> str:
             or "피지컬 ai" in value or "온디바이스 ai" in value):
         return "AI·인공지능"
     return ""
+
+
+def _theme_group_precedence(group: tuple[str, str]) -> int:
+    """같은 종목의 넓은 테마와 세부 테마가 겹칠 때 세부 테마를 우선한다."""
+    if group[0] != "theme":
+        return 1
+    if group[1] == "2차전지(장비)":
+        return 0
+    if group[1] == "2차전지":
+        return 2
+    return 1
 
 
 @dataclass(slots=True)
@@ -305,16 +342,18 @@ class NameDelegate(QStyledItemDelegate):
         style = opt.widget.style() if opt.widget else QApplication.style()
         style.drawControl(QStyle.CE_ItemViewItem, opt, painter, opt.widget)
         leader = bool(index.data(THEME_LEADER_ROLE))
+        singleton = bool(index.data(THEME_SINGLETON_ROLE))
+        theme_color = index.data(THEME_COLOR_ROLE)
         text_rect = style.subElementRect(
             QStyle.SE_ItemViewItemText, opt, opt.widget).adjusted(3, 0, -2, 0)
         painter.save()
         painter.setClipRect(option.rect)
+        if isinstance(theme_color, QColor):
+            # 테마정렬일 때만: 같은 테마는 같은 색 세로바, 다음 테마는 다른 색.
+            painter.fillRect(QRect(option.rect.left(), option.rect.top(), 4,
+                                   option.rect.height()), theme_color)
+            text_rect.adjust(5, 0, 0, 0)
         if leader:
-            # 대장이 곧 다음 테마 묶음의 시작점이므로, 행 전체를 칠하지 않고
-            # 종목명 왼쪽 금색선과 ★만으로 명확히 구분한다.
-            painter.fillRect(QRect(
-                option.rect.left(), option.rect.top(), 4, option.rect.height()),
-                THEME_LEADER)
             leader_font = QFont(opt.font)
             leader_font.setBold(True)
             painter.setFont(leader_font)
@@ -322,6 +361,12 @@ class NameDelegate(QStyledItemDelegate):
             marker_rect = QRect(
                 text_rect.left() + 3, text_rect.top(), 12, text_rect.height())
             painter.drawText(marker_rect, Qt.AlignLeft | Qt.AlignVCenter, "★")
+            text_rect.adjust(15, 0, 0, 0)
+        elif singleton:
+            painter.setPen(THEME_SINGLETON)
+            marker_rect = QRect(
+                text_rect.left() + 3, text_rect.top(), 12, text_rect.height())
+            painter.drawText(marker_rect, Qt.AlignLeft | Qt.AlignVCenter, "◇")
             text_rect.adjust(15, 0, 0, 0)
         else:
             painter.setFont(opt.font)
@@ -505,6 +550,8 @@ class TieredProxy(QSortFilterProxyModel):
         self.theme_labels: dict[str, tuple[str, ...]] = {}
         self.relation_groups: dict[str, tuple[str, ...]] = {}
         self._theme_sort_keys: dict[str, tuple] = {}
+        # 현재 테마정렬에서 실제로 선택된 묶음. 표 전체 가로 구분선에도 쓴다.
+        self._theme_group_keys: dict[str, tuple[str, str]] = {}
         self._opening_auction = _in_opening_auction()
         # 상한가진입시간 정렬 중 비상한 그룹이 유지할 마지막 일반 정렬 기준.
         self._non_limit_sort_col = FIELDS.index("rate")
@@ -540,6 +587,7 @@ class TieredProxy(QSortFilterProxyModel):
     def _refresh_theme_sort_keys(self):
         """테마 강도와 테마 안 종목 순서를 현재 조건검색 행으로 계산한다."""
         self._theme_sort_keys = {}
+        self._theme_group_keys = {}
         model = self.sourceModel()
         if model is None or not hasattr(model, "rows"):
             return
@@ -605,8 +653,14 @@ class TieredProxy(QSortFilterProxyModel):
             # 테마가 없는 종목을 보완할 때만 사용해, 계열사 때문에 다른
             # 종목의 AI/의료 등 세부 테마가 섞이지 않게 한다.
             candidates = family_candidates or theme_candidates or relation_candidates
-            group = min(candidates, key=lambda item: strengths.get(
-                item, (2, 999999, 0, 0, item[1]))) if candidates else ("none", "미분류")
+            group = min(
+                candidates,
+                key=lambda item: (
+                    _theme_group_precedence(item),
+                    strengths.get(item, (2, 999999, 0, 0, item[1])),
+                ),
+            ) if candidates else ("none", "미분류")
+            self._theme_group_keys[code] = group
             theme_strength = strengths.get(
                 group, (2, 999999, 0, 0, group[1]))
             at_limit = self._theme_at_limit(row)
@@ -621,20 +675,25 @@ class TieredProxy(QSortFilterProxyModel):
             if group[0] != "none":
                 grouped_codes.setdefault(f"{group[0]}:{group[1]}", []).append(code)
 
-        # 현재 검색 결과에 2종목 이상 모인 그룹만 '대장'을 표시한다.
-        # 단독 테마 종목은 대장이라기보다 미분류/개별 테마 종목이므로
-        # 별표를 붙이지 않는다.
+        # 2종목 이상 그룹에는 대장(★), 단독 테마에는 별도 표식(◇)을
+        # 표시해 대장 여부와 테마 경계를 함께 알린다.
         leaders = {
             min(codes, key=lambda code: self._theme_sort_keys[code])
             for codes in grouped_codes.values() if len(codes) >= 2
         }
-        if getattr(model, "theme_leaders", set()) != leaders:
+        singletons = {
+            codes[0] for codes in grouped_codes.values() if len(codes) == 1
+        }
+        if (getattr(model, "theme_leaders", set()) != leaders
+                or getattr(model, "theme_singletons", set()) != singletons):
             model.theme_leaders = leaders
+            model.theme_singletons = singletons
             if model.codes:
                 model.dataChanged.emit(
                     model.index(0, NAME_COL),
                     model.index(len(model.codes) - 1, NAME_COL),
                 )
+
 
     def sort(self, column, order=Qt.AscendingOrder):
         self._opening_auction = _in_opening_auction()
@@ -653,6 +712,22 @@ class TieredProxy(QSortFilterProxyModel):
         if orientation == Qt.Vertical and role == Qt.DisplayRole:
             return section + 1
         return super().headerData(section, orientation, role)
+
+    def data(self, index, role=Qt.DisplayRole):
+        if role == THEME_COLOR_ROLE:
+            if not self.theme_mode or not index.isValid():
+                return None
+            model = self.sourceModel()
+            source_index = self.mapToSource(index)
+            if model is None or not source_index.isValid() or not hasattr(model, "codes"):
+                return None
+            code = model.codes[source_index.row()]
+            # 단독 테마는 ◇ 표식만 사용하고 세로바는 표시하지 않는다.
+            if code in getattr(model, "theme_singletons", set()):
+                return None
+            return _theme_group_color(
+                self._theme_group_keys.get(code, ("none", "미분류")))
+        return super().data(index, role)
 
     def lessThan(self, left, right):
         if self.theme_mode:
@@ -703,6 +778,50 @@ class TieredProxy(QSortFilterProxyModel):
         return super().lessThan(left, right)
 
 
+class ThemeGroupedTableView(QTableView):
+    """테마 묶음이 바뀌는 행에 표 전체 가로 구분선을 표시한다."""
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        proxy = self.model()
+        if not isinstance(proxy, TieredProxy) or not proxy.theme_mode:
+            return
+        source = proxy.sourceModel()
+        if source is None or not hasattr(source, "codes"):
+            return
+
+        painter = QPainter(self.viewport())
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        previous_group = None
+        for row in range(proxy.rowCount()):
+            proxy_index = proxy.index(row, 0)
+            source_index = proxy.mapToSource(proxy_index)
+            if not source_index.isValid():
+                continue
+            code = source.codes[source_index.row()]
+            group = proxy._theme_group_keys.get(code, ("none", "미분류"))
+            # 첫 묶음도 헤더 바로 아래부터 표시하고, 묶음의 끝에도 선을
+            # 넣는다. 따라서 화면 전체가 '우선주' 하나여도 경계가 보인다.
+            is_start = group[0] != "none" and group != previous_group
+            next_group = ("none", "미분류")
+            if row + 1 < proxy.rowCount():
+                next_source = proxy.mapToSource(proxy.index(row + 1, 0))
+                if next_source.isValid():
+                    next_code = source.codes[next_source.row()]
+                    next_group = proxy._theme_group_keys.get(
+                        next_code, ("none", "미분류"))
+            is_end = group[0] != "none" and group != next_group
+            if is_start or is_end:
+                rect = self.visualRect(proxy_index)
+                if rect.isValid() and rect.bottom() >= 0 and rect.top() <= self.viewport().height():
+                    # 대장/단독 여부와 무관하게 표 전체에서 즉시 보이도록 고정색을 쓴다.
+                    painter.setPen(QPen(THEME_DIVIDER, 3))
+                    y = rect.top() if is_start else rect.bottom()
+                    painter.drawLine(0, y, self.viewport().width(), y)
+            previous_group = group
+        painter.end()
+
+
 class StockModel(QAbstractTableModel):
     def __init__(self):
         super().__init__()
@@ -724,6 +843,7 @@ class StockModel(QAbstractTableModel):
         self.relation_labels: dict[str, tuple[str, ...]] = {}
         self.relation_evidence: dict[str, tuple[str, ...]] = {}
         self.theme_leaders: set[str] = set()
+        self.theme_singletons: set[str] = set()
         self.new_today: set[str] = set()     # 상장 당일 (main 주입, 좌하단 마젠타)
         self.new15: set[str] = set()         # 상장 15일 이내 (좌하단 하늘)
         self.new30: set[str] = set()         # 상장 16~30일 (좌하단 청회)
@@ -1766,6 +1886,8 @@ class StockModel(QAbstractTableModel):
                     else 1 if code in self.new30 else 0)
         if role == THEME_LEADER_ROLE:
             return self.codes[index.row()] in self.theme_leaders
+        if role == THEME_SINGLETON_ROLE:
+            return self.codes[index.row()] in self.theme_singletons
         if role == Qt.ToolTipRole and field == "name":  # 모서리 삼각형 설명
             code = self.codes[index.row()]
             parts = []
@@ -1780,6 +1902,8 @@ class StockModel(QAbstractTableModel):
                 parts.append("DART 근거: " + "\n".join(evidence))
             if code in self.theme_leaders:
                 parts.append("★ 현재 테마 대장")
+            elif code in self.theme_singletons:
+                parts.append("◇ 현재 조건검색의 단독 테마 종목")
             if code in self.nxt:
                 parts.append("좌상단 노랑 = NXT 거래가능")
             if code in self.misu:
@@ -2454,7 +2578,7 @@ class ConditionScreen(QWidget):
         self.proxy = TieredProxy()
         self.proxy.setSourceModel(self.model)
         self.proxy.setSortRole(Qt.UserRole)
-        self.table = QTableView()
+        self.table = ThemeGroupedTableView()
         self.table.setModel(self.proxy)
         # 주문허용 체크 등으로 포커스가 테이블 밖으로 이동해도 청산키는
         # 활성 조건검색창 전체에서 받아야 한다. 여러 창 중 활성 창만 처리한다.
@@ -3131,11 +3255,6 @@ class ConditionScreen(QWidget):
             self.watch_toggled.emit(code, code not in self.model.watched)
         elif index.column() == ORDER_COL:
             order_status = self.model.order_status.get(code, "")
-            if (order_status in ("장종료", "오류", "수량부족", "분할부족",
-                                 "취소없음")
-                    or order_status.endswith("완료")):
-                self.model.set_order_status(code, "")
-                self.order_status_value.setText("")
             cell_rect = self.table.visualRect(index)
             cursor_x = self.table.viewport().mapFromGlobal(QCursor.pos()).x()
             cancel_area = (
@@ -3143,11 +3262,15 @@ class ConditionScreen(QWidget):
             # 취소 버튼이 실제로 그려진 주문만 취소한다. 수동취소가 기본 선택인
             # 상태에서 단순히 셀 오른쪽을 눌러도 빈 계좌 취소조회가 나가면 안 된다.
             if cancel_area and code in self.model.order_cancellable:
-                if code in self.model.order_cancellable:
-                    self.model.set_order_status(
-                        code, self.model.order_status.get(code, ""), False)
+                self.model.set_order_status(
+                    code, self.model.order_status.get(code, ""), False)
                 self.cancel_requested.emit(code)
                 return
+            if (order_status in ("장종료", "오류", "수량부족", "분할부족",
+                                 "취소없음")
+                    or order_status.endswith("완료")):
+                self.model.set_order_status(code, "")
+                self.order_status_value.setText("")
             self._select_order_target(code)
         elif index.column() == BALANCE_SELL_COL:
             self._acknowledge_balance_alert(code)

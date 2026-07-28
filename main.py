@@ -2161,7 +2161,7 @@ class App:
 
     def _ensure_analysis_window(self):
         if self._analysis is None:
-            self._analysis = AnalysisWindow(self.rest)
+            self._analysis = AnalysisWindow(self.rest, self)
             self._analysis.watchlist_changed.connect(
                 self._sync_realtime_watch_models)
             self._analysis.news_auto_changed.connect(
@@ -2627,9 +2627,10 @@ class AnalysisWindow(QMainWindow):
         ("데이터 관리", "SQLite 데이터 수집 상태와 갱신 작업을 관리합니다."),
     )
 
-    def __init__(self, rest=None):
+    def __init__(self, rest=None, app: "App | None" = None):
         super().__init__()
         self._rest = rest
+        self._app = app
         self._collection_task = None
         self._collection_cancelled = False
         self._dart_task = None
@@ -5918,6 +5919,11 @@ class AnalysisWindow(QMainWindow):
                 _, dart_links = save_source_classifications(
                     dart, snapshot_date, "DART", 0.45)
                 saved += dart_links
+                # 테마 DB 갱신 후 실행 중인 화면이 이전 테마 연결표를
+                # 계속 사용하지 않도록 현재 테마정렬을 즉시 재계산한다.
+                if self._app:
+                    for view in self._app.views:
+                        view.screen.refresh_theme_sort()
                 message = (
                     f"키움 {kiwoom_links:,} · WICS {wics_links:,} · "
                     f"KRX {krx_links:,} · DART {dart_links:,}건")
@@ -5992,6 +5998,11 @@ class AnalysisWindow(QMainWindow):
             else:
                 theme_count, saved = save_theme_snapshot(
                     snapshots, snapshot_date, "NAVER", 0.95)
+                # 네이버 테마 갱신 후에도 화면의 메모리 테마표를 즉시
+                # DB 기준으로 교체해야 테마정렬이 오래된 분류를 쓰지 않는다.
+                if self._app:
+                    for view in self._app.views:
+                        view.screen.refresh_theme_sort()
                 message = f"테마 {theme_count:,}개 · 연결 {saved:,}건"
         except Exception as error:  # noqa: BLE001
             errors += 1

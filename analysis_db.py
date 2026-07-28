@@ -1781,22 +1781,59 @@ def active_theme_labels(db_path: Path = DB_PATH) -> dict[str, tuple[str, ...]]:
                   AND TRIM(t.theme_name)<>''
                 ORDER BY st.stock_code,
                     CASE st.source
-                        WHEN 'NAVER' THEN 0
-                        WHEN 'KIWOOM' THEN 1
-                        WHEN 'WICS' THEN 2
-                        WHEN 'KRX' THEN 3
-                        WHEN 'DART' THEN 4
+                        WHEN 'MANUAL' THEN 0
+                        WHEN 'NAVER' THEN 1
+                        WHEN 'KIWOOM' THEN 2
+                        WHEN 'WICS' THEN 3
+                        WHEN 'KRX' THEN 4
+                        WHEN 'DART' THEN 5
                         ELSE 9
                     END,
                     t.theme_name""",
         ).fetchall()
-    result: dict[str, list[str]] = {}
+        preferred_codes = {
+            str(row["stock_code"] or "").removesuffix("_AL")
+            for row in connection.execute(
+                """SELECT stock_code FROM stocks
+                     WHERE stock_type='PREFERRED'""",
+            ).fetchall()
+        }
+    # 화면 테마정렬은 한 종목에 대해 가장 신뢰도 높은 출처 하나만 사용한다.
+    # MANUAL은 운용자가 명시적으로 검증·등록한 테마이므로 자동 수집 원천보다 우선한다.
+    # 예를 들어 네이버 세부 테마가 있는 포톤·알트에 WICS의 넓은 업종인
+    # '핸드셋'까지 함께 붙이면, 서로 다른 재료의 종목이 같은 테마로
+    # 정렬될 수 있다. 네이버 테마가 없을 때에만 키움/WICS 등을 보완한다.
+    source_rank = {
+        "MANUAL": 0,
+        "NAVER": 1,
+        "KIWOOM": 2,
+        "WICS": 3,
+        "KRX": 4,
+        "DART": 5,
+    }
+    by_code_source: dict[str, dict[str, list[str]]] = {}
     for row in rows:
         code = str(row["stock_code"] or "").removesuffix("_AL")
         theme = str(row["theme_name"] or "").strip()
-        if code and theme and theme not in result.setdefault(code, []):
-            result[code].append(theme)
-    return {code: tuple(themes) for code, themes in result.items()}
+        source = str(row["source"] or "").upper()
+        if code and theme:
+            themes = by_code_source.setdefault(code, {}).setdefault(source, [])
+            if theme not in themes:
+                themes.append(theme)
+    result: dict[str, tuple[str, ...]] = {}
+    for code, sources in by_code_source.items():
+        preferred = min(
+            sources,
+            key=lambda source: (source_rank.get(source, 9), source),
+        )
+        themes = list(sources[preferred])
+        # 우선주는 본주와의 관계와 별개로 단기 수급에서 함께 움직이는
+        # 독립 테마다. 세부 업종(식품·IT서비스 등)만으로 분리하지 않고
+        # 현재 조건검색의 우선주 흐름을 하나의 그룹으로 정렬한다.
+        if code in preferred_codes and "우선주" not in themes:
+            themes.append("우선주")
+        result[code] = tuple(themes)
+    return result
 
 
 def active_relation_groups(db_path: Path = DB_PATH) -> dict[str, tuple[str, ...]]:
