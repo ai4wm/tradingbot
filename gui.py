@@ -43,6 +43,7 @@ STORED = (set(FIELDS) - {
     "program_net_qty"} | BOOK_FIELDS
 BAR_COL = FIELDS.index("bar")
 RATE_COL = FIELDS.index("rate")
+PRICE_COL = FIELDS.index("price")
 NAME_COL = FIELDS.index("name")
 THEME_COL = FIELDS.index("theme")
 TIME_COL = FIELDS.index("time")
@@ -514,6 +515,8 @@ def _limit_tier(d: dict, opening_auction: bool = False) -> int:
 
     개장 동시호가의 누적거래량은 0이 아닌 값이 남아 있을 수 있으므로, 이때는
     거래량과 무관하게 예상상한을 매도잔량 0/있음으로 먼저 완전히 분리한다.
+    장중 실제 상한가도 매도잔량 0/있음 순으로 연속 배치한 뒤 예상상한과
+    일반 종목을 표시한다.
     """
     actual_limit = d["upper"] > 0 and d["price"] == d["upper"]
     expected_limit = d["exp_price"] > 0 and (
@@ -523,18 +526,18 @@ def _limit_tier(d: dict, opening_auction: bool = False) -> int:
         return 0 if d["ask_qty"] == 0 else 1
     if d["vol"] == 0 and expected_limit:
         return 0 if d["ask_qty"] == 0 else 1
-    if d["vol"] > 0 and d["ask_qty"] == 0:
-        if actual_limit:
-            return 2
-        if expected_limit:
-            return 3
-    return 4
+    if actual_limit:
+        return 2 if d["ask_qty"] == 0 else 3
+    if expected_limit:
+        return 4 if d["ask_qty"] == 0 else 5
+    return 6
 
 
 class TieredProxy(QSortFilterProxyModel):
     """상한가정렬 모드(limit_mode):
-    개장 동시호가 예상상한(매도0 -> 매도있음), 실제 상한, 장중 예상상한 순으로
-    각 그룹을 분리해 위에 고정하고 그룹 안은 현재 정렬컬럼과 정렬방향을 따른다.
+    개장 동시호가 예상상한, 실제 상한, 장중 예상상한을 각각
+    매도잔량 0 -> 매도잔량 있음 순으로 분리해 위에 고정한다.
+    그룹 안은 현재 정렬컬럼과 정렬방향을 따른다.
     모드 off면 전 컬럼 일반 정렬."""
 
     def __init__(self):
@@ -683,10 +686,19 @@ class TieredProxy(QSortFilterProxyModel):
             for position, group in enumerate(ordered_groups)
         }
 
-        # 2종목 이상 그룹에는 대장(★), 단독 테마에는 별도 표식(◇)을
-        # 표시해 대장 여부와 테마 경계를 함께 알린다.
+        # 대장(★): 테마 안에 실제 상한가 종목이 있으면 가장 빠른 진입 종목,
+        # 없으면 현재 등락률 최상위 종목. 따라서 비상한 장세에서는 수시로
+        # 바뀔 수 있지만, 상한가가 나온 뒤에는 진입 순서를 우선한다.
+        def leader_key(code: str) -> tuple:
+            row = model.rows[code]
+            rate = -float(row.get("rate") or 0)
+            if self._theme_at_limit(row):
+                return (0, self._theme_entry_time(row), rate,
+                        str(row.get("name") or ""), code)
+            return (1, 999999, rate, str(row.get("name") or ""), code)
+
         leaders = {
-            min(codes, key=lambda code: self._theme_sort_keys[code])
+            min(codes, key=leader_key)
             for codes in grouped_codes.values() if len(codes) >= 2
         }
         singletons = {
@@ -792,12 +804,12 @@ class TieredProxy(QSortFilterProxyModel):
             desc = self.sortOrder() == Qt.DescendingOrder
             if ta != tb:  # 우선순위 그룹 순서는 현재 정렬방향과 무관하게 고정
                 return ta > tb if desc else ta < tb
-            if ta == 2 and left.column() == TIME_COL:
+            if ta in (2, 3) and left.column() == TIME_COL:
                 # 실제 상한가 그룹에서는 진입시간 미수신 종목을 항상 뒤로 보낸다.
                 a_has_time, b_has_time = bool(a["time"]), bool(b["time"])
                 if a_has_time != b_has_time:
                     return not a_has_time if desc else a_has_time
-            if ta == 4 and left.column() in NON_LIMIT_IGNORED_SORT_COLS:
+            if ta == 6 and left.column() in NON_LIMIT_IGNORED_SORT_COLS:
                 # 진입시간/매수잔량은 비상한 그룹에 적용하지 않고 직전 정렬을 유지한다.
                 fallback_left = m.index(left.row(), self._non_limit_sort_col)
                 fallback_right = m.index(right.row(), self._non_limit_sort_col)
@@ -918,6 +930,22 @@ class StockModel(QAbstractTableModel):
         self.rows[code] = {f: "" if f in ("name", "time") else 0 for f in STORED}
         self.endInsertRows()
         self.update_stock(code, data)  # exp 게이트/파생/로그를 신규 행에도 동일 적용
+
+    def add_stocks(self, entries: list[tuple[str, dict]]) -> int:
+        """초기 조건 스냅샷의 대량 편입을 한 번의 모델 삽입으로 처리한다."""
+        new_entries = [(code, data) for code, data in entries if code not in self.rows]
+        if not new_entries:
+            return 0
+        first = len(self.codes)
+        self.beginInsertRows(QModelIndex(), first, first + len(new_entries) - 1)
+        for code, data in new_entries:
+            stored = {field: "" if field in ("name", "time") else 0 for field in STORED}
+            # 초기 스냅샷은 종목코드만 들어온다. REST 백필 전까지 이름만 즉시 보인다.
+            stored["name"] = str(data.get("name") or code)
+            self.codes.append(code)
+            self.rows[code] = stored
+        self.endInsertRows()
+        return len(new_entries)
 
     def remove_stock(self, code: str):
         if code not in self.rows:
@@ -2425,11 +2453,11 @@ class ConditionScreen(QWidget):
                 self.auto_refresh, self.auto_remove, self.sound_check,
                 self.limit_sort, self.theme_sort):
             checkbox.setStyle(self._checkbox_style)
-        self.unified_check = QPushButton("K")  # KRX<->통합(_AL) 시세 전환 토글, 전 창 공통 (main이 배선)
+        self.unified_check = QPushButton("K")  # KRX<->통합 조건검색·시세 전환, 전 창 공통
         self.unified_check.setCheckable(True)
         self.unified_check.setFixedSize(24, 24)
-        self.unified_check.setToolTip("시세 소스 전환 — KRX 전용 / KRX+NXT 통합(_AL). "
-                                      "편입/이탈(조건검색)은 KRX 기준 그대로")
+        self.unified_check.setToolTip(
+            "시장 전환 — K: KRX 조건검색·시세 / 통: KRX+NXT 통합 조건검색·시세")
         self.unified_check.toggled.connect(self._on_unified_style)
         self.rank_btn = QPushButton("순위")
         self.rank_btn.setToolTip("실시간 종목조회순위 [0198] 창 열기/닫기")
@@ -2771,6 +2799,10 @@ class ConditionScreen(QWidget):
         self._apply_sort()
         self._view_mode = None  # normal / rank / holdings (None=초기)
         self.set_view_mode("normal")  # 순위/변동 기본 숨김
+        # 테마 열은 정렬 사용 여부와 무관하게 항상 실제 분류를 표시해야 한다.
+        # 이전에는 테마정렬을 켤 때만 DB 연결표를 읽어, 체크가 꺼진 채
+        # 시작하면 삼성전자·SK하이닉스처럼 분류가 있는 종목도 미분류였다.
+        self._load_theme_classification()
         self.rank_period.activated.connect(self._save_rank_period)
         self.set_rank_period("rank")  # 기본: 조회순위 기준시간 (급증 선택 시 main이 교체)
         if self._settings.value(self.prefix + "limit_sort", "false") == "true":  # 상한가정렬 복원
@@ -3160,6 +3192,13 @@ class ConditionScreen(QWidget):
             "QPushButton{background:#FFDD00;color:black;font-weight:bold}" if on else "")
 
     def _on_data_changed(self, *a):
+        # 테마순서는 등락률·현재가(상한 판정)·진입시간 변화에만 영향받는다.
+        # 체결/분·호가 등 매 틱 갱신마다 전체 테마를 다시 정렬하지 않는다.
+        if self.theme_sort.isChecked() and not self.limit_sort.isChecked():
+            if len(a) >= 2 and isinstance(a[1], QModelIndex):
+                first, last = a[0].column(), a[1].column()
+                if not any(first <= column <= last for column in (RATE_COL, PRICE_COL, TIME_COL)):
+                    return
         # 스로틀: 이미 대기중이면 리셋하지 않음 -> 틱이 몰려도 200ms마다 반드시 재정렬됨
         if (self.limit_sort.isChecked() or self.theme_sort.isChecked()) and not self._resort_timer.isActive():
             self._resort_timer.start(200)
@@ -3457,31 +3496,35 @@ class ConditionScreen(QWidget):
         self._settings.setValue(self._mkey("limit_sort"), "true" if on else "false")
         self._settings.sync()
 
+    def _load_theme_classification(self) -> bool:
+        """저장된 테마·관계 연결표를 화면 모델과 정렬 프록시에 반영한다."""
+        try:
+            # GUI 모듈을 DB 초기화와 분리하기 위해 실제 화면 생성 시 불러온다.
+            from analysis_db import (
+                active_relation_groups, active_theme_labels,
+                dart_relation_evidence_labels,
+            )
+            labels = active_theme_labels()
+            relation_groups = active_relation_groups()
+            relation_evidence = dart_relation_evidence_labels()
+        except Exception as error:  # noqa: BLE001
+            log.warning("theme labels unavailable: %s", error)
+            labels = {}
+            relation_groups = {}
+            relation_evidence = {}
+        self.model.set_theme_labels(labels)
+        self.model.set_relation_groups(relation_groups)
+        self.model.set_relation_evidence(relation_evidence)
+        self.proxy.set_theme_labels(labels)
+        self.proxy.set_relation_groups(relation_groups)
+        return bool(labels)
+
     def _on_theme_sort(self, on: bool):
         """실시간 조건검색을 현재 강한 테마 흐름으로 묶어 정렬한다."""
         if on and self.limit_sort.isChecked():
             self.limit_sort.setChecked(False)
         if on:
-            try:
-                # GUI 모듈을 DB 초기화와 분리하기 위해 실제 사용 시점에만 불러온다.
-                from analysis_db import (
-                    active_relation_groups, active_theme_labels,
-                    dart_relation_evidence_labels,
-                )
-                labels = active_theme_labels()
-                relation_groups = active_relation_groups()
-                relation_evidence = dart_relation_evidence_labels()
-            except Exception as error:  # noqa: BLE001
-                log.warning("theme labels unavailable: %s", error)
-                labels = {}
-                relation_groups = {}
-                relation_evidence = {}
-            self.model.set_theme_labels(labels)
-            self.model.set_relation_groups(relation_groups)
-            self.model.set_relation_evidence(relation_evidence)
-            self.proxy.set_theme_labels(labels)
-            self.proxy.set_relation_groups(relation_groups)
-            if not labels:
+            if not self._load_theme_classification():
                 QToolTip.showText(
                     QCursor.pos(),
                     "저장된 테마 분류가 없어 미분류 종목은 등락률 순으로 표시합니다.",
@@ -3518,6 +3561,10 @@ class ConditionScreen(QWidget):
     def on_included(self, code: str, data: dict):
         """조건 편입 (CNSRREQ I)"""
         self.model.add_stock(code, data)
+
+    def on_included_many(self, codes: list[str]):
+        """초기 조건 스냅샷의 대량 편입."""
+        self.model.add_stocks([(code, {"name": code}) for code in codes])
 
     def on_excluded(self, code: str):
         """조건 이탈 (CNSRREQ D)"""

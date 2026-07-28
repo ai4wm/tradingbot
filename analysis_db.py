@@ -797,13 +797,17 @@ def save_condition_snapshot(condition_seq: str, condition_name: str,
 
 
 def recent_condition_snapshots(condition_seq: str | None = None, limit: int = 20,
-                               db_path: Path = DB_PATH) -> list[dict]:
+                               db_path: Path = DB_PATH,
+                               condition_name: str | None = None) -> list[dict]:
     """최근 조건검색 일반조회 요약을 반환한다."""
     clauses = []
     params: list = []
     if condition_seq is not None:
         clauses.append("condition_seq = ?")
         params.append(str(condition_seq))
+    if condition_name is not None:
+        clauses.append("condition_name = ?")
+        params.append(str(condition_name))
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
     params.append(max(1, int(limit)))
     with closing(connect(db_path)) as connection:
@@ -2542,6 +2546,82 @@ def rotation_theme_daily_rows(theme_id: int, source: str, as_of_date: str,
             (int(theme_id), source.upper(), cutoff_date, as_of_date),
         ).fetchall()
         return [dict(row) for row in rows]
+
+
+def rotation_cycle_profile_rows(theme_id: int, source: str, as_of_date: str,
+                                db_path: Path = DB_PATH) -> list[dict]:
+    """선택 테마의 기간·월·계절·시장국면별 반복 강도를 집계한다."""
+    if not db_path.exists():
+        return []
+    source = str(source or "NAVER").upper()
+    with closing(connect(db_path)) as connection:
+        daily = [dict(row) for row in connection.execute(
+            """SELECT p.trade_date,
+                      AVG(COALESCE(p.change_rate, 0)) AS average_rate,
+                      SUM(COALESCE(p.trading_value, 0)) AS trading_value,
+                      SUM(CASE WHEN COALESCE(p.change_rate, 0)>=8 THEN 1 ELSE 0 END)
+                          AS strong_count,
+                      SUM(CASE WHEN e.stock_code IS NOT NULL THEN 1 ELSE 0 END)
+                          AS limit_count
+                 FROM daily_prices p
+                 JOIN stock_themes st ON st.stock_code=p.stock_code
+                 LEFT JOIN limit_up_events e
+                   ON e.trade_date=p.trade_date AND e.stock_code=p.stock_code
+                WHERE st.theme_id=? AND st.source=? AND st.valid_to IS NULL
+                  AND p.trade_date<=?
+                GROUP BY p.trade_date ORDER BY p.trade_date DESC""",
+            (int(theme_id), source, as_of_date),
+        ).fetchall()]
+        index_rows = [dict(row) for row in connection.execute(
+            """SELECT trade_date, close_value FROM market_index_prices
+                WHERE market='KOSPI' AND trade_date<=?
+                  AND close_value IS NOT NULL
+                ORDER BY trade_date""", (as_of_date,)).fetchall()]
+
+    def summarize(category: str, label: str, items: list[dict]) -> dict:
+        samples = len(items)
+        strong_days = sum(int(item["strong_count"] or 0) > 0 for item in items)
+        return {
+            "category": category, "label": label, "samples": samples,
+            "average_rate": (sum(float(item["average_rate"] or 0)
+                                 for item in items) / samples if samples else 0),
+            "strong_days": strong_days,
+            "limit_count": sum(int(item["limit_count"] or 0) for item in items),
+            "average_value": (sum(int(item["trading_value"] or 0)
+                                  for item in items) / samples if samples else 0),
+            "hit_rate": strong_days / samples * 100 if samples else 0,
+        }
+
+    result = []
+    for days in (5, 20, 60, 120, 244):
+        result.append(summarize("기간", f"최근 {days}거래일", daily[:days]))
+    for month in range(1, 13):
+        items = [row for row in daily if int(row["trade_date"][4:6]) == month]
+        if items:
+            result.append(summarize("월별", f"{month}월", items))
+    seasons = {
+        "봄(3~5월)": {3, 4, 5}, "여름(6~8월)": {6, 7, 8},
+        "가을(9~11월)": {9, 10, 11}, "겨울(12~2월)": {12, 1, 2},
+    }
+    for label, months in seasons.items():
+        items = [row for row in daily if int(row["trade_date"][4:6]) in months]
+        if items:
+            result.append(summarize("계절", label, items))
+
+    regime_by_date = {}
+    closes = [(row["trade_date"], float(row["close_value"])) for row in index_rows]
+    for index, (trade_date, close) in enumerate(closes):
+        if index < 20 or not closes[index - 20][1]:
+            continue
+        change = (close / closes[index - 20][1] - 1) * 100
+        regime_by_date[trade_date] = "상승장" if change >= 3 else (
+            "하락장" if change <= -3 else "횡보장")
+    for regime in ("상승장", "횡보장", "하락장"):
+        items = [row for row in daily
+                 if regime_by_date.get(row["trade_date"]) == regime]
+        if items:
+            result.append(summarize("시장구간", regime, items))
+    return result
 
 
 def rotation_stock_rows(as_of_date: str, theme_id: int,

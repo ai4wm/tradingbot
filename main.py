@@ -6,10 +6,11 @@
 import asyncio
 import ctypes
 import logging
+import math
 import os
 import sys
 import time
-from collections import Counter
+from collections import Counter, deque
 from ctypes import wintypes
 from datetime import date, datetime, timedelta
 
@@ -20,7 +21,7 @@ from PySide6.QtCore import (
     QAbstractNativeEventFilter, QDate, QPoint, QRect, QSettings, QSize, Qt,
     QTimer, QUrl, QUrlQuery, Signal,
 )
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QPalette
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QPainter, QPalette, QPen
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDateEdit, QDialog, QFormLayout,
     QGridLayout, QHBoxLayout, QLabel, QMainWindow, QLineEdit, QMessageBox, QProgressBar,
@@ -44,6 +45,7 @@ from analysis_db import (
     limit_up_backtest_rows,
     rebuild_rotation_analysis, rotation_signal_rows,
     rotation_theme_daily_rows, rotation_stock_rows,
+    rotation_cycle_profile_rows,
     save_market_index_prices, market_index_coverage,
     save_market_investor_flows, pending_market_investor_flow_requests,
     market_investor_flow_coverage,
@@ -189,6 +191,9 @@ RANK_SUBMODE = {RANK_SEQ: "rank", NXT_RATE_SEQ: "nxt_rate",
 RANK_SEQS = set(RANK_SUBMODE)
 RANK_TOP = 20          # 순위 모드 실시간 슬롯 캡 (95한도 공유)
 ORDERABLE_PREFETCH_TOP = 20  # 화면에 정렬된 상위 선조회 수
+ROTATION_CONDITION_SEQ = "1"
+ROTATION_CONDITION_NAME = "=====8% 이상종목 15%예상상한가==========="
+ROTATION_BATCH_NAME = f"시장테마 브리핑 · {ROTATION_CONDITION_NAME}"
 THEME_MODES = ("system", "dark", "light")
 THEME_UI = {
     "system": ("🖥", "테마: 시스템 — Windows 설정을 따름"),
@@ -622,17 +627,20 @@ class View:
         for code in cur - new:
             self.screen.on_excluded(code)
             self.app.queue_real(code, add=False, suffix=self._real_suffix())
-        for code in new - cur:
-            self.screen.on_included(code, {"name": code})
+        added = list(dict.fromkeys(code for code in codes if code not in cur))
+        if added:
+            self.screen.on_included_many(added)
+        for code in added:
             if code in self.app._account_auto_cancel_armed:
                 self.screen.model.set_account_auto_cancel_armed(code, True)
-            self.app.queue_real(code, add=True, suffix=self._real_suffix())
-        if new - cur:
-            self.app.queue_condition_relation_autocollect(new - cur, self.screen)
+        if added:
+            # 실시간 종목 등록은 현재 모든 창의 모델을 기준으로 한 번만 동기화한다.
+            self.app.queue_real("", add=True, suffix=self._real_suffix())
+            self.app.queue_condition_relation_autocollect(set(added), self.screen)
             self._schedule_refresh()
             self._maybe_beep()
         log.info("snapshot%s: %d codes (+%d/-%d) %s", self.prefix or " ",
-                 len(new), len(new - cur), len(cur - new), ",".join(sorted(new)))
+                 len(new), len(added), len(cur - new), ",".join(sorted(new)))
 
     def on_event(self, code: str, is_insert: bool):
         if is_insert:
@@ -713,9 +721,8 @@ class App:
         self._condition_relation_timer.setSingleShot(True)
         self._condition_relation_timer.timeout.connect(
             self._run_condition_relation_collection)
-        # 화면과 분리된 조건검색 일반조회 예약. 기본은 현재 본창의 일반
-        # 조건식 1개를 사용하고, QSettings에 seq를 콤마로 지정하면 그 목록을
-        # 순차 조회한다. 결과는 DB 스냅샷으로만 저장한다.
+        # 화면과 분리된 순환매 전용 조건검색 일반조회 예약. 본창에서 어떤
+        # 조건식을 보고 있는지와 무관하게 8% 이상 조건식을 DB에 저장한다.
         self._background_condition_task = None
         self._background_condition_slots: set[tuple[str, str]] = set()
         self._background_condition_timer = QTimer()
@@ -785,6 +792,8 @@ class App:
         # 전일거래량: 동시호가 역산실패(0) 종목만 ka10081로 1회 백필 (정적값 캐시)
         self._prevvol_pending: set[str] = set()
         self._prevvol_done: set[str] = set()
+        self._prevvol_queue: deque[str] = deque()
+        self._prevvol_workers: set[asyncio.Task] = set()
         self._single_timer = QTimer()
         self._single_timer.timeout.connect(self._on_single_poll)
         self._single_timer.start(3000)
@@ -792,7 +801,8 @@ class App:
         self._analysis = None
         # 뉴스 자동수집은 분석창 표시 여부와 무관하게 메인 앱이 관리한다.
         self._news_auto_timer = QTimer()
-        self._news_auto_timer.setInterval(5 * 60 * 1000)
+        news_interval = int(self._settings.value("analysis_news_interval", 5))
+        self._news_auto_timer.setInterval(news_interval * 60 * 1000)
         self._news_auto_timer.timeout.connect(self._auto_news_collection)
         if self._settings.value("analysis_news_auto", "false") == "true":
             self._news_auto_timer.start()
@@ -817,9 +827,10 @@ class App:
         self.ws.on_real = self._on_real
         self.ws.on_vi = self._on_vi
         self.ws.on_order = self._on_account_order_event
-        # 통합(_AL) 시세: 전 창 공통 설정. 첫 REG 전에 접미사 확정돼야 해서 여기서 복원
+        # 통합 시세·조건검색: 전 창 공통 설정. 첫 REG/CNSRREQ 전에 확정한다.
         if self._settings.value("unified_real", "false") == "true":
             self.ws.real_suffix = self.rest.suffix = "_AL"
+            self.ws.condition_stex_tp = "A"
             screen.unified_check.setChecked(True)  # toggled 연결 전 = 시각 상태만
         screen.unified_check.toggled.connect(self._on_unified)
         screen.theme_btn.clicked.connect(self._cycle_theme)
@@ -1314,6 +1325,7 @@ class App:
         self._settings.setValue("unified_real", "true" if on else "false")
         self._settings.sync()
         self.rest.suffix = "_AL" if on else ""  # watch_info 백필도 같은 소스로
+        # WS가 기존 조건을 해제한 뒤 A(통합)/K(KRX)로 즉시 재등록한다.
         asyncio.ensure_future(self.ws.set_real_suffix("_AL" if on else ""))
         for v in self.views:  # 전 종목 시세 강제 재백필: 편입 diff 없어도 KRX<->통합 값 교체
             v._schedule_refresh()
@@ -1539,6 +1551,69 @@ class App:
             return []
         return [(seq, names.get(seq, seq))]
 
+    def _rotation_condition_target(self) -> tuple[str, str]:
+        """순환매 전용 조건식을 본창 선택과 독립적으로 정확히 찾는다."""
+        saved_seq = str(self._settings.value(
+            "rotation_condition_seq", ROTATION_CONDITION_SEQ
+        ) or ROTATION_CONDITION_SEQ).strip()
+        saved_name = str(self._settings.value(
+            "rotation_condition_name", ROTATION_CONDITION_NAME
+        ) or ROTATION_CONDITION_NAME).strip()
+        condition_by_seq = {
+            str(seq): str(name) for seq, name in self._cond_items
+        }
+        if not condition_by_seq:
+            return saved_seq, saved_name
+        if condition_by_seq.get(saved_seq) == saved_name:
+            return saved_seq, saved_name
+
+        # 조건식 순서가 바뀐 경우에만 전체 이름이 정확히 같은 항목으로
+        # seq를 보정한다. '8%' 포함 여부 같은 부분 문자열 판정은 하지 않는다.
+        exact_matches = [
+            (seq, name) for seq, name in condition_by_seq.items()
+            if name == saved_name
+        ]
+        if len(exact_matches) != 1:
+            if not exact_matches:
+                raise RuntimeError(
+                    f"순환매 전용 조건식을 찾을 수 없습니다: {saved_name}")
+            raise RuntimeError(
+                f"이름이 같은 순환매 조건식이 {len(exact_matches)}개입니다: "
+                f"{saved_name}")
+        resolved_seq, resolved_name = exact_matches[0]
+        self._settings.setValue("rotation_condition_seq", resolved_seq)
+        self._settings.setValue("rotation_condition_name", resolved_name)
+        self._settings.sync()
+        log.info("rotation condition seq remapped: %s -> %s name=%s",
+                 saved_seq, resolved_seq, resolved_name)
+        return resolved_seq, resolved_name
+
+    def _recent_rotation_batch_result(
+            self, max_age_seconds: float) -> dict | None:
+        """방금 정상 저장된 8% 배치가 있으면 버튼 결과 형식으로 반환한다."""
+        rows = recent_condition_snapshots(
+            limit=1, condition_name=ROTATION_BATCH_NAME)
+        if not rows:
+            return None
+        snapshot = rows[0]
+        try:
+            captured = datetime.fromisoformat(str(snapshot["captured_at"]))
+            now = datetime.now(captured.tzinfo) if captured.tzinfo else datetime.now()
+            age = (now - captured).total_seconds()
+        except (TypeError, ValueError):
+            return None
+        if age < -5 or age > float(max_age_seconds):
+            return None
+        snapshot_id = int(snapshot["snapshot_id"])
+        return {
+            "snapshot_id": snapshot_id,
+            "codes": int(snapshot["stock_count"] or 0),
+            "themes": len(condition_theme_stats(snapshot_id)),
+            "captured_at": str(snapshot["captured_at"]),
+            "reused": True,
+            "age_seconds": max(0.0, age),
+        }
+
     @staticmethod
     def _background_condition_slot(now: datetime) -> str:
         """현재 시각이 예약 조회 구간이면 슬롯명을, 아니면 빈 값을 반환한다."""
@@ -1554,7 +1629,7 @@ class App:
         return ""
 
     def _run_background_condition_schedule(self, startup: bool = False):
-        """예약 시각에 일반 조건검색을 한 번씩 백그라운드 수집한다."""
+        """예약 시각에 순환매 전용 조건식을 백그라운드 수집한다."""
         if self._background_condition_task and not self._background_condition_task.done():
             return
         now = datetime.now()
@@ -1576,14 +1651,63 @@ class App:
         marker = (day_key, slot)
         if marker in self._background_condition_slots:
             return
-        targets = self._background_condition_targets()
+        try:
+            targets = [self._rotation_condition_target()]
+        except RuntimeError as error:
+            log.warning("background rotation snapshot skipped: %s", error)
+            self._background_condition_slots.add(marker)
+            return
         if not targets:
             log.info("background condition snapshot skipped: no target condition")
             self._background_condition_slots.add(marker)
             return
         self._background_condition_slots.add(marker)
         self._background_condition_task = asyncio.ensure_future(
-            self._collect_background_condition_targets(targets, slot))
+            self._collect_scheduled_rotation_snapshot(targets, slot))
+
+    async def _collect_scheduled_rotation_snapshot(
+            self, targets: list[tuple[str, str]], slot: str) -> dict | None:
+        """자동수집 0건을 최근 정상값 또는 60초 후 재조회로 보완한다."""
+        result = await self._collect_background_condition_targets(targets, slot)
+        if result:
+            result["reused"] = False
+            return result
+
+        fallback = self._recent_rotation_batch_result(5 * 60)
+        if fallback:
+            fallback["reuse_reason"] = "자동수집 0건 · 5분 이내 정상 수집값"
+            log.warning(
+                "scheduled rotation empty response fallback: "
+                "slot=%s snapshot=%d age=%.1fs codes=%d",
+                slot, fallback["snapshot_id"], fallback["age_seconds"],
+                fallback["codes"])
+            return fallback
+
+        log.warning(
+            "scheduled rotation empty response: slot=%s retry in 60s", slot)
+        await asyncio.sleep(60)
+        retry_slot = slot + "_RETRY"
+        result = await self._collect_background_condition_targets(
+            targets, retry_slot)
+        if result:
+            result["reused"] = False
+            log.info("scheduled rotation retry succeeded: slot=%s codes=%d",
+                     retry_slot, result["codes"])
+            return result
+
+        fallback = self._recent_rotation_batch_result(5 * 60)
+        if fallback:
+            fallback["reuse_reason"] = "자동 재조회 0건 · 최근 정상 수집값"
+            log.warning(
+                "scheduled rotation retry fallback: "
+                "slot=%s snapshot=%d age=%.1fs codes=%d",
+                retry_slot, fallback["snapshot_id"],
+                fallback["age_seconds"], fallback["codes"])
+            return fallback
+        log.warning(
+            "scheduled rotation snapshot unavailable after retry: slot=%s",
+            retry_slot)
+        return None
 
     async def _collect_background_condition_targets(
             self, targets: list[tuple[str, str]], slot: str):
@@ -1596,7 +1720,8 @@ class App:
         try:
             for seq, name in targets:
                 try:
-                    result = await self.collect_condition_snapshot(seq, name, "KRX")
+                    result = await self.collect_condition_snapshot(
+                        seq, name, "KRX")
                     combined_truncated = combined_truncated or result["truncated"]
                     captured_names.append(name)
                     combined_quotes.extend(result.get("quotes", ()))
@@ -1668,9 +1793,60 @@ class App:
                              batch_id, candidate_count)
                 log.info("background condition batch saved: slot=%s codes=%d "
                          "sources=%d", slot, len(combined_codes), len(captured_names))
+                return {
+                    "snapshot_id": int(batch_id) if batch_rows_saved else 0,
+                    "codes": len(combined_codes),
+                    "themes": len(batch_rows),
+                }
+            return None
         finally:
             log.info("background condition slot finished: slot=%s targets=%d elapsed=%.2fs",
                      slot, len(targets), time.monotonic() - started)
+
+    async def collect_rotation_snapshot_now(self):
+        """8% 이상 전용 조건식을 일반조회해 순환매 스냅샷을 만든다."""
+        # 같은 조건식의 정상 수집이 1분 안에 끝났으면 다시 API를 호출하지
+        # 않는다. 현재가·테마 보강까지 끝난 배치이므로 그대로 분석에 반영한다.
+        recent = self._recent_rotation_batch_result(60)
+        if recent:
+            recent["reuse_reason"] = "1분 이내 정상 수집값"
+            log.info("rotation recent batch reused: snapshot=%d age=%.1fs codes=%d",
+                     recent["snapshot_id"], recent["age_seconds"],
+                     recent["codes"])
+            return recent
+
+        # 앱 시작 직후 예약 수집과 버튼 클릭이 겹치면 같은 조건식 일반조회가
+        # 연달아 전송되어 두 번째 응답이 0건으로 올 수 있다. 진행 중인 예약
+        # 수집이 있으면 그 결과를 먼저 공유한다.
+        background_task = self._background_condition_task
+        if background_task is not None and not background_task.done():
+            scheduled_result = await asyncio.shield(background_task)
+            if scheduled_result:
+                result = dict(scheduled_result)
+                result["reused"] = True
+                result["reuse_reason"] = "진행 중이던 예약 수집 완료값"
+                return result
+
+        target = self._rotation_condition_target()
+        slot = "ROTATION_" + datetime.now().strftime("%H%M%S")
+        result = await self._collect_background_condition_targets(
+            [target], slot)
+        if result:
+            result["reused"] = False
+            return result
+
+        # 키움이 짧은 간격의 중복 일반조회에 0건을 반환한 경우, 오류로
+        # 끝내지 않고 5분 이내 마지막 정상 배치를 사용한다.
+        fallback = self._recent_rotation_batch_result(5 * 60)
+        if fallback:
+            fallback["reuse_reason"] = "중복조회 0건 · 최근 정상 수집값"
+            log.warning(
+                "rotation empty response fallback: snapshot=%d age=%.1fs codes=%d",
+                fallback["snapshot_id"], fallback["age_seconds"],
+                fallback["codes"])
+            return fallback
+        raise RuntimeError(
+            f"순환매 조건검색 결과가 없습니다: {target[1]} (seq={target[0]})")
 
     # --- 웹소켓 콜백 라우팅 -------------------------------------------------
     def _on_condition_list(self, items):
@@ -2125,13 +2301,30 @@ class App:
             self._single_task = asyncio.ensure_future(self._poll_single(codes))
 
     def ensure_prev_vol(self, model):
-        """전일거래량이 0인(동시호가 역산실패) 종목만 ka10081로 1회 백필."""
+        """전일거래량이 0인 종목을 제한된 저우선순위 백필 큐에 넣는다."""
         for code in list(model.codes):
             if (model.rows[code].get("prev_vol", 0) == 0
                     and code not in self._prevvol_pending
                     and code not in self._prevvol_done):
                 self._prevvol_pending.add(code)
-                asyncio.ensure_future(self._fetch_prev_vol(code))
+                self._prevvol_queue.append(code)
+        self._start_prevvol_workers()
+
+    def _start_prevvol_workers(self):
+        """초기 대량 편입 때 ka10081 요청이 동시에 폭주하지 않게 최대 3개만 실행한다."""
+        while self._prevvol_queue and len(self._prevvol_workers) < 3:
+            task = asyncio.ensure_future(self._drain_prevvol_queue())
+            self._prevvol_workers.add(task)
+            task.add_done_callback(self._on_prevvol_worker_done)
+
+    def _on_prevvol_worker_done(self, task: asyncio.Task):
+        self._prevvol_workers.discard(task)
+        # 마지막 pop 직후 새 종목이 들어오는 경합에서도 큐가 멈추지 않게 한다.
+        self._start_prevvol_workers()
+
+    async def _drain_prevvol_queue(self):
+        while self._prevvol_queue:
+            await self._fetch_prev_vol(self._prevvol_queue.popleft())
 
     async def _fetch_prev_vol(self, code: str):
         try:
@@ -2180,6 +2373,8 @@ class App:
                 self._sync_realtime_watch_models)
             self._analysis.news_auto_changed.connect(
                 self._set_news_auto_collection)
+            self._analysis.news_auto_interval_changed.connect(
+                self._set_news_auto_interval)
             self._analysis.new_news_found.connect(self._notify_new_news)
             self._analysis.limit_count_collect_requested.connect(
                 self._manual_limit_count_refresh)
@@ -2191,6 +2386,12 @@ class App:
             self._news_auto_timer.start()
         else:
             self._news_auto_timer.stop()
+
+    def _set_news_auto_interval(self, minutes: int):
+        """분석창 네이버 API 뉴스 자동수집 주기를 메인 타이머에 반영한다."""
+        self._news_auto_timer.setInterval(int(minutes) * 60 * 1000)
+        if self._settings.value("analysis_news_auto", "false") == "true":
+            self._news_auto_timer.start()
 
     def _auto_news_collection(self):
         """분석창이 닫혀 있어도 등록 종목의 공식 API 뉴스를 수집한다."""
@@ -2292,7 +2493,10 @@ class App:
         self._refresh_market_overview()
         self._extra_windows.append(win)
         win.show()
-        win.resize(self.views[0].screen.window().size())  # 크기는 항상 본창 따라감 (위치만 창별 기억)
+        if seeded:
+            # 최초 생성한 추가 창만 본창 크기로 시작한다.
+            # 이후에는 ConditionWindow가 prefix별로 저장한 크기와 위치를 그대로 복원한다.
+            win.resize(self.views[0].screen.window().size())
         if seeded:  # 본창과 완전히 겹치지 않게 살짝 비껴 배치
             win.move(win.x() + 40, win.y() + 40)
         if self._cond_items:  # 이미 목록 받아놨으면 즉시 콤보 채움 + 자동 등록
@@ -2618,11 +2822,117 @@ class DisclosureDialog(QDialog):
             QDesktopServices.openUrl(QUrl(url))
 
 
+class RotationCycleWidget(QWidget):
+    """선택 테마의 순환 단계와 과거 상한가 발생일을 원형·시간축으로 표시한다."""
+
+    STAGES = ("초기", "확산", "과열", "소멸", "재점화")
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._theme = "선택 테마 없음"
+        self._phase = ""
+        self._next_text = ""
+        self._events = []
+        self._stage_counts = {}
+        self.setMinimumHeight(245)
+
+    def set_cycle(
+            self, theme: str, phase: str, next_text: str, events,
+            stage_counts=None):
+        phase_map = {"신규": "초기", "상한가": "확산", "관찰": "초기"}
+        self._theme = str(theme or "선택 테마 없음")
+        self._phase = phase_map.get(str(phase or ""), str(phase or ""))
+        self._next_text = str(next_text or "")
+        self._events = list(events or [])[-12:]
+        self._stage_counts = dict(stage_counts or {})
+        self.update()
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        dark = self.palette().color(QPalette.ColorRole.Base).lightness() < 128
+        foreground = QColor("#ECEFF1" if dark else "#263238")
+        muted = QColor("#78909C")
+        painter.fillRect(self.rect(), QColor("#182126" if dark else "#F6F8FA"))
+        painter.setPen(foreground)
+        title_font = painter.font()
+        title_font.setBold(True)
+        title_font.setPointSize(max(10, title_font.pointSize() + 1))
+        painter.setFont(title_font)
+        painter.drawText(12, 24, f"{self._theme} · 현재 {self._phase or '-'}"
+                         + (f" · 다음 {self._next_text}" if self._next_text else ""))
+        painter.setPen(QColor("#FFB300"))
+        painter.drawText(self.width() - 125, 24, "순환 방향 ↻ 시계방향")
+
+        center_x = self.width() * 0.5
+        center_y = 105
+        radius_x = max(150, min(310, self.width() * 0.34))
+        radius_y = 62
+        centers = []
+        for index, stage in enumerate(self.STAGES):
+            angle = -math.pi / 2 + index * math.tau / len(self.STAGES)
+            centers.append((center_x + math.cos(angle) * radius_x,
+                            center_y + math.sin(angle) * radius_y, stage))
+        for index, (x1, y1, stage) in enumerate(centers):
+            x2, y2, _ = centers[(index + 1) % len(centers)]
+            dx, dy = x2 - x1, y2 - y1
+            length = max(1.0, math.hypot(dx, dy))
+            ux, uy = dx / length, dy / length
+            start_x, start_y = x1 + ux * 38, y1 + uy * 21
+            end_x, end_y = x2 - ux * 38, y2 - uy * 21
+            active_edge = stage == self._phase
+            edge_color = QColor("#FFB300" if active_edge else "#78909C")
+            painter.setPen(QPen(edge_color, 4 if active_edge else 2))
+            painter.drawLine(int(start_x), int(start_y), int(end_x), int(end_y))
+            # 목표 노드 앞에 화살촉을 그려 시계방향 진행을 명확히 표시한다.
+            arrow_size = 9
+            side_x, side_y = -uy, ux
+            base_x, base_y = end_x - ux * arrow_size, end_y - uy * arrow_size
+            painter.drawLine(int(end_x), int(end_y),
+                             int(base_x + side_x * 5), int(base_y + side_y * 5))
+            painter.drawLine(int(end_x), int(end_y),
+                             int(base_x - side_x * 5), int(base_y - side_y * 5))
+        normal_font = painter.font()
+        normal_font.setPointSize(max(9, normal_font.pointSize() - 1))
+        painter.setFont(normal_font)
+        for x, y, stage in centers:
+            active = stage == self._phase
+            painter.setBrush(QColor("#FFB300" if active else "#37474F"))
+            painter.setPen(QPen(QColor("#FFF59D" if active else "#90A4AE"),
+                                3 if active else 1))
+            painter.drawEllipse(int(x - 34), int(y - 18), 68, 36)
+            painter.setPen(QColor("#1B1B1B" if active else "#ECEFF1"))
+            count = int(self._stage_counts.get(stage, 0))
+            label = f"{stage}\n{count}개" if self._stage_counts else stage
+            painter.drawText(int(x - 34), int(y - 18), 68, 36,
+                             Qt.AlignmentFlag.AlignCenter, label)
+
+        line_y = self.height() - 34
+        left, right = 55, max(56, self.width() - 30)
+        painter.setPen(QPen(muted, 2))
+        painter.drawLine(left, line_y, right, line_y)
+        events = sorted(self._events, key=lambda row: str(row.get("trade_date") or ""))
+        for index, row in enumerate(events):
+            x = left if len(events) == 1 else int(
+                left + (right - left) * index / (len(events) - 1))
+            count = int(row.get("limit_up_count") or 0)
+            radius = 4 + min(7, count * 2)
+            painter.setBrush(QColor("#EF5350" if count else "#42A5F5"))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawEllipse(x - radius, line_y - radius, radius * 2, radius * 2)
+            if index in (0, len(events) - 1):
+                painter.setPen(foreground)
+                painter.drawText(x - 35, line_y + 12, 70, 18,
+                                 Qt.AlignmentFlag.AlignCenter,
+                                 str(row.get("trade_date") or "")[-4:])
+
+
 class AnalysisWindow(QMainWindow):
     """시장 분석 전용 비모달 창. 기능은 탭 단위로 점진적으로 확장한다."""
 
     watchlist_changed = Signal()
     news_auto_changed = Signal(bool)
+    news_auto_interval_changed = Signal(int)
     new_news_found = Signal(int)
     limit_count_collect_requested = Signal()
 
@@ -2648,6 +2958,9 @@ class AnalysisWindow(QMainWindow):
         self._collection_task = None
         self._collection_cancelled = False
         self._dart_task = None
+        self._rotation_collect_task = None
+        self._news_web_auto_timer = QTimer(self)
+        self._news_web_auto_timer.timeout.connect(self._auto_reload_news_web)
         self.setWindowTitle("분석")
         self._key = "analysis_geometry"
         self._settings = QSettings("layout.ini", QSettings.IniFormat)
@@ -3470,17 +3783,28 @@ class AnalysisWindow(QMainWindow):
         fetch_btn = QPushButton("선택 종목 뉴스 조회")
         fetch_btn.clicked.connect(
             lambda: self._start_realtime_news_collection(True, True))
-        self._news_auto = QCheckBox("자동수집 5분")
+        self._news_auto = QCheckBox("자동수집")
         self._news_auto.setChecked(
             self._settings.value(
                 "analysis_news_auto", "false") == "true")
+        self._news_auto_interval = QComboBox()
+        for minutes in (1, 3, 5, 10, 15, 30):
+            self._news_auto_interval.addItem(f"{minutes}분", minutes)
+        saved_news_interval = int(
+            self._settings.value("analysis_news_interval", 5))
+        saved_news_index = self._news_auto_interval.findData(saved_news_interval)
+        self._news_auto_interval.setCurrentIndex(
+            saved_news_index if saved_news_index >= 0 else 2)
         self._news_auto.toggled.connect(self._news_auto_toggled)
+        self._news_auto_interval.currentIndexChanged.connect(
+            self._news_auto_interval_changed)
         controls.addWidget(QLabel("감시종목"))
         controls.addWidget(self._news_watch_search, 1)
         controls.addWidget(add_btn)
         controls.addWidget(remove_btn)
         controls.addWidget(fetch_btn)
         controls.addWidget(self._news_auto)
+        controls.addWidget(self._news_auto_interval)
         layout.addLayout(controls)
 
         self._news_status = QLabel(
@@ -3563,6 +3887,16 @@ class AnalysisWindow(QMainWindow):
         self._news_web_back = QPushButton("←")
         self._news_web_forward = QPushButton("→")
         self._news_web_reload = QPushButton("새로고침")
+        self._news_web_auto = QCheckBox("자동 새로고침")
+        self._news_web_auto_interval = QComboBox()
+        for seconds in (5, 10, 30, 60, 300):
+            self._news_web_auto_interval.addItem(f"{seconds}초", seconds)
+        saved_interval = int(self._settings.value("analysis_web_auto_interval", 30))
+        interval_index = self._news_web_auto_interval.findData(saved_interval)
+        self._news_web_auto_interval.setCurrentIndex(
+            interval_index if interval_index >= 0 else 2)
+        self._news_web_auto.setChecked(
+            self._settings.value("analysis_web_auto", "false") == "true")
         external_btn = QPushButton("외부 브라우저")
         self._news_web_back.clicked.connect(
             lambda: self._news_web_action("back"))
@@ -3571,9 +3905,14 @@ class AnalysisWindow(QMainWindow):
         self._news_web_reload.clicked.connect(
             lambda: self._news_web_action("reload"))
         external_btn.clicked.connect(self._open_news_web_external)
+        self._news_web_auto.toggled.connect(self._news_web_auto_toggled)
+        self._news_web_auto_interval.currentIndexChanged.connect(
+            self._news_web_auto_interval_changed)
         web_controls.addWidget(self._news_web_back)
         web_controls.addWidget(self._news_web_forward)
         web_controls.addWidget(self._news_web_reload)
+        web_controls.addWidget(self._news_web_auto)
+        web_controls.addWidget(self._news_web_auto_interval)
         web_controls.addStretch(1)
         web_controls.addWidget(external_btn)
         web_layout.addLayout(web_controls)
@@ -3681,6 +4020,9 @@ class AnalysisWindow(QMainWindow):
         except ImportError:
             pass
         web_layout.addWidget(self._news_web_host, 1)
+        if self._news_web_auto.isChecked():
+            self._news_web_auto_timer.start(
+                int(self._news_web_auto_interval.currentData()) * 1000)
 
         self._news_right_splitter = QSplitter(Qt.Orientation.Vertical)
         self._news_right_splitter.addWidget(news_pane)
@@ -3984,6 +4326,12 @@ class AnalysisWindow(QMainWindow):
         if enabled:
             self._start_realtime_news_collection(False, False)
 
+    def _news_auto_interval_changed(self, _index: int):
+        minutes = int(self._news_auto_interval.currentData())
+        self._settings.setValue("analysis_news_interval", minutes)
+        self._settings.sync()
+        self.news_auto_interval_changed.emit(minutes)
+
     def _start_realtime_news_collection(
             self, selected_only: bool, show_warning: bool):
         if not config.NAVER_CLIENT_ID or not config.NAVER_CLIENT_SECRET:
@@ -4257,7 +4605,7 @@ class AnalysisWindow(QMainWindow):
                     window.setTimeout(applyTodayHighlight, 500);
                     window.setTimeout(applyTodayHighlight, 1500);
                 """
-            script = f"""
+                script = f"""
                 (() => {{
                     const target =
                         document.querySelector('ul.tabs_submenu') ||
@@ -4318,6 +4666,25 @@ class AnalysisWindow(QMainWindow):
     def _open_news_web_external(self):
         if self._news_current_url:
             QDesktopServices.openUrl(QUrl(self._news_current_url))
+
+    def _news_web_auto_toggled(self, enabled: bool):
+        self._settings.setValue("analysis_web_auto", "true" if enabled else "false")
+        if enabled:
+            self._news_web_auto_timer.start(
+                int(self._news_web_auto_interval.currentData()) * 1000)
+        else:
+            self._news_web_auto_timer.stop()
+
+    def _news_web_auto_interval_changed(self, _index: int):
+        seconds = int(self._news_web_auto_interval.currentData())
+        self._settings.setValue("analysis_web_auto_interval", seconds)
+        if self._news_web_auto.isChecked():
+            self._news_web_auto_timer.start(seconds * 1000)
+
+    def _auto_reload_news_web(self):
+        if (self._news_webview is not None and self._news_webview.isVisible()
+                and self._news_webview.url().toString() not in ("", "about:blank")):
+            self._news_webview.reload()
 
     def _build_flow_page(self, layout: QVBoxLayout):
         controls = QHBoxLayout()
@@ -4893,19 +5260,50 @@ class AnalysisWindow(QMainWindow):
         self._rotation_search.setClearButtonEnabled(True)
         self._rotation_search.returnPressed.connect(
             self._refresh_rotation_analysis)
-        run_btn = QPushButton("순환매 분석")
-        run_btn.clicked.connect(self._refresh_rotation_analysis)
+        self._rotation_run_btn = QPushButton("순환매 분석")
+        self._rotation_run_btn.setToolTip(
+            "8% 이상 전용 조건식을 일반조회하고 현재가를 조회해 순환매 분석에 반영합니다.")
+        self._rotation_run_btn.clicked.connect(
+            self._start_rotation_live_analysis)
+        self._rotation_action_status = QLabel("분석 대기")
+        self._rotation_action_status.setMinimumWidth(250)
         controls.addWidget(QLabel("기준일"))
         controls.addWidget(self._rotation_date)
         controls.addWidget(self._rotation_source)
         controls.addWidget(self._rotation_window)
         controls.addWidget(self._rotation_search, 1)
-        controls.addWidget(run_btn)
+        controls.addWidget(self._rotation_run_btn)
+        controls.addWidget(self._rotation_action_status)
         layout.addLayout(controls)
 
         self._rotation_summary = QLabel("순환매 분석 대기")
         self._rotation_summary.setWordWrap(True)
         layout.addWidget(self._rotation_summary)
+        self._rotation_live_summary = QLabel("오늘 조건검색 스냅샷 없음")
+        self._rotation_live_summary.setWordWrap(True)
+        layout.addWidget(self._rotation_live_summary)
+        live_columns = (
+            "순위", "현재 테마", "현재 신호", "과거 단계", "결합 단계",
+            "결합점수", "상한가", "종목수", "평균등락률", "최고등락률",
+            "현재 대장", "수집시각", "다음 예상", "신뢰도", "판단 근거",
+        )
+        self._rotation_live_table = QTableWidget(0, len(live_columns))
+        self._rotation_live_table.setHorizontalHeaderLabels(live_columns)
+        self._rotation_live_table.setSortingEnabled(True)
+        self._rotation_live_table.setAlternatingRowColors(True)
+        self._rotation_live_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers)
+        self._rotation_live_table.verticalHeader().setVisible(False)
+        self._rotation_live_table.setMaximumHeight(210)
+        self._rotation_live_table.cellClicked.connect(
+            self._rotation_live_clicked)
+        layout.addWidget(self._rotation_live_table)
+        self._rotation_market_cycle_widget = RotationCycleWidget()
+        self._rotation_market_cycle_widget.set_cycle(
+            "시장 전체 테마", "", "분석 대기", [], {})
+        layout.addWidget(self._rotation_market_cycle_widget)
+        self._rotation_cycle_widget = RotationCycleWidget()
+        layout.addWidget(self._rotation_cycle_widget)
         notice = QLabel(
             "현재 테마 구성을 과거 상한가에 연결한 1차 후보 분석입니다. "
             "점수는 매수 신호가 아니며, 당시 뉴스·공시로 테마를 복원하면 "
@@ -4971,6 +5369,18 @@ class AnalysisWindow(QMainWindow):
         self._rotation_stock_table.customContextMenuRequested.connect(
             self._rotation_stock_right_clicked)
 
+        profile_columns = (
+            "구분", "기간·구간", "표본", "평균등락률", "8% 발생일",
+            "발생률", "상한가", "평균거래대금",
+        )
+        self._rotation_profile_table = QTableWidget(0, len(profile_columns))
+        self._rotation_profile_table.setHorizontalHeaderLabels(profile_columns)
+        self._rotation_profile_table.setSortingEnabled(True)
+        self._rotation_profile_table.setAlternatingRowColors(True)
+        self._rotation_profile_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers)
+        self._rotation_profile_table.verticalHeader().setVisible(False)
+
         def rotation_pane(title, table):
             widget = QWidget()
             pane_layout = QVBoxLayout(widget)
@@ -4989,6 +5399,10 @@ class AnalysisWindow(QMainWindow):
             rotation_pane(
                 "대장주·선도주·후발 후보",
                 self._rotation_stock_table))
+        self._rotation_bottom_splitter.addWidget(
+            rotation_pane(
+                "기간·월·계절·시장구간 반복 통계",
+                self._rotation_profile_table))
         self._rotation_vertical_splitter = QSplitter(
             Qt.Orientation.Vertical)
         self._rotation_vertical_splitter.addWidget(
@@ -5020,25 +5434,117 @@ class AnalysisWindow(QMainWindow):
             self._rotation_bottom_splitter.saveState())
         self._settings.sync()
 
+    def _start_rotation_live_analysis(self):
+        """버튼 클릭 시 조건검색을 즉시 수집하고 완료 후 분석을 갱신한다."""
+        if (self._rotation_collect_task is not None
+                and not self._rotation_collect_task.done()):
+            return
+        if self._app is None:
+            self._refresh_rotation_analysis()
+            return
+        clicked_at = datetime.now().strftime("%H:%M:%S")
+        self._rotation_action_status.setText(
+            f"● {clicked_at} 요청 접수")
+        self._rotation_action_status.setStyleSheet(
+            "QLabel { color: #d9b36c; font-weight: bold; }")
+        log.info("rotation analysis requested: time=%s", clicked_at)
+        self._rotation_collect_task = asyncio.ensure_future(
+            self._collect_and_refresh_rotation())
+
+    async def _collect_and_refresh_rotation(self):
+        self._rotation_run_btn.setEnabled(False)
+        self._rotation_run_btn.setText("실시간 수집 중…")
+        self._rotation_live_summary.setText(
+            "8% 이상 전용 조건식을 조회하고 현재가를 REST로 수집하는 중입니다…")
+        self._rotation_action_status.setText(
+            f"● {datetime.now().strftime('%H:%M:%S')} 데이터 확인 중…")
+        # 최근 배치를 즉시 재사용하는 경로도 버튼과 상태 문구가 먼저 화면에
+        # 그려지도록 이벤트 루프에 한 번 제어권을 돌려준다.
+        await asyncio.sleep(0)
+        try:
+            result = await self._app.collect_rotation_snapshot_now()
+            self._rotation_action_status.setText(
+                f"● {datetime.now().strftime('%H:%M:%S')} 순환매 계산 중…")
+            await asyncio.sleep(0)
+            self._rotation_date.setDate(QDate.currentDate())
+            self._refresh_rotation_analysis()
+            if result.get("reused"):
+                status = (
+                    f"8% 이상 최근 정상 수집값 적용 · 종목 "
+                    f"{result['codes']:,}개 · 테마 {result['themes']:,}개 · "
+                    f"{result.get('reuse_reason', '재사용')}")
+            else:
+                status = (
+                    f"8% 이상 조건검색 반영 완료 · 종목 "
+                    f"{result['codes']:,}개 · 테마 {result['themes']:,}개")
+            completed_at = datetime.now().strftime("%H:%M:%S")
+            mode = "최근값 적용" if result.get("reused") else "신규수집"
+            self._rotation_action_status.setText(
+                f"✓ {completed_at} 완료 · {mode} · "
+                f"{result['codes']:,}종목/{result['themes']:,}테마")
+            self._rotation_action_status.setStyleSheet(
+                "QLabel { color: #45c46a; font-weight: bold; }")
+            self.statusBar().showMessage(status, 5000)
+            log.info(
+                "rotation analysis completed: reused=%s codes=%d themes=%d",
+                bool(result.get("reused")), result["codes"], result["themes"])
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001
+            log.exception("live rotation snapshot failed")
+            self._rotation_live_summary.setText(
+                f"8% 이상 조건검색 수집 실패: {error}")
+            self._rotation_action_status.setText(
+                f"✕ {datetime.now().strftime('%H:%M:%S')} 실패 · {error}")
+            self._rotation_action_status.setStyleSheet(
+                "QLabel { color: #e85b5b; font-weight: bold; }")
+            self._show_async_error(
+                "순환매 실시간 분석",
+                f"8% 이상 조건검색 수집에 실패했습니다.\n{error}")
+        finally:
+            self._rotation_run_btn.setEnabled(True)
+            self._rotation_run_btn.setText("순환매 분석")
+            self._rotation_collect_task = None
+
     def _refresh_rotation_analysis(self):
         if not hasattr(self, "_rotation_table"):
             return
         requested_date = self._rotation_date.date().toString("yyyyMMdd")
         source = str(self._rotation_source.currentData() or "NAVER")
+        snapshots = [
+            row for row in recent_condition_snapshots(
+                limit=100, condition_name=ROTATION_BATCH_NAME)
+            if str(row["condition_seq"]).startswith("BATCH:")
+            and str(row["captured_at"] or "")[:10].replace("-", "")
+            == requested_date
+        ]
+        if not snapshots:
+            self._rotation_live_table.setRowCount(0)
+            self._rotation_live_summary.setText(
+                "선택 기준일의 조건검색 스냅샷 없음")
+            self._rotation_market_cycle_widget.set_cycle(
+                "시장 전체 테마", "", "당일 스냅샷 없음", [], {})
         self._rotation_summary.setText("순환매 후보를 계산하는 중입니다…")
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             result = rebuild_rotation_analysis(requested_date, source)
             as_of_date = result["as_of_date"]
             if not as_of_date:
+                if snapshots:
+                    self._refresh_rotation_condition_snapshot(
+                        snapshots[0], [])
                 self._rotation_summary.setText(
                     "선택 날짜 이전에 저장된 일봉이 없습니다.")
                 return
             self._rotation_as_of_date = as_of_date
             actual_date = QDate.fromString(as_of_date, "yyyyMMdd")
-            if actual_date.isValid():
+            if (actual_date.isValid()
+                    and requested_date != datetime.now().strftime("%Y%m%d")):
                 self._rotation_date.setDate(actual_date)
             rows = rotation_signal_rows(as_of_date, source)
+            if snapshots:
+                self._refresh_rotation_condition_snapshot(
+                    snapshots[0], rows)
             query = self._rotation_search.text().strip().lower()
             if query:
                 rows = [
@@ -5072,6 +5578,221 @@ class AnalysisWindow(QMainWindow):
                 f"순환매 분석에 실패했습니다.\n{error}")
         finally:
             QApplication.restoreOverrideCursor()
+
+    def _refresh_rotation_condition_snapshot(
+            self, snapshot: dict, historical_rows: list[dict]):
+        """현재 조건검색 강도와 과거 순환 신호를 결합해 현재 단계를 계산한다."""
+        rows = condition_theme_stats(int(snapshot["snapshot_id"]))
+        history_by_theme = {
+            str(row["theme_name"]): row for row in historical_rows
+        }
+        combined_rows = []
+        for row in rows:
+            top_rate = float(row["top_rate"] or 0)
+            average_rate = float(row["average_rate"] or 0)
+            upper_count = int(row["upper_count"] or 0)
+            member_count = int(row["member_count"] or 0)
+            current_signal = (
+                "상한가" if upper_count else
+                "확산" if top_rate >= 15 else
+                "초기" if top_rate >= 8 else "관찰"
+            )
+            history = history_by_theme.get(str(row["theme_name"]))
+            historical_phase = str(history["phase"] or "-") if history else "신규"
+            historical_score = float(history["rotation_score"] or 0) if history else 0.0
+            live_score = min(100.0, upper_count * 25.0
+                             + max(0.0, top_rate) * 3.0
+                             + max(0.0, average_rate) * 2.0
+                             + min(member_count, 10))
+            combined_score = live_score if not history else (
+                live_score * 0.65 + historical_score * 0.35)
+            if current_signal == "관찰":
+                combined_phase = historical_phase if history else "관찰"
+            elif not history:
+                combined_phase = "신규"
+            elif historical_phase in ("소멸", "대기", "관찰"):
+                combined_phase = "재점화"
+            elif upper_count and average_rate >= 10:
+                combined_phase = "과열"
+            else:
+                combined_phase = current_signal
+            next_expected = {
+                "신규": "확산 후보",
+                "초기": "확산 후보",
+                "확산": "후발주 확산",
+                "재점화": "2차 확산 후보",
+                "과열": "순환 이탈 주의",
+                "소멸": "재점화 대기",
+            }.get(combined_phase, "추가 확인")
+            history_events = int(history["events_20d"] or 0) if history else 0
+            history_days = int(history["active_days_20d"] or 0) if history else 0
+            agreement = bool(history and current_signal != "관찰" and (
+                historical_phase in ("초기", "확산", "재점화")
+                or combined_phase == "재점화"))
+            confidence = min(95.0, 25.0
+                             + min(25.0, history_events * 4.0 + history_days)
+                             + min(30.0, upper_count * 10.0
+                                   + max(0.0, top_rate)
+                                   + min(member_count, 8))
+                             + (10.0 if agreement else 0.0))
+            reason_parts = [
+                f"현재 최고 {top_rate:+.1f}%",
+                f"평균 {average_rate:+.1f}%",
+                f"상한가 {upper_count}개",
+            ]
+            if history:
+                reason_parts.append(
+                    f"과거20일 {history_events}건/{history_days}일")
+            else:
+                reason_parts.append("과거 이력 없음")
+            combined_rows.append({
+                "row": row, "top_rate": top_rate,
+                "average_rate": average_rate, "upper_count": upper_count,
+                "member_count": member_count, "current_signal": current_signal,
+                "historical_phase": historical_phase,
+                "combined_phase": combined_phase,
+                "combined_score": combined_score,
+                "next_expected": next_expected,
+                "confidence": confidence,
+                "reason": " · ".join(reason_parts),
+            })
+        combined_rows.sort(
+            key=lambda item: (item["combined_score"], item["top_rate"]),
+            reverse=True)
+        self._refresh_market_rotation_cycle(combined_rows)
+        query = self._rotation_search.text().strip().lower()
+        if query:
+            combined_rows = [
+                item for item in combined_rows
+                if query in str(item["row"]["theme_name"]).lower()
+            ]
+        table = self._rotation_live_table
+        table.setSortingEnabled(False)
+        table.setRowCount(len(combined_rows))
+        for row_index, item_row in enumerate(combined_rows):
+            row = item_row["row"]
+            values = (
+                row_index + 1, row["theme_name"], item_row["current_signal"],
+                item_row["historical_phase"], item_row["combined_phase"],
+                f"{item_row['combined_score']:.1f}", item_row["upper_count"],
+                item_row["member_count"], f"{item_row['average_rate']:+.2f}%",
+                f"{item_row['top_rate']:+.2f}%",
+                row["leader_stock_name"] or "-",
+                str(snapshot["captured_at"])[:19],
+                item_row["next_expected"],
+                f"{item_row['confidence']:.0f}%", item_row["reason"],
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                if column in (0, 6, 7):
+                    item = NumericTableWidgetItem(str(value), int(value))
+                elif column in (5, 8, 9, 13):
+                    number = {
+                        5: item_row["combined_score"],
+                        8: item_row["average_rate"],
+                        9: item_row["top_rate"],
+                        13: item_row["confidence"],
+                    }[column]
+                    item = NumericTableWidgetItem(str(value), number)
+                if column == 4 and item_row["combined_phase"] == "과열":
+                    item.setBackground(QColor("#6a3030"))
+                elif column == 4 and item_row["combined_phase"] in ("신규", "재점화"):
+                    item.setBackground(QColor("#345c3d"))
+                if column == 13:
+                    confidence = item_row["confidence"]
+                    item.setBackground(QColor(
+                        "#345c3d" if confidence >= 75 else
+                        "#654f2c" if confidence >= 55 else "#474747"))
+                if column == 14:
+                    item.setToolTip(item_row["reason"])
+                item.setData(Qt.ItemDataRole.UserRole + 30,
+                             item_row["combined_phase"])
+                item.setData(Qt.ItemDataRole.UserRole + 31,
+                             item_row["next_expected"])
+                table.setItem(row_index, column, item)
+        table.setSortingEnabled(True)
+        table.resizeColumnsToContents()
+        table.sortItems(0, Qt.SortOrder.AscendingOrder)
+        self._rotation_live_summary.setText(
+            f"현재 조건검색 스냅샷 {snapshot['captured_at']} · "
+            f"테마 {len(combined_rows):,}개 · 종목 {snapshot['stock_count']:,}개 · "
+            "현재 65% + 과거 35% 결합"
+            + (" · 다음 후보 " + ", ".join(
+                f"{item['row']['theme_name']} {item['confidence']:.0f}%"
+                for item in combined_rows
+                if item["combined_phase"] in ("신규", "초기", "재점화", "확산")
+            )[:180] if combined_rows else ""))
+        if combined_rows:
+            first = combined_rows[0]
+            self._rotation_cycle_widget.set_cycle(
+                first["row"]["theme_name"], first["combined_phase"],
+                first["next_expected"], [])
+
+    def _refresh_market_rotation_cycle(self, combined_rows):
+        """당일 강세 테마 전체 분포로 시장 순환매의 위치를 계산한다."""
+        stage_counts = Counter()
+        active_rows = []
+        for item in combined_rows:
+            phase = str(item.get("combined_phase") or "")
+            if phase == "신규":
+                phase = "초기"
+            if phase in RotationCycleWidget.STAGES:
+                stage_counts[phase] += 1
+                active_rows.append(item)
+        if not active_rows:
+            self._rotation_market_cycle_widget.set_cycle(
+                "시장 전체 테마", "", "판단 자료 부족", [], stage_counts)
+            return
+
+        total = len(active_rows)
+        top_rows = active_rows[:min(5, total)]
+        preferred_leading = any(
+            "우선주" in str(item["row"]["theme_name"])
+            for item in top_rows)
+        late_count = stage_counts["과열"] + stage_counts["소멸"]
+        spread_count = stage_counts["확산"]
+        restart_count = stage_counts["재점화"]
+        early_count = stage_counts["초기"]
+
+        if stage_counts["소멸"] / total >= 0.40:
+            market_phase = "소멸"
+            next_text = "새 주도 테마 재점화 대기"
+        elif preferred_leading or late_count / total >= 0.35:
+            market_phase = "과열"
+            next_text = "소멸·주도 테마 교체 주의"
+        elif spread_count / total >= 0.35:
+            market_phase = "확산"
+            next_text = "과열 여부 확인"
+        elif restart_count > early_count:
+            market_phase = "재점화"
+            next_text = "2차 확산 여부 확인"
+        else:
+            market_phase = "초기"
+            next_text = "확산 여부 확인"
+
+        reasons = [
+            f"전체 {total}개",
+            f"초기 {stage_counts['초기']}",
+            f"확산 {spread_count}",
+            f"과열 {stage_counts['과열']}",
+            f"소멸 {stage_counts['소멸']}",
+            f"재점화 {restart_count}",
+        ]
+        if preferred_leading:
+            reasons.append("상위권 우선주 출현")
+        self._rotation_market_cycle_widget.set_cycle(
+            "시장 전체 테마", market_phase,
+            f"{next_text} · {' · '.join(reasons)}", [], stage_counts)
+
+    def _rotation_live_clicked(self, row: int, _column: int):
+        theme_item = self._rotation_live_table.item(row, 1)
+        phase_item = self._rotation_live_table.item(row, 4)
+        if theme_item is None or phase_item is None:
+            return
+        self._rotation_cycle_widget.set_cycle(
+            theme_item.text(),
+            str(phase_item.data(Qt.ItemDataRole.UserRole + 30) or ""),
+            str(phase_item.data(Qt.ItemDataRole.UserRole + 31) or ""), [])
 
     def _fill_rotation_candidates(self, rows):
         table = self._rotation_table
@@ -5156,6 +5877,21 @@ class AnalysisWindow(QMainWindow):
         timeline_rows = rotation_theme_daily_rows(
             theme_id, source, as_of_date, trading_days)
         stock_rows = rotation_stock_rows(as_of_date, theme_id, source)
+        profile_rows = rotation_cycle_profile_rows(
+            theme_id, source, as_of_date)
+        historical_phase = ""
+        for candidate in getattr(self, "_rotation_rows", []):
+            if int(candidate["theme_id"]) == int(theme_id):
+                historical_phase = str(candidate["phase"] or "")
+                break
+        next_text = {
+            "초기": "확산 후보", "확산": "과열 또는 후발 확산",
+            "과열": "소멸·이탈 주의", "소멸": "재점화 대기",
+            "재점화": "2차 확산 후보",
+        }.get(historical_phase, "")
+        self._rotation_cycle_widget.set_cycle(
+            theme_name, historical_phase, next_text,
+            list(reversed(timeline_rows[:12])))
 
         table = self._rotation_timeline_table
         table.setSortingEnabled(False)
@@ -5242,6 +5978,34 @@ class AnalysisWindow(QMainWindow):
         stock_table.setColumnWidth(
             2, min(180, max(100, stock_table.columnWidth(2))))
         stock_table.sortItems(0, Qt.SortOrder.AscendingOrder)
+
+        profile_table = self._rotation_profile_table
+        profile_table.setSortingEnabled(False)
+        profile_table.setRowCount(len(profile_rows))
+        for row_index, row in enumerate(profile_rows):
+            values = (
+                row["category"], row["label"], int(row["samples"] or 0),
+                f"{float(row['average_rate'] or 0):+.2f}%",
+                int(row["strong_days"] or 0),
+                f"{float(row['hit_rate'] or 0):.1f}%",
+                int(row["limit_count"] or 0),
+                f"{int(row['average_value'] or 0)/100_000_000:,.0f}억",
+            )
+            numbers = {
+                2: int(row["samples"] or 0),
+                3: float(row["average_rate"] or 0),
+                4: int(row["strong_days"] or 0),
+                5: float(row["hit_rate"] or 0),
+                6: int(row["limit_count"] or 0),
+                7: int(row["average_value"] or 0),
+            }
+            for column, value in enumerate(values):
+                item = (NumericTableWidgetItem(str(value), numbers[column])
+                        if column in numbers else QTableWidgetItem(str(value)))
+                profile_table.setItem(row_index, column, item)
+        profile_table.setSortingEnabled(True)
+        profile_table.resizeColumnsToContents()
+        profile_table.sortItems(0, Qt.SortOrder.AscendingOrder)
         self.statusBar().showMessage(
             f"{theme_name} · 상한가 발생일 {len(timeline_rows):,}일 · "
             f"구성 종목 {len(stock_rows):,}개", 5000)

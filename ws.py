@@ -156,9 +156,10 @@ class WSClient:
         # (순수코드, 명시 접미사) -> 참조수. suffix=None은 전역 KRX/통합 설정을 따르고,
         # "_NX"는 NXT 전용 창이라 전역 설정이 바뀌어도 그대로 유지한다.
         self._reg_codes: dict[tuple[str, str | None], int] = {}
-        # 시세 접미사: "" = KRX 전용, "_AL" = KRX+NXT 통합 (REG 코드에만 붙임, 실측 확인).
-        # 조건검색(CNSRREQ)은 stex_tp "K"만 허용이라 편입/이탈은 항상 KRX 기준.
+        # 통합 버튼은 시세와 조건검색 시장을 함께 전환한다.
+        # 시세: ""=KRX, "_AL"=KRX+NXT 통합 / 조건검색: K=KRX, A=통합.
         self.real_suffix = ""
+        self.condition_stex_tp = "K"
         self._connected = asyncio.Event()
         self._seen_fids: set = set()       # 처음 본 (type,fid)만 로그 (FID 발굴용)
         self._real_stats: dict = {}        # 5초 단위 REAL 수신 빈도 (예상값 갱신속도 진단용)
@@ -184,7 +185,10 @@ class WSClient:
 
     async def register_condition(self, seq: str):
         self._active_seqs.add(str(seq))
-        await self._send({"trnm": "CNSRREQ", "seq": seq, "search_type": "1", "stex_tp": "K"})
+        await self._send({
+            "trnm": "CNSRREQ", "seq": seq, "search_type": "1",
+            "stex_tp": self.condition_stex_tp,
+        })
 
     async def request_condition_once(self, seq: str, timeout: float = 30.0) -> list[str]:
         """조건검색 일반(ka10172)을 1회 요청한다.
@@ -198,7 +202,8 @@ class WSClient:
         future = loop.create_future()
         self._condition_once_waiters.setdefault(key, []).append(future)
         await self._send({"trnm": "CNSRREQ", "seq": key,
-                          "search_type": "0", "stex_tp": "K"})
+                          "search_type": "0",
+                          "stex_tp": self.condition_stex_tp})
         try:
             return await asyncio.wait_for(future, timeout)
         finally:
@@ -289,16 +294,30 @@ class WSClient:
                      sum(target.values()), len(target), len(register), len(remove), force)
 
     async def set_real_suffix(self, suffix: str):
-        """KRX 전용("") <-> 통합("_AL") 런타임 전환: 기존 등록 전부 갈아끼움."""
-        if suffix == self.real_suffix:
+        """KRX↔통합 전환: 시세 등록과 조건검색을 같은 시장으로 재등록한다."""
+        next_condition_stex = "A" if suffix == "_AL" else "K"
+        suffix_changed = suffix != self.real_suffix
+        condition_changed = next_condition_stex != self.condition_stex_tp
+        if not suffix_changed and not condition_changed:
             return
         default_keys = [k for k in self._reg_codes if k[1] is None]
-        if default_keys:
+        if suffix_changed and default_keys:
             await self._send(build_remove([self._registered_item(k) for k in default_keys], REAL_TYPES))
         self.real_suffix = suffix
-        log.info("real suffix -> %r", suffix)
-        if default_keys:
+        self.condition_stex_tp = next_condition_stex
+        log.info("market source -> real=%r condition=%s",
+                 suffix, self.condition_stex_tp)
+        if suffix_changed and default_keys:
             await self._send(build_reg([self._registered_item(k) for k in default_keys], REAL_TYPES))
+        if condition_changed:
+            # 조건검색 서버는 등록 당시 거래소구분을 유지하므로 해제 후 새 시장으로
+            # 다시 요청해야 버튼 전환 즉시 초기 목록과 이후 편입·이탈이 바뀐다.
+            for seq in sorted(self._active_seqs):
+                await self._send({"trnm": "CNSRCLR", "seq": seq})
+                await self._send({
+                    "trnm": "CNSRREQ", "seq": seq, "search_type": "1",
+                    "stex_tp": self.condition_stex_tp,
+                })
 
     # --- 내부 ----------------------------------------------------------
     async def _connect_once(self):
@@ -322,7 +341,8 @@ class WSClient:
         await self.list_conditions()
         for seq in self._active_seqs:
             await self._send({"trnm": "CNSRREQ", "seq": seq,
-                              "search_type": "1", "stex_tp": "K"})
+                              "search_type": "1",
+                              "stex_tp": self.condition_stex_tp})
         if self._reg_codes:
             await self._send(build_reg([self._registered_item(k) for k in self._reg_codes], REAL_TYPES))
 
