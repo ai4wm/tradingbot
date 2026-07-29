@@ -2752,6 +2752,9 @@ class ConditionScreen(QWidget):
             self.order_preview_value.setToolTip("")
             return
 
+        upper = int(
+            self.model.rows.get(
+                self._order_target_code, {}).get("upper") or 0)
         fixed_total = fixed_count * 100
         excluded = max(0, available_qty - fixed_total)
         fixed_slots = self._order_slots(fixed_count, selected_count)
@@ -2772,13 +2775,15 @@ class ConditionScreen(QWidget):
                 f"{base + 1:,}/{base:,}주씩" if extra else f"{base:,}주씩")
             split_text = (
                 f"{self._order_slots(remaining_count, selected_count)}&nbsp; "
-                f"<b>{remaining_count}회</b> · {per_order} · 총 {available_qty:,}주")
+                f"<b>{remaining_count}회</b> · {per_order}")
         else:
             split_text = "주문가능수량 없음"
 
         self.order_preview_value.setText(
             f"<b>상한가 지정가</b>&nbsp;&nbsp; 100주씩 {fixed_text}"
-            f"&nbsp;&nbsp;│&nbsp;&nbsp; 분할매수 {split_text}")
+            f"&nbsp;&nbsp;│&nbsp;&nbsp; 분할매수 {split_text}"
+            f"&nbsp;&nbsp;·&nbsp;&nbsp;"
+            f"<b>{fixed_total * upper:,}원</b>")
         self.order_preview_value.setToolTip(
             "■ 실제 전송되는 주문 · □ 설정했지만 수량 부족으로 전송되지 않는 주문")
 
