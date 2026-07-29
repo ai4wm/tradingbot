@@ -46,6 +46,7 @@ PRICE_COL = FIELDS.index("price")
 NAME_COL = FIELDS.index("name")
 THEME_COL = FIELDS.index("theme")
 TIME_COL = FIELDS.index("time")
+VOLUME_COL = FIELDS.index("vol")
 BID_QTY_COL = FIELDS.index("bid_qty")
 NON_LIMIT_IGNORED_SORT_COLS = {TIME_COL, BID_QTY_COL}
 STREAK_COL = FIELDS.index("streak")
@@ -711,46 +712,103 @@ class TieredProxy(QSortFilterProxyModel):
 
 
 class ThemeGroupedTableView(QTableView):
-    """테마 묶음이 바뀌는 행에 표 전체 가로 구분선을 표시한다."""
+    """테마·거래상태 가로 구분선과 핵심 거래 열 세로 안내선을 표시한다."""
 
     def paintEvent(self, event):
         super().paintEvent(event)
         proxy = self.model()
-        if not isinstance(proxy, TieredProxy) or not proxy.theme_mode:
-            return
-        source = proxy.sourceModel()
-        if source is None or not hasattr(source, "codes"):
-            return
-
         painter = QPainter(self.viewport())
         painter.setRenderHint(QPainter.Antialiasing, False)
-        previous_group = None
-        for row in range(proxy.rowCount()):
-            proxy_index = proxy.index(row, 0)
-            source_index = proxy.mapToSource(proxy_index)
-            if not source_index.isValid():
-                continue
-            code = source.codes[source_index.row()]
-            group = proxy._theme_group_keys.get(code, ("none", "미분류"))
-            # 첫 묶음도 헤더 바로 아래부터 표시하고, 묶음의 끝에도 선을
-            # 넣는다. 따라서 화면 전체가 '우선주' 하나여도 경계가 보인다.
-            is_start = group[0] != "none" and group != previous_group
-            next_group = ("none", "미분류")
-            if row + 1 < proxy.rowCount():
-                next_source = proxy.mapToSource(proxy.index(row + 1, 0))
-                if next_source.isValid():
-                    next_code = source.codes[next_source.row()]
-                    next_group = proxy._theme_group_keys.get(
-                        next_code, ("none", "미분류"))
-            is_end = group[0] != "none" and group != next_group
-            if is_start or is_end:
-                rect = self.visualRect(proxy_index)
-                if rect.isValid() and rect.bottom() >= 0 and rect.top() <= self.viewport().height():
-                    # 대장/단독 여부와 무관하게 표 전체에서 즉시 보이도록 고정색을 쓴다.
-                    painter.setPen(QPen(THEME_DIVIDER, 3))
-                    y = rect.top() if is_start else rect.bottom()
+        if isinstance(proxy, TieredProxy) and proxy.theme_mode:
+            source = proxy.sourceModel()
+            if source is not None and hasattr(source, "codes"):
+                previous_group = None
+                for row in range(proxy.rowCount()):
+                    proxy_index = proxy.index(row, 0)
+                    source_index = proxy.mapToSource(proxy_index)
+                    if not source_index.isValid():
+                        continue
+                    code = source.codes[source_index.row()]
+                    group = proxy._theme_group_keys.get(
+                        code, ("none", "미분류"))
+                    # 첫 묶음도 헤더 바로 아래부터 표시하고, 묶음의 끝에도 선을
+                    # 넣는다. 따라서 화면 전체가 '우선주' 하나여도 경계가 보인다.
+                    is_start = (
+                        group[0] != "none" and group != previous_group)
+                    next_group = ("none", "미분류")
+                    if row + 1 < proxy.rowCount():
+                        next_source = proxy.mapToSource(
+                            proxy.index(row + 1, 0))
+                        if next_source.isValid():
+                            next_code = source.codes[next_source.row()]
+                            next_group = proxy._theme_group_keys.get(
+                                next_code, ("none", "미분류"))
+                    is_end = group[0] != "none" and group != next_group
+                    if is_start or is_end:
+                        rect = self.visualRect(proxy_index)
+                        if (
+                            rect.isValid()
+                            and rect.bottom() >= 0
+                            and rect.top() <= self.viewport().height()
+                        ):
+                            # 대장/단독 여부와 무관하게 표 전체에서 즉시 보이도록
+                            # 고정색을 쓴다.
+                            painter.setPen(QPen(THEME_DIVIDER, 3))
+                            y = rect.top() if is_start else rect.bottom()
+                            painter.drawLine(
+                                0, y, self.viewport().width(), y)
+                    previous_group = group
+
+        # 상한가 정렬 순서는 그대로 두고, 09시 이후에도 예상상한 상태로
+        # 아직 첫 거래가 시작되지 않은 종목군의 끝만 가로선으로 구분한다.
+        if (
+            isinstance(proxy, TieredProxy)
+            and proxy.limit_mode
+            and not _in_opening_auction()
+            and proxy.rowCount() > 1
+        ):
+            source = proxy.sourceModel()
+            last_waiting_row = -1
+            if source is not None and hasattr(source, "codes"):
+                for row in range(proxy.rowCount()):
+                    source_index = proxy.mapToSource(proxy.index(row, 0))
+                    if not source_index.isValid():
+                        break
+                    code = source.codes[source_index.row()]
+                    if _limit_tier(source.rows[code], False) not in (0, 1):
+                        break
+                    last_waiting_row = row
+            if 0 <= last_waiting_row < proxy.rowCount() - 1:
+                y = (
+                    self.rowViewportPosition(last_waiting_row)
+                    + self.rowHeight(last_waiting_row) - 1
+                )
+                if 0 <= y < self.viewport().height():
+                    painter.setPen(QPen(QColor("#FFD54F"), 2))
                     painter.drawLine(0, y, self.viewport().width(), y)
-            previous_group = group
+
+        # 셀 배경과 숫자색은 그대로 두고, 가장 중요한 두 열의 위치만
+        # 끊김 없는 세로선으로 표시한다. 논리 열 기준이라 사용자가 열을
+        # 옮기거나 너비를 바꿔도 선은 해당 열을 그대로 따라간다.
+        if proxy is not None and proxy.rowCount() > 0:
+            last_row = proxy.rowCount() - 1
+            line_bottom = min(
+                self.viewport().height() - 1,
+                self.rowViewportPosition(last_row)
+                + self.rowHeight(last_row) - 1,
+            )
+            if line_bottom >= 0:
+                for column, color, width in (
+                    (VOLUME_COL, QColor("#FFB300"), 2),
+                    (BID_QTY_COL, QColor("#26C6DA"), 1),
+                ):
+                    if self.isColumnHidden(column):
+                        continue
+                    left = self.columnViewportPosition(column)
+                    right = left + self.columnWidth(column) - 1
+                    painter.setPen(QPen(color, width))
+                    painter.drawLine(left, 0, left, line_bottom)
+                    painter.drawLine(right, 0, right, line_bottom)
         painter.end()
 
 
