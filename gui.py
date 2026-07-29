@@ -800,7 +800,7 @@ class ThemeGroupedTableView(QTableView):
             if line_bottom >= 0:
                 for column, color, width in (
                     (VOLUME_COL, QColor("#FFB300"), 2),
-                    (BID_QTY_COL, QColor("#26C6DA"), 1),
+                    (BID_QTY_COL, QColor("#FFB300"), 1),
                 ):
                     if self.isColumnHidden(column):
                         continue
