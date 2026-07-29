@@ -27,6 +27,7 @@ class MarketInfo:
     """ka10099 종목 분류셋 묶음 (시작 시 1회 조회해 gui 모델에 주입)."""
     kosdaq: set[str] = field(default_factory=set)  # 코스닥 (종목명 보라)
     single: set[str] = field(default_factory=set)  # 단일가 매매 (예상값 상시 표시)
+    short_overheat: set[str] = field(default_factory=set)  # 단기과열 (30분 단일가)
     liquidation: set[str] = field(default_factory=set)  # 정리매매 (가격제한폭 없음)
     nxt: set[str] = field(default_factory=set)     # 넥스트레이드 거래가능 (좌상단 노랑)
     misu: set[str] = field(default_factory=set)    # 미수가능 (우상단 녹색)
@@ -140,13 +141,16 @@ class RestClient:
         return data
 
     async def buy_order(self, code: str, qty: int, price: int) -> dict:
-        """국내주식 시장가 매수. price는 주문가능수량·예약금 계산용이다."""
+        """KRX 보통 지정가 매수. 주문 화면은 상한가를 price로 전달한다."""
+        price = int(price)
+        if price <= 0:
+            raise ValueError("매수 지정가는 0원보다 커야 합니다")
         data = await self._order_request("kt10000", {
             "dmst_stex_tp": "KRX",
             "stk_cd": code,
             "ord_qty": str(int(qty)),
-            "ord_uv": "",
-            "trde_tp": "3",  # 시장가
+            "ord_uv": str(price),
+            "trde_tp": "0",  # 보통 지정가
             "cond_uv": "",
         })
         order_no = str(data.get("ord_no") or data.get("order_no") or "")
@@ -154,14 +158,19 @@ class RestClient:
             raise RuntimeError("매수 주문번호가 응답에 없습니다")
         return {"order_no": order_no, "raw": data}
 
-    async def sell_order(self, code: str, qty: int, price: int) -> dict:
-        """KRX 보통 지정가 매도. 보호매도는 상한가 가격만 전달한다."""
+    async def sell_order(
+            self, code: str, qty: int, price: int = 0, *,
+            market: bool = False) -> dict:
+        """KRX 지정가 또는 시장가 매도."""
+        price = int(price)
+        if not market and price <= 0:
+            raise ValueError("매도 지정가는 0원보다 커야 합니다")
         data = await self._order_request("kt10001", {
             "dmst_stex_tp": "KRX",
             "stk_cd": code,
             "ord_qty": str(int(qty)),
-            "ord_uv": str(int(price)),
-            "trde_tp": "0",
+            "ord_uv": "" if market else str(price),
+            "trde_tp": "3" if market else "0",
             "cond_uv": "",
         })
         order_no = str(data.get("ord_no") or data.get("order_no") or "")
@@ -170,9 +179,20 @@ class RestClient:
         return {"order_no": order_no, "raw": data}
 
     async def cancel_order(
-            self, code: str, original_order_no: str, qty: int) -> dict:
+            self, code: str, original_order_no: str, qty: int,
+            exchange: str = "KRX") -> dict:
+        """원주문 1건을 취소한다. qty=0이면 그 주문의 잔량 전부 취소."""
+        exchange = str(exchange or "KRX").strip().upper()
+        if exchange in ("통합", "0"):
+            exchange = "SOR"
+        elif exchange == "1":
+            exchange = "KRX"
+        elif exchange == "2":
+            exchange = "NXT"
+        if exchange not in {"KRX", "NXT", "SOR"}:
+            exchange = "KRX"
         data = await self._order_request("kt10003", {
-            "dmst_stex_tp": "KRX",
+            "dmst_stex_tp": exchange,
             "orig_ord_no": str(original_order_no),
             "stk_cd": code,
             "cncl_qty": str(int(qty)),
@@ -344,11 +364,13 @@ class RestClient:
                     m.misu.add(code)
                 if "관리종목" in state:
                     m.admin.add(code)
-                order_warning = r.get("orderWarning")
+                order_warning = str(r.get("orderWarning") or "").strip()
                 if order_warning in ("2", "3"):
                     m.single.add(code)
                     if order_warning == "2":
                         m.liquidation.add(code)
+                    else:
+                        m.short_overheat.add(code)
                 elif (r.get("marketCode") in ("0", "10") and not code.endswith("0")
                         and 0 < shares < 500_000):
                     m.single.add(code)  # 저유동성 우선주
@@ -521,6 +543,44 @@ class RestClient:
             {row["date"]: row for row in rows}.values(),
             key=lambda row: row["date"],
         )
+
+    async def market_breadth(self) -> list[dict]:
+        """ka20001 조회시점의 코스피·코스닥 지수와 등락 종목 수를 반환한다."""
+        rows = []
+        for index_code, market in (("001", "KOSPI"), ("101", "KOSDAQ")):
+            data = await self.request(
+                "ka20001",
+                {"mrkt_tp": "0", "inds_cd": index_code},
+                "/api/dostk/sect",
+            )
+            if str(data.get("return_code", "0")) not in ("0", ""):
+                raise RuntimeError(
+                    data.get("return_msg") or f"{market} 현재시장 조회 실패")
+            rising = abs(_to_int(data.get("rising")))
+            falling = abs(_to_int(data.get("fall")))
+            unchanged = abs(_to_int(data.get("stdns")))
+            upper = abs(_to_int(data.get("upl")))
+            lower = abs(_to_int(data.get("lst")))
+            stock_count = abs(_to_int(data.get("trde_frmatn_stk_num")))
+            if not stock_count:
+                stock_count = rising + falling + unchanged
+            rows.append({
+                "market": market,
+                "index_code": index_code,
+                "close_value": abs(_to_float(data.get("cur_prc"))),
+                "change_rate": _to_float(data.get("flu_rt")),
+                "volume": abs(_to_int(data.get("trde_qty"))),
+                "trading_value": (
+                    abs(_to_int(data.get("trde_prica"))) * 1_000_000
+                ),
+                "stock_count": stock_count,
+                "rising": rising,
+                "falling": falling,
+                "unchanged": unchanged,
+                "limit_up_count": upper,
+                "limit_down_count": lower,
+            })
+        return rows
 
     async def market_investor_flows(
         self, market: str, trade_date: str
@@ -722,12 +782,22 @@ class RestClient:
                 row_code = row_code.split("_")[0].removeprefix("A")
                 if order_no and remaining > 0 and row_code == code:
                     ordered = max(0, _to_int(item.get("ord_qty")))
+                    exchange = str(
+                        item.get("stex_tp_txt") or "").strip().upper()
+                    if exchange == "통합" or str(
+                            item.get("sor_yn") or "").upper() == "Y":
+                        exchange = "SOR"
+                    if exchange not in {"KRX", "NXT", "SOR"}:
+                        exchange = {
+                            "0": "SOR", "1": "KRX", "2": "NXT",
+                        }.get(str(item.get("stex_tp") or ""), "KRX")
                     out.append({
                         "code": code,
                         "order_no": order_no,
                         "order_qty": ordered,
                         "remaining_qty": remaining,
                         "filled_qty": max(0, ordered - remaining),
+                        "exchange": exchange,
                     })
             if response.headers.get("cont-yn", "N").upper() != "Y":
                 break
@@ -743,7 +813,7 @@ class RestClient:
         qty = 0
         for order in orders:
             await self.cancel_order(
-                order["code"], order["order_no"], order["remaining_qty"])
+                order["code"], order["order_no"], 0, order["exchange"])
             sent += 1
             qty += order["remaining_qty"]
         return sent, qty
@@ -757,7 +827,8 @@ class RestClient:
         for order in await self.open_buy_orders(code):
             if order["order_no"] == target_order_no:
                 qty = order["remaining_qty"]
-                await self.cancel_order(order["code"], target_order_no, qty)
+                await self.cancel_order(
+                    order["code"], target_order_no, 0, order["exchange"])
                 return 1, qty
         return 0, 0
 
@@ -772,7 +843,7 @@ class RestClient:
         qty = 0
         for order in targets:
             await self.cancel_order(
-                order["code"], order["order_no"], order["remaining_qty"])
+                order["code"], order["order_no"], 0, order["exchange"])
             qty += order["remaining_qty"]
         return len(targets), qty
 
@@ -931,6 +1002,9 @@ class RestClient:
                 "rank": rank, "code": code, "name": name,
                 "price": abs(_to_int(r.get("cur_prc"))),
                 "rate": _to_float(r.get("flu_rt")),
+                "volume": abs(_to_int(r.get("now_trde_qty"))),
+                "trading_value": (
+                    abs(_to_int(r.get("trde_prica"))) * 1_000_000),
                 "prev_rate": 0.0,
                 "rank_chg": _to_int(r.get("pred_rank")) - _to_int(r.get("now_rank")),
                 "time": "",

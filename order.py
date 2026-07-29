@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""분할매수와 원주문별 누적 100주 자동취소 상태기계."""
+"""상한가 지정가 분할매수와 취소 상태기계."""
 import asyncio
 import logging
 from dataclasses import dataclass, field
@@ -23,6 +23,8 @@ class ChildOrder:
     order_no: str = ""
     filled_qty: int = 0
     remaining_qty: int = 0
+    submitting: bool = False
+    cancel_requested: bool = False
     cancel_sent: bool = False
     done: bool = False
     seen_fills: set[str] = field(default_factory=set)
@@ -102,7 +104,7 @@ class OrderEngine:
     def stop_local_submissions(self, code: str):
         """아직 서버에 나가지 않은 앱 매수를 중단한다.
 
-        서버에 접수된 주문의 취소 여부는 계좌 미체결 조회가 단일 기준이다.
+        이미 전송 중이면 응답에서 주문번호를 받은 직후 잔량 전부를 취소한다.
         """
         batch = self.batches.get(code)
         if not batch:
@@ -110,8 +112,13 @@ class OrderEngine:
         batch.stop_requested = True
         for child in batch.children:
             if not child.order_no:
-                child.remaining_qty = 0
-                child.done = True
+                if child.submitting:
+                    # REST 매수 응답을 기다리는 주문은 주문번호가 생기는 즉시
+                    # 잔량 전부 취소해야 하므로 완료 처리하지 않는다.
+                    child.cancel_requested = True
+                else:
+                    child.remaining_qty = 0
+                    child.done = True
         self._notify(batch, "전송중단")
 
     def cancel_submitted_children(self, code: str) -> tuple[int, int]:
@@ -126,13 +133,21 @@ class OrderEngine:
         self.stop_local_submissions(code)
         count = qty = 0
         for child in batch.children:
-            if (not child.order_no or child.remaining_qty <= 0
-                    or child.cancel_sent):
+            if not child.order_no:
+                if child.submitting and child.cancel_requested:
+                    # 현재 전송 중인 매수도 취소 대상으로 집계한다. 매수 응답이
+                    # 돌아오면 worker가 실제 취소를 최우선으로 대기열에 넣는다.
+                    count += 1
+                    qty += child.remaining_qty
                 continue
-            child.cancel_sent = True
+            if child.remaining_qty <= 0:
+                continue
             count += 1
             qty += child.remaining_qty
-            self._put(0, "cancel", batch, child)
+            child.cancel_requested = True
+            if not child.cancel_sent:
+                child.cancel_sent = True
+                self._put(0, "cancel", batch, child)
         if count:
             self._notify(batch, "취소대기")
         return count, qty
@@ -146,16 +161,27 @@ class OrderEngine:
                     child.done = True
                     continue
                 if action == "buy":
+                    child.submitting = True
                     result = await self.rest.buy_order(
                         batch.code, child.requested_qty, batch.price)
                     child.order_no = result["order_no"]
                     batch.sent_count += 1
                     if child.order_no:
                         self._by_order_no[child.order_no] = (batch, child)
-                    self._notify(batch, "전송")
+                    if (
+                        (batch.stop_requested or child.cancel_requested)
+                        and child.remaining_qty > 0
+                        and not child.cancel_sent
+                    ):
+                        child.cancel_requested = True
+                        child.cancel_sent = True
+                        self._put(0, "cancel", batch, child)
+                        self._notify(batch, "취소대기")
+                    else:
+                        self._notify(batch, "전송")
                 elif action == "cancel":
                     await self.rest.cancel_order(
-                        batch.code, child.order_no, child.remaining_qty)
+                        batch.code, child.order_no, 0)
                     self._notify(batch, "취소전송")
             except Exception as exc:  # noqa: BLE001
                 if action == "cancel":
@@ -171,6 +197,8 @@ class OrderEngine:
                 self._notify(batch, "오류")
                 log.exception("%s %s failed", action, batch.code)
             finally:
+                if action == "buy":
+                    child.submitting = False
                 self._queue.task_done()
 
     def on_order_event(self, event: dict):

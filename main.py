@@ -31,17 +31,20 @@ from PySide6.QtWidgets import (
 
 from analysis_db import (
     DB_PATH, database_stats, initialize, save_stock_history, start_collection,
-    update_collection, limit_up_rows, limit_up_stocks, save_dart_corp_codes,
+    update_collection, latest_collection_run,
+    limit_up_rows, limit_up_stocks, delete_limit_up_record,
+    save_dart_corp_codes,
     save_dart_parent_relations,
-    pending_dart_relation_checks, save_dart_relation_checks,
     sync_stock_catalog, save_krx_market_day, krx_collected_dates,
     pending_intraday_events, save_last_entry_time,
     save_disclosures, disclosure_rows, disclosure_list_rows,
     pending_disclosure_stocks, mark_disclosure_range_collected,
-    save_theme_snapshot, save_source_classifications,
+    save_theme_snapshot, theme_source_codes, theme_source_member_counts,
+    save_source_classifications,
     limit_up_codes_without_sources, dart_inferred_classifications,
     theme_summary_rows, save_investor_flows, investor_flow_rows,
-    pending_investor_flow_stocks, market_dashboard,
+    pending_investor_flow_stocks, pending_condition_investor_flow_stocks,
+    market_dashboard,
     limit_up_backtest_rows,
     rebuild_rotation_analysis, rotation_signal_rows,
     rotation_theme_daily_rows, rotation_stock_rows,
@@ -56,6 +59,7 @@ from analysis_db import (
     save_condition_snapshot, save_condition_snapshot_quotes,
     save_condition_theme_stats, active_theme_labels,
     recent_condition_snapshots, condition_theme_stats,
+    condition_theme_progress, condition_theme_candidate_evidence,
     save_condition_theme_members, condition_theme_members,
     save_next_day_candidates, next_day_candidate_rows,
 )
@@ -200,13 +204,37 @@ THEME_UI = {
     "dark": ("🌙", "테마: 다크 — 클릭하면 라이트"),
     "light": ("☀", "테마: 라이트 — 클릭하면 시스템"),
 }
+NEWS_WEB_AUTO_RELOAD_PATHS = {
+    "/item/board.naver",  # 종목토론 목록
+    "/item/news.naver",   # 종목뉴스 목록
+    "/item/dart.naver",   # 종목공시 목록
+}
+
+
+def _is_news_web_auto_reload_url(url: QUrl) -> bool:
+    """자동 새로고침이 필요한 네이버 종목 목록 화면인지 판정한다."""
+    return (
+        url.host().lower() == "finance.naver.com"
+        and url.path() in NEWS_WEB_AUTO_RELOAD_PATHS
+    )
 
 
 def _market_context(data: dict) -> dict:
     """저장된 국내 지수·시장수급·등락 종목수로 설명 가능한 국면을 판정한다."""
     indices = {row["market"]: row for row in data.get("indices", [])}
     flows = {row["market"]: row for row in data.get("market_flows", [])}
-    breadth = {row["market"]: row for row in data.get("markets", [])}
+    index_dates = {
+        str(row.get("trade_date") or "") for row in data.get("indices", [])
+        if row.get("trade_date")
+    }
+    use_breadth = bool(data.get("live_market")) or (
+        len(index_dates) == 1
+        and str(data.get("trade_date") or "") in index_dates
+    )
+    breadth = (
+        {row["market"]: row for row in data.get("markets", [])}
+        if use_breadth else {}
+    )
     score = 0
     rates = {}
     for market in ("KOSPI", "KOSDAQ"):
@@ -256,6 +284,10 @@ def _market_context(data: dict) -> dict:
         "leadership": leadership,
         "flow_state": flow_state,
         "score": score,
+        "kospi_rate": kospi_rate,
+        "kosdaq_rate": kosdaq_rate,
+        "average_rise_ratio": (
+            sum(ratios) / len(ratios) if ratios else None),
     }
 
 
@@ -335,12 +367,46 @@ def _market_session_states(now: datetime) -> tuple[str, str, str]:
 
 
 def _is_krx_market_open(now: datetime | None = None) -> bool:
-    """조건검색 자동 관계수집을 허용할 KRX 장중(09:00~15:30)인지 반환한다."""
+    """KRX 정규장 시간(09:00~15:30)인지 반환한다."""
     now = now or datetime.now()
     if _krx_holiday_reason(now.date()):
         return False
     seconds = now.hour * 3600 + now.minute * 60 + now.second
     return 9 * 3600 <= seconds < 15 * 3600 + 30 * 60
+
+
+def _previous_krx_quote_price(price: int) -> int:
+    """일반 주권의 바로 아래 유효 호가가격을 반환한다."""
+    price = max(1, int(price))
+    if price <= 2_000:
+        tick = 1
+    elif price <= 5_000:
+        tick = 5
+    elif price <= 20_000:
+        tick = 10
+    elif price <= 50_000:
+        tick = 50
+    elif price <= 200_000:
+        tick = 100
+    elif price <= 500_000:
+        tick = 500
+    else:
+        tick = 1_000
+    return max(1, price - tick)
+
+
+def _balance_stage3_limit_price(row: dict) -> int:
+    """매수 4호가가 비어도 최우선 매수가 기준 3틱 아래 가격을 만든다."""
+    quoted = int(row.get("bid_price4") or 0)
+    if quoted > 0:
+        return quoted
+    price = int(row.get("bid_price") or row.get("upper") or 0)
+    if price <= 0:
+        return 0
+    for _ in range(3):
+        price = _previous_krx_quote_price(price)
+    lower = int(row.get("lower") or 0)
+    return max(lower, price) if lower > 0 else price
 
 
 def _largest_shareholder_evidence(
@@ -636,7 +702,6 @@ class View:
         if added:
             # 실시간 종목 등록은 현재 모든 창의 모델을 기준으로 한 번만 동기화한다.
             self.app.queue_real("", add=True, suffix=self._real_suffix())
-            self.app.queue_condition_relation_autocollect(set(added), self.screen)
             self._schedule_refresh()
             self._maybe_beep()
         log.info("snapshot%s: %d codes (+%d/-%d) %s", self.prefix or " ",
@@ -648,7 +713,6 @@ class View:
             if code in self.app._account_auto_cancel_armed:
                 self.screen.model.set_account_auto_cancel_armed(code, True)
             self.app.queue_real(code, add=True, suffix=self._real_suffix())
-            self.app.queue_condition_relation_autocollect({code}, self.screen)
             self._schedule_refresh()
             self._maybe_beep()
         else:
@@ -703,6 +767,14 @@ class View:
             self._entry_pending.discard(code)
             self._entry_cache[code] = t
             self.screen.on_tick(code, {"time": t})
+            if t:
+                trade_date = QDate.currentDate().toString("yyyyMMdd")
+                if save_last_entry_time(trade_date, code, t):
+                    log.info(
+                        "live limit entry saved: %s %s %s",
+                        trade_date, code, t)
+                    if self.app._analysis is not None:
+                        self.app._analysis._refresh_limit_up_table()
 
 
 class App:
@@ -715,21 +787,11 @@ class App:
         self._orderable_prefetch_task = None
         self._orderable_prefetch_failed: dict[tuple[str, int], float] = {}
         self._orderable_prefetch_blocked_date = ""
-        self._condition_relation_task = None
-        self._condition_relation_pending: set[str] = set()
-        self._condition_relation_timer = QTimer()
-        self._condition_relation_timer.setSingleShot(True)
-        self._condition_relation_timer.timeout.connect(
-            self._run_condition_relation_collection)
-        # 화면과 분리된 순환매 전용 조건검색 일반조회 예약. 본창에서 어떤
-        # 조건식을 보고 있는지와 무관하게 8% 이상 조건식을 DB에 저장한다.
+        # 순환매 분석은 경량 분석창에서 사용하지 않으므로 예약 수집을
+        # 시작하지 않는다. 수동 호출용 상태만 남겨 기존 저장 데이터와의
+        # 호환성을 유지한다.
         self._background_condition_task = None
         self._background_condition_slots: set[tuple[str, str]] = set()
-        self._background_condition_timer = QTimer()
-        self._background_condition_timer.setInterval(30000)
-        self._background_condition_timer.timeout.connect(
-            self._run_background_condition_schedule)
-        self._background_condition_timer.start()
         self._orderable_prefetch_timer = QTimer()
         self._orderable_prefetch_timer.timeout.connect(
             self._queue_orderable_prefetch)
@@ -745,19 +807,6 @@ class App:
         self._global_hotkeys = WindowsGlobalHotkeys(
             self._on_global_exit_hotkey)
         screen.global_hotkeys = True
-        self._market_strip_timer = QTimer()
-        self._market_strip_timer.setInterval(60 * 1000)
-        self._market_strip_timer.timeout.connect(
-            self._refresh_market_overview)
-        self._market_strip_timer.start()
-        QTimer.singleShot(0, self._refresh_market_overview)
-        self._external_market_task = None
-        self._external_market_timer = QTimer()
-        self._external_market_timer.setInterval(60 * 1000)
-        self._external_market_timer.timeout.connect(
-            self._queue_external_market_collection)
-        self._external_market_timer.start()
-        QTimer.singleShot(3000, self._queue_external_market_collection)
         self._extra_windows: list = []  # 추가 창(ConditionWindow) 목록
         self._cond_items = []           # CNSRLST 결과 (새 창 콤보 채우기용)
         self._condition_reload_id = 0   # 재조회 타임아웃과 실제 응답의 경합 방지
@@ -772,11 +821,13 @@ class App:
         self._emergency_tasks: dict[str, asyncio.Task] = {}
         self._emergency_prices: dict[str, int] = {}
         self._emergency_recheck: set[str] = set()
+        # 주문셀에서 종료 상태를 확인해 지운 뒤에는 이미 진행 중이던 계좌조회가
+        # 같은 '대상없음'을 뒤늦게 다시 덮어쓰지 못하게 한다.
+        self._emergency_status_dismissed: set[str] = set()
         # 종목별 계좌 자동취소는 행에서 사용자가 직접 켠 경우에만 무장된다.
         # 웹소켓 체결 ID로 중복 이벤트를 제거하고, 무장 이후 각 매수 주문의
-        # 체결량이 100주에 도달하면 계좌의 해당 종목 미체결 매수를 한 번에
-        # 취소한다. 종목 내 다른 분할 주문 체결량은 합산하지 않고, 취소 대상도
-        # 기준 주문번호의 잔량으로 한정한다.
+        # 체결량이 100주에 도달하면 그 주문번호의 잔량 전부를 취소한다.
+        # 종목 내 다른 분할 주문 체결량은 합산하지 않는다.
         self._account_auto_cancel_armed: set[str] = set()
         self._account_auto_cancel_filled: dict[tuple[str, str], int] = {}
         self._account_auto_cancel_fill_ids: set[tuple[str, str, str]] = set()
@@ -799,7 +850,7 @@ class App:
         self._single_timer.start(3000)
         self._rank = None
         self._analysis = None
-        # 뉴스 자동수집은 분석창 표시 여부와 무관하게 메인 앱이 관리한다.
+        # 네이버 뉴스 API 자동수집은 저장된 체크 상태와 주기에만 따른다.
         self._news_auto_timer = QTimer()
         news_interval = int(self._settings.value("analysis_news_interval", 5))
         self._news_auto_timer.setInterval(news_interval * 60 * 1000)
@@ -807,11 +858,8 @@ class App:
         if self._settings.value("analysis_news_auto", "false") == "true":
             self._news_auto_timer.start()
             QTimer.singleShot(10000, self._auto_news_collection)
-        self._auto_intraday_timer = QTimer()
-        self._auto_intraday_timer.timeout.connect(self._auto_intraday_collection)
-        self._auto_intraday_timer.start(60000)
-        QTimer.singleShot(10000, lambda: self._auto_intraday_collection(True))
-        QTimer.singleShot(5000, lambda: self._run_background_condition_schedule(True))
+        # 상한가 원천은 분석창의 KRX·키움 수집 버튼으로만 저장한다.
+        # 장중 조건검색값이나 시작 직후 자동 보완으로 종가를 확정하지 않는다.
         # 공인 IP 감시: 바뀌면 키움 화이트리스트에서 벗어나 API 차단 -> 상단바 경보
         self._public_ip = None
         self._ip_task = None
@@ -856,7 +904,6 @@ class App:
         screen.reload_btn.clicked.connect(self._reload_conditions)
         screen.rank_btn.clicked.connect(self._on_rank)
         screen.newwin_btn.clicked.connect(self._on_newwin)
-        screen.analysis_btn.clicked.connect(self._on_analysis)
         screen.order_target_selected.connect(
             lambda code, price, target=screen:
             self._queue_orderable_quantity(target, code, price))
@@ -873,6 +920,8 @@ class App:
             lambda code, spec, source=screen:
             self._set_global_exit_hotkey(source, code, spec))
         screen.emergency_exit_requested.connect(self._emergency_exit)
+        screen.order_status_acknowledged.connect(
+            self._acknowledge_order_status)
         screen.balance_sell_changed.connect(self._set_balance_sell)
         screen.watch_toggled.connect(
             lambda code, enabled, target=screen:
@@ -880,13 +929,6 @@ class App:
         screen.analysis_stock_requested.connect(
             lambda code, target=screen:
             self._open_condition_analysis_stock(target, code))
-        screen.market_overview_requested.connect(self._open_market_status)
-        screen.relation_collection_requested.connect(
-            lambda codes, target=screen:
-            self._start_condition_relation_collection(target, codes))
-        screen.theme_sort.toggled.connect(
-            lambda on, target=screen:
-            self._on_theme_sort_relation_autocollect(target, on))
 
     def _sync_order_enabled(
             self, enabled: bool, source: ConditionScreen | None = None):
@@ -1265,18 +1307,19 @@ class App:
     def _on_order_update(self, batch, state: str):
         count = len(batch.children)
         mode = "자" if batch.auto_cancel else "수"
-        if state == "긴급정리" or batch.stop_requested:
+        if state == "긴급정리":
             compact = "긴급정리"
         elif batch.error:
             compact = "장종료" if "장종료" in batch.error else "오류"
         elif batch.remaining_qty == 0 and batch.sent_count == count:
             compact = f"{mode} 완료"
-        elif state.startswith("취소"):
+        elif state.startswith("취소") or batch.stop_requested:
             compact = f"{mode} 취소"
         else:
             compact = f"{mode} {batch.sent_count}/{count}"
         detail = (
             f"상태 {state} · {'자동취소' if batch.auto_cancel else '수동취소'}"
+            f" · 상한가 지정가 {batch.price:,}원"
             f" · 전송 {batch.sent_count}/{count}"
             f" · 체결 {batch.total_filled:,}/{batch.total_requested:,}주"
             f" · 잔량 {batch.remaining_qty:,}주"
@@ -1372,8 +1415,9 @@ class App:
             if self._rank is not None:
                 self._rank.set_market(self._market)
             m = self._market
-            log.info("kosdaq %d, single %d, liquidation %d, nxt %d, misu %d, admin %d",
-                     len(m.kosdaq), len(m.single), len(m.liquidation),
+            log.info("kosdaq %d, single %d, short_overheat %d, liquidation %d, "
+                     "nxt %d, misu %d, admin %d",
+                     len(m.kosdaq), len(m.single), len(m.short_overheat), len(m.liquidation),
                      len(m.nxt), len(m.misu), len(m.admin))
         except Exception as e:  # noqa: BLE001
             log.warning("market_info failed: %s", e)
@@ -1418,12 +1462,14 @@ class App:
             m.refresh_streaks()
         if self._market is None:
             return
-        m.kosdaq, m.single, m.liquidation, m.nxt, m.misu, m.admin = (
-            self._market.kosdaq, self._market.single, self._market.liquidation,
-            self._market.nxt, self._market.misu, self._market.admin)
+        m.kosdaq, m.single, m.short_overheat, m.liquidation, m.nxt, m.misu, m.admin = (
+            self._market.kosdaq, self._market.single, self._market.short_overheat,
+            self._market.liquidation, self._market.nxt, self._market.misu,
+            self._market.admin)
         m.new_today, m.new15, m.new30 = (
             self._market.new_today, self._market.new15, self._market.new30)
         m.shares = self._market.shares
+        m.refresh_market_markers()
 
     async def collect_condition_snapshot(self, seq: str, condition_name: str = "",
                                          market: str = "KRX") -> dict:
@@ -1482,6 +1528,8 @@ class App:
                     "upper_count": upper_count,
                     "average_rate": sum(rates) / len(rates) if rates else 0,
                     "top_rate": max(rates) if rates else 0,
+                    "trading_value": sum(
+                        int(row.get("trading_value") or 0) for row in rows),
                     "leader_stock_code": leader_code,
                     "leader_stock_name": str(leader.get("name") or ""),
                 })
@@ -1778,6 +1826,9 @@ class App:
                             for row in rows),
                         "average_rate": sum(rates) / len(rates) if rates else 0,
                         "top_rate": max(rates) if rates else 0,
+                        "trading_value": sum(
+                            int(row.get("trading_value") or 0)
+                            for row in rows),
                         "leader_stock_code": leader_code,
                         "leader_stock_name": str(leader.get("name") or ""),
                     })
@@ -1909,35 +1960,50 @@ class App:
                 return
             self._account_auto_cancel_fill_ids.add(token)
         order_key = (code, order_no)
-        filled = self._account_auto_cancel_filled.get(order_key, 0) + fill_qty
+        previous_filled = self._account_auto_cancel_filled.get(order_key, 0)
+        order_qty = max(0, int(event.get("order_qty") or 0))
+        remaining_qty = event.get("remaining_qty")
+        if order_qty and remaining_qty is not None:
+            # 주문을 앱에서 냈는지 영웅문에서 냈는지와 무관하게, 이벤트의
+            # 주문수량-잔량을 누적체결량의 권위값으로 사용한다. 셀을 늦게
+            # 켰거나 체결 이벤트 일부를 놓쳐도 주문별 100주를 판정할 수 있다.
+            filled = max(
+                previous_filled,
+                order_qty - max(0, int(remaining_qty)),
+            )
+        else:
+            filled = previous_filled + fill_qty
         self._account_auto_cancel_filled[order_key] = filled
         log.warning(
             "account auto-cancel fill code=%s order=%s fill=%s order_total=%s/100",
             code, order_no, fill_qty, filled)
         if filled < 100 or order_key in self._account_auto_cancel_tasks:
             return
-        remaining_qty = event.get("remaining_qty")
         task = asyncio.ensure_future(
-            self._auto_cancel_account(code, order_no, remaining_qty))
+            self._auto_cancel_account(
+                code, order_no, remaining_qty, event.get("exchange")))
         self._account_auto_cancel_tasks[order_key] = task
         task.add_done_callback(
             lambda _task, key=order_key:
             self._account_auto_cancel_tasks.pop(key, None))
 
     async def _auto_cancel_account(
-            self, code: str, order_no: str, remaining_qty: int | None):
+            self, code: str, order_no: str, remaining_qty: int | None,
+            exchange: str | None = None):
         try:
             # 체결 이벤트의 주문번호·잔량으로 직접 취소한다. 계좌 미체결 조회가
             # 지연되거나 일부만 반환되어도 100주를 체결한 해당 주문을 놓치지 않는다.
-            if remaining_qty is not None:
+            if remaining_qty is not None and exchange:
                 qty = max(0, int(remaining_qty))
                 if qty:
-                    await self.rest.cancel_order(code, order_no, qty)
+                    # 키움 취소수량 0은 이 원주문번호의 잔량 전부를 뜻한다.
+                    await self.rest.cancel_order(
+                        code, order_no, 0, str(exchange))
                     count = 1
                 else:
                     count = 0
             else:
-                # 일부 체결 이벤트에 잔량 FID가 없는 경우만 계좌 조회로 보완한다.
+                # 잔량 또는 거래소 FID가 없는 경우 계좌 조회로 보완한다.
                 count, qty = await self.rest.cancel_open_buy_order(code, order_no)
             log.warning(
                 "account auto-cancel code=%s event_order=%s "
@@ -2025,27 +2091,33 @@ class App:
         ratio = float(setting.get(
             ("first_ratio", "second_ratio", "third_ratio")[target - 1],
             (0.0, 0.5, 1.0)[target - 1]))
-        price = next((
-            int(view.screen.model.rows[code].get(
-                "bid_price4" if target == 3 and ratio > 0 else "upper") or 0)
-            for view in self.views if code in view.screen.model.rows), 0)
-        # 3단계는 최우선 매수호가보다 세 단계 아래인 매수 4호가로
-        # 적극 지정가 매도한다. 호가가 비어 있으면 단계 완료로 처리하지
-        # 않아 다음 실시간 호가 갱신 때 다시 시도한다.
-        if target == 3 and ratio > 0 and price <= 0:
-            log.warning(
-                "balance sell stage3 waiting for bid4 code=%s bid_qty=%s",
-                code, bid_qty)
-            return
         if ratio <= 0:
             self._complete_balance_stage(code, target)
+            return
+        market_sell = bool(setting.get("market_sell", False))
+        row = next((
+            view.screen.model.rows[code]
+            for view in self.views if code in view.screen.model.rows), {})
+        if market_sell:
+            price = 0
+        elif target == 3:
+            # 매수 4호가 잔량/존재 여부와 무관하게 3틱 아래 가격으로
+            # 지정가를 즉시 낸다. 실제 4호가가 비면 가격을 직접 계산한다.
+            price = _balance_stage3_limit_price(row)
+        else:
+            price = int(row.get("upper") or 0)
+        if not market_sell and price <= 0:
+            log.warning(
+                "balance sell reference price unavailable "
+                "code=%s stage=%s bid_qty=%s",
+                code, target, bid_qty)
             return
         running = self._balance_sell_tasks.get(code)
         if running and not running.done():
             return
         task = asyncio.ensure_future(
             self._execute_balance_stage(
-                code, target, ratio, price, bid_qty))
+                code, target, ratio, price, bid_qty, market_sell))
         self._balance_sell_tasks[code] = task
         task.add_done_callback(
             lambda _task, stock_code=code:
@@ -2061,10 +2133,10 @@ class App:
 
     async def _execute_balance_stage(
             self, code: str, target: int, ratio: float,
-            price: int, bid_qty: int):
+            price: int, bid_qty: int, market_sell: bool):
         try:
             sold = await self._sell_account_position(
-                code, ratio, price, f"잔량 {target}단계")
+                code, ratio, price, f"잔량 {target}단계", market_sell)
         except Exception:  # noqa: BLE001
             log.exception(
                 "balance sell failed; stage remains pending "
@@ -2080,7 +2152,8 @@ class App:
             code, target, bid_qty, sold)
 
     async def _sell_account_position(
-            self, code: str, ratio: float, price: int, reason: str) -> int:
+            self, code: str, ratio: float, price: int, reason: str,
+            market_sell: bool = False) -> int:
         """실제 계좌 매매가능수량을 조회해 지정 비율만큼 매도한다."""
         position = await self.rest.holding_position(code)
         held = max(0, int(position.get("held_qty") or 0))
@@ -2092,20 +2165,35 @@ class App:
             return 0
         ratio = min(1.0, max(0.0, float(ratio)))
         qty = sellable if ratio >= 1.0 else max(1, int(sellable * ratio))
-        result = await self.rest.sell_order(code, qty, int(price))
+        result = await self.rest.sell_order(
+            code, qty, int(price), market=market_sell)
         log.warning(
             "%s account sell sent code=%s held=%s sellable=%s qty=%s "
-            "price=%s order_no=%s",
-            reason, code, held, sellable, qty, price, result["order_no"])
+            "order_type=%s price=%s order_no=%s",
+            reason, code, held, sellable, qty,
+            "시장가" if market_sell else "지정가",
+            "" if market_sell else price, result["order_no"])
         return qty
 
     def _emergency_exit(self, code: str, price: int, order_enabled: bool):
+        # 새 청산키 입력은 새 결과이므로 이전 사용자의 상태 확인 기록을 해제한다.
+        self._emergency_status_dismissed.discard(code)
         if price > 0:
             self._emergency_prices[code] = int(price)
         if order_enabled:
             self._emergency_locked.add(code)
             self.orders.stop_local_submissions(code)
         self._queue_emergency_reconcile(code, price, order_enabled)
+
+    def _acknowledge_order_status(self, code: str):
+        """종료 상태를 모든 창에서 지우고 진행 중인 이전 결과의 재표시를 막는다."""
+        self._emergency_status_dismissed.add(code)
+        for view in self.views:
+            if (
+                code in view.screen.model.rows
+                and view.screen.model.order_status.get(code) == "대상없음"
+            ):
+                view.screen.set_order_state(code, "", "", False)
 
     def _queue_emergency_reconcile(
             self, code: str, price: int | None = None,
@@ -2156,12 +2244,17 @@ class App:
         held_qty = max(0, int(position.get("held_qty") or 0))
         sellable_qty = max(0, int(position.get("sellable_qty") or 0))
         if held_qty <= 0 and pending_qty <= 0:
-            for view in self.views:
-                if code in view.screen.model.rows:
-                    view.screen.set_order_state(
-                        code, "대상없음",
-                        "상태 청산 대상 없음 · 계좌 보유수량 0주",
-                        False)
+            if code not in self._emergency_status_dismissed:
+                for view in self.views:
+                    if code in view.screen.model.rows:
+                        view.screen.set_order_state(
+                            code, "대상없음",
+                            "상태 청산 대상 없음 · 계좌 보유수량 0주",
+                            False)
+            else:
+                log.info(
+                    "emergency no-position status suppressed after "
+                    "acknowledgement code=%s", code)
             log.warning("emergency exit ignored no-position code=%s", code)
             return
         if not order_enabled:
@@ -2381,20 +2474,20 @@ class App:
         return self._analysis
 
     def _set_news_auto_collection(self, enabled: bool):
-        """분석창 체크 상태를 메인 앱의 백그라운드 뉴스 타이머에 반영한다."""
+        """저장된 자동수집 체크 상태를 백그라운드 타이머에 반영한다."""
         if enabled:
             self._news_auto_timer.start()
         else:
             self._news_auto_timer.stop()
 
     def _set_news_auto_interval(self, minutes: int):
-        """분석창 네이버 API 뉴스 자동수집 주기를 메인 타이머에 반영한다."""
+        """사용자가 선택한 뉴스 자동수집 주기를 즉시 반영한다."""
         self._news_auto_timer.setInterval(int(minutes) * 60 * 1000)
         if self._settings.value("analysis_news_auto", "false") == "true":
             self._news_auto_timer.start()
 
     def _auto_news_collection(self):
-        """분석창이 닫혀 있어도 등록 종목의 공식 API 뉴스를 수집한다."""
+        """자동수집이 체크된 경우에만 등록 종목의 뉴스를 수집한다."""
         if self._settings.value("analysis_news_auto", "false") != "true":
             self._news_auto_timer.stop()
             return
@@ -2477,7 +2570,6 @@ class App:
         screen.global_hotkeys = True
         screen.newwin_btn.setVisible(False)  # 추가 창에선 창+/순위/통합 숨김 (메인창에서만)
         screen.rank_btn.setVisible(False)
-        screen.analysis_btn.setVisible(False)
         screen.unified_check.setVisible(False)  # 통합 시세는 전 창 공통 -> 메인창에서만 전환
         screen.theme_btn.setVisible(False)  # 테마는 앱 전체 공통 -> 메인창에서만 전환
         win = ConditionWindow(prefix, on_close=self._on_window_closed)
@@ -2490,7 +2582,6 @@ class App:
             screen.set_account_summary(self._account_summary)
         self.views.append(view)
         self._wire_extra(screen)
-        self._refresh_market_overview()
         self._extra_windows.append(win)
         win.show()
         if seeded:
@@ -2520,6 +2611,8 @@ class App:
             lambda code, spec, source=screen:
             self._set_global_exit_hotkey(source, code, spec))
         screen.emergency_exit_requested.connect(self._emergency_exit)
+        screen.order_status_acknowledged.connect(
+            self._acknowledge_order_status)
         screen.balance_sell_changed.connect(self._set_balance_sell)
         screen.watch_toggled.connect(
             lambda code, enabled, target=screen:
@@ -2527,186 +2620,6 @@ class App:
         screen.analysis_stock_requested.connect(
             lambda code, target=screen:
             self._open_condition_analysis_stock(target, code))
-        screen.market_overview_requested.connect(self._open_market_status)
-        screen.relation_collection_requested.connect(
-            lambda codes, target=screen:
-            self._start_condition_relation_collection(target, codes))
-        screen.theme_sort.toggled.connect(
-            lambda on, target=screen:
-            self._on_theme_sort_relation_autocollect(target, on))
-
-    def _set_relation_collection_state(self, text: str, enabled: bool):
-        """모든 조건검색 창에 관계수집 작업 상태를 동일하게 표시한다."""
-        for view in self.views:
-            button = view.screen.relation_collect_btn
-            button.setText(text)
-            button.setEnabled(enabled)
-
-    @staticmethod
-    def _show_nonmodal_message(
-        parent: QWidget, title: str, text: str,
-        icon: QMessageBox.Icon = QMessageBox.Icon.Information,
-    ):
-        """비동기 작업 중 Qt 중첩 이벤트 루프를 만들지 않는 알림창."""
-        box = QMessageBox(parent)
-        box.setIcon(icon)
-        box.setWindowTitle(title)
-        box.setText(text)
-        box.setStandardButtons(QMessageBox.StandardButton.Ok)
-        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        box.open()
-
-    def _start_condition_relation_collection(
-        self, screen: ConditionScreen, codes: object,
-    ):
-        """현재 조건검색 결과로만 DART 최대주주 관계 수집을 시작한다."""
-        if not config.DART_API_KEY:
-            QMessageBox.warning(
-                screen, "관계수집", ".env에 DART_API_KEY가 설정되지 않았습니다.")
-            return
-        if self._condition_relation_task and not self._condition_relation_task.done():
-            return
-        stock_codes = list(dict.fromkeys(
-            str(code or "").removesuffix("_AL").strip()
-            for code in codes if str(code or "").strip()))
-        if not stock_codes:
-            QMessageBox.information(
-                screen, "관계수집", "현재 조건검색에 수집할 종목이 없습니다.")
-            return
-        self._set_relation_collection_state("수집중", False)
-        self._condition_relation_task = asyncio.ensure_future(
-            self._collect_condition_relations(screen, stock_codes, announce=True))
-
-    def _on_theme_sort_relation_autocollect(
-        self, screen: ConditionScreen, on: bool,
-    ):
-        if on:
-            self.queue_condition_relation_autocollect(
-                set(screen.model.codes), screen)
-
-    def queue_condition_relation_autocollect(
-        self, codes: set[str], screen: ConditionScreen,
-    ):
-        """새 편입을 모아 이미 확인되지 않은 종목의 관계만 자동 수집한다."""
-        if (not config.DART_API_KEY or not screen.theme_sort.isChecked()
-                or not _is_krx_market_open()):
-            return
-        self._condition_relation_pending.update(
-            str(code or "").removesuffix("_AL").strip()
-            for code in codes if str(code or "").strip())
-        if self._condition_relation_pending and not self._condition_relation_timer.isActive():
-            # 관계 분류는 체결·주문 경로가 아니므로 편입 흐름을 충분히 모아
-            # DART 요청 횟수를 낮춘 뒤 처리한다.
-            self._condition_relation_timer.start(60000)
-
-    def _run_condition_relation_collection(self):
-        if self._condition_relation_task and not self._condition_relation_task.done():
-            return
-        pending = self._condition_relation_pending
-        self._condition_relation_pending = set()
-        if not _is_krx_market_open():
-            return
-        active_codes = {
-            code for view in self.views if view.screen.theme_sort.isChecked()
-            for code in view.screen.model.codes
-        }
-        pending &= active_codes
-        if not pending:
-            return
-        relation_year = str(datetime.now().year - 1)
-        stock_codes = pending_dart_relation_checks(pending, relation_year)
-        if not stock_codes:
-            return
-        self._set_relation_collection_state("자동수집", False)
-        self._condition_relation_task = asyncio.ensure_future(
-            self._collect_condition_relations(
-                self.views[0].screen, stock_codes, announce=False))
-
-    async def _collect_condition_relations(
-        self, screen: ConditionScreen, stock_codes: list[str], announce: bool,
-    ):
-        """조건검색 종목의 최대주주가 상장사인 관계만 저장한다."""
-        client = DartClient(config.DART_API_KEY)
-        parent_evidence_by_child: dict[str, dict[str, str]] = {}
-        checked_results: dict[str, str] = {}
-        errors = missing_catalog = missing_corp = 0
-        relation_year = str(datetime.now().year - 1)
-        try:
-            targets = []
-            missing_corp_codes = []
-            for stock_code in stock_codes:
-                stock = resolve_analysis_stock(stock_code)
-                if stock is None:
-                    missing_catalog += 1
-                    continue
-                corp_code = str(stock.get("dart_corp_code") or "").strip()
-                if not corp_code:
-                    missing_corp_codes.append(stock_code)
-                    continue
-                targets.append((stock_code, corp_code))
-            if missing_corp_codes:
-                # 이미 DB에 기업코드가 있으면 이 대용량 목록 요청은 생략한다.
-                # 신규 상장 등 코드가 비어 있는 종목이 처음 들어왔을 때만 갱신한다.
-                self._set_relation_collection_state("코드조회", False)
-                mapping = await client.corp_codes()
-                save_dart_corp_codes(mapping)
-                for stock_code in missing_corp_codes:
-                    stock = resolve_analysis_stock(stock_code)
-                    corp_code = str((stock or {}).get("dart_corp_code") or "").strip()
-                    if corp_code:
-                        targets.append((stock_code, corp_code))
-                    else:
-                        missing_corp += 1
-            for index, (stock_code, corp_code) in enumerate(targets, 1):
-                self._set_relation_collection_state(
-                    f"{index}/{len(targets)}", False)
-                try:
-                    shareholders = await client.largest_shareholders(
-                        corp_code, relation_year)
-                    evidence = _largest_shareholder_evidence(
-                        shareholders, relation_year)
-                    if evidence:
-                        parent_evidence_by_child[stock_code] = evidence
-                        checked_results[stock_code] = "MAX_SHAREHOLDER"
-                    else:
-                        checked_results[stock_code] = "NO_MAX_SHAREHOLDER"
-                except Exception as error:  # noqa: BLE001
-                    errors += 1
-                    log.warning("condition relation %s: %s", stock_code, error)
-                # 자동 편입이 한꺼번에 들어와도 DART 요청을 폭주시키지 않는다.
-                await asyncio.sleep(0.2)
-            relation_groups, relation_members = save_dart_parent_relations(
-                parent_evidence_by_child)
-            save_dart_relation_checks(checked_results, relation_year)
-            for view in self.views:
-                view.screen.refresh_theme_sort()
-            detail = (
-                f"조건검색 {len(stock_codes):,}종목 중 {len(targets):,}종목을 조회했습니다.\n"
-                f"상장사 최대주주 관계 {relation_groups:,}묶음 / {relation_members:,}종목을 저장했고 "
-                "테마정렬에 반영했습니다."
-            )
-            extras = []
-            if missing_catalog:
-                extras.append(f"카탈로그 없음 {missing_catalog:,}")
-            if missing_corp:
-                extras.append(f"기업코드 없음 {missing_corp:,}")
-            if errors:
-                extras.append(f"오류 {errors:,}")
-            if extras:
-                detail += "\n" + " · ".join(extras)
-            if announce:
-                self._show_nonmodal_message(screen, "관계수집 완료", detail)
-        except Exception as error:  # noqa: BLE001
-            log.exception("condition relationship collection failed")
-            self._show_nonmodal_message(
-                screen, "관계수집", f"수집에 실패했습니다.\n{error}",
-                QMessageBox.Icon.Warning)
-        finally:
-            await client.close()
-            self._set_relation_collection_state("관계수집", True)
-            self._condition_relation_task = None
-            if self._condition_relation_pending:
-                self._condition_relation_timer.start(0)
 
     def _on_window_closed(self, win):
         if _SHUTDOWN[0]:  # 앱 종료 동반 닫힘: 창 개수 보존 (재시작 때 복원용)
@@ -2928,7 +2841,7 @@ class RotationCycleWidget(QWidget):
 
 
 class AnalysisWindow(QMainWindow):
-    """시장 분석 전용 비모달 창. 기능은 탭 단위로 점진적으로 확장한다."""
+    """실시간 뉴스·상한가·테마 전용 경량 분석창."""
 
     watchlist_changed = Signal()
     news_auto_changed = Signal(bool)
@@ -2939,16 +2852,7 @@ class AnalysisWindow(QMainWindow):
     TABS = (
         ("실시간 뉴스·종토방", "직접 등록한 종목의 뉴스와 웹페이지를 확인합니다."),
         ("상한가", "상한가 종목 수집·조회·성과 분석 화면입니다."),
-        ("시장 현황", "시장 요약과 주요 지표를 표시합니다."),
         ("테마", "테마 강도와 종목 확산 흐름을 분석합니다."),
-        ("시장테마 브리핑", "조건검색 통합 스냅샷의 테마 확산과 대장을 표시합니다."),
-        ("다음날 후보", "전일 강세·점상 종목을 다음 거래일 관찰 후보로 정리합니다."),
-        ("점상 체결 분석", "점상 종목의 장 시작 후 거래량과 체결 집중도를 분석합니다."),
-        ("순환매", "테마 순환과 대장주·후발 후보를 분석합니다."),
-        ("수급", "투자자별 수급과 거래대금 흐름을 분석합니다."),
-        ("공시", "OpenDART 공시와 종목 움직임을 연결합니다."),
-        ("백테스트", "과거 신호의 이후 성과를 검증합니다."),
-        ("데이터 관리", "SQLite 데이터 수집 상태와 갱신 작업을 관리합니다."),
     )
 
     def __init__(self, rest=None, app: "App | None" = None):
@@ -2957,8 +2861,15 @@ class AnalysisWindow(QMainWindow):
         self._app = app
         self._collection_task = None
         self._collection_cancelled = False
+        self._market_refresh_task = None
+        self._market_live_leaders: list[dict] = []
+        self._market_live_markets: list[dict] = []
+        self._market_live_indices: list[dict] = []
+        self._market_query_time: datetime | None = None
+        self._unified_refresh_task = None
         self._dart_task = None
         self._rotation_collect_task = None
+        self._rotation_refresh_task = None
         self._news_web_auto_timer = QTimer(self)
         self._news_web_auto_timer.timeout.connect(self._auto_reload_news_web)
         self.setWindowTitle("분석")
@@ -3000,23 +2911,22 @@ class AnalysisWindow(QMainWindow):
         principle_bar.addWidget(self._analysis_clock_label)
 
         self._principle_label = QLabel(
-            "<div style='font-size:20px; font-weight:800;'>"
-            "잃지 않으면 성공이다.</div>"
-            "<div style='font-size:14px; font-weight:600; margin-top:3px;'>"
-            "기회를 놓친 것은 손실이 아니다. "
-            "좋은 기회는 드물지만, 이번이 마지막은 아니다.</div>"
-            "<div style='font-size:15px; font-weight:800; margin-top:5px;"
-            " color:#fff59d;'>"
-            "무너진 종목은 매도 기회가 짧다. 첫 번째 반등에서 팔아라. "
-            "다음 날 갭상승할 확률은 없다.</div>")
+            "<div style='font-size:22px; font-weight:900; color:#ffff00;'>"
+            "상한가 무너지면 무조건 시장가로 매도한다!</div>"
+            "<div style='font-size:17px; font-weight:800; color:#ffffff;"
+            " margin-top:7px;'>"
+            "한순간의 실수가 엄청난 고통을 준다.</div>"
+            "<div style='font-size:17px; font-weight:900; color:#80ffea;"
+            " margin-top:7px;'>"
+            "1억 잔고가 될 때까지는 절대로 단타는 하지 않는다.</div>")
         self._principle_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._principle_label.setWordWrap(True)
-        self._principle_label.setMinimumHeight(96)
+        self._principle_label.setMinimumHeight(102)
         self._principle_label.setStyleSheet(
             "QLabel {"
-            " color: #fff4df;"
-            " background-color: #5b2018;"
-            " border: 2px solid #ff9f43;"
+            " color: #ffffff;"
+            " background-color: #c00000;"
+            " border: 3px solid #ffd600;"
             " border-radius: 7px;"
             " padding: 7px 12px;"
             "}")
@@ -3033,35 +2943,32 @@ class AnalysisWindow(QMainWindow):
             self._analysis_on_top_btn, 0, Qt.AlignmentFlag.AlignTop)
         central_layout.addLayout(principle_bar)
 
+        collection_row = QHBoxLayout()
+        self._collection_progress = QProgressBar()
+        self._collection_progress.setRange(0, 1)
+        self._collection_progress.setValue(0)
+        self._collection_progress.setMaximumHeight(14)
+        self._collection_status = QLabel(
+            "상한가·테마 데이터 수동 수집 대기")
+        self._cancel_btn = QPushButton("수집 중지")
+        self._cancel_btn.setEnabled(False)
+        self._cancel_btn.clicked.connect(self._cancel_history_collection)
+        collection_row.addWidget(self._collection_progress, 1)
+        collection_row.addWidget(self._collection_status, 2)
+        collection_row.addWidget(self._cancel_btn)
+        central_layout.addLayout(collection_row)
+
         tabs = QTabWidget()
         self._tabs = tabs
         for title, description in self.TABS:
             page = QWidget()
             layout = QVBoxLayout(page)
-            if title == "데이터 관리":
-                self._build_data_page(layout)
-            elif title == "시장 현황":
-                self._build_market_page(layout)
-            elif title == "실시간 뉴스·종토방":
+            if title == "실시간 뉴스·종토방":
                 self._build_realtime_news_page(layout)
             elif title == "상한가":
                 self._build_limit_up_page(layout)
-            elif title == "공시":
-                self._build_disclosure_page(layout)
             elif title == "테마":
                 self._build_theme_page(layout)
-            elif title == "시장테마 브리핑":
-                self._build_market_theme_brief_page(layout)
-            elif title == "다음날 후보":
-                self._build_next_day_candidate_page(layout)
-            elif title == "점상 체결 분석":
-                self._build_point_lock_analysis_page(layout)
-            elif title == "순환매":
-                self._build_rotation_page(layout)
-            elif title == "수급":
-                self._build_flow_page(layout)
-            elif title == "백테스트":
-                self._build_backtest_page(layout)
             else:
                 label = QLabel(description)
                 label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -3089,12 +2996,10 @@ class AnalysisWindow(QMainWindow):
         QTimer.singleShot(0, self._ensure_titlebar_visible)
         if self._settings.value("analysis_on_top", "false") == "true":
             self._analysis_on_top_btn.setChecked(True)
-        self._refresh_db_status()
         self._refresh_realtime_watch_table()
         self._refresh_realtime_news_table()
         if self._selected_watch_code:
             self._open_selected_watch_board()
-        self._refresh_market_page()
 
     def _ensure_titlebar_visible(self):
         screens = QApplication.screens()
@@ -3238,8 +3143,10 @@ class AnalysisWindow(QMainWindow):
 
     def _analysis_on_top_toggle(self, on: bool):
         geo = self.geometry()
+        was_visible = self.isVisible()
         self.setWindowFlag(Qt.WindowStaysOnTopHint, on)
-        self.show()
+        if was_visible:
+            self.show()
         if not geo.isEmpty():
             self.setGeometry(geo)
         self._settings.setValue(
@@ -3256,33 +3163,147 @@ class AnalysisWindow(QMainWindow):
         box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         box.open()
 
-    def _analysis_tab_changed(self, index: int):
-        title = self._tabs.tabText(index)
-        if title == "시장 현황":
-            self._refresh_market_page()
-        elif title == "실시간 뉴스·종토방":
+    def _collection_completed_today(self, data_type: str) -> bool:
+        run = latest_collection_run(data_type)
+        today = QDate.currentDate().toString("yyyyMMdd")
+        return bool(
+            run
+            and str(run.get("date_to") or "") >= today
+            and (
+                run.get("status") == "COMPLETED"
+                or (
+                    data_type in {"NAVER_THEME", "KIWOOM_THEME"}
+                    and int(run.get("saved_count") or 0) > 0
+                    and int(run.get("processed_count") or 0) > 0
+                )
+            )
+        )
+
+    def _set_unified_stage(self, text: str):
+        self._unified_refresh_btn.setText(text)
+        self.statusBar().showMessage(f"전체 갱신 · {text}")
+
+    def _start_unified_refresh(self):
+        if (
+            self._unified_refresh_task is not None
+            and not self._unified_refresh_task.done()
+        ):
+            return
+        if self._collection_task and not self._collection_task.done():
+            self.statusBar().showMessage(
+                "다른 데이터 수집이 끝난 뒤 전체 갱신을 실행해 주세요.", 5000)
+            return
+        self._unified_refresh_btn.setEnabled(False)
+        self._unified_cancel_btn.setEnabled(True)
+        self._collection_cancelled = False
+        self._unified_refresh_task = asyncio.ensure_future(
+            self._run_unified_refresh())
+
+    def _cancel_unified_refresh(self):
+        task = self._unified_refresh_task
+        if task is None or task.done():
+            return
+        self._collection_cancelled = True
+        self._unified_cancel_btn.setEnabled(False)
+        self.statusBar().showMessage("전체 갱신을 중지하는 중입니다…")
+        task.cancel()
+
+    async def _run_unified_refresh(self):
+        """오래된 원천 수집부터 파생 분석과 전 탭 표시까지 순차 갱신한다."""
+        errors = []
+        cancelled = False
+        today = QDate.currentDate().toString("yyyyMMdd")
+        try:
+            if not self._collection_completed_today("NAVER_THEME"):
+                self._set_unified_stage("네이버 테마")
+                self._collection_cancelled = False
+                await self._collect_naver_themes(new_only=True)
+                run = latest_collection_run("NAVER_THEME")
+                if not run or run.get("status") != "COMPLETED":
+                    errors.append("네이버 테마")
+
+            if self._app is not None:
+                self._set_unified_stage("조건검색·후보")
+                try:
+                    await self._app.collect_rotation_snapshot_now()
+                except Exception as error:  # noqa: BLE001
+                    errors.append("조건검색")
+                    log.warning("unified condition refresh failed: %s", error)
+
+            self._set_unified_stage("시장·수급")
+            await self._collect_market_dashboard_now()
+
+            if config.DART_API_KEY:
+                self._set_unified_stage("오늘 공시")
+                try:
+                    await self._collect_dart(today, today)
+                except Exception as error:  # noqa: BLE001
+                    errors.append("DART 공시")
+                    log.warning("unified DART refresh failed: %s", error)
+
+            if (
+                config.NAVER_CLIENT_ID and config.NAVER_CLIENT_SECRET
+                and realtime_watch_codes()
+                and news_request_count_today() < 20000
+            ):
+                self._set_unified_stage("감시종목 뉴스")
+                try:
+                    await self._collect_realtime_news(
+                        sorted(realtime_watch_codes()))
+                except Exception as error:  # noqa: BLE001
+                    errors.append("뉴스")
+                    log.warning("unified news refresh failed: %s", error)
+
+            if not self._collection_completed_today("KIWOOM_THEME"):
+                self._set_unified_stage("신규 키움 테마")
+                self._collection_cancelled = False
+                await self._collect_themes(new_only=True)
+                run = latest_collection_run("KIWOOM_THEME")
+                if not run or run.get("status") != "COMPLETED":
+                    errors.append("키움 테마")
+
+            self._set_unified_stage("파생분석·화면")
+            await self._refresh_all_analysis_tabs()
+        except asyncio.CancelledError:
+            cancelled = True
+            log.info("unified analysis refresh cancelled by user")
+        except Exception as error:  # noqa: BLE001
+            errors.append(str(error))
+            log.exception("unified analysis refresh failed")
+        finally:
+            self._unified_refresh_btn.setEnabled(True)
+            self._unified_refresh_btn.setText("전체 갱신")
+            self._unified_cancel_btn.setEnabled(False)
+            self._unified_refresh_task = None
+            message = (
+                "전체 갱신 중지됨"
+                if cancelled else
+                f"전체 갱신 완료 · 일부 실패 {', '.join(errors)}"
+                if errors else "전체 갱신 완료"
+            )
+            self.statusBar().showMessage(message, 10000)
+            log.info("unified analysis refresh completed: errors=%s", errors)
+
+    async def _refresh_all_analysis_tabs(self):
+        """DB 상태와 현재 보이는 탭만 그린다. 숨은 탭은 진입 시 갱신한다."""
+        title = self._tabs.tabText(self._tabs.currentIndex())
+        if title == "실시간 뉴스·종토방":
             self._refresh_realtime_watch_table()
             self._refresh_realtime_news_table()
         elif title == "상한가":
             self._refresh_limit_up_table()
         elif title == "테마":
             self._refresh_theme_table()
-        elif title == "시장테마 브리핑":
-            self._refresh_market_theme_brief()
-        elif title == "다음날 후보":
-            self._refresh_next_day_candidates()
-        elif title == "점상 체결 분석":
-            self._refresh_point_lock_analysis()
-        elif title == "순환매":
-            self._refresh_rotation_analysis()
-        elif title == "수급":
-            self._refresh_flow_table()
-        elif title == "공시":
-            self._refresh_disclosure_table()
-        elif title == "백테스트":
-            self._refresh_backtest()
-        elif title == "데이터 관리":
-            self._refresh_db_status()
+
+    def _analysis_tab_changed(self, index: int):
+        title = self._tabs.tabText(index)
+        if title == "실시간 뉴스·종토방":
+            self._refresh_realtime_watch_table()
+            self._refresh_realtime_news_table()
+        elif title == "상한가":
+            self._refresh_limit_up_table()
+        elif title == "테마":
+            self._refresh_theme_table()
 
     def _build_backtest_page(self, layout: QVBoxLayout):
         controls = QHBoxLayout()
@@ -3417,11 +3438,15 @@ class AnalysisWindow(QMainWindow):
     def _build_market_page(self, layout: QVBoxLayout):
         top = QHBoxLayout()
         self._market_basis = QLabel("최근 거래일 데이터 대기")
-        refresh = QPushButton("새로고침")
-        refresh.clicked.connect(self._refresh_market_page)
+        self._market_refresh_btn = QPushButton("새로고침")
+        self._market_refresh_btn.setToolTip(
+            "국내 종목 마감자료, 코스피·코스닥 지수, 시장 수급, "
+            "해외지표를 다시 조회합니다.")
+        self._market_refresh_btn.clicked.connect(
+            self._request_market_page_refresh)
         top.addWidget(self._market_basis)
         top.addStretch(1)
-        top.addWidget(refresh)
+        top.addWidget(self._market_refresh_btn)
         layout.addLayout(top)
         self._market_regime = QLabel(
             "시장 국면 판정 대기 · 해외지표는 수집기 연결 전입니다.")
@@ -3443,7 +3468,7 @@ class AnalysisWindow(QMainWindow):
             ("SOX", "필라델피아 반도체"),
             ("NASDAQ_FUT", "나스닥100 선물"),
             ("USDKRW", "원/달러"),
-            ("EXTERNAL_STATUS", "해외지표"),
+            ("EXTERNAL_STATUS", "해외지표 수집"),
         )
         for position, (key, title) in enumerate(card_names):
             label = QLabel(
@@ -3490,14 +3515,16 @@ class AnalysisWindow(QMainWindow):
             pane("시장별 투자자 수급", self._market_investor_table))
         self._market_top_splitter = QSplitter(Qt.Orientation.Horizontal)
         self._market_top_splitter.addWidget(
-            pane("강한 테마 TOP 15", self._market_theme_table))
+            pane("조회시점 8% 조건 강한 테마 TOP 15",
+                 self._market_theme_table))
         self._market_top_splitter.addWidget(
             pane("거래대금 주도주 TOP 20", self._market_leader_table))
         self._market_bottom_splitter = QSplitter(Qt.Orientation.Horizontal)
         self._market_bottom_splitter.addWidget(
             pane("상한가", self._market_limit_table))
         self._market_bottom_splitter.addWidget(
-            pane("외국인+기관 순매수 TOP 15", self._market_flow_table))
+            pane("8% 조건종목 외국인+기관 순매수 TOP 15",
+                 self._market_flow_table))
         self._market_vertical_splitter = QSplitter(Qt.Orientation.Vertical)
         self._market_vertical_splitter.addWidget(self._market_signal_splitter)
         self._market_vertical_splitter.addWidget(self._market_top_splitter)
@@ -3583,14 +3610,36 @@ class AnalysisWindow(QMainWindow):
         if not hasattr(self, "_market_summary"):
             return
         data = market_dashboard()
-        trade_date = data["trade_date"]
+        if self._market_live_markets:
+            data["markets"] = self._market_live_markets
+            data["live_market"] = True
+        if self._market_live_indices:
+            data["indices"] = self._market_live_indices
+        if self._market_live_leaders:
+            data["leaders"] = self._market_live_leaders
+        trade_date = (
+            data.get("trade_date")
+            or (
+                QDate.currentDate().toString("yyyyMMdd")
+                if data.get("live_market") else ""
+            )
+        )
         if not trade_date:
             self._market_basis.setText("저장된 시장 데이터가 없습니다.")
             return
-        self._market_basis.setText(
-            f"기준일 {trade_date} 마감 데이터"
-            + (" · 장전에는 전 거래일 시황으로 표시됩니다."
-               if trade_date != QDate.currentDate().toString("yyyyMMdd") else ""))
+        if self._market_query_time and data.get("live_market"):
+            theme_time = str(data.get("theme_snapshot_at") or "")
+            theme_detail = (
+                f" · 테마 조건검색 {theme_time[11:19]}"
+                if len(theme_time) >= 19 else "")
+            self._market_basis.setText(
+                "조회시각 기준 "
+                + self._market_query_time.strftime("%Y-%m-%d %H:%M:%S")
+                + " · 지수·등락 종목 수·거래대금·상하한가 실시간 조회"
+                + theme_detail)
+        else:
+            self._market_basis.setText(
+                f"저장 자료 {trade_date} · 전체 갱신을 누르면 조회시각 기준으로 전환")
         context = _market_context(data)
         regime_styles = {
             "위험선호": ("#173F2A", "#B9F6CA", "#38A169"),
@@ -3601,7 +3650,9 @@ class AnalysisWindow(QMainWindow):
         self._market_regime.setText(
             f"{context['regime']} · {context['leadership']} · "
             f"{context['flow_state']}  |  "
-            "국내 마감 데이터 기반 규칙 판정 · 매수 신호 아님")
+            + ("조회시각 데이터 기반 규칙 판정 · 매수 신호 아님"
+               if data.get("live_market")
+               else "저장 데이터 기반 규칙 판정 · 매수 신호 아님"))
         self._market_regime.setStyleSheet(
             "QLabel { padding:5px 10px;"
             f" background:{background}; color:{foreground};"
@@ -3690,14 +3741,15 @@ class AnalysisWindow(QMainWindow):
             ).total_seconds()
             status = "수집 정상" if age_seconds <= 180 else "수집 지연"
             self._set_market_card(
-                "EXTERNAL_STATUS", "해외지표", status,
-                f"마지막 수집 {newest_collected.strftime('%m/%d %H:%M:%S')}"
+                "EXTERNAL_STATUS", "해외지표 수집",
+                "NQ선물 · SOX · 원/달러",
+                f"{status} · 마지막 {newest_collected.strftime('%m/%d %H:%M:%S')}"
                 " · 시장 마감 시 원본값 고정",
                 unavailable=age_seconds > 180,
             )
         else:
             self._set_market_card(
-                "EXTERNAL_STATUS", "해외지표", "첫 자동조회 대기",
+                "EXTERNAL_STATUS", "해외지표 수집", "첫 자동조회 대기",
                 "앱 실행 약 3초 후 시작", unavailable=True)
 
         summaries = []
@@ -3736,6 +3788,7 @@ class AnalysisWindow(QMainWindow):
                  row.get("foreign_20d") or 0),
             ) for row in data.get("market_flows", [])
         ], 0, Qt.SortOrder.AscendingOrder)
+
         self._fill_dashboard_table(self._market_theme_table, [
             (
                 row["theme_name"],
@@ -3759,8 +3812,12 @@ class AnalysisWindow(QMainWindow):
             (
                 f"{row['stock_name']} ({row['stock_code']})",
                 row["last_entry_time"] or "-",
-                (f"{(row['trading_value'] or 0)/100_000_000:,.0f}억",
-                 row["trading_value"] or 0),
+                (
+                    (f"{row['trading_value']/100_000_000:,.0f}억",
+                     row["trading_value"])
+                    if row.get("trading_value") is not None
+                    else "-"
+                ),
             ) for row in data["limit_ups"]
         ], 1, Qt.SortOrder.AscendingOrder)
         self._fill_dashboard_table(self._market_flow_table, [
@@ -3769,6 +3826,154 @@ class AnalysisWindow(QMainWindow):
                 (f"{row['net']:+,}", row["net"]),
             ) for row in data["flows"]
         ], 1, Qt.SortOrder.DescendingOrder)
+
+    def _request_market_page_refresh(self):
+        """시장 현황의 원천 데이터를 다시 조회한 뒤 화면을 갱신한다."""
+        if (
+            self._market_refresh_task is not None
+            and not self._market_refresh_task.done()
+        ):
+            return
+        if self._rest is None:
+            self._refresh_market_page()
+            self._market_basis.setText(
+                self._market_basis.text()
+                + " · 키움 REST 연결이 없어 저장 자료만 표시")
+            return
+        self._market_refresh_btn.setEnabled(False)
+        self._market_basis.setText(
+            "국내 종목·지수·시장 수급을 조회 중입니다...")
+        self._market_refresh_task = asyncio.ensure_future(
+            self._collect_market_dashboard_now())
+
+    async def _collect_market_dashboard_now(self):
+        """버튼을 누른 조회시각의 국내 시장·수급·해외지표를 갱신한다."""
+        trade_date = QDate.currentDate().toString("yyyyMMdd")
+        saved_market = saved_index = saved_flow = saved_stock_flow = 0
+        saved_external = 0
+        errors = []
+        self._market_live_markets = []
+        self._market_live_indices = []
+        self._market_query_time = None
+        try:
+            try:
+                breadth = await self._rest.market_breadth()
+                queried_at = datetime.now().astimezone()
+                self._market_live_markets = [
+                    dict(row) for row in breadth]
+                self._market_live_indices = [{
+                    "market": row["market"],
+                    "index_code": row["index_code"],
+                    "close_value": row["close_value"],
+                    "change_rate": row["change_rate"],
+                    "trading_value": row["trading_value"],
+                    "trade_date": trade_date,
+                    "collected_at": queried_at.isoformat(timespec="seconds"),
+                } for row in breadth]
+                self._market_query_time = queried_at
+            except Exception as error:  # noqa: BLE001
+                errors.append(f"조회시점 전체시장: {error}")
+                log.warning(
+                    "market dashboard live breadth refresh failed: %s", error)
+            if config.KRX_API_KEY:
+                client = KrxClient(config.KRX_API_KEY)
+                try:
+                    rows = await client.daily_market(trade_date)
+                    if rows:
+                        saved_market, _ = save_krx_market_day(rows)
+                    else:
+                        log.info(
+                            "KRX daily archive not published yet: %s",
+                            trade_date)
+                except Exception as error:  # noqa: BLE001
+                    errors.append(f"KRX 일별 보조자료: {error}")
+                    log.warning(
+                        "market dashboard KRX refresh failed: %s", error)
+                finally:
+                    await client.close()
+            for index_code, market in (("001", "KOSPI"), ("101", "KOSDAQ")):
+                try:
+                    rows = await self._rest.market_index_daily(
+                        index_code, trade_date, trade_date)
+                    if not rows:
+                        raise RuntimeError("오늘 지수 응답 없음")
+                    saved_index += save_market_index_prices(rows)
+                except Exception as error:  # noqa: BLE001
+                    errors.append(f"{market} 지수: {error}")
+                    log.warning(
+                        "market dashboard index refresh %s failed: %s",
+                        market, error)
+            for market in ("KOSPI", "KOSDAQ"):
+                try:
+                    rows = await self._rest.market_investor_flows(
+                        market, trade_date)
+                    if not rows:
+                        raise RuntimeError("오늘 시장수급 응답 없음")
+                    saved_flow += save_market_investor_flows(rows)
+                except Exception as error:  # noqa: BLE001
+                    errors.append(f"{market} 수급: {error}")
+                    log.warning(
+                        "market dashboard flow refresh %s failed: %s",
+                        market, error)
+            try:
+                rank_rows = await self._rest.trade_value_rank(stex_tp="1")
+                labels = active_theme_labels()
+                self._market_live_leaders = [{
+                    "stock_code": row["code"],
+                    "stock_name": row["name"],
+                    "change_rate": row["rate"],
+                    "trading_value": row["trading_value"],
+                    "themes": ", ".join(labels.get(row["code"], ())),
+                } for row in rank_rows[:20]]
+                if not self._market_live_leaders:
+                    raise RuntimeError("거래대금 순위 응답 없음")
+            except Exception as error:  # noqa: BLE001
+                errors.append(f"거래대금 TOP20: {error}")
+                log.warning(
+                    "market dashboard trade value rank failed: %s", error)
+            stocks = pending_condition_investor_flow_stocks(trade_date)
+            for index, stock in enumerate(stocks, 1):
+                try:
+                    self._market_basis.setText(
+                        f"종목별 외인·기관 수급 조회 중 "
+                        f"{index}/{len(stocks)} · {stock['stock_name']}")
+                    rows = await self._rest.investor_flows(
+                        stock["stock_code"], trade_date, trade_date)
+                    saved_stock_flow += save_investor_flows(
+                        stock["stock_code"], rows)
+                except Exception as error:  # noqa: BLE001
+                    errors.append(
+                        f"{stock['stock_name']} 종목수급: {error}")
+                    log.warning(
+                        "market dashboard stock flow %s failed: %s",
+                        stock["stock_code"], error)
+            try:
+                rows, external_errors = await GlobalMarketClient().fetch_all()
+                saved_external = save_external_market_quotes(rows)
+                errors.extend(external_errors)
+            except Exception as error:  # noqa: BLE001
+                errors.append(f"해외지표: {error}")
+                log.warning(
+                    "market dashboard external refresh failed: %s", error)
+        finally:
+            self._refresh_market_page()
+            if self._app is not None:
+                self._app._refresh_market_overview()
+            if errors:
+                self._market_basis.setText(
+                    self._market_basis.text()
+                    + f" · 갱신 일부 실패 {len(errors)}건")
+            else:
+                self._market_basis.setText(
+                    self._market_basis.text()
+                    + datetime.now().strftime(" · 갱신 완료 %H:%M:%S"))
+            log.info(
+                "market dashboard refreshed: market=%d index=%d flow=%d "
+                "stock_flow=%d external=%d errors=%d",
+                saved_market, saved_index, saved_flow, saved_stock_flow,
+                saved_external, len(errors))
+            self._market_refresh_btn.setEnabled(True)
+            self._market_refresh_task = None
 
     def _build_realtime_news_page(self, layout: QVBoxLayout):
         controls = QHBoxLayout()
@@ -3792,7 +3997,8 @@ class AnalysisWindow(QMainWindow):
             self._news_auto_interval.addItem(f"{minutes}분", minutes)
         saved_news_interval = int(
             self._settings.value("analysis_news_interval", 5))
-        saved_news_index = self._news_auto_interval.findData(saved_news_interval)
+        saved_news_index = self._news_auto_interval.findData(
+            saved_news_interval)
         self._news_auto_interval.setCurrentIndex(
             saved_news_index if saved_news_index >= 0 else 2)
         self._news_auto.toggled.connect(self._news_auto_toggled)
@@ -3887,14 +4093,9 @@ class AnalysisWindow(QMainWindow):
         self._news_web_back = QPushButton("←")
         self._news_web_forward = QPushButton("→")
         self._news_web_reload = QPushButton("새로고침")
-        self._news_web_auto = QCheckBox("자동 새로고침")
-        self._news_web_auto_interval = QComboBox()
-        for seconds in (5, 10, 30, 60, 300):
-            self._news_web_auto_interval.addItem(f"{seconds}초", seconds)
-        saved_interval = int(self._settings.value("analysis_web_auto_interval", 30))
-        interval_index = self._news_web_auto_interval.findData(saved_interval)
-        self._news_web_auto_interval.setCurrentIndex(
-            interval_index if interval_index >= 0 else 2)
+        self._news_web_auto = QCheckBox("5분 자동 새로고침")
+        self._news_web_auto.setToolTip(
+            "종목토론·뉴스·공시 목록 화면에서만 5분마다 새로고침")
         self._news_web_auto.setChecked(
             self._settings.value("analysis_web_auto", "false") == "true")
         external_btn = QPushButton("외부 브라우저")
@@ -3906,13 +4107,10 @@ class AnalysisWindow(QMainWindow):
             lambda: self._news_web_action("reload"))
         external_btn.clicked.connect(self._open_news_web_external)
         self._news_web_auto.toggled.connect(self._news_web_auto_toggled)
-        self._news_web_auto_interval.currentIndexChanged.connect(
-            self._news_web_auto_interval_changed)
         web_controls.addWidget(self._news_web_back)
         web_controls.addWidget(self._news_web_forward)
         web_controls.addWidget(self._news_web_reload)
         web_controls.addWidget(self._news_web_auto)
-        web_controls.addWidget(self._news_web_auto_interval)
         web_controls.addStretch(1)
         web_controls.addWidget(external_btn)
         web_layout.addLayout(web_controls)
@@ -4021,8 +4219,7 @@ class AnalysisWindow(QMainWindow):
             pass
         web_layout.addWidget(self._news_web_host, 1)
         if self._news_web_auto.isChecked():
-            self._news_web_auto_timer.start(
-                int(self._news_web_auto_interval.currentData()) * 1000)
+            self._news_web_auto_timer.start(5 * 60 * 1000)
 
         self._news_right_splitter = QSplitter(Qt.Orientation.Vertical)
         self._news_right_splitter.addWidget(news_pane)
@@ -4458,12 +4655,12 @@ class AnalysisWindow(QMainWindow):
             QTimer.singleShot(delay, lambda c=color: set_color(c))
 
     def open_market_status(self):
-        """시장 현황 탭을 선택하고 최신 저장 데이터로 새로 그린다."""
+        """시장 현황 탭을 선택하고 조회시점 원천을 즉시 갱신한다."""
         for index in range(self._tabs.count()):
             if self._tabs.tabText(index) == "시장 현황":
                 self._tabs.setCurrentIndex(index)
                 break
-        self._refresh_market_page()
+        self._request_market_page_refresh()
 
     def _selected_watch_name(self) -> str:
         stock = resolve_analysis_stock(self._selected_watch_code)
@@ -4669,21 +4866,15 @@ class AnalysisWindow(QMainWindow):
 
     def _news_web_auto_toggled(self, enabled: bool):
         self._settings.setValue("analysis_web_auto", "true" if enabled else "false")
+        self._settings.sync()
         if enabled:
-            self._news_web_auto_timer.start(
-                int(self._news_web_auto_interval.currentData()) * 1000)
+            self._news_web_auto_timer.start(5 * 60 * 1000)
         else:
             self._news_web_auto_timer.stop()
 
-    def _news_web_auto_interval_changed(self, _index: int):
-        seconds = int(self._news_web_auto_interval.currentData())
-        self._settings.setValue("analysis_web_auto_interval", seconds)
-        if self._news_web_auto.isChecked():
-            self._news_web_auto_timer.start(seconds * 1000)
-
     def _auto_reload_news_web(self):
         if (self._news_webview is not None and self._news_webview.isVisible()
-                and self._news_webview.url().toString() not in ("", "about:blank")):
+                and _is_news_web_auto_reload_url(self._news_webview.url())):
             self._news_webview.reload()
 
     def _build_flow_page(self, layout: QVBoxLayout):
@@ -4963,9 +5154,16 @@ class AnalysisWindow(QMainWindow):
         self._theme_search.returnPressed.connect(self._refresh_theme_table)
         refresh = QPushButton("조회")
         refresh.clicked.connect(self._refresh_theme_table)
+        self._theme_btn = QPushButton("키움 테마 수집")
+        self._theme_btn.clicked.connect(self._start_theme_collection)
+        self._naver_theme_btn = QPushButton("네이버 테마 수집")
+        self._naver_theme_btn.clicked.connect(
+            self._start_naver_theme_collection)
         controls.addWidget(QLabel("검색"))
         controls.addWidget(self._theme_search, 1)
         controls.addWidget(refresh)
+        controls.addWidget(self._theme_btn)
+        controls.addWidget(self._naver_theme_btn)
         layout.addLayout(controls)
 
         self._theme_summary = QLabel("테마 0개")
@@ -5033,6 +5231,8 @@ class AnalysisWindow(QMainWindow):
         table.setColumnWidth(1, min(260, max(140, table.columnWidth(1))))
         table.setColumnWidth(4, 500)
         table.sortItems(0, Qt.SortOrder.AscendingOrder)
+        self._theme_summary.setText(
+            f"현재 테마 {len(rows):,}개 · 종목 연결 {total_members:,}건")
 
     def _build_market_theme_brief_page(self, layout: QVBoxLayout):
         controls = QHBoxLayout()
@@ -5116,9 +5316,6 @@ class AnalysisWindow(QMainWindow):
             f"종목 {latest['stock_count']:,}개"
             + (" · 100종목 제한 가능성" if latest["truncated"] else "")
         )
-        self._theme_summary.setText(
-            f"현재 테마 {len(rows):,}개 · 종목 연결 {total_members:,}건")
-
     def _theme_table_clicked(self, row: int, column: int):
         if column != 1:
             return
@@ -5467,7 +5664,7 @@ class AnalysisWindow(QMainWindow):
                 f"● {datetime.now().strftime('%H:%M:%S')} 순환매 계산 중…")
             await asyncio.sleep(0)
             self._rotation_date.setDate(QDate.currentDate())
-            self._refresh_rotation_analysis()
+            await self._refresh_rotation_analysis_async()
             if result.get("reused"):
                 status = (
                     f"8% 이상 최근 정상 수집값 적용 · 종목 "
@@ -5507,6 +5704,16 @@ class AnalysisWindow(QMainWindow):
             self._rotation_collect_task = None
 
     def _refresh_rotation_analysis(self):
+        """순환매 계산을 이벤트 루프 밖에서 실행해 분석창 멈춤을 방지한다."""
+        if (
+            self._rotation_refresh_task is not None
+            and not self._rotation_refresh_task.done()
+        ):
+            return
+        self._rotation_refresh_task = asyncio.ensure_future(
+            self._refresh_rotation_analysis_async())
+
+    async def _refresh_rotation_analysis_async(self):
         if not hasattr(self, "_rotation_table"):
             return
         requested_date = self._rotation_date.date().toString("yyyyMMdd")
@@ -5527,7 +5734,8 @@ class AnalysisWindow(QMainWindow):
         self._rotation_summary.setText("순환매 후보를 계산하는 중입니다…")
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            result = rebuild_rotation_analysis(requested_date, source)
+            result = await asyncio.to_thread(
+                rebuild_rotation_analysis, requested_date, source)
             as_of_date = result["as_of_date"]
             if not as_of_date:
                 if snapshots:
@@ -5552,7 +5760,8 @@ class AnalysisWindow(QMainWindow):
                     if query in str(row["theme_name"]).lower()
                 ]
             self._rotation_rows = rows
-            self._fill_rotation_candidates(rows)
+            if not snapshots:
+                self._fill_rotation_candidates(rows)
             phase_counts = Counter(row["phase"] for row in rows)
             phases = " · ".join(
                 f"{name} {count:,}" for name, count in phase_counts.items()
@@ -5561,7 +5770,7 @@ class AnalysisWindow(QMainWindow):
                 f"기준일 {as_of_date} · {source} 테마 "
                 f"{result['themes']:,}개 · 종목 연결 {result['stocks']:,}건"
                 + (f" · {phases}" if phases else ""))
-            if rows:
+            if rows and not snapshots:
                 self._rotation_table.setCurrentCell(0, 1)
                 self._refresh_rotation_detail(
                     int(rows[0]["theme_id"]),
@@ -5578,11 +5787,29 @@ class AnalysisWindow(QMainWindow):
                 f"순환매 분석에 실패했습니다.\n{error}")
         finally:
             QApplication.restoreOverrideCursor()
+            current = asyncio.current_task()
+            if (
+                self._rotation_refresh_task is current
+                or self._rotation_refresh_task is None
+            ):
+                self._rotation_refresh_task = None
 
     def _refresh_rotation_condition_snapshot(
             self, snapshot: dict, historical_rows: list[dict]):
         """현재 조건검색 강도와 과거 순환 신호를 결합해 현재 단계를 계산한다."""
         rows = condition_theme_stats(int(snapshot["snapshot_id"]))
+        progress_by_theme = condition_theme_progress(
+            int(snapshot["snapshot_id"]))
+        candidate_evidence = condition_theme_candidate_evidence(
+            int(snapshot["snapshot_id"]))
+        snapshot_date = str(snapshot["captured_at"] or "")[:10]
+        market_data = market_dashboard()
+        if self._market_live_markets:
+            market_data["markets"] = self._market_live_markets
+            market_data["live_market"] = True
+        if self._market_live_indices:
+            market_data["indices"] = self._market_live_indices
+        market_state = _market_context(market_data)
         history_by_theme = {
             str(row["theme_name"]): row for row in historical_rows
         }
@@ -5592,30 +5819,56 @@ class AnalysisWindow(QMainWindow):
             average_rate = float(row["average_rate"] or 0)
             upper_count = int(row["upper_count"] or 0)
             member_count = int(row["member_count"] or 0)
-            current_signal = (
-                "상한가" if upper_count else
-                "확산" if top_rate >= 15 else
-                "초기" if top_rate >= 8 else "관찰"
+            progress = progress_by_theme.get(
+                str(row["theme_name"]), {})
+            evidence = candidate_evidence.get(
+                str(row["theme_name"]), {})
+            first_appeared_today = bool(
+                evidence.get("first_seen_date") == snapshot_date
+                and int(evidence.get("appearance_days") or 0) == 1
             )
+            duration = int(progress.get("consecutive_days") or 0)
+            max_streak = int(progress.get("max_stock_streak") or 0)
+            participants_5d = int(progress.get("participants_5d") or 0)
+            last_event_days = int(
+                progress.get("last_event_days_ago", 999))
+            breadth = (
+                upper_count / member_count if member_count else 0.0)
+            active_now = bool(
+                upper_count or top_rate >= 8 or average_rate >= 5)
+            if active_now and duration <= 0:
+                duration = 1
+            if active_now and (
+                (duration >= 3
+                 and (upper_count >= 2 or participants_5d >= 3))
+                or (max_streak >= 3 and upper_count >= 2)
+                or (duration >= 2 and upper_count >= 3)
+            ):
+                current_signal = "과열"
+            elif active_now and (
+                duration >= 2 or upper_count >= 2 or participants_5d >= 2
+            ):
+                current_signal = "확산"
+            elif (
+                active_now
+                and bool(progress.get("had_previous_cycle"))
+                and not first_appeared_today
+            ):
+                current_signal = "재점화"
+            elif active_now:
+                current_signal = "초기"
+            elif last_event_days <= 5:
+                current_signal = "소멸"
+            else:
+                current_signal = "관찰"
             history = history_by_theme.get(str(row["theme_name"]))
             historical_phase = str(history["phase"] or "-") if history else "신규"
-            historical_score = float(history["rotation_score"] or 0) if history else 0.0
             live_score = min(100.0, upper_count * 25.0
                              + max(0.0, top_rate) * 3.0
                              + max(0.0, average_rate) * 2.0
                              + min(member_count, 10))
-            combined_score = live_score if not history else (
-                live_score * 0.65 + historical_score * 0.35)
-            if current_signal == "관찰":
-                combined_phase = historical_phase if history else "관찰"
-            elif not history:
-                combined_phase = "신규"
-            elif historical_phase in ("소멸", "대기", "관찰"):
-                combined_phase = "재점화"
-            elif upper_count and average_rate >= 10:
-                combined_phase = "과열"
-            else:
-                combined_phase = current_signal
+            combined_score = live_score
+            combined_phase = current_signal
             next_expected = {
                 "신규": "확산 후보",
                 "초기": "확산 후보",
@@ -5626,40 +5879,129 @@ class AnalysisWindow(QMainWindow):
             }.get(combined_phase, "추가 확인")
             history_events = int(history["events_20d"] or 0) if history else 0
             history_days = int(history["active_days_20d"] or 0) if history else 0
-            agreement = bool(history and current_signal != "관찰" and (
-                historical_phase in ("초기", "확산", "재점화")
-                or combined_phase == "재점화"))
             confidence = min(95.0, 25.0
-                             + min(25.0, history_events * 4.0 + history_days)
+                             + min(25.0, duration * 7.0)
                              + min(30.0, upper_count * 10.0
                                    + max(0.0, top_rate)
                                    + min(member_count, 8))
-                             + (10.0 if agreement else 0.0))
+                             + min(15.0, breadth * 15.0))
             reason_parts = [
+                f"진행 {duration}거래일",
                 f"현재 최고 {top_rate:+.1f}%",
                 f"평균 {average_rate:+.1f}%",
-                f"상한가 {upper_count}개",
+                f"상한가 {upper_count}/{member_count}개",
+                f"5일 참여 {participants_5d}종목",
             ]
+            if max_streak >= 2:
+                reason_parts.append(f"최장 {max_streak}연상")
             if history:
                 reason_parts.append(
                     f"과거20일 {history_events}건/{history_days}일")
             else:
                 reason_parts.append("과거 이력 없음")
+            is_new_theme = bool(
+                first_appeared_today
+                and duration <= 1
+            )
+            material_score = min(
+                15.0,
+                int(evidence.get("disclosure_count") or 0) * 8.0
+                + int(evidence.get("strong_news_count") or 0) * 4.0
+                + (8.0 if evidence.get("is_manual") else 0.0),
+            )
+            participation_score = min(
+                15.0, max(0, member_count - 1) * 7.5)
+            trading_value = int(row.get("trading_value") or 0)
+            value_score = (
+                10.0 if trading_value >= 10_000_000_000
+                else 7.0 if trading_value >= 3_000_000_000
+                else 4.0 if trading_value >= 1_000_000_000
+                else 1.0 if trading_value > 0 else 0.0
+            )
+            defensive_words = (
+                "우선주", "방산", "금", "식품", "전력", "배당", "정책",
+                "통신", "가스",
+            )
+            growth_words = (
+                "AI", "로봇", "반도체", "바이오", "2차전지", "메타버스",
+                "자율주행",
+            )
+            theme_name = str(row["theme_name"])
+            if market_state["regime"] == "위험회피":
+                market_score = (
+                    10.0 if any(word in theme_name for word in defensive_words)
+                    else 3.0 if any(word in theme_name for word in growth_words)
+                    else 5.0
+                )
+            elif market_state["regime"] == "위험선호":
+                market_score = (
+                    10.0 if any(word in theme_name for word in growth_words)
+                    else 6.0
+                )
+            else:
+                market_score = 6.0
+            history_bonus = min(
+                10.0,
+                float(history["rotation_score"] or 0) * 0.10
+                if history else 0.0,
+            )
+            candidate_score = (
+                40.0 + participation_score + value_score
+                + material_score + market_score + history_bonus
+                if is_new_theme else 0.0
+            )
+            material_confirmed = bool(
+                evidence.get("strong_news_count")
+                or evidence.get("disclosure_count")
+                or evidence.get("is_manual")
+            )
+            is_candidate = bool(
+                is_new_theme
+                and member_count >= 2
+                and material_confirmed
+                and combined_phase == "초기"
+                and candidate_score >= 55.0
+            )
+            candidate_reason = " · ".join(filter(None, (
+                "오늘 첫 출현" if is_new_theme else "",
+                (
+                    "재료 " + ",".join(evidence.get("material_types") or ())
+                    if evidence.get("material_types") else
+                    "수동 검증 테마" if evidence.get("is_manual") else ""
+                ),
+                f"동반 {member_count}종목",
+                f"거래대금 {trading_value / 100_000_000:,.0f}억",
+                f"장세 {market_state['regime']}",
+            )))
             combined_rows.append({
                 "row": row, "top_rate": top_rate,
                 "average_rate": average_rate, "upper_count": upper_count,
                 "member_count": member_count, "current_signal": current_signal,
+                "duration": duration, "max_streak": max_streak,
+                "breadth": breadth,
+                "codes": list(progress.get("codes") or ()),
+                "trading_value": int(row.get("trading_value") or 0),
                 "historical_phase": historical_phase,
                 "combined_phase": combined_phase,
                 "combined_score": combined_score,
                 "next_expected": next_expected,
                 "confidence": confidence,
                 "reason": " · ".join(reason_parts),
+                "is_candidate": is_candidate,
+                "candidate_score": candidate_score,
+                "candidate_reason": candidate_reason,
+                "first_seen_date": str(
+                    evidence.get("first_seen_date") or ""),
+                "material_score": material_score,
+                "market_score": market_score,
+                "history_bonus": history_bonus,
+                "material_types": list(
+                    evidence.get("material_types") or ()),
             })
         combined_rows.sort(
             key=lambda item: (item["combined_score"], item["top_rate"]),
             reverse=True)
-        self._refresh_market_rotation_cycle(combined_rows)
+        self._refresh_market_rotation_cycle(combined_rows, market_state)
         query = self._rotation_search.text().strip().lower()
         if query:
             combined_rows = [
@@ -5671,6 +6013,11 @@ class AnalysisWindow(QMainWindow):
         table.setRowCount(len(combined_rows))
         for row_index, item_row in enumerate(combined_rows):
             row = item_row["row"]
+            next_display = (
+                f"신규후보 {item_row['candidate_score']:.0f}점"
+                if item_row["is_candidate"]
+                else item_row["next_expected"]
+            )
             values = (
                 row_index + 1, row["theme_name"], item_row["current_signal"],
                 item_row["historical_phase"], item_row["combined_phase"],
@@ -5679,7 +6026,7 @@ class AnalysisWindow(QMainWindow):
                 f"{item_row['top_rate']:+.2f}%",
                 row["leader_stock_name"] or "-",
                 str(snapshot["captured_at"])[:19],
-                item_row["next_expected"],
+                next_display,
                 f"{item_row['confidence']:.0f}%", item_row["reason"],
             )
             for column, value in enumerate(values):
@@ -5713,57 +6060,172 @@ class AnalysisWindow(QMainWindow):
         table.setSortingEnabled(True)
         table.resizeColumnsToContents()
         table.sortItems(0, Qt.SortOrder.AscendingOrder)
+        candidate_rows = sorted(
+            (item for item in combined_rows if item["is_candidate"]),
+            key=lambda item: (
+                item["candidate_score"], item["member_count"],
+                item["average_rate"]),
+            reverse=True,
+        )
+        self._fill_new_theme_candidates(candidate_rows)
         self._rotation_live_summary.setText(
             f"현재 조건검색 스냅샷 {snapshot['captured_at']} · "
             f"테마 {len(combined_rows):,}개 · 종목 {snapshot['stock_count']:,}개 · "
-            "현재 65% + 과거 35% 결합"
-            + (" · 다음 후보 " + ", ".join(
-                f"{item['row']['theme_name']} {item['confidence']:.0f}%"
-                for item in combined_rows
-                if item["combined_phase"] in ("신규", "초기", "재점화", "확산")
-            )[:180] if combined_rows else ""))
+            "현재 단계와 신규 후보 분리"
+            + (
+                " · 신규 후보 " + ", ".join(
+                    f"{item['row']['theme_name']} "
+                    f"{item['candidate_score']:.0f}점"
+                    for item in candidate_rows[:5])
+                if candidate_rows else " · 조건 충족 신규 후보 없음"
+            ))
+        self._rotation_live_summary.setToolTip("\n".join(
+            f"{item['row']['theme_name']} {item['candidate_score']:.1f}점 · "
+            f"{item['candidate_reason']}"
+            for item in candidate_rows[:10]
+        ))
         if combined_rows:
             first = combined_rows[0]
             self._rotation_cycle_widget.set_cycle(
                 first["row"]["theme_name"], first["combined_phase"],
                 first["next_expected"], [])
 
-    def _refresh_market_rotation_cycle(self, combined_rows):
-        """당일 강세 테마 전체 분포로 시장 순환매의 위치를 계산한다."""
-        stage_counts = Counter()
+    def _fill_new_theme_candidates(self, rows):
+        """아래 후보 표를 오늘 처음 등장한 강한 재료 테마만으로 채운다."""
+        columns = (
+            "순위", "신규 테마", "단계", "후보점수", "현재 상한가",
+            "동반종목", "진행일", "최초출현", "평균등락률",
+            "거래대금", "재료점수", "장세점수", "판단 근거",
+        )
+        table = self._rotation_table
+        table.setHorizontalHeaderLabels(columns)
+        table.setSortingEnabled(False)
+        table.setRowCount(len(rows))
+        for row_index, item_row in enumerate(rows):
+            row = item_row["row"]
+            values = (
+                row_index + 1,
+                row["theme_name"],
+                item_row["combined_phase"],
+                f"{item_row['candidate_score']:.1f}",
+                int(item_row["upper_count"]),
+                int(item_row["member_count"]),
+                int(item_row["duration"]),
+                item_row["first_seen_date"],
+                f"{item_row['average_rate']:+.2f}%",
+                f"{item_row['trading_value']/100_000_000:,.0f}억",
+                f"{item_row['material_score']:.1f}",
+                f"{item_row['market_score']:.1f}",
+                item_row["candidate_reason"],
+            )
+            numbers = {
+                0: row_index + 1,
+                3: item_row["candidate_score"],
+                4: item_row["upper_count"],
+                5: item_row["member_count"],
+                6: item_row["duration"],
+                8: item_row["average_rate"],
+                9: item_row["trading_value"],
+                10: item_row["material_score"],
+                11: item_row["market_score"],
+            }
+            for column, value in enumerate(values):
+                item = (
+                    NumericTableWidgetItem(str(value), numbers[column])
+                    if column in numbers else QTableWidgetItem(str(value))
+                )
+                if column == 2:
+                    item.setBackground(QColor("#345c3d"))
+                if column == 12:
+                    item.setToolTip(item_row["candidate_reason"])
+                table.setItem(row_index, column, item)
+        table.setSortingEnabled(True)
+        table.resizeColumnsToContents()
+        table.setColumnWidth(1, min(280, max(170, table.columnWidth(1))))
+        table.setColumnWidth(12, min(550, max(300, table.columnWidth(12))))
+        table.sortItems(3, Qt.SortOrder.DescendingOrder)
+
+    def _refresh_market_rotation_cycle(self, combined_rows, market_state):
+        """종목 중복 제거 강도와 시장 급락을 함께 반영해 전체 단계를 계산한다."""
+        phase_priority = {
+            "소멸": 0, "초기": 1, "재점화": 2, "확산": 3, "과열": 4,
+        }
+        stock_phases: dict[str, str] = {}
+        stage_weights = Counter()
         active_rows = []
+        code_theme_counts = Counter(
+            code
+            for item in combined_rows
+            for code in item.get("codes", ())
+        )
         for item in combined_rows:
             phase = str(item.get("combined_phase") or "")
             if phase == "신규":
                 phase = "초기"
             if phase in RotationCycleWidget.STAGES:
-                stage_counts[phase] += 1
                 active_rows.append(item)
+                codes = item.get("codes", ())
+                unique_share = sum(
+                    1.0 / max(1, code_theme_counts[code])
+                    for code in codes
+                )
+                strength = (
+                    1.0
+                    + int(item.get("upper_count") or 0) * 0.75
+                    + min(4, int(item.get("duration") or 0)) * 0.25
+                    + min(
+                        2.0,
+                        int(item.get("trading_value") or 0)
+                        / 10_000_000_000,
+                    )
+                )
+                stage_weights[phase] += unique_share * strength
+                for code in codes:
+                    previous = stock_phases.get(code)
+                    if (
+                        previous is None
+                        or phase_priority[phase] > phase_priority[previous]
+                    ):
+                        stock_phases[code] = phase
+        stage_counts = Counter(stock_phases.values())
         if not active_rows:
             self._rotation_market_cycle_widget.set_cycle(
                 "시장 전체 테마", "", "판단 자료 부족", [], stage_counts)
             return
 
-        total = len(active_rows)
-        top_rows = active_rows[:min(5, total)]
-        preferred_leading = any(
-            "우선주" in str(item["row"]["theme_name"])
-            for item in top_rows)
-        late_count = stage_counts["과열"] + stage_counts["소멸"]
-        spread_count = stage_counts["확산"]
-        restart_count = stage_counts["재점화"]
-        early_count = stage_counts["초기"]
+        total = max(1, len(stock_phases))
+        preferred_row = next((
+            item for item in active_rows
+            if "우선주" in str(item["row"]["theme_name"])
+        ), None)
+        preferred_overheated = bool(
+            preferred_row
+            and int(preferred_row.get("upper_count") or 0) >= 3
+            and int(preferred_row.get("duration") or 0) >= 3
+        )
+        kospi_rate = market_state.get("kospi_rate")
+        kosdaq_rate = market_state.get("kosdaq_rate")
+        index_crash = any(
+            rate is not None and float(rate) <= -3.0
+            for rate in (kospi_rate, kosdaq_rate)
+        )
+        total_weight = max(0.001, sum(stage_weights.values()))
+        late_weight = (
+            stage_weights["과열"] + stage_weights["소멸"])
 
-        if stage_counts["소멸"] / total >= 0.40:
+        if preferred_overheated and index_crash:
+            market_phase = "과열"
+            next_text = "하락장 말기 쏠림 · 소멸·주도 테마 교체 주의"
+        elif stage_weights["소멸"] / total_weight >= 0.40:
             market_phase = "소멸"
             next_text = "새 주도 테마 재점화 대기"
-        elif preferred_leading or late_count / total >= 0.35:
+        elif preferred_overheated or late_weight / total_weight >= 0.35:
             market_phase = "과열"
             next_text = "소멸·주도 테마 교체 주의"
-        elif spread_count / total >= 0.35:
+        elif stage_weights["확산"] / total_weight >= 0.35:
             market_phase = "확산"
             next_text = "과열 여부 확인"
-        elif restart_count > early_count:
+        elif stage_weights["재점화"] > stage_weights["초기"]:
             market_phase = "재점화"
             next_text = "2차 확산 여부 확인"
         else:
@@ -5771,15 +6233,22 @@ class AnalysisWindow(QMainWindow):
             next_text = "확산 여부 확인"
 
         reasons = [
-            f"전체 {total}개",
+            f"중복제거 종목 {total}개",
             f"초기 {stage_counts['초기']}",
-            f"확산 {spread_count}",
+            f"확산 {stage_counts['확산']}",
             f"과열 {stage_counts['과열']}",
             f"소멸 {stage_counts['소멸']}",
-            f"재점화 {restart_count}",
+            f"재점화 {stage_counts['재점화']}",
         ]
-        if preferred_leading:
-            reasons.append("상위권 우선주 출현")
+        if preferred_overheated:
+            reasons.append(
+                f"우선주 {preferred_row['upper_count']}/"
+                f"{preferred_row['member_count']} 상한가 · "
+                f"{preferred_row['duration']}거래일")
+        if index_crash:
+            reasons.append(
+                f"지수 급락 KOSPI {float(kospi_rate or 0):+.2f}% · "
+                f"KOSDAQ {float(kosdaq_rate or 0):+.2f}%")
         self._rotation_market_cycle_widget.set_cycle(
             "시장 전체 테마", market_phase,
             f"{next_text} · {' · '.join(reasons)}", [], stage_counts)
@@ -6119,6 +6588,9 @@ class AnalysisWindow(QMainWindow):
         self._limit_to = QDateEdit(QDate.currentDate())
         self._limit_to.setCalendarPopup(True)
         self._limit_to.setDisplayFormat("yyyy-MM-dd")
+        # 상한가 조회 기간과 원천 수집 기간을 하나로 사용한다.
+        self._date_from = self._limit_from
+        self._date_to = self._limit_to
         refresh = QPushButton("조회")
         refresh.clicked.connect(self._refresh_limit_up_table)
         disclosure_btn = QPushButton("선택 종목 공시 보기")
@@ -6137,6 +6609,35 @@ class AnalysisWindow(QMainWindow):
         controls.addWidget(limit_refresh_btn)
         controls.addStretch(1)
         layout.addLayout(controls)
+
+        collection_controls = QHBoxLayout()
+        self._krx_btn = QPushButton("KRX 상한가 수집")
+        self._krx_btn.setToolTip(
+            "선택 기간의 KRX 공식 일봉과 종가 상한가를 수동 저장합니다.")
+        self._krx_btn.clicked.connect(self._start_krx_collection)
+        self._kiwoom_limit_btn = QPushButton("키움 상한가 수집")
+        self._kiwoom_limit_btn.setToolTip(
+            "선택 기간의 키움 일봉을 조회해 종가 상한가를 수동 저장합니다.")
+        self._kiwoom_limit_btn.clicked.connect(
+            self._start_history_collection)
+        self._collect_btn = QPushButton("상한가 진입시간 보완")
+        self._collect_btn.clicked.connect(self._start_intraday_enrichment)
+        self._delete_limit_btn = QPushButton("선택 기록 삭제")
+        self._delete_limit_btn.setToolTip(
+            "표에서 선택한 날짜·종목의 상한가 기록을 확인 후 삭제합니다.")
+        self._delete_limit_btn.setStyleSheet(
+            "QPushButton { color:#ffffff; background:#b71c1c;"
+            " border:1px solid #ff8a80; font-weight:700; padding:3px 8px; }"
+            "QPushButton:hover { background:#d32f2f; }")
+        self._delete_limit_btn.clicked.connect(
+            self._delete_selected_limit_up_record)
+        collection_controls.addWidget(QLabel("수동 저장"))
+        collection_controls.addWidget(self._krx_btn)
+        collection_controls.addWidget(self._kiwoom_limit_btn)
+        collection_controls.addWidget(self._collect_btn)
+        collection_controls.addWidget(self._delete_limit_btn)
+        collection_controls.addStretch(1)
+        layout.addLayout(collection_controls)
 
         search_controls = QHBoxLayout()
         self._limit_stock_search = QLineEdit()
@@ -6345,6 +6846,67 @@ class AnalysisWindow(QMainWindow):
         return str(
             item.data(Qt.ItemDataRole.UserRole + 2) or "").strip()
 
+    def _delete_selected_limit_up_record(self):
+        """선택한 상한가 이벤트를 명시적 확인 뒤 삭제한다."""
+        row = self._limit_table.currentRow()
+        if row < 0:
+            QMessageBox.information(
+                self, "상한가 기록 삭제",
+                "상한가 표에서 삭제할 행을 먼저 선택해 주세요.")
+            return
+        date_item = self._limit_table.item(row, 0)
+        code_item = self._limit_table.item(row, 1)
+        name_item = self._limit_table.item(row, 2)
+        trade_date = str(date_item.text() if date_item else "").strip()
+        stock_code = self._limit_stock_code(row)
+        if not stock_code and code_item is not None:
+            stock_code = code_item.text().strip()
+        stock_name = str(name_item.text() if name_item else stock_code).strip()
+        if len(trade_date) == 8 and trade_date.isdigit():
+            date_text = (
+                f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}")
+        else:
+            date_text = trade_date
+        answer = QMessageBox.question(
+            self,
+            "상한가 기록 삭제 확인",
+            f"{date_text}  {stock_name} ({stock_code})\n\n"
+            "이 상한가 기록을 삭제하시겠습니까?\n"
+            "조건검색이 만든 임시 일봉은 함께 삭제하고, "
+            "KRX·키움 정식 일봉은 보존합니다.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            result = delete_limit_up_record(trade_date, stock_code)
+        except (OSError, ValueError) as error:
+            QMessageBox.critical(
+                self, "상한가 기록 삭제", f"삭제하지 못했습니다.\n{error}")
+            return
+        if not result["deleted"]:
+            QMessageBox.information(
+                self, "상한가 기록 삭제",
+                "이미 삭제됐거나 해당 기록을 찾을 수 없습니다.")
+            self._refresh_limit_up_table()
+            return
+        log.warning(
+            "manual limit-up record deleted: date=%s code=%s name=%s "
+            "source=%s condition_price=%s",
+            trade_date, stock_code, stock_name, result["price_source"],
+            result["condition_price_deleted"])
+        self._refresh_limit_up_table()
+        self._refresh_theme_table()
+        detail = (
+            " · 조건검색 임시 일봉도 삭제"
+            if result["condition_price_deleted"] else
+            " · 정식 일봉은 보존"
+        )
+        self._collection_status.setText(
+            f"삭제 완료 · {date_text} {stock_name} ({stock_code}){detail}")
+        self.statusBar().showMessage(self._collection_status.text(), 7000)
+
     def _open_selected_disclosures(self):
         row = self._limit_table.currentRow()
         if row < 0:
@@ -6381,8 +6943,10 @@ class AnalysisWindow(QMainWindow):
             self._data_dart_btn.setEnabled(False)
         self._dart_task = asyncio.ensure_future(self._collect_dart())
 
-    async def _collect_dart(self):
-        date_from, date_to = self._limit_dates()
+    async def _collect_dart(
+            self, date_from: str | None = None, date_to: str | None = None):
+        if date_from is None or date_to is None:
+            date_from, date_to = self._limit_dates()
         client = DartClient(config.DART_API_KEY)
         saved = errors = 0
         parent_evidence_by_child: dict[str, dict[str, str]] = {}
@@ -6602,6 +7166,24 @@ class AnalysisWindow(QMainWindow):
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(os.fspath(DB_PATH.parent)))
 
+    def _set_core_collection_running(self, running: bool):
+        """남겨 둔 상한가·테마 수집 버튼을 한 번에 잠그거나 해제한다."""
+        for name in (
+            "_krx_btn",
+            "_kiwoom_limit_btn",
+            "_collect_btn",
+            "_theme_btn",
+            "_naver_theme_btn",
+            "_dart_btn",
+            "_delete_limit_btn",
+        ):
+            button = getattr(self, name, None)
+            if button is not None:
+                button.setEnabled(not running)
+        self._cancel_btn.setEnabled(running)
+        self._date_from.setEnabled(not running)
+        self._date_to.setEnabled(not running)
+
     def _start_theme_collection(self):
         if self._rest is None:
             QMessageBox.warning(
@@ -6610,18 +7192,10 @@ class AnalysisWindow(QMainWindow):
         if self._collection_task and not self._collection_task.done():
             return
         self._collection_cancelled = False
-        self._krx_btn.setEnabled(False)
-        self._kiwoom_limit_btn.setEnabled(False)
-        self._market_index_btn.setEnabled(False)
-        self._market_flow_btn.setEnabled(False)
-        self._collect_btn.setEnabled(False)
-        self._data_dart_btn.setEnabled(False)
-        self._theme_btn.setEnabled(False)
-        self._naver_theme_btn.setEnabled(False)
-        self._cancel_btn.setEnabled(True)
+        self._set_core_collection_running(True)
         self._collection_task = asyncio.ensure_future(self._collect_themes())
 
-    async def _collect_themes(self):
+    async def _collect_themes(self, new_only: bool = False):
         snapshot_date = QDate.currentDate().toString("yyyyMMdd")
         run_id = start_collection(
             "KIWOOM_THEME", snapshot_date, snapshot_date)
@@ -6629,6 +7203,21 @@ class AnalysisWindow(QMainWindow):
         status, message = "COMPLETED", ""
         try:
             groups = await self._rest.theme_groups()
+            if new_only:
+                known_counts = theme_source_member_counts("KIWOOM")
+                groups = [
+                    group for group in groups
+                    if (
+                        str(group.get("thema_grp_cd") or "").strip()
+                        not in known_counts
+                        or int(group.get("stk_num") or 0)
+                        != known_counts.get(
+                            str(group.get("thema_grp_cd") or "").strip(), -1)
+                    )
+                ]
+                log.info(
+                    "Kiwoom changed theme scan: known=%d changed=%d",
+                    len(known_counts), len(groups))
             self._collection_progress.setRange(0, max(1, len(groups)))
             self._collection_progress.setValue(0)
             snapshots = []
@@ -6663,7 +7252,8 @@ class AnalysisWindow(QMainWindow):
                 await asyncio.sleep(0)
             if status == "COMPLETED":
                 theme_count, kiwoom_links = save_theme_snapshot(
-                    snapshots, snapshot_date)
+                    snapshots, snapshot_date, "KIWOOM", 0.8,
+                    replace_source=not new_only)
                 saved = kiwoom_links
 
                 classifier = ClassificationClient()
@@ -6703,8 +7293,13 @@ class AnalysisWindow(QMainWindow):
                     for view in self._app.views:
                         view.screen.refresh_theme_sort()
                 message = (
-                    f"키움 {kiwoom_links:,} · WICS {wics_links:,} · "
+                    f"{'신규 ' if new_only else ''}키움 "
+                    f"{theme_count:,}개/{kiwoom_links:,}건 · "
+                    f"WICS {wics_links:,} · "
                     f"KRX {krx_links:,} · DART {dart_links:,}건")
+        except asyncio.CancelledError:
+            status, message = "CANCELLED", "사용자가 중지함"
+            raise
         except Exception as error:  # noqa: BLE001
             status, message = "FAILED", str(error)
             log.exception("Kiwoom theme collection failed")
@@ -6715,37 +7310,20 @@ class AnalysisWindow(QMainWindow):
                 run_id, status, processed, saved, errors, message)
             self._collection_status.setText(
                 f"{status} · {message or '저장하지 않음'}")
-            self._krx_btn.setEnabled(True)
-            self._kiwoom_limit_btn.setEnabled(True)
-            self._market_index_btn.setEnabled(True)
-            self._market_flow_btn.setEnabled(True)
-            self._collect_btn.setEnabled(True)
-            self._data_dart_btn.setEnabled(True)
-            self._theme_btn.setEnabled(True)
-            self._naver_theme_btn.setEnabled(True)
-            self._cancel_btn.setEnabled(False)
+            self._set_core_collection_running(False)
             self._collection_task = None
             self._refresh_limit_up_table()
             self._refresh_theme_table()
-            self._refresh_db_status()
 
     def _start_naver_theme_collection(self):
         if self._collection_task and not self._collection_task.done():
             return
         self._collection_cancelled = False
-        self._krx_btn.setEnabled(False)
-        self._kiwoom_limit_btn.setEnabled(False)
-        self._market_index_btn.setEnabled(False)
-        self._market_flow_btn.setEnabled(False)
-        self._collect_btn.setEnabled(False)
-        self._data_dart_btn.setEnabled(False)
-        self._theme_btn.setEnabled(False)
-        self._naver_theme_btn.setEnabled(False)
-        self._cancel_btn.setEnabled(True)
+        self._set_core_collection_running(True)
         self._collection_task = asyncio.ensure_future(
             self._collect_naver_themes())
 
-    async def _collect_naver_themes(self):
+    async def _collect_naver_themes(self, new_only: bool = False):
         snapshot_date = QDate.currentDate().toString("yyyyMMdd")
         run_id = start_collection(
             "NAVER_THEME", snapshot_date, snapshot_date)
@@ -6770,18 +7348,26 @@ class AnalysisWindow(QMainWindow):
             snapshots = await client.naver_themes(
                 progress=progress,
                 cancelled=lambda: self._collection_cancelled,
+                known_codes=(
+                    theme_source_codes("NAVER") if new_only else None),
             )
             if self._collection_cancelled:
                 status, message = "CANCELLED", "사용자가 중지함"
             else:
                 theme_count, saved = save_theme_snapshot(
-                    snapshots, snapshot_date, "NAVER", 0.95)
+                    snapshots, snapshot_date, "NAVER", 0.95,
+                    replace_source=not new_only)
                 # 네이버 테마 갱신 후에도 화면의 메모리 테마표를 즉시
                 # DB 기준으로 교체해야 테마정렬이 오래된 분류를 쓰지 않는다.
                 if self._app:
                     for view in self._app.views:
                         view.screen.refresh_theme_sort()
-                message = f"테마 {theme_count:,}개 · 연결 {saved:,}건"
+                message = (
+                    f"{'신규 ' if new_only else ''}테마 "
+                    f"{theme_count:,}개 · 연결 {saved:,}건")
+        except asyncio.CancelledError:
+            status, message = "CANCELLED", "사용자가 중지함"
+            raise
         except Exception as error:  # noqa: BLE001
             errors += 1
             status, message = "FAILED", str(error)
@@ -6794,19 +7380,10 @@ class AnalysisWindow(QMainWindow):
                 run_id, status, processed, saved, errors, message)
             self._collection_status.setText(
                 f"{status} · {message or '저장하지 않음'}")
-            self._krx_btn.setEnabled(True)
-            self._kiwoom_limit_btn.setEnabled(True)
-            self._market_index_btn.setEnabled(True)
-            self._market_flow_btn.setEnabled(True)
-            self._collect_btn.setEnabled(True)
-            self._data_dart_btn.setEnabled(True)
-            self._theme_btn.setEnabled(True)
-            self._naver_theme_btn.setEnabled(True)
-            self._cancel_btn.setEnabled(False)
+            self._set_core_collection_running(False)
             self._collection_task = None
             self._refresh_limit_up_table()
             self._refresh_theme_table()
-            self._refresh_db_status()
 
     def _start_market_flow_collection(self):
         if self._rest is None:
@@ -7036,17 +7613,7 @@ class AnalysisWindow(QMainWindow):
             QMessageBox.warning(self, "KRX 수집", "시작일이 종료일보다 늦습니다.")
             return
         self._collection_cancelled = False
-        self._krx_btn.setEnabled(False)
-        self._kiwoom_limit_btn.setEnabled(False)
-        self._market_index_btn.setEnabled(False)
-        self._market_flow_btn.setEnabled(False)
-        self._collect_btn.setEnabled(False)
-        self._data_dart_btn.setEnabled(False)
-        self._theme_btn.setEnabled(False)
-        self._naver_theme_btn.setEnabled(False)
-        self._cancel_btn.setEnabled(True)
-        self._date_from.setEnabled(False)
-        self._date_to.setEnabled(False)
+        self._set_core_collection_running(True)
         self._collection_task = asyncio.ensure_future(
             self._collect_krx(
                 date_from.toString("yyyyMMdd"), date_to.toString("yyyyMMdd")))
@@ -7110,19 +7677,8 @@ class AnalysisWindow(QMainWindow):
                 f"{status} · 거래일 {processed:,} · 일봉 {saved:,} "
                 f"· 상한가 {events:,} · 오류 {errors:,}"
                 + (f" · {message}" if message else ""))
-            self._krx_btn.setEnabled(True)
-            self._kiwoom_limit_btn.setEnabled(True)
-            self._market_index_btn.setEnabled(True)
-            self._market_flow_btn.setEnabled(True)
-            self._collect_btn.setEnabled(True)
-            self._data_dart_btn.setEnabled(True)
-            self._theme_btn.setEnabled(True)
-            self._naver_theme_btn.setEnabled(True)
-            self._cancel_btn.setEnabled(False)
-            self._date_from.setEnabled(True)
-            self._date_to.setEnabled(True)
+            self._set_core_collection_running(False)
             self._collection_task = None
-            self._refresh_db_status()
             self._refresh_limit_up_table()
 
     def _start_intraday_enrichment(self, silent: bool = False):
@@ -7149,17 +7705,7 @@ class AnalysisWindow(QMainWindow):
                     f"{latest} 상한가 종목의 진입시간이 이미 모두 저장되어 있습니다.")
             return
         self._collection_cancelled = False
-        self._krx_btn.setEnabled(False)
-        self._kiwoom_limit_btn.setEnabled(False)
-        self._market_index_btn.setEnabled(False)
-        self._market_flow_btn.setEnabled(False)
-        self._collect_btn.setEnabled(False)
-        self._theme_btn.setEnabled(False)
-        self._naver_theme_btn.setEnabled(False)
-        self._data_dart_btn.setEnabled(False)
-        self._cancel_btn.setEnabled(True)
-        self._date_from.setEnabled(False)
-        self._date_to.setEnabled(False)
+        self._set_core_collection_running(True)
         self._collection_task = asyncio.ensure_future(
             self._collect_intraday(latest, events))
 
@@ -7210,19 +7756,8 @@ class AnalysisWindow(QMainWindow):
                 f"{status} · {trade_date} · 처리 {processed:,} "
                 f"· 저장 {saved:,} · 조회불가 {unavailable:,} "
                 f"· 오류 {errors:,}")
-            self._krx_btn.setEnabled(True)
-            self._kiwoom_limit_btn.setEnabled(True)
-            self._market_index_btn.setEnabled(True)
-            self._market_flow_btn.setEnabled(True)
-            self._collect_btn.setEnabled(True)
-            self._data_dart_btn.setEnabled(True)
-            self._theme_btn.setEnabled(True)
-            self._naver_theme_btn.setEnabled(True)
-            self._cancel_btn.setEnabled(False)
-            self._date_from.setEnabled(True)
-            self._date_to.setEnabled(True)
+            self._set_core_collection_running(False)
             self._collection_task = None
-            self._refresh_db_status()
             self._refresh_limit_up_table()
 
     def _start_history_collection(self):
@@ -7238,17 +7773,7 @@ class AnalysisWindow(QMainWindow):
             QMessageBox.warning(self, "데이터 수집", "시작일이 종료일보다 늦습니다.")
             return
         self._collection_cancelled = False
-        self._krx_btn.setEnabled(False)
-        self._kiwoom_limit_btn.setEnabled(False)
-        self._market_index_btn.setEnabled(False)
-        self._market_flow_btn.setEnabled(False)
-        self._collect_btn.setEnabled(False)
-        self._data_dart_btn.setEnabled(False)
-        self._theme_btn.setEnabled(False)
-        self._naver_theme_btn.setEnabled(False)
-        self._cancel_btn.setEnabled(True)
-        self._date_from.setEnabled(False)
-        self._date_to.setEnabled(False)
+        self._set_core_collection_running(True)
         self._collection_task = asyncio.ensure_future(
             self._collect_history(
                 date_from.toString("yyyyMMdd"), date_to.toString("yyyyMMdd")))
@@ -7329,19 +7854,8 @@ class AnalysisWindow(QMainWindow):
                 run_id, status, processed, saved, errors, message)
             self._collection_status.setText(
                 f"{status} · 종목 {processed:,} · 일봉 {saved:,} · 오류 {errors:,}")
-            self._krx_btn.setEnabled(True)
-            self._kiwoom_limit_btn.setEnabled(True)
-            self._market_index_btn.setEnabled(True)
-            self._market_flow_btn.setEnabled(True)
-            self._collect_btn.setEnabled(True)
-            self._data_dart_btn.setEnabled(True)
-            self._theme_btn.setEnabled(True)
-            self._naver_theme_btn.setEnabled(True)
-            self._cancel_btn.setEnabled(False)
-            self._date_from.setEnabled(True)
-            self._date_to.setEnabled(True)
+            self._set_core_collection_running(False)
             self._collection_task = None
-            self._refresh_db_status()
             self._refresh_limit_up_table()
 
     def resizeEvent(self, event):

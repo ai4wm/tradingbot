@@ -53,8 +53,8 @@ TONES = {  # (주파수Hz, 길이ms) 나열 -> 멜로디. 시스템 테마 무�
     "jump": [(1100, 1000)],  # 급상승: 띠—— 긴 단일음
     "in":   [(784, 140), (1047, 140), (1319, 280)],  # 조건 편입: 뚜-뚜-띠~↑ (3음 차임, 길고 또렷)
     "balance1": [(880, 180), (880, 180)],  # 잔량 1단계: 주의
-    "balance2": [(988, 160), (784, 260)],  # 잔량 2단계: 50% 보호매도
-    "balance3": [(659, 150), (523, 150), (392, 420)],  # 잔량 3단계: 전량 정리
+    "balance2": [(880, 180), (880, 180)],
+    "balance3": [(880, 180), (880, 180)],
 }
 
 
@@ -92,8 +92,8 @@ def _tone_wav(tones, sample_rate: int = 44100) -> bytes:
 _SOUND_EFFECTS = {}
 KIWOOM_ALERT_FILES = {
     "balance1": Path(r"C:\KiwoomHero4\sound\sound7.wav"),
-    "balance2": Path(r"C:\KiwoomHero4\sound\매도주문체결4.wav"),
-    "balance3": Path(r"C:\KiwoomHero4\sound\매도주문체결4.wav"),
+    "balance2": Path(r"C:\KiwoomHero4\sound\주문접수완료1.wav"),
+    "balance3": Path(r"C:\KiwoomHero4\sound\주문접수완료1.wav"),
 }
 
 

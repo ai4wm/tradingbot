@@ -29,18 +29,17 @@ from PySide6.QtWidgets import (
 log = logging.getLogger("gui")
 
 # 순위/변동: ★조회순위(ka00198) 모드 전용 -> 다른 화면에선 숨김 (set_view_mode)
-COLUMNS = ["순위",  "변동",      "등락률", "연상", "종목명", "테마",   "현재가", "예상체결가", "주문",  "L일봉H", "예상등락률", "전일거래량", "거래량", "매도잔량", "매수잔량", "예상체결량", "체결/분", "프매",    "시총(억)", "상한가진입시간", "3단매도(만)", "자동취소",       "청산키"]
-FIELDS  = ["qrank", "qrank_chg", "rate",   "streak", "name", "theme", "price", "exp_price", "order", "bar",    "exp_rate",   "prev_vol", "vol",   "ask_qty",  "bid_qty",  "exp_qty",  "tpm",    "program", "mcap",   "time",             "balance_sell", "auto_cancel_arm", "exit_hotkey"]
+COLUMNS = ["순위",  "변동",      "등락률", "연상", "종목명", "테마",   "현재가", "예상체결가", "주문",  "L일봉H", "예상등락률", "전일거래량", "거래량", "매도잔량", "매수잔량", "예상체결량", "시총(억)", "상한가진입시간", "3단매도(만)", "자동취소",       "청산키"]
+FIELDS  = ["qrank", "qrank_chg", "rate",   "streak", "name", "theme", "price", "exp_price", "order", "bar",    "exp_rate",   "prev_vol", "vol",   "ask_qty",  "bid_qty",  "exp_qty",  "mcap",   "time",             "balance_sell", "auto_cancel_arm", "exit_hotkey"]
 # 컬럼은 아니지만 L일봉H 그리기에 필요한 저장 필드 (시/저/고/전일종가/상한/하한)
-# streak(연상)/mcap(시가총액)/tpm(체결/분)/program(프매)은 저장 안 함: 매번 계산
+# streak(연상)/mcap(시가총액)은 저장 안 함: 매번 계산
 BOOK_FIELDS = {f"{side}_{kind}{level if level > 1 else ''}"
                for side in ("ask", "bid") for kind in ("price", "qty")
                for level in range(1, 6)}
 STORED = (set(FIELDS) - {
-    "streak", "theme", "mcap", "tpm", "program", "order", "balance_sell",
+    "streak", "theme", "mcap", "order", "balance_sell",
     "auto_cancel_arm", "exit_hotkey"}) | {
-    "open", "low", "high", "base", "upper", "lower",
-    "program_net_qty"} | BOOK_FIELDS
+    "open", "low", "high", "base", "upper", "lower"} | BOOK_FIELDS
 BAR_COL = FIELDS.index("bar")
 RATE_COL = FIELDS.index("rate")
 PRICE_COL = FIELDS.index("price")
@@ -51,12 +50,11 @@ BID_QTY_COL = FIELDS.index("bid_qty")
 NON_LIMIT_IGNORED_SORT_COLS = {TIME_COL, BID_QTY_COL}
 STREAK_COL = FIELDS.index("streak")
 MCAP_COL = FIELDS.index("mcap")
-TPM_COL = FIELDS.index("tpm")
-PROGRAM_COL = FIELDS.index("program")
 ORDER_COL = FIELDS.index("order")
 BALANCE_SELL_COL = FIELDS.index("balance_sell")
 AUTO_CANCEL_ARM_COL = FIELDS.index("auto_cancel_arm")
 EXIT_HOTKEY_COL = FIELDS.index("exit_hotkey")
+BALANCE_SELL_MARKET_LAST_KEY = "balance_sell_market_last"
 RANK_COLS = (FIELDS.index("qrank"), FIELDS.index("qrank_chg"))
 RANK_DEFAULT_WIDTHS = {RANK_COLS[0]: 42, RANK_COLS[1]: 48}
 RANK_PERIODS = {  # 순위 계열 기준시간 콤보: (표시, data). 모드 따라 교체
@@ -67,11 +65,8 @@ BAR_ROLE = Qt.UserRole + 1  # 델리게이트에 (open, high, low, close, base, 
 NXT_ROLE = Qt.UserRole + 2  # NameDelegate에 NXT 종목 여부 전달
 MISU_ROLE = Qt.UserRole + 3  # NameDelegate에 미수가능 여부 전달
 NEW_ROLE = Qt.UserRole + 4  # NameDelegate에 신규상장 단계 전달 (3=당일 2=15일이내 1=30일이내 0=아님)
-TPM_PRICE_DIRECTION_ROLE = Qt.UserRole + 5  # 최근 5초 가격 방향: 하락(-1)/보합(0)/상승(+1)
+SHORT_OVERHEAT_ROLE = Qt.UserRole + 5  # NameDelegate에 단기과열(30분 단일가) 여부 전달
 BUY_TREND_ROLE = Qt.UserRole + 6  # 매수% 추세: 최근 20초 비중 vs 이전 40초 (-1/0/+1)
-PROGRAM_DIRECTION_ROLE = Qt.UserRole + 8  # 최근 20초 실제 순매수 변화: 감소(-1)/없음(0)/증가(+1)
-TPM_ALERT_ROLE = Qt.UserRole + 11  # 체결속도 순위 하락(-1)/정상(0)/상승(+1)
-TPM_RANK_CHANGE_ROLE = Qt.UserRole + 12  # 최근 순위 이동 구간의 누적 단계 수
 ORDER_CANCEL_ROLE = Qt.UserRole + 13  # 주문 셀 오른쪽 즉시 잔량취소 영역
 THEME_LEADER_ROLE = Qt.UserRole + 14  # 테마정렬에서 각 묶음의 첫 대장 종목
 THEME_SINGLETON_ROLE = Qt.UserRole + 15  # 현재 조건검색에서 단독인 테마 종목
@@ -86,25 +81,22 @@ PREDICT_HORIZONS = (
     ("10분", 300, 120, 250, (0.13, 0.18, 0.22, 0.17, 0.13, 0.05, 0.12), 0.25),
 )
 PROGRAM_PREDICT_WEIGHTS = (0.10, 0.15, 0.20)  # 3·5·10분 예측에서 프로그램 수급 최대 반영률
-TPM_RANK_FLASH_MIN = 3  # 짧은 이동 잡음은 숫자만 표시하고 3단계부터 점멸
-TPM_RANK_BLINK_SECONDS = 1.5  # 마지막 이동 뒤 이 시간까지만 점멸하고 이후 고정색 유지
-TPM_REFRESH_MS = 500  # 실시간 순위 표본·점멸 갱신 주기
-
 LIMIT = 29.5  # 상한/하한 판정 임계 (KRX +-30%)
 # ponytail: 매크로가 2주+로 갈아타면 이 값을 올리거나 금액기준(delta*price)으로 교체
-DESC_FIRST = {"bid_qty", "rate", "price", "exp_price", "exp_rate", "streak", "tpm", "program", "qrank_chg"}  # 첫 클릭 내림차순 컬럼
+DESC_FIRST = {"bid_qty", "rate", "price", "exp_price", "exp_rate", "streak", "qrank_chg"}  # 첫 클릭 내림차순 컬럼
 RED  = QColor("#e83030")
 BLUE = QColor("#2050d0")
 PURPLE = QColor("#C080F0")  # 코스닥 종목명
 ADMIN = QColor("#FF6A3D")   # 관리종목 종목명 (경고 주황빨강, 코스닥보다 우선)
-NXT_MARK = QColor("#FFDD00")  # NXT 좌상단 삼각형 (밝은 노랑)
+NXT_EXCLUDE_BG_DARK = QColor("#6B2B2B")   # 다크 테마: NXT 매매 제외 확인용 종목명 배경
+NXT_EXCLUDE_BG_LIGHT = QColor("#FFD6D6")  # 라이트 테마: NXT 매매 제외 확인용 종목명 배경
+SHORT_OVERHEAT_BG_DARK = QColor("#704800")   # 다크 테마: 단기과열 30분 단일가
+SHORT_OVERHEAT_BG_LIGHT = QColor("#FFE0A6")  # 라이트 테마: 단기과열 30분 단일가
 MISU_MARK = QColor("#33C24D")  # 미수가능 우상단 삼각형 (녹색)
 NEW_MARKS = {3: QColor("#FF3DC8"), 2: QColor("#38B8FF"), 1: QColor("#8098B8")}  # 신규: 당일/15일/30일
 WHITE = QColor("white")
 TRACK = QColor("#d8d8d8")
 CENTER = QColor("#707070")  # L일봉H 0% 중심선
-TPM_RANK_UP_FLASH = QColor("#FFF176")  # 체결속도 순위 상승: 밝은 노랑
-TPM_RANK_DOWN_FLASH = QColor("#7667D9")  # 체결속도 순위 하락: 보라
 WATCH_BG = QColor("#FFD54F")  # 실시간 뉴스 감시: 연상 셀 배경
 WATCH_TEXT = QColor("#111111")
 THEME_LEADER = QColor("#F4B400")  # 테마 대장 표시: 등락률 색과 분리한 금색
@@ -180,18 +172,6 @@ class ProgramBucket:
     sec: int
     buy_qty: int = 0
     sell_qty: int = 0
-
-
-@dataclass(frozen=True, slots=True)
-class TpmSnapshot:
-    """체결/분 표시 한 번에 필요한 반초 단위 계산값."""
-
-    count: int
-    price_direction: int
-    rank: int
-    rank_change: int
-    rank_moving: bool
-    blink_on: bool
 
 
 def _draw_selection_lines(painter, rect, palette):
@@ -328,8 +308,8 @@ class BarDelegate(QStyledItemDelegate):
 
 
 class NameDelegate(QStyledItemDelegate):
-    """종목명 셀: 기본 렌더(글자색=코스닥 보라/관리 주황) 후 모서리 삼각형.
-    좌상단 노랑=NXT, 우상단 녹색=미수가능(증거금100%는 무표시),
+    """종목명 셀: 단기과열은 주황색, NXT는 제외 확인용 적갈색 배경.
+    우상단 녹색=미수가능(증거금100%는 무표시),
     좌하단=신규상장(마젠타=당일, 하늘=15일이내, 청회=30일이내)."""
 
     def paint(self, painter, option, index):
@@ -339,10 +319,29 @@ class NameDelegate(QStyledItemDelegate):
         opt = QStyleOptionViewItem(option)
         opt.state &= ~(QStyle.State_Selected | QStyle.State_HasFocus)
         self.initStyleOption(opt, index)
+        nxt = bool(index.data(NXT_ROLE))
+        short_overheat = bool(index.data(SHORT_OVERHEAT_ROLE))
         text = opt.text
         opt.text = ""
         style = opt.widget.style() if opt.widget else QApplication.style()
         style.drawControl(QStyle.CE_ItemViewItem, opt, painter, opt.widget)
+        if short_overheat:
+            # 단기과열과 NXT가 동시에 잡히면 주문 주의도가 높은 단기과열을 우선한다.
+            background = (
+                SHORT_OVERHEAT_BG_DARK
+                if opt.palette.base().color().lightness() < 128
+                else SHORT_OVERHEAT_BG_LIGHT
+            )
+            painter.fillRect(option.rect, background)
+        elif nxt:
+            # NXT 가능 종목은 실제 필터가 아니라 사용자가 주문 전 제외 대상을
+            # 즉시 알아보도록 종목명 셀 전체를 테마 밝기에 맞춰 표시한다.
+            background = (
+                NXT_EXCLUDE_BG_DARK
+                if opt.palette.base().color().lightness() < 128
+                else NXT_EXCLUDE_BG_LIGHT
+            )
+            painter.fillRect(option.rect, background)
         leader = bool(index.data(THEME_LEADER_ROLE))
         theme_color = index.data(THEME_COLOR_ROLE)
         text_rect = style.subElementRect(
@@ -368,9 +367,9 @@ class NameDelegate(QStyledItemDelegate):
         painter.setPen(opt.palette.text().color())
         painter.drawText(text_rect, Qt.AlignLeft | Qt.AlignVCenter | Qt.TextSingleLine, text)
         painter.restore()
-        nxt, misu = index.data(NXT_ROLE), index.data(MISU_ROLE)
+        misu = index.data(MISU_ROLE)
         new = index.data(NEW_ROLE)
-        if not (nxt or misu or new):
+        if not (misu or new):
             if selected:
                 _draw_selection_lines(painter, option.rect, option.palette)
             return
@@ -379,11 +378,6 @@ class NameDelegate(QStyledItemDelegate):
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing, True)
         painter.setPen(Qt.NoPen)
-        if nxt:
-            painter.setBrush(NXT_MARK)
-            painter.drawPolygon(QPolygon([QPoint(r.left(), r.top()),
-                                          QPoint(r.left() + s, r.top()),
-                                          QPoint(r.left(), r.top() + s)]))
         if misu:
             painter.setBrush(MISU_MARK)
             painter.drawPolygon(QPolygon([QPoint(r.right(), r.top()),
@@ -397,112 +391,6 @@ class NameDelegate(QStyledItemDelegate):
         painter.restore()
         if selected:
             _draw_selection_lines(painter, option.rect, option.palette)
-
-
-class TpmDelegate(QStyledItemDelegate):
-    """왼쪽에 순위변동, 오른쪽에 체결/분과 최근 5초 가격 방향을 표시."""
-
-    def __init__(self, trend_role=TPM_PRICE_DIRECTION_ROLE, parent=None):
-        super().__init__(parent)
-        self.trend_role = trend_role
-
-    def paint(self, painter, option, index):
-        trend = index.data(self.trend_role) or 0
-        rank_change = index.data(TPM_RANK_CHANGE_ROLE) or 0
-        selected = _is_current_row(option, index)
-        if not index.data(Qt.DisplayRole):
-            opt = QStyleOptionViewItem(option)
-            opt.state &= ~(QStyle.State_Selected | QStyle.State_HasFocus)
-            super().paint(painter, opt, index)
-            if selected:
-                _draw_selection_lines(painter, option.rect, option.palette)
-            return
-
-        opt = QStyleOptionViewItem(option)
-        opt.state &= ~(QStyle.State_Selected | QStyle.State_HasFocus)
-        self.initStyleOption(opt, index)
-        text = opt.text
-
-        painter.save()
-        if opt.backgroundBrush.style() != Qt.NoBrush:
-            painter.fillRect(option.rect, opt.backgroundBrush)
-        else:
-            painter.fillRect(option.rect, option.palette.base())
-        painter.setFont(opt.font)
-        r = option.rect.adjusted(1, 0, -1, 0)
-        arrow = "▲" if trend > 0 else "▼"
-        # 화살표 자리는 항상 확보하되 추가 패딩 없이 숫자에 바로 붙인다.
-        arrow_w = max(painter.fontMetrics().horizontalAdvance("▲"),
-                      painter.fontMetrics().horizontalAdvance("▼"))
-        rank_text = f"+{rank_change}" if rank_change > 0 else str(rank_change)
-        rank_font = QFont(opt.font)
-        if rank_font.pointSize() > 0:
-            rank_font.setPointSize(max(7, rank_font.pointSize() - 2))
-        rank_w = 0
-        if rank_change:
-            painter.setFont(rank_font)
-            rank_w = min(22, painter.fontMetrics().horizontalAdvance(rank_text) + 1)
-            rank_rect = QRect(r.left(), r.top(), rank_w, r.height())
-            painter.setPen(RED if rank_change > 0 else BLUE)
-            painter.drawText(rank_rect, Qt.AlignLeft | Qt.AlignVCenter, rank_text)
-            painter.setFont(opt.font)
-        number_rect = QRect(
-            r.left() + rank_w, r.top(),
-            max(0, r.width() - arrow_w - rank_w), r.height())
-        arrow_rect = QRect(number_rect.right() + 1, r.top(), arrow_w, r.height())
-        painter.setPen(opt.palette.text().color())
-        painter.drawText(number_rect, Qt.AlignRight | Qt.AlignVCenter, text)
-        if trend:
-            # 체결/분 1500 초과는 셀 배경도 빨강이라 빨강 ▲가 묻힌다.
-            # 이 구간의 증가 ▲만 흰색으로 바꿔 방향과 가독성을 함께 유지한다.
-            hot_tpm = (index.data(Qt.UserRole) or 0) > 1500
-            painter.setPen(WHITE if trend > 0 and hot_tpm else RED if trend > 0 else BLUE)
-            painter.drawText(arrow_rect, Qt.AlignLeft | Qt.AlignVCenter, arrow)
-        if selected:
-            _draw_selection_lines(painter, option.rect, option.palette)
-        painter.restore()
-
-
-class ProgramDelegate(QStyledItemDelegate):
-    """당일 실제 프로그램 순매수량과 최근 20초 증감 화살표를 그린다."""
-
-    def paint(self, painter, option, index):
-        direction = index.data(PROGRAM_DIRECTION_ROLE) or 0
-        net = index.data(Qt.UserRole) or 0
-        selected = _is_current_row(option, index)
-        text = index.data(Qt.DisplayRole)
-        if not text:
-            opt = QStyleOptionViewItem(option)
-            opt.state &= ~(QStyle.State_Selected | QStyle.State_HasFocus)
-            super().paint(painter, opt, index)
-            if selected:
-                _draw_selection_lines(painter, option.rect, option.palette)
-            return
-
-        opt = QStyleOptionViewItem(option)
-        opt.state &= ~(QStyle.State_Selected | QStyle.State_HasFocus)
-        self.initStyleOption(opt, index)
-        painter.save()
-        if opt.backgroundBrush.style() != Qt.NoBrush:
-            painter.fillRect(option.rect, opt.backgroundBrush)
-        else:
-            painter.fillRect(option.rect, option.palette.base())
-        painter.setFont(opt.font)
-        r = option.rect.adjusted(1, 0, -1, 0)
-        arrow = "▲" if direction > 0 else "▼"
-        arrow_w = max(painter.fontMetrics().horizontalAdvance("▲"),
-                      painter.fontMetrics().horizontalAdvance("▼"))
-        value_rect = QRect(
-            r.left(), r.top(), max(0, r.width() - arrow_w), r.height())
-        arrow_rect = QRect(value_rect.right() + 1, r.top(), arrow_w, r.height())
-        painter.setPen(RED if net > 0 else BLUE if net < 0 else opt.palette.text().color())
-        painter.drawText(value_rect, Qt.AlignRight | Qt.AlignVCenter, str(text))
-        if direction:
-            painter.setPen(RED if direction > 0 else BLUE)
-            painter.drawText(arrow_rect, Qt.AlignLeft | Qt.AlignVCenter, arrow)
-        if selected:
-            _draw_selection_lines(painter, option.rect, option.palette)
-        painter.restore()
 
 
 def _in_opening_auction() -> bool:
@@ -877,8 +765,9 @@ class StockModel(QAbstractTableModel):
         self._exp_live: set[str] = set()     # 예상 컬럼 표시중
         self.kosdaq: set[str] = set()        # 코스닥 코드 집합 (main이 시작 시 주입)
         self.single: set[str] = set()        # 단일가 매매 종목: 예상값 상시 표시 (main 주입)
+        self.short_overheat: set[str] = set()  # 단기과열 30분 단일가: 종목명 주황 배경
         self.liquidation: set[str] = set()   # 정리매매: 가격제한폭 없음 (main 주입)
-        self.nxt: set[str] = set()           # 넥스트레이드(NXT) 거래가능: 좌상단 노랑 삼각형 (main 주입)
+        self.nxt: set[str] = set()           # 넥스트레이드(NXT) 거래가능: 종목명 제외 배경 (main 주입)
         self.misu: set[str] = set()          # 미수가능(증거금<100%): 우상단 녹색 삼각형 (main 주입)
         self.admin: set[str] = set()         # 관리종목: 종목명 경고색 (코스닥보다 우선, main 주입)
         self.limit_cnt: dict[str, tuple[int, int]] = {}  # (어제까지 연속상한 일수, 어제 종가) (main 주입, 연상 컬럼)
@@ -898,17 +787,13 @@ class StockModel(QAbstractTableModel):
         self.program_history: dict[str, deque] = {}  # 최근 5분 0w 매수/매도수량 차분
         self._program_cumulative: dict[str, tuple] = {}  # 마지막 (매수수량누적, 매도수량누적, 출처)
         self._program_since: dict[str, float] = {}  # 현재 출처 누적값을 관찰하기 시작한 시각
-        self._tpm_cache: dict[str, tuple[int, TpmSnapshot]] = {}  # 반초 안의 다중 data() 호출 재사용
-        self._tpm_ranks: dict[str, int] = {}  # 0.5초 전 체결속도 순위
-        self._tpm_rank_moves: dict[str, tuple[int, float]] = {}  # (같은 방향 누적 이동, 마지막 이동시각)
-        self._tpm_rank_universe: frozenset[str] = frozenset()
         self._prediction_cache: dict[str, tuple] = {}   # 같은 초의 반복 data() 계산 방지
         self.order_target_code = ""       # 주문 컬럼에서 선택한 현재 대상종목
         self.order_status: dict[str, str] = {}
         self.order_cancellable: set[str] = set()
         # 종목이 행에서 빠졌다 다시 들어와도 같은 실행 세션에서는
         # 사용자가 적용한 3단 기준을 보존한다.
-        self.balance_sell_settings: dict[str, dict[str, int]] = {}
+        self.balance_sell_settings: dict[str, dict] = {}
         self.balance_sell_stage: dict[str, int] = {}
         self.balance_alert_stage: dict[str, int] = {}
         self.balance_alert_ticks: dict[str, int] = {}
@@ -961,9 +846,6 @@ class StockModel(QAbstractTableModel):
         self.program_history.pop(code, None)
         self._program_cumulative.pop(code, None)
         self._program_since.pop(code, None)
-        self._tpm_cache.pop(code, None)
-        self._tpm_ranks.pop(code, None)
-        self._tpm_rank_moves.pop(code, None)
         self._prediction_cache.pop(code, None)
         self.order_status.pop(code, None)
         self.order_cancellable.discard(code)
@@ -1003,6 +885,16 @@ class StockModel(QAbstractTableModel):
             [Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.ForegroundRole,
              Qt.ItemDataRole.BackgroundRole])
 
+    def refresh_market_markers(self):
+        """시장 분류 조회가 끝난 즉시 종목명 색상·표식을 다시 그린다."""
+        if not self.codes:
+            return
+        self.dataChanged.emit(
+            self.index(0, NAME_COL),
+            self.index(len(self.codes) - 1, NAME_COL),
+            [Qt.ItemDataRole.ForegroundRole, Qt.ItemDataRole.ToolTipRole,
+             NXT_ROLE, SHORT_OVERHEAT_ROLE, MISU_ROLE, NEW_ROLE])
+
     def set_order_status(self, code: str, text: str, cancellable: bool = False):
         if code not in self.rows:
             return
@@ -1040,9 +932,8 @@ class StockModel(QAbstractTableModel):
         row = self.codes.index(code)
         stored = self.rows[code]
         tick_qty = fields.get("tick_qty")  # STORED 필터 전에 보존: +매수체결 / -매도체결
-        program_changed = False
         if ("program_buy_qty" in fields and "program_sell_qty" in fields):
-            program_changed = self._ingest_program(
+            self._ingest_program(
                 code, fields["program_buy_qty"], fields["program_sell_qty"],
                 fields.get("_program_source", ""), time.monotonic())
         hot = fields.get("exp_hot", 0) or code in self.single  # 0H발/단일가종목 = 국면 확정
@@ -1091,7 +982,6 @@ class StockModel(QAbstractTableModel):
             qty = int(tick_qty or 0)
             price = int(fields.get("price", stored["price"]))
             dq.append((now, qty, price))
-            self._tpm_cache.pop(code, None)
             while dq and dq[0][0] < now - 60:
                 dq.popleft()
             # 3·5·10분 점수는 원본 틱 대신 1초 요약으로 계산해 종목 수가 많아도
@@ -1116,21 +1006,14 @@ class StockModel(QAbstractTableModel):
                 bucket.traded_qty += abs(qty)
             while history and history[0].sec <= sec - 300:
                 history.popleft()
-        cols = {TPM_COL} if ticked else set()
-        if program_changed:
-            cols.add(PROGRAM_COL)
+        cols = set()
         for f, v in fields.items():
             if stored.get(f) == v:
                 continue
             if f in FIELDS:
                 cols.add(FIELDS.index(f))
-            if f == "vol":  # 체결/분 의존
-                cols.add(TPM_COL)
             if f == "bid_qty":  # 미설정 3단매도 자동 제안값도 함께 갱신
                 cols.add(BALANCE_SELL_COL)
-            if f == "price":  # 체결/분 오른쪽의 최근 5초 가격 방향 의존
-                cols.add(TPM_COL)
-                self._tpm_cache.pop(code, None)
             if f in ("price", "open", "low", "high", "base", "upper", "lower"):  # L일봉H 의존
                 cols.add(BAR_COL)
             if f in ("price", "upper", "exp_price"):  # 연상 판정(_at_limit) 의존
@@ -1173,84 +1056,6 @@ class StockModel(QAbstractTableModel):
             history.popleft()
         return True
 
-    def refresh_tpm(self):
-        """체결/분 감쇠와 실시간 순위 이동·점멸을 갱신한다."""
-        if self.codes:
-            self._refresh_tpm_ranks(time.monotonic())
-            self._tpm_cache.clear()
-            self.dataChanged.emit(
-                self.index(0, TPM_COL), self.index(len(self.codes) - 1, TPM_COL))
-
-    def refresh_program(self):
-        """프매 흐름을 1초마다 갱신한다."""
-        if self.codes:
-            self.dataChanged.emit(
-                self.index(0, PROGRAM_COL), self.index(len(self.codes) - 1, PROGRAM_COL))
-
-    def _refresh_tpm_ranks(self, now):
-        """체결/분 순위를 0.5초 전과 비교한다. 동률은 직전 순서를 유지한다."""
-        counts = {
-            code: sum(1 for t, _, _ in self.ticks.get(code, ()) if t >= now - 60)
-            for code in self.codes
-        }
-        source_order = {code: position for position, code in enumerate(self.codes, 1)}
-        previous = self._tpm_ranks
-        ordered = sorted(
-            self.codes,
-            key=lambda code: (
-                -counts[code],
-                previous.get(code, len(self.codes) + source_order[code]),
-            ),
-        )
-        current = {code: rank for rank, code in enumerate(ordered, 1)}
-        universe = frozenset(self.codes)
-
-        # 편입·이탈만으로 모든 종목의 순위가 밀리는 것은 신호로 사용하지 않는다.
-        if universe != self._tpm_rank_universe or set(previous) != set(current):
-            self._tpm_rank_moves.clear()
-        else:
-            for code, rank in current.items():
-                delta = previous[code] - rank  # 양수=상승, 음수=하락
-                old_delta, last_move = self._tpm_rank_moves.get(code, (0, 0.0))
-                if delta:
-                    same_direction = old_delta and (old_delta > 0) == (delta > 0)
-                    accumulated = old_delta + delta if same_direction else delta
-                    self._tpm_rank_moves[code] = (accumulated, now)
-
-        self._tpm_ranks = current
-        self._tpm_rank_universe = universe
-
-    def _tpm_snapshot(self, code, stored, now):
-        """60초 체결수, 5초 가격방향, 현재 순위와 직전 순위 이동을 계산한다."""
-        stamp = int(now * 2)
-        cached = self._tpm_cache.get(code)
-        if cached and cached[0] == stamp:
-            return cached[1]
-
-        dq = self.ticks.get(code, ())
-        count = sum(1 for t, _, _ in dq if t >= now - 60)
-
-        current_price = int(stored.get("price") or 0)
-        if not current_price:
-            current_price = next((p for _, _, p in reversed(dq) if p), 0)
-        reference_price = next(
-            (p for t, _, p in reversed(dq) if p and t <= now - 5), 0)
-        price_direction = (
-            1 if reference_price and current_price > reference_price
-            else -1 if reference_price and current_price < reference_price
-            else 0
-        )
-        rank_change, last_move = self._tpm_rank_moves.get(code, (0, 0.0))
-        rank_moving = bool(
-            rank_change and now - last_move <= TPM_RANK_BLINK_SECONDS)
-
-        snapshot = TpmSnapshot(
-            count, price_direction, self._tpm_ranks.get(code, 0),
-            rank_change, rank_moving, blink_on=stamp % 2 == 0,
-        )
-        self._tpm_cache[code] = (stamp, snapshot)
-        return snapshot
-
     @staticmethod
     def _program_interval(program_history, market_history, lower, upper):
         """지정 구간의 프로그램 수량방향과 전체 체결수량 대비 참여율을 반환한다."""
@@ -1269,25 +1074,6 @@ class StockModel(QAbstractTableModel):
     def _program_metrics(cls, program_history, market_history, now, lookback):
         return cls._program_interval(
             program_history, market_history, now - lookback, now)
-
-    @staticmethod
-    def _format_program_qty(value):
-        sign = "+" if value > 0 else "-" if value < 0 else ""
-        return f"{sign}{abs(value):,}주"
-
-    @staticmethod
-    def _format_program_compact(value):
-        """좁은 컬럼에는 실제 순매수 수량을 만/억 단위로 압축한다."""
-        sign = "+" if value > 0 else "-" if value < 0 else ""
-        absolute = abs(value)
-        if absolute >= 100_000_000:
-            scaled, suffix = absolute / 100_000_000, "억"
-        elif absolute >= 10_000:
-            scaled, suffix = absolute / 10_000, "만"
-        else:
-            return f"{sign}{absolute:,}"
-        digits = 0 if scaled >= 10 or scaled.is_integer() else 1
-        return f"{sign}{scaled:.{digits}f}{suffix}"
 
     @staticmethod
     def _combined_buy_pct(items):
@@ -1573,13 +1359,10 @@ class StockModel(QAbstractTableModel):
                 return "대표 테마 · ★ 대장과 현재 편입 종목수 · ◇ 단독 테마"
             if FIELDS[section] == "streak":
                 return "연속 상한가 일수 · 셀 클릭=실시간 뉴스 감시 등록/해제"
-            if FIELDS[section] == "tpm":
-                return ("최근 60초 체결 건수 "
-                        "(왼쪽 +/- 순위변동, 오른쪽 ▲/▼ 최근 5초 가격)")
-            if FIELDS[section] == "program":
-                return "당일 실제 프로그램 순매수 수량 (▲/▼ 최근 20초 순매수 증감)"
             if FIELDS[section] == "auto_cancel_arm":
-                return "종목별 계좌 자동취소 감시 · 기본 해제 · 클릭해야만 작동"
+                return (
+                    "선택 종목 계좌 자동취소 · 앱/영웅문 주문 포함 · "
+                    "기본 해제")
             return COLUMNS[section]  # 칸 좁혀 헤더 글자 잘려도 오버로 확인
         if orientation == Qt.Horizontal and role == Qt.DisplayRole:
             return COLUMNS[section]
@@ -1616,9 +1399,12 @@ class StockModel(QAbstractTableModel):
             stage = self.balance_sell_stage.get(code, 0)
             if role == Qt.DisplayRole:
                 if setting:
+                    keys = ["first", "second"]
+                    if int(setting.get("third", 0)) > 0:
+                        keys.append("third")
                     return " / ".join(
                         _shares_in_ten_thousands(setting[key])
-                        for key in ("first", "second", "third"))
+                        for key in keys)
                 bid = max(0, int(stored.get("bid_qty") or 0))
                 if bid:
                     first, _, _ = _balance_sell_suggestion(bid)
@@ -1651,6 +1437,8 @@ class StockModel(QAbstractTableModel):
                 if setting:
                     return (
                         f"적용 중인 보조 설정\n"
+                        f"주문방식: "
+                        f"{'시장가' if setting.get('market_sell', False) else '지정가'}\n"
                         f"1차 {setting['first']:,}주 이하"
                         f"{' (꺼짐)' if not setting['first'] else ''}: "
                         f"{int(float(setting.get('first_ratio', 0)) * 100)}% 매도\n"
@@ -1706,12 +1494,13 @@ class StockModel(QAbstractTableModel):
                 return font
             if role == Qt.ToolTipRole:
                 return (
-                    "자동취소 감시 중 · 각 계좌 매수주문의 체결량이 100주에 "
-                    "도달하면 그 주문의 남은 수량만 취소\n"
+                    "선택한 이 종목만 자동취소 감시 중 · 앱/영웅문 주문 포함\n"
+                    "각 매수 주문번호별 체결량이 100주에 도달하면 "
+                    "그 주문의 잔량 전부 취소\n"
                     "클릭하면 즉시 해제"
                     if armed else
-                    "해제 상태 · 클릭해야만 이 종목의 계좌 자동취소 감시 시작\n"
-                    "영웅문에서 낸 주문도 포함")
+                    "해제 상태 · 클릭하면 선택한 이 종목만 감시 시작\n"
+                    "앱과 영웅문에서 낸 매수주문 모두 포함")
             return None
         if field == "order":
             selected = code == self.order_target_code
@@ -1775,70 +1564,6 @@ class StockModel(QAbstractTableModel):
                     if code in self.watched
                     else "클릭하면 실시간 뉴스 감시에 등록")
             return None
-        if field == "tpm":  # 체결/분 = 최근 60초 체결 틱수, 매번 계산 (저장 안 함)
-            now = time.monotonic()
-            code = self.codes[index.row()]
-            snapshot = self._tpm_snapshot(code, stored, now)
-            n = snapshot.count
-            if role == Qt.DisplayRole:
-                return str(n) if n else ""
-            if role == Qt.UserRole:
-                return n
-            if role == TPM_PRICE_DIRECTION_ROLE:
-                return snapshot.price_direction
-            if role == TPM_ALERT_ROLE:
-                return 1 if snapshot.rank_change > 0 else -1 if snapshot.rank_change < 0 else 0
-            if role == TPM_RANK_CHANGE_ROLE:
-                return snapshot.rank_change
-            if role == Qt.ToolTipRole:
-                price_label = ("상승 ▲" if snapshot.price_direction > 0
-                               else "하락 ▼" if snapshot.price_direction < 0
-                               else "보합")
-                rank_label = (
-                    f"{snapshot.rank_change:+d}단계"
-                    if snapshot.rank_change else "변동 없음")
-                state_label = (
-                    "이동중" if snapshot.rank_moving
-                    else "상승상태 유지" if snapshot.rank_change > 0
-                    else "하락상태 유지" if snapshot.rank_change < 0
-                    else "대기")
-                return (
-                    f"최근 60초 {n}건 | 체결속도 {snapshot.rank or '-'}위\n"
-                    f"실시간 순위변동 {rank_label} · {state_label} | "
-                    f"가격 5초 {price_label}"
-                )
-            if role == Qt.TextAlignmentRole:
-                return Qt.AlignRight | Qt.AlignVCenter
-            base_background = None
-            if n >= 100:  # 활동 단계: 보통 회색 / 활발 초록 / 이후 노랑·주황·빨강
-                if n < 300:
-                    base_background = QColor("#E8ECEF")
-                elif n <= 500:
-                    base_background = QColor("#CDECCF")
-                else:
-                    base_background = (
-                        QColor("#FFE000") if n <= 1000
-                        else QColor("#FF8C00") if n <= 1500 else RED)
-            # 수치가 비었거나 미미한 종목은 이전 순위변동이 남아도 색을 입히지 않는다.
-            # 체결/분 100건 이상부터만 활동 배경·순위 하이라이트를 쓴다.
-            rank_highlight = n >= 100 and abs(snapshot.rank_change) >= TPM_RANK_FLASH_MIN
-            # 순위 이동 중에는 점멸하고, 멈추면 방향이 바뀔 때까지 같은 색을 고정한다.
-            highlight_on = (
-                rank_highlight
-                and (not snapshot.rank_moving or snapshot.blink_on))
-            if role == Qt.BackgroundRole:
-                if highlight_on:
-                    if snapshot.rank_change > 0:
-                        return TPM_RANK_UP_FLASH
-                    return TPM_RANK_DOWN_FLASH
-                return base_background
-            if role == Qt.ForegroundRole:
-                if highlight_on:
-                    return QColor("black") if snapshot.rank_change > 0 else WHITE
-                return WHITE if n > 1500 else QColor("black") if base_background else None
-            if role == Qt.FontRole and n > 500:
-                f = QFont(); f.setBold(True); return f
-            return None
         if field == "buy_pct":  # 최근 1분 수량 70% + 건수 30% - 불일치 감점
             now = time.monotonic()
             dq = self.ticks.get(self.codes[index.row()], ())
@@ -1860,49 +1585,6 @@ class StockModel(QAbstractTableModel):
                 return Qt.AlignRight | Qt.AlignVCenter
             if role == Qt.ForegroundRole and pct is not None:
                 return RED if pct >= 55 else BLUE if pct <= 45 else None
-            return None
-        if field == "program":  # FID 210 당일 누적 순매수 + 최근 20초 실제 증감
-            now = time.monotonic()
-            code = self.codes[index.row()]
-            program_history = self.program_history.get(code, ())
-            cumulative = self._program_cumulative.get(code)
-            calculated_net = cumulative[0] - cumulative[1] if cumulative else 0
-            fid_net = int(stored.get("program_net_qty") or 0)
-            net = fid_net if fid_net or not calculated_net else calculated_net
-            recent = self._program_interval(
-                program_history, self.prediction_history.get(code, ()),
-                now - 20, now)
-            recent_net = recent[3]
-            direction = 1 if recent_net > 0 else -1 if recent_net < 0 else 0
-            if role == Qt.DisplayRole:
-                return self._format_program_compact(net) if cumulative else ""
-            if role == Qt.UserRole:
-                return net
-            if role == PROGRAM_DIRECTION_ROLE:
-                return direction
-            if role == Qt.ToolTipRole:
-                if not cumulative:
-                    return "프로그램매매 데이터 대기중"
-                buy, sell = cumulative[0], cumulative[1]
-                lines = [
-                    "당일 프로그램매매 누적 수량 (FID 210)",
-                    f"매수 {buy:,}주 | 매도 {sell:,}주",
-                    f"실제 순매수 {self._format_program_qty(net)}",
-                    f"최근 20초 변화 {self._format_program_qty(recent_net)} "
-                    f"{'▲' if direction > 0 else '▼' if direction < 0 else ''}".rstrip(),
-                ]
-                for label, lookback in (("1분", 60), ("3분", 180), ("5분", 300)):
-                    stat = self._program_metrics(
-                        program_history, self.prediction_history.get(code, ()),
-                        now, lookback)
-                    lines.append(
-                        f"{label} 변화 {self._format_program_qty(stat[3])}"
-                        if stat[2] else f"{label} 변화 없음")
-                return "\n".join(lines)
-            if role == Qt.TextAlignmentRole:
-                return Qt.AlignRight | Qt.AlignVCenter
-            if role == Qt.ForegroundRole:
-                return RED if net > 0 else BLUE if net < 0 else None
             return None
         if field == "predict":  # 3·5·10분 단타 상승압력 종합점수
             now = time.monotonic()
@@ -1962,8 +1644,10 @@ class StockModel(QAbstractTableModel):
         if role == BAR_ROLE and field == "bar":  # 델리게이트용
             return (stored["open"], stored["high"], stored["low"], stored["price"],
                     stored["base"], stored["upper"], stored["lower"])
-        if role == NXT_ROLE:  # 델리게이트 모서리 삼각형 판단
+        if role == NXT_ROLE:  # 델리게이트 종목명 배경 판단
             return self.codes[index.row()] in self.nxt
+        if role == SHORT_OVERHEAT_ROLE:
+            return self.codes[index.row()] in self.short_overheat
         if role == MISU_ROLE:
             return self.codes[index.row()] in self.misu
         if role == NEW_ROLE:
@@ -1990,8 +1674,12 @@ class StockModel(QAbstractTableModel):
                 parts.append("★ 현재 테마 대장")
             elif code in self.theme_singletons:
                 parts.append("◇ 현재 조건검색의 단독 테마 종목")
-            if code in self.nxt:
-                parts.append("좌상단 노랑 = NXT 거래가능")
+            if code in self.short_overheat:
+                parts.append("종목명 주황색 배경 = 단기과열(30분 단일가)")
+            if code in self.nxt and code in self.short_overheat:
+                parts.append("NXT 거래가능(단기과열 배경 우선)")
+            elif code in self.nxt:
+                parts.append("종목명 적갈색 배경 = NXT 거래가능(매매 제외 확인용)")
             if code in self.misu:
                 parts.append("우상단 녹색 = 미수가능")
             new = self.data(index, NEW_ROLE)
@@ -2072,6 +1760,13 @@ def _compact_shares(value: int) -> str:
     return f"{value:,}"
 
 
+def _stored_bool(value) -> bool:
+    """QSettings가 bool 또는 문자열로 돌려주는 값을 동일하게 해석한다."""
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
 def _shares_in_ten_thousands(value: int) -> str:
     """3단매도 셀에는 '만' 없이 만 주 단위 숫자만 표시한다."""
     value = max(0, int(value or 0))
@@ -2145,6 +1840,10 @@ class BalanceSellDialog(QDialog):
         self.screen = screen
         self.code = code
         self.config = screen.model.balance_sell_settings.get(code)
+        self._settings = getattr(screen, "_settings", None)
+        if self._settings is None:
+            self._settings = QSettings("layout.ini", QSettings.IniFormat)
+        self._market_sell_key = BALANCE_SELL_MARKET_LAST_KEY
         self._manual_edit = self.config is not None
         self._third_before_second_full = None
         name = screen.model.rows.get(code, {}).get("name") or code
@@ -2152,15 +1851,13 @@ class BalanceSellDialog(QDialog):
         self.setModal(True)
         self.setMinimumWidth(430)
 
-        self.current_label = QLabel()
-        self.current_label.setStyleSheet("font-weight:bold")
         self.applied_label = QLabel()
         self.applied_label.setWordWrap(True)
         self.first_edit = BalanceStepSpinBox()
         self.second_edit = BalanceStepSpinBox()
         self.third_edit = BalanceStepSpinBox()
         for edit in (self.first_edit, self.second_edit, self.third_edit):
-            edit.setRange(0, 100_000_000)
+            edit.setRange(0, 2_147_483_647)
             edit.setSingleStep(10_000)
             edit.setGroupSeparatorShown(True)
             edit.setAlignment(Qt.AlignRight)
@@ -2183,15 +1880,59 @@ class BalanceSellDialog(QDialog):
             combo.currentIndexChanged.connect(self._mark_manual)
         self.second_sell_combo.currentIndexChanged.connect(
             self._on_second_sell_changed)
+        self.market_sell_check = QCheckBox("시장가 매도")
+        self.market_sell_check.setToolTip(
+            "마지막 체크/해제 상태를 즉시 저장해 다음 설정창과 앱 재실행 때 "
+            "복원합니다. 실제 주문에는 해당 종목에서 설정 적용해야 반영됩니다.")
+        self.market_sell_check.setStyleSheet(
+            "QCheckBox:checked{color:#E53935;font-weight:bold}")
+        saved_market_sell = self._settings.value(self._market_sell_key)
+        if saved_market_sell is None:
+            # 직전 버전의 공통값 또는 종목별 체크 기록을 마지막 선택값으로
+            # 한 번 이전한다. 이후에는 이 단일 키만 읽고 쓴다.
+            previous_global = self._settings.value(
+                "balance_sell_market_enabled")
+            legacy_values = [
+                self._settings.value(key)
+                for key in self._settings.allKeys()
+                if key.startswith("balance_sell_market/")
+            ]
+            if previous_global is not None:
+                market_sell = _stored_bool(previous_global)
+            elif legacy_values:
+                market_sell = any(
+                    _stored_bool(value) for value in legacy_values)
+            else:
+                market_sell = bool(
+                    self.config
+                    and self.config.get("market_sell", False))
+            if (
+                previous_global is not None
+                or legacy_values
+                or self.config is not None
+            ):
+                self._settings.setValue(
+                    self._market_sell_key,
+                    "true" if market_sell else "false")
+                self._settings.sync()
+        else:
+            market_sell = _stored_bool(saved_market_sell)
+        self.market_sell_check.setChecked(market_sell)
         self.error_label = QLabel()
         self.error_label.setWordWrap(True)
         self.error_label.setStyleSheet("color:#E53935;font-weight:bold")
+        self.market_sell_check.toggled.connect(
+            self._on_market_sell_toggled)
 
-        apply_btn = QPushButton("설정 적용  Enter")
+        self.apply_btn = QPushButton("설정 적용  Enter")
         cancel_btn = QPushButton("취소  Esc")
         off_btn = QPushButton("감시 해제")
         rebase_btn = QPushButton("현재 잔량으로 다시 계산")
-        apply_btn.clicked.connect(self._apply)
+        self.apply_btn.setDefault(True)
+        self.apply_btn.setAutoDefault(True)
+        for button in (cancel_btn, off_btn, rebase_btn):
+            button.setAutoDefault(False)
+        self.apply_btn.clicked.connect(self._apply)
         cancel_btn.clicked.connect(self.reject)
         off_btn.clicked.connect(self._disable)
         rebase_btn.clicked.connect(self._rebase_now)
@@ -2199,7 +1940,8 @@ class BalanceSellDialog(QDialog):
 
         grid = QGridLayout()
         grid.addWidget(QLabel("현재 적용값"), 0, 0)
-        grid.addWidget(self.applied_label, 0, 1, 1, 3)
+        grid.addWidget(self.applied_label, 0, 1, 1, 2)
+        grid.addWidget(self.market_sell_check, 0, 3)
         grid.addWidget(QLabel("1차"), 1, 0)
         grid.addWidget(self.first_edit, 1, 1)
         grid.addWidget(QLabel("이하 → 경고음 +"), 1, 2)
@@ -2214,21 +1956,13 @@ class BalanceSellDialog(QDialog):
         grid.addWidget(self.third_sell_combo, 3, 3)
 
         buttons = QHBoxLayout()
-        buttons.addWidget(off_btn)
         buttons.addWidget(rebase_btn)
         buttons.addStretch(1)
         buttons.addWidget(cancel_btn)
-        buttons.addWidget(apply_btn)
+        buttons.addWidget(self.apply_btn)
+        buttons.addWidget(off_btn)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(self.current_label)
-        layout.addWidget(QLabel(
-            "적용할 때 최신 상한가 매수잔량보다 10% 이상 낮아야 합니다.\n"
-            "매도비율은 계좌의 해당 종목 매매가능수량 기준이며, "
-            "편집 중에는 기존값이 유지됩니다."))
-        layout.addWidget(QLabel(
-            "증감: 기본 1만 · Shift 10만 · Ctrl 100만 (화살표 또는 휠)"))
-        layout.addWidget(QLabel("잔량을 0주로 설정한 단계는 소리·매도 모두 작동하지 않습니다."))
         layout.addLayout(grid)
         layout.addWidget(self.error_label)
         layout.addLayout(buttons)
@@ -2249,7 +1983,9 @@ class BalanceSellDialog(QDialog):
                 combo.setCurrentIndex(combo_index if combo_index >= 0 else 0)
             self._on_second_sell_changed()
             self.applied_label.setText(
-                f"{_compact_shares(self.config['first'])}↓ "
+                ("시장가 · " if self.config.get("market_sell", False)
+                 else "지정가 · ")
+                + f"{_compact_shares(self.config['first'])}↓ "
                 f"{self.first_sell_combo.currentText()} / "
                 f"{_compact_shares(self.config['second'])}↓ "
                 f"{self.second_sell_combo.currentText()} / "
@@ -2271,12 +2007,20 @@ class BalanceSellDialog(QDialog):
         self._timer.timeout.connect(self._refresh_live)
         self._timer.start(150)
         self._refresh_live()
-        self.first_edit.setFocus()
-        self.first_edit.lineEdit().selectAll()
+        self.apply_btn.setFocus()
+        # 창이 실제 표시된 뒤에도 Enter 기본 버튼에 포커스를 유지한다.
+        QTimer.singleShot(0, self.apply_btn.setFocus)
 
     def _mark_manual(self):
         self._manual_edit = True
         self.error_label.clear()
+
+    def _on_market_sell_toggled(self, checked: bool):
+        """시장가 체크박스의 마지막 선택 상태를 즉시 기억한다."""
+        self._settings.setValue(
+            self._market_sell_key, "true" if checked else "false")
+        self._settings.sync()
+        self._mark_manual()
 
     def _on_second_sell_changed(self, *_):
         full = float(self.second_sell_combo.currentData() or 0) >= 1.0
@@ -2330,19 +2074,9 @@ class BalanceSellDialog(QDialog):
         self._manual_edit = True
         self.error_label.setText(
             "현재 잔량으로 다시 계산했습니다. Enter를 눌러야 적용됩니다.")
-        self.first_edit.setFocus()
-        self.first_edit.lineEdit().selectAll()
+        self.apply_btn.setFocus()
 
     def _refresh_live(self):
-        row = self.screen.model.rows.get(self.code, {})
-        current = self._current_bid()
-        upper = int(row.get("upper") or 0)
-        bid_price = int(row.get("bid_price") or 0)
-        locked = bool(upper and bid_price == upper)
-        maximum = int(current * 0.90)
-        state = "상한가 최우선잔량" if locked else "상한가 최우선잔량 아님"
-        self.current_label.setText(
-            f"현재 {current:,}주 · 입력 최대 {maximum:,}주 · {state}")
         if not self._manual_edit and self.config is None:
             self._refresh_suggestion()
 
@@ -2356,18 +2090,13 @@ class BalanceSellDialog(QDialog):
         third = self.third_edit.value()
         if float(self.second_sell_combo.currentData() or 0) >= 1.0:
             third = 0
-        maximum = int(current * 0.90)
         if not upper or bid_price != upper:
             self.error_label.setText(
                 "현재 최우선 매수호가가 상한가가 아니므로 적용할 수 없습니다.")
             return
-        active = [value for value in (first, second, third) if value > 0]
-        valid_order = all(
-            left > right for left, right in zip(active, active[1:]))
-        if (any(value > maximum for value in active) or not valid_order):
+        if any(value > current for value in (first, second, third)):
             self.error_label.setText(
-                f"활성 기준은 {maximum:,}주 이하이며, 0을 제외하고 "
-                "1차 > 2차 > 3차 순서여야 합니다.")
+                f"각 단계 기준은 현재 매수잔량 {current:,}주 이하여야 합니다.")
             return
         self.screen.set_balance_sell_setting(
             self.code, {
@@ -2375,6 +2104,7 @@ class BalanceSellDialog(QDialog):
                 "first_ratio": float(self.first_sell_combo.currentData()),
                 "second_ratio": float(self.second_sell_combo.currentData()),
                 "third_ratio": float(self.third_sell_combo.currentData()),
+                "market_sell": self.market_sell_check.isChecked(),
             })
         self.accept()
 
@@ -2391,17 +2121,18 @@ class ConditionScreen(QWidget):
     order_requested = Signal(str, str, int, bool, int, int)
     cancel_requested = Signal(str)
     emergency_exit_requested = Signal(str, int, bool)
+    order_status_acknowledged = Signal(str)
     exit_hotkey_changed = Signal(str, object)
     balance_sell_changed = Signal(str, object)
     account_auto_cancel_changed = Signal(str, bool)
     watch_toggled = Signal(str, bool)
     analysis_stock_requested = Signal(str)
     market_overview_requested = Signal()
-    relation_collection_requested = Signal(object)
 
     def __init__(self, prefix: str = "", parent=None):
         super().__init__(parent)
         self.prefix = prefix  # 다중창: 창별 설정 키 접두사 ("", "w2_", ...)
+        self._settings = QSettings("layout.ini", QSettings.IniFormat)
         self.model = StockModel()
 
         # 툴바: 조건목록 새로고침 / 조건식 선택 / 등록 토글 / 이탈삭제 / 종목수
@@ -2443,10 +2174,6 @@ class ConditionScreen(QWidget):
         self.theme_sort.setToolTip(
             "테마별로 묶어 정렬 · 상한가 진입이 빠른 테마 우선, "
             "그 외는 테마 내 최고 등락률 순 · 테마 안에서는 상한가 진입시각과 등락률 순")
-        self.relation_collect_btn = QPushButton("관계수집")
-        self.relation_collect_btn.setFixedWidth(66)
-        self.relation_collect_btn.setToolTip(
-            "현재 조건검색 종목의 DART 최대주주 관계를 수집해 테마정렬에 반영")
         self._checkbox_style = VisibleCheckStyle()
         self._checkbox_style.setParent(self)
         for checkbox in (
@@ -2465,9 +2192,6 @@ class ConditionScreen(QWidget):
         self.newwin_btn = QPushButton("창+")
         self.newwin_btn.setToolTip("조건검색 창 하나 더 열기 (다른 조건식 동시 감시)")
         self.newwin_btn.setFixedWidth(44)
-        self.analysis_btn = QPushButton("분석")
-        self.analysis_btn.setToolTip("시장·상한가·테마·수급·공시 분석창 열기")
-        self.analysis_btn.setFixedWidth(44)
         self.ip_label = QLabel()  # 공인 IP (App이 메인창만 채움). IP 바뀌면 빨강 강조
         self.ip_label.setVisible(False)
         self.count_label = QLabel("종목수: 0")
@@ -2490,11 +2214,9 @@ class ConditionScreen(QWidget):
         top.addWidget(self.sound_check)
         top.addWidget(self.limit_sort)
         top.addWidget(self.theme_sort)
-        top.addWidget(self.relation_collect_btn)
         top.addWidget(self.unified_check)
         top.addWidget(self.rank_btn)
         top.addWidget(self.newwin_btn)
-        top.addWidget(self.analysis_btn)
         top.addStretch(1)  # 남는 공간은 오른쪽으로
         top.addWidget(self.ip_label)
         top.addWidget(self.count_label)
@@ -2521,7 +2243,7 @@ class ConditionScreen(QWidget):
         self.margin_order_check = QCheckBox("미수")
         self.margin_order_check.setStyle(self._checkbox_style)
         self.margin_order_check.setToolTip(
-            "체크하면 미수 포함 주문가능금액·수량으로 계산 (현재는 UI만 추가)")
+            "체크하면 미수 포함 주문가능금액·수량으로 계산")
         self.order_limit_edit = QLineEdit()
         self.order_limit_edit.setPlaceholderText("자동")
         self.order_limit_edit.setFixedWidth(110)
@@ -2550,7 +2272,11 @@ class ConditionScreen(QWidget):
         self._order_reserved = 0
         self._order_target_code = ""
         self._orderable_detail = None
-        self._margin_preferred = False
+        self._margin_preferred = (
+            self._settings.value(
+                self.prefix + "margin_order", "false") == "true")
+        self._margin_auto_change = True
+        self.margin_order_check.setChecked(self._margin_preferred)
         self._margin_auto_change = False
         self.margin_order_check.toggled.connect(self._on_margin_order_toggled)
 
@@ -2614,12 +2340,13 @@ class ConditionScreen(QWidget):
                        self.auto_cancel_btn, self.manual_cancel_btn):
             button.setStyleSheet(order_choice_style)
 
-        self.fixed_qty_order_btn = QPushButton("100주씩 주문")
-        self.remaining_order_btn = QPushButton("분할주문")
+        self.fixed_qty_order_btn = QPushButton("100주씩")
+        self.remaining_order_btn = QPushButton("분할매수")
         for button in (self.fixed_qty_order_btn, self.remaining_order_btn):
             button.setFixedHeight(24)
             button.setEnabled(False)
-            button.setToolTip("주문허용 체크 후 클릭하면 즉시 실제 주문을 전송합니다")
+            button.setToolTip(
+                "주문허용 체크 후 클릭하면 KRX 상한가 지정가 주문을 전송합니다")
         self.order_enable_check = QCheckBox("주문허용")
         self.order_enable_check.setStyle(self._checkbox_style)
         self.order_enable_check.setToolTip("체크한 동안 주문 버튼이 실제 주문을 전송합니다")
@@ -2680,7 +2407,6 @@ class ConditionScreen(QWidget):
         self._sort_col, self._sort_order = FIELDS.index("rate"), Qt.DescendingOrder  # 기본 등락률 내림차순
         self.limit_sort.toggled.connect(self._on_limit_sort)
         self.theme_sort.toggled.connect(self._on_theme_sort)
-        self.relation_collect_btn.clicked.connect(self._request_relation_collection)
         # 상한가정렬은 그룹 판정이 정렬컬럼 밖의 값(상한/매도잔량/예상등락률)이라 Qt 자동재정렬이
         # 안 걸림 -> 데이터 변경 시 직접 재정렬. 스로틀: 실행중이면 리셋 안 함(디바운스로 하면
         # 틱이 200ms보다 자주 오는 장중엔 계속 리셋돼 영영 안 불림 = 재정렬 멈춤 버그).
@@ -2690,12 +2416,6 @@ class ConditionScreen(QWidget):
         self.model.dataChanged.connect(self._on_data_changed)
         self.model.rowsInserted.connect(self._on_data_changed)
         self.model.rowsRemoved.connect(self._on_data_changed)
-        self._tpm_timer = QTimer(self)  # 체결/분: 틱 끊겨도 값이 줄어들게 주기 갱신
-        self._tpm_timer.timeout.connect(self.model.refresh_tpm)
-        self._tpm_timer.start(TPM_REFRESH_MS)
-        self._program_timer = QTimer(self)
-        self._program_timer.timeout.connect(self.model.refresh_program)
-        self._program_timer.start(1000)
         self._balance_blink_timer = QTimer(self)
         self._balance_blink_timer.timeout.connect(
             self._refresh_balance_alert_blink)
@@ -2714,17 +2434,12 @@ class ConditionScreen(QWidget):
         self.table.setColumnWidth(AUTO_CANCEL_ARM_COL, 62)
         self.table.setColumnWidth(EXIT_HOTKEY_COL, 56)
         self.table.setColumnWidth(BAR_COL, 70)
-        self.table.setColumnWidth(PROGRAM_COL, 72)
         for col, width in RANK_DEFAULT_WIDTHS.items():
             self.table.setColumnWidth(col, width)
         self.table.setItemDelegate(PreserveTextColorDelegate(self.table))
         self.table.setItemDelegateForColumn(BAR_COL, BarDelegate(self.table))
         self.table.setItemDelegateForColumn(NAME_COL, NameDelegate(self.table))
         self.table.setItemDelegateForColumn(ORDER_COL, OrderDelegate(self.table))
-        self.table.setItemDelegateForColumn(
-            TPM_COL, TpmDelegate(TPM_PRICE_DIRECTION_ROLE, self.table))
-        self.table.setItemDelegateForColumn(
-            PROGRAM_COL, ProgramDelegate(self.table))
         self.table.setSelectionBehavior(QTableView.SelectRows)
         self.table.setSelectionMode(QTableView.NoSelection)  # Windows 네이티브 선택 세로 바 차단
         # 행을 클릭한 뒤 위/아래 화살표로 현재 행을 옮길 수 있게 포커스는 허용한다.
@@ -2749,7 +2464,6 @@ class ConditionScreen(QWidget):
         self.model.rowsRemoved.connect(self._update_count)
 
         # 컬럼 너비/순서 기억: 저장된 상태 복원 후, 변경 시 debounce 저장
-        self._settings = QSettings("layout.ini", QSettings.IniFormat)
         state = self._settings.value(self.prefix + "header")
         # 컬럼 수가 바뀐 옛 저장분은 restoreState가 False -> 기본 레이아웃/정렬 유지
         if state is not None and self.table.horizontalHeader().restoreState(state):
@@ -2778,9 +2492,6 @@ class ConditionScreen(QWidget):
                 removed_bad_width = True
         if removed_bad_width:
             self._settings.sync()
-        # 주문 상태(왼쪽)와 즉시취소(오른쪽)가 함께 보여야 하므로 옛 저장폭보다 우선한다.
-        if self.table.columnWidth(ORDER_COL) < 86:
-            self.table.setColumnWidth(ORDER_COL, 86)
         if self.table.columnWidth(BALANCE_SELL_COL) > 170:
             self.table.setColumnWidth(BALANCE_SELL_COL, 125)
         # 저장된 구버전 헤더 순서와 무관하게
@@ -2957,11 +2668,11 @@ class ConditionScreen(QWidget):
         self.fixed_qty_order_btn.setEnabled(common_enabled and fixed_count > 0)
         self.remaining_order_btn.setEnabled(common_enabled and remaining_count > 0)
         self.fixed_qty_order_btn.setText(
-            f"100주씩 주문 ({fixed_count}회)" if fixed_count
-            else "100주씩 주문")
+            f"100주씩 ({fixed_count}회)" if fixed_count
+            else "100주씩")
         self.remaining_order_btn.setText(
-            f"분할주문 ({remaining_count}회)" if remaining_count
-            else "분할주문")
+            f"분할매수 ({remaining_count}회)" if remaining_count
+            else "분할매수")
         self._refresh_order_preview(
             available_qty, selected_count, fixed_count, remaining_count)
 
@@ -3008,8 +2719,8 @@ class ConditionScreen(QWidget):
             split_text = "주문가능수량 없음"
 
         self.order_preview_value.setText(
-            f"<b>예상주문</b>&nbsp;&nbsp; 100주씩 {fixed_text}"
-            f"&nbsp;&nbsp;│&nbsp;&nbsp; 분할 {split_text}")
+            f"<b>상한가 지정가</b>&nbsp;&nbsp; 100주씩 {fixed_text}"
+            f"&nbsp;&nbsp;│&nbsp;&nbsp; 분할매수 {split_text}")
         self.order_preview_value.setToolTip(
             "■ 실제 전송되는 주문 · □ 설정했지만 수량 부족으로 전송되지 않는 주문")
 
@@ -3045,8 +2756,9 @@ class ConditionScreen(QWidget):
         auto_cancel = self.auto_cancel_btn.isChecked()
         self.model.set_order_status(code, "대기")
         self.order_status_value.setText(
-            f"상태 전송대기 · {'자동' if auto_cancel else '수동'} · "
-            f"{count}회 · {total_qty:,}주")
+            f"상태 상한가 지정가 {price:,}원 전송대기 · "
+            f"{'자동' if auto_cancel else '수동'} · {count}회 · "
+            f"{total_qty:,}주")
         self._refresh_order_actions()
         self.order_requested.emit(
             code, mode, count, auto_cancel, total_qty, price)
@@ -3067,6 +2779,10 @@ class ConditionScreen(QWidget):
     def _on_margin_order_toggled(self, checked: bool):
         if not self._margin_auto_change:
             self._margin_preferred = checked
+            self._settings.setValue(
+                self.prefix + "margin_order",
+                "true" if checked else "false")
+            self._settings.sync()
         detail = self._orderable_detail
         if detail and detail["code"] == self._order_target_code:
             self._account_available = (
@@ -3137,7 +2853,12 @@ class ConditionScreen(QWidget):
                 "first_ratio": float(setting.get("first_ratio", 0.0)),
                 "second_ratio": float(setting.get("second_ratio", 0.5)),
                 "third_ratio": float(setting.get("third_ratio", 1.0)),
+                "market_sell": bool(setting.get("market_sell", False)),
             }
+            self._settings.setValue(
+                BALANCE_SELL_MARKET_LAST_KEY,
+                "true" if setting.get("market_sell", False) else "false")
+            self._settings.sync()
             self.model.balance_sell_stage[code] = 0
         if code in self.model.rows:
             row = self.model.codes.index(code)
@@ -3157,6 +2878,13 @@ class ConditionScreen(QWidget):
             row = self.model.codes.index(code)
             cell = self.model.index(row, BALANCE_SELL_COL)
             self.model.dataChanged.emit(cell, cell)
+            if stage > previous and stage == 1:
+                # 1차 경고음을 놓치지 않도록 정렬된 표에서 해당 종목 행을
+                # 현재 행으로 표시하고, 화면 밖이면 보이는 위치까지 이동한다.
+                visible_cell = self.proxy.mapFromSource(cell)
+                if visible_cell.isValid():
+                    self.table.setCurrentIndex(visible_cell)
+                    self.table.scrollTo(visible_cell)
 
     def _refresh_balance_alert_blink(self):
         if not self.model.balance_alert_stage:
@@ -3193,7 +2921,7 @@ class ConditionScreen(QWidget):
 
     def _on_data_changed(self, *a):
         # 테마순서는 등락률·현재가(상한 판정)·진입시간 변화에만 영향받는다.
-        # 체결/분·호가 등 매 틱 갱신마다 전체 테마를 다시 정렬하지 않는다.
+        # 호가 등 매 틱 갱신마다 전체 테마를 다시 정렬하지 않는다.
         if self.theme_sort.isChecked() and not self.limit_sort.isChecked():
             if len(a) >= 2 and isinstance(a[1], QModelIndex):
                 first, last = a[0].column(), a[1].column()
@@ -3365,14 +3093,51 @@ class ConditionScreen(QWidget):
                 self.cancel_requested.emit(code)
                 return
             if (order_status in ("장종료", "오류", "수량부족", "분할부족",
-                                 "취소없음")
+                                 "취소없음", "대상없음")
                     or order_status.endswith("완료")):
                 self.model.set_order_status(code, "")
                 self.order_status_value.setText("")
+                self.order_status_acknowledged.emit(code)
+                log.info(
+                    "order status acknowledged code=%s status=%s",
+                    code, order_status)
             self._select_order_target(code)
         elif index.column() == BALANCE_SELL_COL:
             self._acknowledge_balance_alert(code)
-            BalanceSellDialog(self, code, self).exec()
+            dialog = BalanceSellDialog(self, code, self)
+            dialog.adjustSize()
+            # 네이티브 창을 생성해야 Windows 제목 표시줄까지 포함한 실제
+            # 프레임 크기를 얻을 수 있다. 표시 전이라 화면에는 나타나지 않는다.
+            dialog.winId()
+            frame_width = dialog.frameGeometry().width()
+            frame_height = dialog.frameGeometry().height()
+
+            # 설정창 하단을 표 바로 위에 두고, 오른쪽 끝은 클릭한
+            # 3단매도 셀에 맞춘다. 화면 가장자리에서는 작업영역 안으로
+            # 밀어 넣어 제목 표시줄과 버튼이 잘리지 않게 한다.
+            cell_rect = self.table.visualRect(index)
+            cell_right = self.table.viewport().mapToGlobal(
+                cell_rect.topRight()).x()
+            table_top = self.table.mapToGlobal(QPoint(0, 0)).y()
+            gap = 8
+            target_x = cell_right - frame_width + 1
+            target_y = table_top - frame_height - gap
+            anchor = QPoint(cell_right, table_top)
+            target_screen = QApplication.screenAt(anchor)
+            if target_screen is None:
+                target_screen = QApplication.primaryScreen()
+            if target_screen is not None:
+                available = target_screen.availableGeometry()
+                target_x = min(
+                    max(target_x, available.left() + gap),
+                    available.right() - frame_width - gap + 1,
+                )
+                target_y = min(
+                    max(target_y, available.top() + gap),
+                    available.bottom() - frame_height - gap + 1,
+                )
+            dialog.move(target_x, target_y)
+            dialog.exec()
         elif index.column() == AUTO_CANCEL_ARM_COL:
             armed = code not in self.model.account_auto_cancel_armed
             self.account_auto_cancel_changed.emit(code, armed)
@@ -3534,10 +3299,6 @@ class ConditionScreen(QWidget):
         self.proxy.invalidate()
         self._settings.setValue(self._mkey("theme_sort"), "true" if on else "false")
         self._settings.sync()
-
-    def _request_relation_collection(self):
-        """현재 화면의 조건검색 종목만 DART 관계 수집 대상으로 넘긴다."""
-        self.relation_collection_requested.emit(list(self.model.codes))
 
     def refresh_theme_sort(self):
         """새로 저장된 관계 데이터를 현재 테마정렬 화면에 즉시 반영한다."""

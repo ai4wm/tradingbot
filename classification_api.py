@@ -107,9 +107,10 @@ class ClassificationClient:
         return mapping
 
     async def naver_themes(
-        self, progress=None, cancelled=None, concurrency: int = 4
+        self, progress=None, cancelled=None, concurrency: int = 4,
+        known_codes: set[str] | None = None,
     ) -> list[dict]:
-        """네이버 금융의 현재 테마와 구성 종목을 수집한다."""
+        """네이버 금융 테마를 수집하며 known_codes는 상세조회를 건너뛴다."""
         themes: dict[str, str] = {}
         page = 1
         while True:
@@ -126,6 +127,12 @@ class ClassificationClient:
             if found == 0:
                 break
             page += 1
+
+        if known_codes is not None:
+            themes = {
+                number: name for number, name in themes.items()
+                if number not in known_codes
+            }
 
         semaphore = asyncio.Semaphore(concurrency)
         total = len(themes)

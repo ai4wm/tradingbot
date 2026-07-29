@@ -123,6 +123,12 @@ def parse_order_item(item: dict) -> dict:
 
     code = str(values.get("9001") or item.get("item") or "")
     code = code.split("_")[0].lstrip("A")
+    exchange = str(values.get("2135") or values.get("2134") or "").strip()
+    exchange = {
+        "통합": "SOR", "0": "SOR", "1": "KRX", "2": "NXT",
+    }.get(exchange, exchange.upper())
+    if exchange not in {"KRX", "NXT", "SOR"}:
+        exchange = ""
     return {
         "code": code,
         "order_no": str(values.get("9203") or "").strip(),
@@ -133,6 +139,7 @@ def parse_order_item(item: dict) -> dict:
         "fill_id": str(values.get("909") or "").strip(),
         "fill_price": integer("910"),
         "fill_qty": integer("911"),
+        "exchange": exchange,
         "side": (
             "buy" if "매수" in str(values.get("905") or "")
             else "sell" if "매도" in str(values.get("905") or "")

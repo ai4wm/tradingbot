@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "market_analysis.db"
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 17
 ANALYSIS_STOCK_TYPES = (
     "COMMON", "PREFERRED", "SPAC", "FOREIGN", "REIT", "INFRA",
 )
@@ -356,6 +356,9 @@ CREATE TABLE IF NOT EXISTS news_item_versions (
     FOREIGN KEY (news_id) REFERENCES news_items(news_id)
 );
 
+CREATE INDEX IF NOT EXISTS idx_news_item_versions_hash
+ON news_item_versions(news_id, content_hash);
+
 CREATE TABLE IF NOT EXISTS news_stock_maps (
     news_id INTEGER NOT NULL,
     stock_code TEXT NOT NULL,
@@ -556,8 +559,10 @@ CREATE TABLE IF NOT EXISTS condition_snapshot_quotes (
     volume INTEGER NOT NULL DEFAULT 0,
     buy_queue INTEGER NOT NULL DEFAULT 0,
     open_price INTEGER NOT NULL DEFAULT 0,
+    high_price INTEGER NOT NULL DEFAULT 0,
     low_price INTEGER NOT NULL DEFAULT 0,
     upper_price INTEGER NOT NULL DEFAULT 0,
+    trading_value INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (snapshot_id, stock_code),
     FOREIGN KEY (snapshot_id) REFERENCES condition_snapshot_runs(snapshot_id)
         ON DELETE CASCADE
@@ -570,6 +575,7 @@ CREATE TABLE IF NOT EXISTS condition_theme_stats (
     upper_count INTEGER NOT NULL DEFAULT 0,
     average_rate REAL NOT NULL DEFAULT 0,
     top_rate REAL NOT NULL DEFAULT 0,
+    trading_value INTEGER NOT NULL DEFAULT 0,
     leader_stock_code TEXT,
     leader_stock_name TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (snapshot_id, theme_name),
@@ -697,11 +703,22 @@ def initialize(db_path: Path = DB_PATH) -> Path:
                 connection.execute(
                     "ALTER TABLE condition_snapshot_quotes ADD COLUMN "
                     "buy_queue INTEGER NOT NULL DEFAULT 0")
-            for column, definition in (("open_price", "INTEGER NOT NULL DEFAULT 0"),
-                                       ("low_price", "INTEGER NOT NULL DEFAULT 0")):
+            for column, definition in (
+                    ("open_price", "INTEGER NOT NULL DEFAULT 0"),
+                    ("high_price", "INTEGER NOT NULL DEFAULT 0"),
+                    ("low_price", "INTEGER NOT NULL DEFAULT 0"),
+                    ("trading_value", "INTEGER NOT NULL DEFAULT 0")):
                 if column not in quote_columns:
                     connection.execute(
                         f"ALTER TABLE condition_snapshot_quotes ADD COLUMN {column} {definition}")
+            theme_stat_columns = {
+                row[1] for row in connection.execute(
+                    "PRAGMA table_info(condition_theme_stats)").fetchall()
+            }
+            if "trading_value" not in theme_stat_columns:
+                connection.execute(
+                    "ALTER TABLE condition_theme_stats ADD COLUMN "
+                    "trading_value INTEGER NOT NULL DEFAULT 0")
             row = connection.execute(
                 "SELECT version FROM schema_info ORDER BY rowid DESC LIMIT 1"
             ).fetchone()
@@ -833,17 +850,150 @@ def save_condition_snapshot_quotes(snapshot_id: int, quotes: list[dict],
             int(snapshot_id), code, str(quote.get("name") or ""),
             int(quote.get("price") or 0), float(quote.get("rate") or 0),
             int(quote.get("vol") or 0), int(quote.get("bid_qty") or 0),
-            int(quote.get("open") or 0), int(quote.get("low") or 0),
-            int(quote.get("upper") or 0),
+            int(quote.get("open") or 0), int(quote.get("high") or 0),
+            int(quote.get("low") or 0), int(quote.get("upper") or 0),
+            int(quote.get("trading_value") or 0),
         ))
     with closing(connect(db_path)) as connection:
         with connection:
             connection.executemany(
                 """INSERT OR REPLACE INTO condition_snapshot_quotes(
                        snapshot_id, stock_code, stock_name, price, change_rate,
-                       volume, buy_queue, open_price, low_price, upper_price)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", rows)
+                       volume, buy_queue, open_price, high_price, low_price,
+                       upper_price, trading_value)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", rows)
     return len(rows)
+
+
+def save_condition_limit_ups(snapshot_id: int,
+                             entry_times: dict[str, str] | None = None,
+                             db_path: Path = DB_PATH) -> int:
+    """조건검색 시세에서 현재 상한가인 종목을 당일 분석 원천에 저장한다."""
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    with closing(connect(db_path)) as connection, connection:
+        snapshot = connection.execute(
+            """SELECT captured_at
+                 FROM condition_snapshot_runs
+                WHERE snapshot_id=?""",
+            (int(snapshot_id),),
+        ).fetchone()
+        if not snapshot:
+            return 0
+        trade_date = str(snapshot["captured_at"] or "")[:10].replace("-", "")
+        if len(trade_date) != 8:
+            return 0
+        quotes = connection.execute(
+            """SELECT stock_code, stock_name, price, change_rate, volume,
+                      open_price, high_price, low_price, upper_price,
+                      trading_value
+                 FROM condition_snapshot_quotes
+                WHERE snapshot_id=?
+                  AND upper_price>0
+                  AND price>=upper_price""",
+            (int(snapshot_id),),
+        ).fetchall()
+        if not quotes:
+            return 0
+        connection.executemany(
+            """INSERT INTO stocks(
+                   stock_code, stock_name, market, stock_type, updated_at)
+               VALUES (?, ?, '', 'COMMON', ?)
+               ON CONFLICT(stock_code) DO UPDATE SET
+                   stock_name=CASE
+                       WHEN excluded.stock_name<>'' THEN excluded.stock_name
+                       ELSE stocks.stock_name END,
+                   updated_at=excluded.updated_at""",
+            [(row["stock_code"], row["stock_name"], now) for row in quotes],
+        )
+        price_rows = []
+        for row in quotes:
+            price = int(row["price"] or 0)
+            rate = float(row["change_rate"] or 0)
+            volume = int(row["volume"] or 0)
+            previous = (
+                round(price / (1.0 + rate / 100.0))
+                if price and rate > -100 else None
+            )
+            price_rows.append((
+                trade_date, row["stock_code"],
+                int(row["open_price"] or 0) or None,
+                int(row["high_price"] or row["upper_price"] or price) or None,
+                int(row["low_price"] or 0) or None,
+                price or None, previous,
+                int(row["upper_price"] or 0) or None,
+                volume,
+                int(row["trading_value"] or 0) or price * volume,
+                rate, now,
+            ))
+        connection.executemany(
+            """INSERT INTO daily_prices(
+                   trade_date, stock_code, open_price, high_price, low_price,
+                   close_price, prev_close, upper_price, volume, trading_value,
+                   change_rate, source, collected_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'CONDITION', ?)
+               ON CONFLICT(trade_date, stock_code) DO UPDATE SET
+                   open_price=COALESCE(daily_prices.open_price,
+                                       excluded.open_price),
+                   high_price=CASE
+                       WHEN daily_prices.high_price IS NULL
+                            OR excluded.high_price>daily_prices.high_price
+                       THEN excluded.high_price ELSE daily_prices.high_price END,
+                   low_price=COALESCE(daily_prices.low_price,
+                                      excluded.low_price),
+                   close_price=excluded.close_price,
+                   prev_close=COALESCE(daily_prices.prev_close,
+                                       excluded.prev_close),
+                   upper_price=excluded.upper_price,
+                   volume=MAX(COALESCE(daily_prices.volume, 0),
+                              COALESCE(excluded.volume, 0)),
+                   trading_value=CASE
+                       WHEN COALESCE(daily_prices.trading_value, 0)>0
+                       THEN daily_prices.trading_value
+                       ELSE excluded.trading_value END,
+                   change_rate=excluded.change_rate,
+                   source=CASE
+                       WHEN COALESCE(daily_prices.source, '') NOT IN
+                            ('', 'CONDITION')
+                       THEN daily_prices.source ELSE 'CONDITION' END,
+                   collected_at=excluded.collected_at""",
+            price_rows,
+        )
+        entry_times = entry_times or {}
+        event_rows = []
+        for row in quotes:
+            previous = connection.execute(
+                """SELECT e.consecutive_days
+                     FROM limit_up_events e
+                    WHERE e.stock_code=?
+                      AND e.trade_date=(
+                          SELECT MAX(p.trade_date)
+                            FROM daily_prices p
+                           WHERE p.stock_code=? AND p.trade_date<?
+                      )""",
+                (row["stock_code"], row["stock_code"], trade_date),
+            ).fetchone()
+            streak = int(previous["consecutive_days"] or 0) + 1 if previous else 1
+            event_rows.append((
+                trade_date, row["stock_code"], streak,
+                str(entry_times.get(row["stock_code"]) or ""),
+                "조건검색 상한가 스냅샷", now,
+            ))
+        connection.executemany(
+            """INSERT INTO limit_up_events(
+                   trade_date, stock_code, closed_at_limit, touched_limit,
+                   consecutive_days, last_entry_time, reason_text, collected_at)
+               VALUES (?, ?, 1, 1, ?, NULLIF(?, ''), ?, ?)
+               ON CONFLICT(trade_date, stock_code) DO UPDATE SET
+                   closed_at_limit=1, touched_limit=1,
+                   consecutive_days=excluded.consecutive_days,
+                   last_entry_time=COALESCE(excluded.last_entry_time,
+                                            limit_up_events.last_entry_time),
+                   reason_text=COALESCE(limit_up_events.reason_text,
+                                        excluded.reason_text),
+                   collected_at=excluded.collected_at""",
+            event_rows,
+        )
+    return len(event_rows)
 
 
 def save_condition_theme_stats(snapshot_id: int, stats: list[dict],
@@ -858,6 +1008,7 @@ def save_condition_theme_stats(snapshot_id: int, stats: list[dict],
             int(snapshot_id), theme, int(item.get("member_count") or 0),
             int(item.get("upper_count") or 0), float(item.get("average_rate") or 0),
             float(item.get("top_rate") or 0),
+            int(item.get("trading_value") or 0),
             str(item.get("leader_stock_code") or ""),
             str(item.get("leader_stock_name") or ""),
         ))
@@ -866,8 +1017,9 @@ def save_condition_theme_stats(snapshot_id: int, stats: list[dict],
             connection.executemany(
                 """INSERT OR REPLACE INTO condition_theme_stats(
                        snapshot_id, theme_name, member_count, upper_count,
-                       average_rate, top_rate, leader_stock_code, leader_stock_name)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", rows)
+                       average_rate, top_rate, trading_value,
+                       leader_stock_code, leader_stock_name)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""", rows)
     return len(rows)
 
 
@@ -876,13 +1028,232 @@ def condition_theme_stats(snapshot_id: int, db_path: Path = DB_PATH) -> list[dic
     with closing(connect(db_path)) as connection:
         rows = connection.execute(
             """SELECT theme_name, member_count, upper_count, average_rate,
-                      top_rate, leader_stock_code, leader_stock_name
+                      top_rate, trading_value,
+                      leader_stock_code, leader_stock_name
                FROM condition_theme_stats
                WHERE snapshot_id = ?
                ORDER BY upper_count DESC, top_rate DESC, member_count DESC""",
             (int(snapshot_id),),
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def condition_theme_progress(
+        snapshot_id: int, db_path: Path = DB_PATH) -> dict[str, dict]:
+    """현재 스냅샷 테마별 연속 진행일과 최근 상한가 확산을 계산한다."""
+    labels = active_theme_labels(db_path)
+    with closing(connect(db_path)) as connection:
+        snapshot = connection.execute(
+            """SELECT captured_at FROM condition_snapshot_runs
+                WHERE snapshot_id=?""",
+            (int(snapshot_id),),
+        ).fetchone()
+        if not snapshot:
+            return {}
+        trade_date = str(snapshot["captured_at"] or "")[:10].replace("-", "")
+        quote_codes = [
+            str(row[0] or "").removeprefix("A")
+            for row in connection.execute(
+                """SELECT stock_code FROM condition_snapshot_quotes
+                    WHERE snapshot_id=?""",
+                (int(snapshot_id),),
+            ).fetchall()
+        ]
+        market_dates = [
+            str(row[0])
+            for row in connection.execute(
+                """SELECT DISTINCT trade_date FROM daily_prices
+                    WHERE trade_date<=?
+                    ORDER BY trade_date DESC LIMIT 60""",
+                (trade_date,),
+            ).fetchall()
+        ]
+        events = []
+        if quote_codes:
+            placeholders = ",".join("?" for _ in quote_codes)
+            events = connection.execute(
+                f"""SELECT trade_date, stock_code, consecutive_days
+                      FROM limit_up_events
+                     WHERE stock_code IN ({placeholders})
+                       AND trade_date<=?
+                       AND touched_limit=1""",
+                (*quote_codes, trade_date),
+            ).fetchall()
+
+    codes_by_theme: dict[str, set[str]] = {}
+    for code in quote_codes:
+        for theme in labels.get(code, ()):
+            codes_by_theme.setdefault(theme, set()).add(code)
+    result: dict[str, dict] = {}
+    date_position = {date: index for index, date in enumerate(market_dates)}
+    for theme, codes in codes_by_theme.items():
+        theme_events = [
+            row for row in events if str(row["stock_code"]) in codes
+        ]
+        event_dates = {str(row["trade_date"]) for row in theme_events}
+        consecutive_days = 0
+        for date in market_dates:
+            if date in event_dates:
+                consecutive_days += 1
+            else:
+                break
+        current_streak = max(
+            (
+                int(row["consecutive_days"] or 0)
+                for row in theme_events
+                if str(row["trade_date"]) == trade_date
+            ),
+            default=0,
+        )
+        recent_dates = set(market_dates[:5])
+        recent_events = [
+            row for row in theme_events
+            if str(row["trade_date"]) in recent_dates
+        ]
+        previous_events = [
+            row for row in theme_events
+            if date_position.get(str(row["trade_date"]), 999)
+            > consecutive_days
+        ]
+        last_event_days_ago = min(
+            (
+                date_position.get(str(row["trade_date"]), 999)
+                for row in theme_events
+            ),
+            default=999,
+        )
+        result[theme] = {
+            "codes": sorted(codes),
+            "consecutive_days": consecutive_days,
+            "max_stock_streak": current_streak,
+            "events_5d": len(recent_events),
+            "participants_5d": len({
+                str(row["stock_code"]) for row in recent_events
+            }),
+            "last_event_days_ago": last_event_days_ago,
+            "had_previous_cycle": bool(previous_events),
+        }
+    return result
+
+
+def condition_theme_candidate_evidence(
+        snapshot_id: int, db_path: Path = DB_PATH) -> dict[str, dict]:
+    """신규 테마 후보용 최초 출현일과 당일 뉴스·공시 근거를 반환한다."""
+    progress = condition_theme_progress(snapshot_id, db_path)
+    if not progress:
+        return {}
+    with closing(connect(db_path)) as connection:
+        snapshot = connection.execute(
+            """SELECT captured_at FROM condition_snapshot_runs
+                WHERE snapshot_id=?""",
+            (int(snapshot_id),),
+        ).fetchone()
+        if not snapshot:
+            return {}
+        iso_date = str(snapshot["captured_at"] or "")[:10]
+        trade_date = iso_date.replace("-", "")
+        first_seen = {
+            str(row["theme_name"]): {
+                "first_seen_date": str(row["first_seen_date"] or ""),
+                "appearance_days": int(row["appearance_days"] or 0),
+            }
+            for row in connection.execute(
+                """SELECT c.theme_name,
+                          MIN(substr(r.captured_at, 1, 10)) AS first_seen_date,
+                          COUNT(DISTINCT substr(r.captured_at, 1, 10))
+                              AS appearance_days
+                     FROM condition_theme_stats c
+                     JOIN condition_snapshot_runs r
+                       ON r.snapshot_id=c.snapshot_id
+                    GROUP BY c.theme_name""",
+            ).fetchall()
+        }
+        manual_themes = {
+            str(row[0])
+            for row in connection.execute(
+                """SELECT DISTINCT t.theme_name
+                     FROM stock_themes st
+                     JOIN themes t ON t.theme_id=st.theme_id
+                    WHERE st.source='MANUAL' AND st.valid_to IS NULL""",
+            ).fetchall()
+        }
+        all_codes = sorted({
+            code for item in progress.values()
+            for code in item.get("codes", ())
+        })
+        news_by_code: dict[str, list] = {}
+        disclosures_by_code: dict[str, list] = {}
+        if all_codes:
+            placeholders = ",".join("?" for _ in all_codes)
+            news_rows_found = connection.execute(
+                f"""SELECT m.stock_code, n.current_title,
+                           COALESCE(l.material_type, '기타') AS material_type,
+                           COALESCE(l.confidence, 0) AS confidence
+                      FROM news_stock_maps m
+                      JOIN news_items n ON n.news_id=m.news_id
+                      LEFT JOIN news_material_labels l ON l.news_id=n.news_id
+                     WHERE m.stock_code IN ({placeholders})
+                       AND substr(COALESCE(n.published_at_source,
+                                           n.first_collected_at), 1, 10)=?
+                       AND n.removal_status='ACTIVE'
+                       AND (
+                           m.match_method<>'QUERY_STOCK'
+                           OR INSTR(
+                               LOWER(n.current_title || ' '
+                                     || n.current_summary),
+                               LOWER(m.matched_text)
+                           )>0
+                       )
+                     ORDER BY n.published_at_source DESC""",
+                (*all_codes, iso_date),
+            ).fetchall()
+            for row in news_rows_found:
+                news_by_code.setdefault(str(row["stock_code"]), []).append(row)
+            disclosure_rows_found = connection.execute(
+                f"""SELECT stock_code, report_name
+                      FROM disclosures
+                     WHERE stock_code IN ({placeholders})
+                       AND receipt_date=?""",
+                (*all_codes, trade_date),
+            ).fetchall()
+            for row in disclosure_rows_found:
+                disclosures_by_code.setdefault(
+                    str(row["stock_code"]), []).append(row)
+
+    strong_types = {
+        "정책·규제", "수주·공급계약", "임상·허가", "M&A·지분",
+        "기술·제품", "실적·전망", "배당·자사주", "원자재·공급망",
+    }
+    result = {}
+    for theme, item in progress.items():
+        codes = item.get("codes", ())
+        news = [
+            row for code in codes for row in news_by_code.get(code, ())
+        ]
+        disclosures = [
+            row for code in codes
+            for row in disclosures_by_code.get(code, ())
+        ]
+        strong_news = [
+            row for row in news
+            if str(row["material_type"]) in strong_types
+            and float(row["confidence"] or 0) >= 0.6
+        ]
+        material_types = list(dict.fromkeys(
+            str(row["material_type"]) for row in strong_news
+        ))
+        result[theme] = {
+            **first_seen.get(theme, {
+                "first_seen_date": "", "appearance_days": 0}),
+            "is_manual": theme in manual_themes,
+            "news_count": len(news),
+            "strong_news_count": len(strong_news),
+            "disclosure_count": len(disclosures),
+            "material_types": material_types,
+            "latest_title": (
+                str(strong_news[0]["current_title"]) if strong_news else ""),
+        }
+    return result
 
 
 def save_condition_theme_members(snapshot_id: int, members: list[dict],
@@ -1665,6 +2036,80 @@ def update_collection(run_id: int, status: str, processed: int, saved: int,
                WHERE run_id=?""",
             (status, processed, saved, errors, message, finished, run_id),
         )
+
+
+def latest_collection_run(data_type: str,
+                          db_path: Path = DB_PATH) -> dict | None:
+    """지정 원천의 가장 최근 수집 실행 상태를 반환한다."""
+    if not db_path.exists():
+        return None
+    with closing(connect(db_path)) as connection:
+        row = connection.execute(
+            """SELECT data_type, date_from, date_to, status,
+                      processed_count, saved_count, error_count, message,
+                      started_at, finished_at
+                 FROM collection_runs
+                WHERE data_type=?
+                ORDER BY run_id DESC LIMIT 1""",
+            (str(data_type),),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def delete_limit_up_record(
+        trade_date: str, stock_code: str,
+        db_path: Path = DB_PATH) -> dict:
+    """상한가 이벤트를 삭제하고 조건검색 임시 일봉만 함께 정리한다.
+
+    KRX·키움에서 받은 정식 일봉은 다른 분석에서도 사용하므로 보존한다.
+    장중 조건검색이 만든 ``CONDITION`` 일봉은 종가가 확정되지 않은 임시값이라
+    해당 이벤트를 사용자가 삭제할 때만 같이 제거한다.
+    """
+    trade_date = str(trade_date or "").strip()
+    stock_code = str(stock_code or "").strip().removeprefix("A")
+    if not re.fullmatch(r"\d{8}", trade_date):
+        raise ValueError("거래일은 YYYYMMDD 형식이어야 합니다.")
+    if not stock_code:
+        raise ValueError("종목코드가 비어 있습니다.")
+    result = {
+        "deleted": False,
+        "trade_date": trade_date,
+        "stock_code": stock_code,
+        "stock_name": "",
+        "price_source": "",
+        "condition_price_deleted": False,
+    }
+    if not db_path.exists():
+        return result
+    with closing(connect(db_path)) as connection, connection:
+        row = connection.execute(
+            """SELECT s.stock_name, COALESCE(p.source, '') AS price_source
+                 FROM limit_up_events e
+                 JOIN stocks s ON s.stock_code=e.stock_code
+                 LEFT JOIN daily_prices p
+                   ON p.trade_date=e.trade_date
+                  AND p.stock_code=e.stock_code
+                WHERE e.trade_date=? AND e.stock_code=?""",
+            (trade_date, stock_code),
+        ).fetchone()
+        if row is None:
+            return result
+        result["stock_name"] = str(row["stock_name"] or "")
+        result["price_source"] = str(row["price_source"] or "")
+        cursor = connection.execute(
+            """DELETE FROM limit_up_events
+                WHERE trade_date=? AND stock_code=?""",
+            (trade_date, stock_code),
+        )
+        result["deleted"] = cursor.rowcount == 1
+        if result["deleted"] and result["price_source"] == "CONDITION":
+            price_cursor = connection.execute(
+                """DELETE FROM daily_prices
+                    WHERE trade_date=? AND stock_code=? AND source='CONDITION'""",
+                (trade_date, stock_code),
+            )
+            result["condition_price_deleted"] = price_cursor.rowcount == 1
+    return result
 
 
 def limit_up_rows(date_from: str, date_to: str, stock_query: str = "",
@@ -2648,7 +3093,7 @@ def rotation_stock_rows(as_of_date: str, theme_id: int,
 
 
 def market_dashboard(db_path: Path = DB_PATH) -> dict:
-    """최근 거래일 기준 시장 요약·테마·주도주·상한가·수급을 반환한다."""
+    """저장 시장 자료와 오늘 최신 조건검색 테마·상한가를 반환한다."""
     empty = {
         "trade_date": "", "markets": [], "themes": [],
         "leaders": [], "limit_ups": [], "flows": [],
@@ -2657,9 +3102,29 @@ def market_dashboard(db_path: Path = DB_PATH) -> dict:
     if not db_path.exists():
         return empty
     with closing(connect(db_path)) as connection:
-        trade_date = connection.execute(
+        latest_trade_date = connection.execute(
             "SELECT MAX(trade_date) FROM daily_prices"
         ).fetchone()[0] or ""
+        trade_date = connection.execute(
+            """WITH coverage AS (
+                   SELECT p.trade_date, COUNT(DISTINCT p.stock_code) AS stocks
+                     FROM daily_prices p
+                     JOIN stocks s ON s.stock_code=p.stock_code
+                    WHERE s.stock_type IN (?, ?, ?, ?, ?, ?)
+                      AND s.market IN ('KOSPI', 'KOSDAQ')
+                    GROUP BY p.trade_date
+               ),
+               maximum AS (
+                   SELECT MAX(stocks) AS stocks FROM coverage
+               )
+               SELECT MAX(c.trade_date)
+                 FROM coverage c, maximum m
+                WHERE c.stocks>=1000
+                  AND c.stocks>=m.stocks*0.5""",
+            ANALYSIS_STOCK_TYPES,
+        ).fetchone()[0] or ""
+        if not trade_date:
+            trade_date = latest_trade_date
         if not trade_date:
             return empty
         markets = connection.execute(
@@ -2697,6 +3162,36 @@ def market_dashboard(db_path: Path = DB_PATH) -> dict:
                 ORDER BY average_rate DESC, trading_value DESC LIMIT 15""",
             (trade_date,),
         ).fetchall()
+        theme_snapshot_at = ""
+        today_iso = datetime.now().astimezone().date().isoformat()
+        live_theme_snapshot = connection.execute(
+            """SELECT r.snapshot_id, r.captured_at
+                 FROM condition_snapshot_runs r
+                WHERE substr(r.captured_at, 1, 10)=?
+                  AND r.condition_seq LIKE 'BATCH:%'
+                  AND EXISTS (
+                      SELECT 1 FROM condition_theme_stats c
+                       WHERE c.snapshot_id=r.snapshot_id
+                  )
+                ORDER BY r.captured_at DESC
+                LIMIT 1""",
+            (today_iso,),
+        ).fetchone()
+        if live_theme_snapshot:
+            live_themes = connection.execute(
+                """SELECT theme_name, member_count, average_rate,
+                          trading_value, upper_count AS limit_up_count
+                     FROM condition_theme_stats
+                    WHERE snapshot_id=?
+                    ORDER BY upper_count DESC, average_rate DESC,
+                             trading_value DESC
+                    LIMIT 15""",
+                (live_theme_snapshot["snapshot_id"],),
+            ).fetchall()
+            if live_themes:
+                themes = live_themes
+                theme_snapshot_at = str(
+                    live_theme_snapshot["captured_at"] or "")
         leaders = connection.execute(
             """WITH naver_labels AS (
                    SELECT st.stock_code,
@@ -2718,7 +3213,7 @@ def market_dashboard(db_path: Path = DB_PATH) -> dict:
         ).fetchall()
         limit_ups = connection.execute(
             """SELECT e.stock_code, s.stock_name, e.last_entry_time,
-                      p.trading_value
+                       p.trading_value
                  FROM limit_up_events e
                  JOIN stocks s ON s.stock_code=e.stock_code
                  JOIN daily_prices p
@@ -2728,9 +3223,47 @@ def market_dashboard(db_path: Path = DB_PATH) -> dict:
                          p.trading_value DESC LIMIT 20""",
             (trade_date,),
         ).fetchall()
+        limit_up_date = trade_date
+        limit_up_source = "DAILY"
+        live_snapshot = connection.execute(
+            """SELECT r.snapshot_id, r.captured_at
+                 FROM condition_snapshot_runs r
+                WHERE substr(r.captured_at, 1, 10)=?
+                  AND instr(r.condition_name, '8%')>0
+                  AND EXISTS (
+                      SELECT 1
+                        FROM condition_snapshot_quotes q
+                       WHERE q.snapshot_id=r.snapshot_id
+                         AND q.upper_price>0
+                         AND q.price>=q.upper_price
+                  )
+                ORDER BY r.captured_at DESC,
+                         CASE WHEN r.condition_seq LIKE 'BATCH:%'
+                              THEN 0 ELSE 1 END
+                LIMIT 1""",
+            (today_iso,),
+        ).fetchone()
+        if live_snapshot:
+            live_limit_ups = connection.execute(
+                """SELECT q.stock_code,
+                          COALESCE(NULLIF(q.stock_name, ''), s.stock_name)
+                              AS stock_name,
+                          NULL AS last_entry_time,
+                          NULL AS trading_value
+                     FROM condition_snapshot_quotes q
+                     LEFT JOIN stocks s ON s.stock_code=q.stock_code
+                    WHERE q.snapshot_id=?
+                      AND q.upper_price>0
+                      AND q.price>=q.upper_price
+                    ORDER BY q.buy_queue DESC, q.volume DESC""",
+                (live_snapshot["snapshot_id"],),
+            ).fetchall()
+            if live_limit_ups:
+                limit_ups = live_limit_ups
+                limit_up_date = today_iso.replace("-", "")
+                limit_up_source = "CONDITION"
         flow_date = connection.execute(
-            "SELECT MAX(trade_date) FROM investor_flows WHERE trade_date<=?",
-            (trade_date,),
+            "SELECT MAX(trade_date) FROM investor_flows"
         ).fetchone()[0]
         flows = []
         if flow_date:
@@ -2753,7 +3286,6 @@ def market_dashboard(db_path: Path = DB_PATH) -> dict:
                               ORDER BY trade_date DESC
                           ) AS rn
                      FROM market_index_prices
-                    WHERE trade_date<=?
                )
                SELECT index_code, market,
                       MAX(CASE WHEN rn=1 THEN trade_date END) AS trade_date,
@@ -2766,7 +3298,6 @@ def market_dashboard(db_path: Path = DB_PATH) -> dict:
                 WHERE rn<=2
                 GROUP BY index_code, market
                 ORDER BY index_code""",
-            (trade_date,),
         ).fetchall()
         index_rows = []
         for row in indices:
@@ -2787,8 +3318,7 @@ def market_dashboard(db_path: Path = DB_PATH) -> dict:
                           national_net_amount_million AS national_net,
                           collected_at
                      FROM market_investor_flows
-                    WHERE trade_date<=?
-                      AND ((market='KOSPI' AND industry_code='001')
+                    WHERE ((market='KOSPI' AND industry_code='001')
                         OR (market='KOSDAQ' AND industry_code='101'))
                ),
                ranked AS (
@@ -2818,12 +3348,33 @@ def market_dashboard(db_path: Path = DB_PATH) -> dict:
                 WHERE rn<=20
                 GROUP BY market
                 ORDER BY market""",
-            (trade_date,),
         ).fetchall()
+        market_rows = [dict(row) for row in markets]
+        if limit_up_source == "CONDITION":
+            live_market_counts = {
+                row["market"]: row["limit_count"]
+                for row in connection.execute(
+                    """SELECT s.market, COUNT(*) AS limit_count
+                         FROM condition_snapshot_quotes q
+                         JOIN stocks s ON s.stock_code=q.stock_code
+                        WHERE q.snapshot_id=?
+                          AND q.upper_price>0
+                          AND q.price>=q.upper_price
+                        GROUP BY s.market""",
+                    (live_snapshot["snapshot_id"],),
+                ).fetchall()
+            }
+            for row in market_rows:
+                row["limit_up_count"] = int(
+                    live_market_counts.get(row["market"], 0))
         return {
             "trade_date": trade_date,
+            "latest_trade_date": latest_trade_date,
             "flow_date": flow_date or "",
-            "markets": [dict(row) for row in markets],
+            "limit_up_date": limit_up_date,
+            "limit_up_source": limit_up_source,
+            "theme_snapshot_at": theme_snapshot_at,
+            "markets": market_rows,
             "themes": [dict(row) for row in themes],
             "leaders": [dict(row) for row in leaders],
             "limit_ups": [dict(row) for row in limit_ups],
@@ -3071,9 +3622,85 @@ def pending_investor_flow_stocks(date_from: str, date_to: str,
         return [dict(row) for row in rows]
 
 
+def pending_condition_investor_flow_stocks(
+        trade_date: str, db_path: Path = DB_PATH) -> list[dict]:
+    """당일 최신 8% 조건검색 종목 중 종목별 수급이 없는 대상을 반환한다."""
+    if not db_path.exists():
+        return []
+    iso_date = (
+        f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}"
+        if len(trade_date) == 8 else trade_date
+    )
+    with closing(connect(db_path)) as connection:
+        snapshot = connection.execute(
+            """SELECT snapshot_id
+                 FROM condition_snapshot_runs
+                WHERE substr(captured_at, 1, 10)=?
+                  AND instr(condition_name, '8%')>0
+                ORDER BY captured_at DESC, snapshot_id DESC
+                LIMIT 1""",
+            (iso_date,),
+        ).fetchone()
+        if not snapshot:
+            return []
+        rows = connection.execute(
+            """SELECT q.stock_code,
+                      COALESCE(NULLIF(q.stock_name, ''), s.stock_name)
+                          AS stock_name
+                 FROM condition_snapshot_quotes q
+                 LEFT JOIN stocks s ON s.stock_code=q.stock_code
+                 LEFT JOIN investor_flows f
+                   ON f.trade_date=? AND f.stock_code=q.stock_code
+                WHERE q.snapshot_id=? AND f.stock_code IS NULL
+                ORDER BY COALESCE(q.trading_value, 0) DESC,
+                         q.price*q.volume DESC""",
+            (trade_date, snapshot["snapshot_id"]),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def theme_source_codes(source: str, db_path: Path = DB_PATH) -> set[str]:
+    """이미 등록된 원천별 테마 코드를 반환한다."""
+    if not db_path.exists():
+        return set()
+    with closing(connect(db_path)) as connection:
+        return {
+            str(row[0] or "").strip()
+            for row in connection.execute(
+                """SELECT source_code FROM theme_sources
+                    WHERE source=? AND source_code<>''""",
+                (str(source or "").upper(),),
+            ).fetchall()
+            if str(row[0] or "").strip()
+        }
+
+
+def theme_source_member_counts(
+        source: str, db_path: Path = DB_PATH) -> dict[str, int]:
+    """원천 테마 코드별 현재 구성종목 수를 반환한다."""
+    if not db_path.exists():
+        return {}
+    with closing(connect(db_path)) as connection:
+        return {
+            str(row["source_code"]): int(row["member_count"] or 0)
+            for row in connection.execute(
+                """SELECT ts.source_code, COUNT(st.stock_code) AS member_count
+                     FROM theme_sources ts
+                     LEFT JOIN stock_themes st
+                       ON st.theme_id=ts.theme_id
+                      AND st.source=ts.source
+                      AND st.valid_to IS NULL
+                    WHERE ts.source=? AND ts.source_code<>''
+                    GROUP BY ts.source_code""",
+                (str(source or "").upper(),),
+            ).fetchall()
+        }
+
+
 def save_theme_snapshot(theme_rows: list[dict], snapshot_date: str,
                         source: str = "KIWOOM",
                         confidence: float = 0.8,
+                        replace_source: bool = True,
                         db_path: Path = DB_PATH) -> tuple[int, int]:
     """현재 테마 구성 스냅샷을 변경 구간 형태로 저장한다."""
     initialize(db_path)
@@ -3130,7 +3757,13 @@ def save_theme_snapshot(theme_rows: list[dict], snapshot_date: str,
                 (source,),
             ).fetchall()
         }
-        removed = active - target
+        if replace_source:
+            removed = active - target
+        else:
+            touched_theme_ids = set(theme_ids.values())
+            removed = {
+                pair for pair in active if pair[1] in touched_theme_ids
+            } - target
         added = target - active
         connection.executemany(
             """UPDATE stock_themes SET valid_to=?
@@ -3166,7 +3799,7 @@ def save_source_classifications(mapping: dict[str, str], snapshot_date: str,
         for label, codes in grouped.items()
     ]
     return save_theme_snapshot(
-        rows, snapshot_date, source, confidence, db_path)
+        rows, snapshot_date, source, confidence, db_path=db_path)
 
 
 def limit_up_codes_without_sources(
@@ -3637,22 +4270,50 @@ def save_news_items(stock_code: str, stock_name: str, rows: list[dict],
                 result["new_ids"].append(news_id)
             else:
                 news_id = int(existing["news_id"])
+                incoming_hash = str(item.get("current_hash") or "")
                 changed = (
                     str(existing["current_content_hash"] or "")
-                    != str(item.get("current_hash") or ""))
-                connection.execute(
-                    """UPDATE news_items SET
-                           canonical_url=?, original_url=?, naver_url=?,
-                           publisher=?, published_at_source=?,
-                           last_seen_at=?, market_session=?, current_title=?,
-                           current_summary=?, current_content_hash=?,
-                           duplicate_cluster_key=?, removal_status='ACTIVE',
-                           missing_since=NULL, removed_at=NULL,
-                           modified_count=modified_count+?
-                       WHERE news_id=?""",
-                    (*values, int(changed), news_id),
+                    != incoming_hash)
+                seen_version = bool(
+                    changed
+                    and connection.execute(
+                        """SELECT 1 FROM news_item_versions
+                           WHERE news_id=? AND content_hash=?
+                           LIMIT 1""",
+                        (news_id, incoming_hash),
+                    ).fetchone()
                 )
-                if changed:
+                new_version = changed and not seen_version
+                if seen_version:
+                    # 같은 기사가 종목별 검색어에 따라 A→B→A 형태의
+                    # 요약문을 반복 반환해도 현재 본문을 되돌리거나 버전을
+                    # 다시 쌓지 않는다. 조회 시각과 원천 URL만 갱신한다.
+                    connection.execute(
+                        """UPDATE news_items SET
+                               canonical_url=?, original_url=?, naver_url=?,
+                               publisher=?, published_at_source=?,
+                               last_seen_at=?, market_session=?,
+                               duplicate_cluster_key=?,
+                               removal_status='ACTIVE',
+                               missing_since=NULL, removed_at=NULL
+                           WHERE news_id=?""",
+                        (*values[:7], values[10], news_id),
+                    )
+                else:
+                    connection.execute(
+                        """UPDATE news_items SET
+                               canonical_url=?, original_url=?, naver_url=?,
+                               publisher=?, published_at_source=?,
+                               last_seen_at=?, market_session=?,
+                               current_title=?, current_summary=?,
+                               current_content_hash=?,
+                               duplicate_cluster_key=?, removal_status='ACTIVE',
+                               missing_since=NULL, removed_at=NULL,
+                               modified_count=modified_count+?
+                           WHERE news_id=?""",
+                        (*values, int(new_version), news_id),
+                    )
+                if new_version:
                     version_no = int(connection.execute(
                         """SELECT COALESCE(MAX(version_no), 0)+1
                            FROM news_item_versions WHERE news_id=?""",
