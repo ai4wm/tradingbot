@@ -5,6 +5,7 @@ import logging
 from dataclasses import dataclass, field
 
 log = logging.getLogger("order")
+audit_log = logging.getLogger("trade.audit")
 
 
 def split_quantity(total_qty: int, count: int) -> list[int]:
@@ -166,6 +167,11 @@ class OrderEngine:
                         batch.code, child.requested_qty, batch.price)
                     child.order_no = result["order_no"]
                     batch.sent_count += 1
+                    audit_log.info(
+                        "buy order accepted code=%s order=%s qty=%s "
+                        "price=%s cancel_mode=%s",
+                        batch.code, child.order_no, child.requested_qty,
+                        batch.price, "auto" if batch.auto_cancel else "manual")
                     if child.order_no:
                         self._by_order_no[child.order_no] = (batch, child)
                     if (
@@ -182,6 +188,10 @@ class OrderEngine:
                 elif action == "cancel":
                     await self.rest.cancel_order(
                         batch.code, child.order_no, 0)
+                    audit_log.info(
+                        "local order cancel sent code=%s order=%s "
+                        "remaining=%s",
+                        batch.code, child.order_no, child.remaining_qty)
                     self._notify(batch, "취소전송")
             except Exception as exc:  # noqa: BLE001
                 if action == "cancel":
@@ -231,6 +241,11 @@ class OrderEngine:
         status = str(event.get("status") or "")
         if child.remaining_qty == 0 or "취소" in status or "완료" in status:
             child.done = True
+        audit_log.info(
+            "tracked order event code=%s order=%s status=%s "
+            "fill_qty=%s filled=%s remaining=%s done=%s",
+            batch.code, child.order_no, status, fill_qty,
+            child.filled_qty, child.remaining_qty, child.done)
         # 자동취소 판단은 앱/영웅문 주문을 구분하지 않고 계좌 미체결
         # 스냅샷(ka10075)을 기준으로 App이 수행한다.
         self._notify(batch, "체결")

@@ -1749,15 +1749,23 @@ def latest_external_market_quotes(
 def save_stock_history(
     stock: dict, bars: list[dict], date_from: str, date_to: str,
     db_path: Path = DB_PATH,
+    *, selected_dates: set[str] | None = None,
 ) -> tuple[int, int]:
     """종목 하나의 일봉과 상한가 이벤트를 원자적으로 저장한다."""
     initialize(db_path)
     now = datetime.now().astimezone().isoformat(timespec="seconds")
+    selected_dates = (
+        {str(trade_date) for trade_date in selected_dates}
+        if selected_dates is not None else None)
     history = sorted(
         (bar for bar in bars if bar["date"] <= date_to),
         key=lambda bar: bar["date"],
     )
-    selected = [bar for bar in history if bar["date"] >= date_from]
+    selected = [
+        bar for bar in history
+        if bar["date"] >= date_from
+        and (selected_dates is None or bar["date"] in selected_dates)
+    ]
     if not selected:
         return 0, 0
     with closing(connect(db_path)) as connection, connection:
@@ -1852,6 +1860,38 @@ def save_stock_history(
             event_rows,
         )
     return len(price_rows), len(event_rows)
+
+
+def stock_history_dates(
+    stock_codes: list[str], date_from: str, date_to: str,
+    db_path: Path = DB_PATH,
+) -> dict[str, set[str]]:
+    """종목별로 이미 저장된 신뢰 가능한 KRX·키움 일봉 날짜를 반환한다."""
+    codes = list(dict.fromkeys(
+        str(code or "").removeprefix("A")
+        for code in stock_codes if str(code or "").strip()
+    ))
+    if not codes or not db_path.exists():
+        return {}
+    result: dict[str, set[str]] = {}
+    with closing(connect(db_path)) as connection:
+        # SQLite 바인딩 개수 제한을 넘지 않도록 종목코드를 나눠 조회한다.
+        for offset in range(0, len(codes), 400):
+            part = codes[offset:offset + 400]
+            placeholders = ",".join("?" for _ in part)
+            rows = connection.execute(
+                f"""SELECT stock_code, trade_date
+                      FROM daily_prices
+                     WHERE stock_code IN ({placeholders})
+                       AND trade_date BETWEEN ? AND ?
+                       AND source IN ('KIWOOM', 'KRX')
+                       AND COALESCE(close_price, 0)>0""",
+                (*part, date_from, date_to),
+            ).fetchall()
+            for row in rows:
+                result.setdefault(str(row["stock_code"]), set()).add(
+                    str(row["trade_date"]))
+    return result
 
 
 def save_krx_market_day(rows: list[dict], db_path: Path = DB_PATH

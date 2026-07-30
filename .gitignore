@@ -2,7 +2,7 @@
 .venv/
 __pycache__/
 *.pyc
-bot.log
+bot.log*
 layout.ini
 data/*.db
 data/*.db-shm

@@ -21,6 +21,16 @@ ETF_PREFIXES = (
     "HANARO", "KOSEF", "KINDEX", "TIMEFOLIO", "히어로즈", "마이티",
 )
 
+# 키움 종목목록이 상호변경 전 이름을 계속 반환하는 동안 공식 현재명을 유지한다.
+STOCK_NAME_OVERRIDES = {
+    "079810": "APS이노베이션",  # 디이엔티, 2026-04-15 상호변경
+}
+
+
+def _stock_name(code: str, name: str) -> str:
+    normalized_code = str(code or "").split("_")[0].removeprefix("A")
+    return STOCK_NAME_OVERRIDES.get(normalized_code, str(name or "").strip())
+
 
 @dataclass
 class MarketInfo:
@@ -241,7 +251,7 @@ class RestClient:
             out.append({
                 **e,
                 "code": code,
-                "name": r.get("stk_nm", ""),
+                "name": _stock_name(code, r.get("stk_nm", "")),
                 "price": abs(_to_int(r.get("cur_prc"))),   # 부호 포함 -> abs
                 "rate": _to_float(r.get("flu_rt")),        # 등락율 (부호 유지: 색)
                 "vol": vol,
@@ -408,7 +418,8 @@ class RestClient:
                     stock_type = "COMMON"
                 out.append({
                     "code": code,
-                    "name": row.get("name") or row.get("stk_nm") or "",
+                    "name": _stock_name(
+                        code, row.get("name") or row.get("stk_nm") or ""),
                     "market": market_name,
                     "stock_type": stock_type,
                     "sector_name": company_class or item_market_name,
@@ -703,7 +714,7 @@ class RestClient:
         return [{
             "rank": _to_int(r.get("bigd_rank")),
             "code": r.get("stk_cd", ""),
-            "name": r.get("stk_nm", ""),
+            "name": _stock_name(r.get("stk_cd", ""), r.get("stk_nm", "")),
             "price": abs(_to_int(r.get("past_curr_prc"))),
             "rate": _to_float(r.get("base_comp_chgr")),
             "prev_rate": _to_float(r.get("prev_base_chgr")),
@@ -742,7 +753,7 @@ class RestClient:
                     sellable = max(0, _to_int(item.get("trde_able_qty")))
                     out.append({
                         "code": code,
-                        "name": item.get("stk_nm", ""),
+                        "name": _stock_name(code, item.get("stk_nm", "")),
                         "held_qty": held,
                         "sellable_qty": sellable,
                     })
@@ -969,7 +980,7 @@ class RestClient:
         rank = 0
         for r in rows:
             code = (r.get("stk_cd") or "").split("_")[0]
-            name = r.get("stk_nm", "")
+            name = _stock_name(code, r.get("stk_nm", ""))
             if not code or (drop_etf and name.startswith(ETF_PREFIXES)):
                 continue
             rank += 1
@@ -994,7 +1005,7 @@ class RestClient:
         rank = 0
         for r in rows:
             code = (r.get("stk_cd") or "").split("_")[0]
-            name = r.get("stk_nm", "")
+            name = _stock_name(code, r.get("stk_nm", ""))
             if not code or (drop_etf and name.startswith(ETF_PREFIXES)):
                 continue
             rank += 1
@@ -1026,7 +1037,8 @@ class RestClient:
             if not code:
                 continue
             out.append({
-                "rank": rank, "code": code, "name": r.get("stk_nm", ""),
+                "rank": rank, "code": code,
+                "name": _stock_name(code, r.get("stk_nm", "")),
                 "price": abs(_to_int(r.get("cur_prc"))),
                 "rate": _to_float(r.get("flu_rt")),
                 "prev_rate": 0.0, "rank_chg": 0, "time": "",

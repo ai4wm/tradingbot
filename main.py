@@ -13,6 +13,7 @@ import time
 from collections import Counter, deque
 from ctypes import wintypes
 from datetime import date, datetime, timedelta
+from logging.handlers import RotatingFileHandler
 
 import holidays
 import qasync
@@ -36,6 +37,7 @@ from analysis_db import (
     save_dart_corp_codes,
     save_dart_parent_relations,
     sync_stock_catalog, save_krx_market_day, krx_collected_dates,
+    stock_history_dates,
     pending_intraday_events, save_last_entry_time,
     save_disclosures, disclosure_rows, disclosure_list_rows,
     pending_disclosure_stocks, mark_disclosure_range_collected,
@@ -74,12 +76,36 @@ from order import OrderEngine, split_quantity
 from rank import RankScreen, _beep
 from ws import WSClient
 
+
+class _ProductionFileLogFilter(logging.Filter):
+    """운영 경고와 검증 중인 거래 기능의 감사 로그만 파일에 남긴다."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return (
+            record.levelno >= logging.WARNING
+            or record.name == "trade.audit"
+        )
+
+
+file_log = RotatingFileHandler(
+    "bot.log",
+    maxBytes=20 * 1024 * 1024,
+    backupCount=5,
+    encoding="utf-8",
+    delay=True,
+)
+file_log.setLevel(logging.INFO)
+file_log.addFilter(_ProductionFileLogFilter())
+console_log = logging.StreamHandler()
+console_log.setLevel(logging.ERROR)
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
-    handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()],
+    handlers=[file_log, console_log],
 )
 log = logging.getLogger("main")
+audit_log = logging.getLogger("trade.audit")
+audit_log.setLevel(logging.INFO)
 
 
 def _is_process_admin() -> bool:
@@ -692,6 +718,11 @@ class View:
         new = set(codes)
         for code in cur - new:
             self.screen.on_excluded(code)
+            if self.seq in RANK_SEQS and code in self.screen.model.rows:
+                # 자동삭제 OFF면 행과 실시간 추적은 남긴다. 다만 직전 순위를
+                # 그대로 두면 현재 상위 20종목보다 실시간 등록 우선순위가
+                # 높아질 수 있으므로 순위 표식만 비워 이탈 상태를 구분한다.
+                self.screen.on_tick(code, {"qrank": 0, "qrank_chg": 0})
             self.app.queue_real(code, add=False, suffix=self._real_suffix())
         added = list(dict.fromkeys(code for code in codes if code not in cur))
         if added:
@@ -950,6 +981,9 @@ class App:
         token = (id(screen), code)
         if spec is None:
             self._global_hotkeys.unregister(token)
+            audit_log.info(
+                "exit hotkey cleared code=%s screen=%s",
+                code, screen.prefix)
             return
         ok = self._global_hotkeys.register(
             token, spec, (screen, code, str(spec.get("label") or "")))
@@ -1267,13 +1301,24 @@ class App:
                 # 간주하고 행에 동일하게 표시한다.
                 self._set_account_auto_cancel(code, True)
             self.orders.submit(code, name, price, quantities, auto_cancel)
+            audit_log.info(
+                "order batch queued code=%s name=%s mode=%s "
+                "cancel_mode=%s price=%s quantities=%s total=%s",
+                code, name, mode,
+                "auto" if auto_cancel else "manual",
+                price, quantities, sum(quantities))
         except Exception as e:  # noqa: BLE001
+            log.exception(
+                "order batch rejected code=%s mode=%s count=%s "
+                "auto_cancel=%s total=%s price=%s",
+                code, mode, count, auto_cancel, total_qty, price)
             screen.set_order_state(code, "오류", f"상태 오류 · {e}", False)
 
     def _cancel_order(self, code: str):
         # 주문 셀의 취소 버튼은 앱이 보낸 분할 주문에만 노출된다. 따라서 계좌
         # 미체결 조회가 일부만 돌아와도, 이 앱이 받은 모든 주문번호를 직접
         # 취소해야 9분할 주문이 빠짐없이 취소된다.
+        audit_log.info("manual cancel requested code=%s", code)
         count, qty = self.orders.cancel_submitted_children(code)
         if count:
             log.warning(
@@ -1286,6 +1331,7 @@ class App:
         try:
             count, qty = await self.rest.cancel_open_buy_orders(code)
         except Exception as e:  # noqa: BLE001
+            log.exception("account open buys cancel failed code=%s", code)
             for view in self.views:
                 if code in view.screen.model.rows:
                     view.screen.set_order_state(
@@ -1929,8 +1975,18 @@ class App:
 
     def _on_account_order_event(self, event: dict):
         """앱/영웅문 어느 쪽 주문이든 계좌 체결 이벤트를 자동취소에 반영한다."""
-        self.orders.on_order_event(event)
         code = str(event.get("code") or "")
+        if code:
+            audit_log.info(
+                "account order event code=%s side=%s status=%s order=%s "
+                "original=%s order_qty=%s fill_qty=%s remaining=%s "
+                "fill_id=%s exchange=%s",
+                code, event.get("side"), event.get("status"),
+                event.get("order_no"), event.get("original_order_no"),
+                event.get("order_qty"), event.get("fill_qty"),
+                event.get("remaining_qty"), event.get("fill_id"),
+                event.get("exchange"))
+        self.orders.on_order_event(event)
         if not code:
             return
         if (
@@ -2065,7 +2121,8 @@ class App:
             row = view.screen.model.codes.index(code)
             cell = view.screen.model.index(row, BALANCE_SELL_COL)
             view.screen.model.dataChanged.emit(cell, cell)
-        log.info("balance sell setting code=%s setting=%s", code, setting)
+        audit_log.info(
+            "balance sell setting code=%s setting=%s", code, setting)
 
     def _check_balance_sell(self, code: str, bid_qty: int):
         setting = self._balance_sell_settings.get(code)
@@ -2074,7 +2131,8 @@ class App:
         today = datetime.now().strftime("%Y%m%d")
         if self._balance_sell_date.get(code) != today:
             self._set_balance_sell(code, None)
-            log.info("expired balance sell setting cleared code=%s", code)
+            audit_log.info(
+                "expired balance sell setting cleared code=%s", code)
             return
         krx_state, _, reason = _market_session_states(datetime.now())
         if reason or krx_state != "정규장":
@@ -2092,6 +2150,12 @@ class App:
             ("first_ratio", "second_ratio", "third_ratio")[target - 1],
             (0.0, 0.5, 1.0)[target - 1]))
         if ratio <= 0:
+            audit_log.info(
+                "balance sell stage skipped code=%s stage=%s "
+                "bid_qty=%s threshold=%s ratio=%s",
+                code, target, bid_qty,
+                setting.get(("first", "second", "third")[target - 1]),
+                ratio)
             self._complete_balance_stage(code, target)
             return
         market_sell = bool(setting.get("market_sell", False))
@@ -2115,6 +2179,12 @@ class App:
         running = self._balance_sell_tasks.get(code)
         if running and not running.done():
             return
+        audit_log.info(
+            "balance sell stage triggered code=%s stage=%s "
+            "bid_qty=%s threshold=%s ratio=%s order_type=%s price=%s",
+            code, target, bid_qty,
+            setting.get(("first", "second", "third")[target - 1]),
+            ratio, "market" if market_sell else "limit", price)
         task = asyncio.ensure_future(
             self._execute_balance_stage(
                 code, target, ratio, price, bid_qty, market_sell))
@@ -2309,6 +2379,10 @@ class App:
             cancelled_count, cancelled_qty = (
                 await self.rest.cancel_open_buy_orders(code))
         except Exception as error:  # noqa: BLE001
+            log.exception(
+                "emergency cancel/sell failed code=%s price=%s "
+                "pending=%s held=%s sellable=%s",
+                code, price, pending_qty, held_qty, sellable_qty)
             for view in self.views:
                 if code in view.screen.model.rows:
                     view.screen.set_order_state(
@@ -2368,11 +2442,26 @@ class App:
             self._reg_task = asyncio.ensure_future(self._flush_real())
 
     def _desired_real_refs(self) -> Counter:
-        """현재 활성 창의 보이는 행을 (코드, 시장접미사)별 참조수로 만든다."""
+        """현재 활성 창의 보이는 행을 실시간 등록 우선순위대로 모은다.
+
+        서버의 95종목 상한에 닿으면 뒤에서 잘리므로 보유종목을 가장 먼저,
+        최근 60초 체결이 꼭 필요한 거래대금 상위 화면을 그다음에 둔다.
+        """
         refs = Counter()
-        for view in self.views:
+        priority = {HOLDINGS_SEQ: 0, TVAL_SEQ: 1}
+        views = sorted(
+            self.views, key=lambda view: priority.get(view.seq, 2))
+        for view in views:
             suffix = view._real_suffix()
-            for code in view.screen.model.codes:
+            codes = view.screen.model.codes
+            if view.seq == TVAL_SEQ:
+                # 상한이 보유종목만으로 거의 찬 경우에도 거래대금 상위 순번부터 살린다.
+                rows = view.screen.model.rows
+                codes = sorted(
+                    codes,
+                    key=lambda code: int(
+                        rows.get(code, {}).get("qrank") or 1_000_000))
+            for code in codes:
                 refs[(code, suffix)] += 1
         return refs
 
@@ -4093,11 +4182,24 @@ class AnalysisWindow(QMainWindow):
         self._news_web_back = QPushButton("←")
         self._news_web_forward = QPushButton("→")
         self._news_web_reload = QPushButton("새로고침")
-        self._news_web_auto = QCheckBox("5분 자동 새로고침")
+        self._news_web_auto = QCheckBox("자동 새로고침")
         self._news_web_auto.setToolTip(
-            "종목토론·뉴스·공시 목록 화면에서만 5분마다 새로고침")
+            "종목토론·뉴스·공시 목록 화면에서만 선택한 간격으로 새로고침")
         self._news_web_auto.setChecked(
             self._settings.value("analysis_web_auto", "false") == "true")
+        self._news_web_auto_interval = QComboBox()
+        for minutes in (1, 3, 5, 10, 15, 30):
+            self._news_web_auto_interval.addItem(f"{minutes}분", minutes)
+        saved_web_interval = int(
+            self._settings.value("analysis_web_auto_interval", 5))
+        saved_web_interval_index = self._news_web_auto_interval.findData(
+            saved_web_interval)
+        self._news_web_auto_interval.setCurrentIndex(
+            saved_web_interval_index
+            if saved_web_interval_index >= 0 else 2)
+        self._news_web_auto_interval.setFixedWidth(68)
+        self._news_web_auto_interval.setToolTip(
+            "웹뷰 자동 새로고침 간격")
         external_btn = QPushButton("외부 브라우저")
         self._news_web_back.clicked.connect(
             lambda: self._news_web_action("back"))
@@ -4107,10 +4209,13 @@ class AnalysisWindow(QMainWindow):
             lambda: self._news_web_action("reload"))
         external_btn.clicked.connect(self._open_news_web_external)
         self._news_web_auto.toggled.connect(self._news_web_auto_toggled)
+        self._news_web_auto_interval.currentIndexChanged.connect(
+            self._news_web_auto_interval_changed)
         web_controls.addWidget(self._news_web_back)
         web_controls.addWidget(self._news_web_forward)
         web_controls.addWidget(self._news_web_reload)
         web_controls.addWidget(self._news_web_auto)
+        web_controls.addWidget(self._news_web_auto_interval)
         web_controls.addStretch(1)
         web_controls.addWidget(external_btn)
         web_layout.addLayout(web_controls)
@@ -4219,7 +4324,9 @@ class AnalysisWindow(QMainWindow):
             pass
         web_layout.addWidget(self._news_web_host, 1)
         if self._news_web_auto.isChecked():
-            self._news_web_auto_timer.start(5 * 60 * 1000)
+            self._news_web_auto_timer.start(
+                int(self._news_web_auto_interval.currentData())
+                * 60 * 1000)
 
         self._news_right_splitter = QSplitter(Qt.Orientation.Vertical)
         self._news_right_splitter.addWidget(news_pane)
@@ -4868,9 +4975,18 @@ class AnalysisWindow(QMainWindow):
         self._settings.setValue("analysis_web_auto", "true" if enabled else "false")
         self._settings.sync()
         if enabled:
-            self._news_web_auto_timer.start(5 * 60 * 1000)
+            self._news_web_auto_timer.start(
+                int(self._news_web_auto_interval.currentData())
+                * 60 * 1000)
         else:
             self._news_web_auto_timer.stop()
+
+    def _news_web_auto_interval_changed(self, _index: int):
+        minutes = int(self._news_web_auto_interval.currentData())
+        self._settings.setValue("analysis_web_auto_interval", minutes)
+        self._settings.sync()
+        if self._news_web_auto.isChecked():
+            self._news_web_auto_timer.start(minutes * 60 * 1000)
 
     def _auto_reload_news_web(self):
         if (self._news_webview is not None and self._news_webview.isVisible()
@@ -6617,7 +6733,8 @@ class AnalysisWindow(QMainWindow):
         self._krx_btn.clicked.connect(self._start_krx_collection)
         self._kiwoom_limit_btn = QPushButton("키움 상한가 수집")
         self._kiwoom_limit_btn.setToolTip(
-            "선택 기간의 키움 일봉을 조회해 종가 상한가를 수동 저장합니다.")
+            "선택 기간 중 오늘과 DB에 없는 키움 일봉만 수집합니다. "
+            "오늘은 묶음 시세로 빠르게 갱신합니다.")
         self._kiwoom_limit_btn.clicked.connect(
             self._start_history_collection)
         self._collect_btn = QPushButton("상한가 진입시간 보완")
@@ -7785,7 +7902,7 @@ class AnalysisWindow(QMainWindow):
 
     async def _collect_history(self, date_from: str, date_to: str):
         run_id = start_collection("DAILY_LIMIT_UP", date_from, date_to)
-        processed = saved = errors = 0
+        processed = saved = unavailable = errors = 0
         status = "COMPLETED"
         message = ""
         try:
@@ -7801,7 +7918,9 @@ class AnalysisWindow(QMainWindow):
             sync_stock_catalog(universe)
             chunks = []
             first = QDate.fromString(date_from, "yyyyMMdd")
-            chunk_to = QDate.fromString(date_to, "yyyyMMdd")
+            chunk_to = min(
+                QDate.fromString(date_to, "yyyyMMdd"),
+                QDate.currentDate())
             while chunk_to >= first:
                 chunk_from = chunk_to.addYears(-1).addDays(1)
                 if chunk_from < first:
@@ -7812,39 +7931,158 @@ class AnalysisWindow(QMainWindow):
                 ))
                 chunk_to = chunk_from.addDays(-1)
 
-            total = len(universe) * len(chunks)
-            self._collection_progress.setRange(0, max(1, total))
+            existing_dates = stock_history_dates(
+                [stock["code"] for stock in universe],
+                date_from, date_to)
+            today = QDate.currentDate().toString("yyyyMMdd")
+            now = datetime.now()
+            refresh_today = (
+                date_from <= today <= date_to
+                and not _krx_holiday_reason(now.date())
+                and (now.hour, now.minute) >= (9, 0)
+            )
+            history_requests = []
+            missing_date_count = 0
             for chunk_index, (part_from, part_to) in enumerate(chunks, 1):
+                expected_dates = set()
+                current = QDate.fromString(part_from, "yyyyMMdd")
+                end = QDate.fromString(part_to, "yyyyMMdd")
+                while current <= end:
+                    current_day = date(
+                        current.year(), current.month(), current.day())
+                    if not _krx_holiday_reason(current_day):
+                        expected_dates.add(current.toString("yyyyMMdd"))
+                    current = current.addDays(1)
                 for stock in universe:
-                    if self._collection_cancelled:
-                        status = "CANCELLED"
-                        message = "사용자가 중지함"
-                        break
-                    try:
-                        bars = await self._rest.daily_bars(
-                            stock["code"], part_to)
-                        price_count, _ = save_stock_history(
-                            stock, bars, part_from, part_to)
-                        saved += price_count
-                    except Exception as error:  # noqa: BLE001
-                        errors += 1
-                        log.warning(
-                            "history collection %s %s~%s: %s",
-                            stock["code"], part_from, part_to, error)
-                    processed += 1
-                    self._collection_progress.setValue(processed)
-                    self._collection_status.setText(
-                        f"{processed:,}/{total:,} · {chunk_index}/{len(chunks)}년차 "
-                        f"{part_from}~{part_to} · {stock['name']} "
-                        f"({stock['code']}) · 일봉 {saved:,}건 "
-                        f"· 오류 {errors:,}건")
-                    if processed % 10 == 0:
-                        update_collection(
-                            run_id, "RUNNING", processed, saved, errors,
-                            f"{part_from}~{part_to}")
-                        await asyncio.sleep(0)
+                    listed_date = "".join(
+                        character for character in str(
+                            stock.get("listed_date") or "")
+                        if character.isdigit())[:8]
+                    required_dates = {
+                        trade_date for trade_date in expected_dates
+                        if not listed_date or trade_date >= listed_date
+                    }
+                    pending_dates = required_dates - existing_dates.get(
+                        stock["code"], set())
+                    # 오늘은 과거 일봉 API가 아니라 100종목 묶음 현재시세로
+                    # 별도 갱신한다. ka10081은 하루만 지정해도 과거 묶음을
+                    # 반환하므로 당일 수집에 사용하지 않는다.
+                    pending_dates.discard(today)
+                    if not pending_dates:
+                        continue
+                    history_requests.append((
+                        chunk_index, part_from, part_to, stock, pending_dates))
+                    missing_date_count += len(pending_dates)
+
+            today_stocks = universe if refresh_today else []
+            total = len(today_stocks) + len(history_requests)
+            self._collection_progress.setRange(0, max(1, total))
+            self._collection_progress.setValue(0)
+            if not total:
+                message = (
+                    "오늘 장 시작 전이라 수집할 당일 일봉이 없음"
+                    if date_from == date_to == today
+                    and not _krx_holiday_reason(now.date())
+                    and (now.hour, now.minute) < (9, 0)
+                    else "선택 기간의 기존 일봉이 모두 저장되어 있음"
+                )
+            else:
+                self._collection_status.setText(
+                    f"수집 대상 · 오늘 {len(today_stocks):,}종목 "
+                    f"· 과거 누락 {missing_date_count:,}건")
+
+            # 오늘 하루는 관심종목정보(ka10095)를 100종목씩 묶어 받아
+            # 종목별 과거 일봉 묶음 조회를 피한다.
+            for offset in range(0, len(today_stocks), 100):
                 if self._collection_cancelled:
+                    status = "CANCELLED"
+                    message = "사용자가 중지함"
                     break
+                stock_part = today_stocks[offset:offset + 100]
+                codes = [stock["code"] for stock in stock_part]
+                try:
+                    quotes = await self._rest.watch_info(
+                        codes, exp=False, suffix="")
+                    quote_by_code = {
+                        str(quote.get("code") or "").removeprefix("A"): quote
+                        for quote in quotes
+                    }
+                    for stock in stock_part:
+                        quote = quote_by_code.get(stock["code"])
+                        if not quote or int(quote.get("price") or 0) <= 0:
+                            unavailable += 1
+                            continue
+                        bars = [
+                            {
+                                "date": "00000000",
+                                "close": int(quote.get("base") or 0),
+                            },
+                            {
+                                "date": today,
+                                "open": int(quote.get("open") or 0),
+                                "high": int(quote.get("high") or 0),
+                                "low": int(quote.get("low") or 0),
+                                "close": int(quote.get("price") or 0),
+                                "volume": int(quote.get("vol") or 0),
+                                "trading_value": int(
+                                    quote.get("trading_value") or 0),
+                            },
+                        ]
+                        price_count, _ = save_stock_history(
+                            stock, bars, today, today,
+                            selected_dates={today})
+                        saved += price_count
+                except Exception as error:  # noqa: BLE001
+                    errors += 1
+                    unavailable += len(stock_part)
+                    log.warning(
+                        "today quote collection %s~%s: %s",
+                        codes[0], codes[-1], error)
+                processed += len(stock_part)
+                self._collection_progress.setValue(processed)
+                self._collection_status.setText(
+                    f"{processed:,}/{total:,} · 오늘 {today} 묶음조회 "
+                    f"· 일봉 {saved:,}건 · 조회불가 {unavailable:,}건 "
+                    f"· 오류 {errors:,}건")
+                update_collection(
+                    run_id, "RUNNING", processed, saved, errors,
+                    f"오늘 {today} · 조회불가 {unavailable:,}건")
+                await asyncio.sleep(0)
+
+            for chunk_index, part_from, part_to, stock, pending_dates in (
+                    history_requests):
+                if status == "CANCELLED":
+                    break
+                if self._collection_cancelled:
+                    status = "CANCELLED"
+                    message = "사용자가 중지함"
+                    break
+                try:
+                    bars = await self._rest.daily_bars(
+                        stock["code"], part_to)
+                    price_count, _ = save_stock_history(
+                        stock, bars, part_from, part_to,
+                        selected_dates=pending_dates)
+                    saved += price_count
+                except Exception as error:  # noqa: BLE001
+                    errors += 1
+                    log.warning(
+                        "history collection %s %s~%s: %s",
+                        stock["code"], part_from, part_to, error)
+                processed += 1
+                self._collection_progress.setValue(processed)
+                self._collection_status.setText(
+                    f"{processed:,}/{total:,} · 구간 "
+                    f"{chunk_index}/{len(chunks)} · "
+                    f"과거 누락 {len(pending_dates):,}일 · "
+                    f"{stock['name']} ({stock['code']}) · "
+                    f"일봉 {saved:,}건 · 조회불가 {unavailable:,}건 "
+                    f"· 오류 {errors:,}건")
+                if processed % 10 == 0:
+                    update_collection(
+                        run_id, "RUNNING", processed, saved, errors,
+                        f"{part_from}~{part_to}")
+                    await asyncio.sleep(0)
         except Exception as error:  # noqa: BLE001
             status = "FAILED"
             message = str(error)
@@ -7853,7 +8091,9 @@ class AnalysisWindow(QMainWindow):
             update_collection(
                 run_id, status, processed, saved, errors, message)
             self._collection_status.setText(
-                f"{status} · 종목 {processed:,} · 일봉 {saved:,} · 오류 {errors:,}")
+                f"{status} · 조회 {processed:,} · 일봉 {saved:,} "
+                f"· 조회불가 {unavailable:,} · 오류 {errors:,}"
+                + (f" · {message}" if message else ""))
             self._set_core_collection_running(False)
             self._collection_task = None
             self._refresh_limit_up_table()

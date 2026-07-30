@@ -57,6 +57,8 @@ FID_0W = {
 }
 
 REAL_TYPES = ["0B", "0D", "0H", "0w", "1h"]  # 체결 / 호가 / 예상 / 프로그램 / VI
+REG_LIMIT_LOG_INTERVAL = 60.0
+REG_LIMIT_LOG_SAMPLE = 5
 
 
 def _num(v):
@@ -171,6 +173,7 @@ class WSClient:
         self._seen_fids: set = set()       # 처음 본 (type,fid)만 로그 (FID 발굴용)
         self._real_stats: dict = {}        # 5초 단위 REAL 수신 빈도 (예상값 갱신속도 진단용)
         self._stats_t = 0.0
+        self._last_reg_limit_log = 0.0
 
     # --- 외부 API -------------------------------------------------------
     async def run(self, token_fn):
@@ -229,6 +232,20 @@ class WSClient:
         code, suffix = key
         return code + (self.real_suffix if suffix is None else suffix)
 
+    def _warn_reg_limit(self, skipped: list[str]):
+        """등록 한도 초과를 종목별로 쏟지 않고 최대 1분에 한 번 요약한다."""
+        if not skipped:
+            return
+        now = time.monotonic()
+        if (self._last_reg_limit_log
+                and now - self._last_reg_limit_log < REG_LIMIT_LOG_INTERVAL):
+            return
+        self._last_reg_limit_log = now
+        sample = list(dict.fromkeys(skipped))[:REG_LIMIT_LOG_SAMPLE]
+        log.warning(
+            "real-time reg limit %d, skipped=%d sample=%s",
+            config.REAL_REG_LIMIT, len(skipped), ",".join(sample))
+
     async def register_real(self, code: str, suffix: str = None):
         await self.register_real_many([code], suffix)
 
@@ -236,14 +253,16 @@ class WSClient:
         """여러 종목을 REG 1건으로 등록(연사하면 서버 105110 거부, 2026-07-07 실측).
         참조수 관리: 여러 창이 같은 종목을 등록하면 카운트만 올리고 REG는 1회."""
         todo = []
+        skipped = []
         for c in codes:  # 중복 포함 리스트 허용: 발생 횟수만큼 참조수 증가
             key = (c, suffix)
             if self._reg_codes.get(key, 0) == 0 and key not in todo:
                 if len(self._reg_codes) + len(todo) >= config.REAL_REG_LIMIT:
-                    log.warning("real-time reg limit %d, skip %s", config.REAL_REG_LIMIT, c)
+                    skipped.append(c)
                     continue
                 todo.append(key)
             self._reg_codes[key] = self._reg_codes.get(key, 0) + 1
+        self._warn_reg_limit(skipped)
         if todo:
             await self._send(build_reg([self._registered_item(k) for k in todo], REAL_TYPES))
 
@@ -271,13 +290,15 @@ class WSClient:
         동기화에서 복구된다. force는 서버 쪽 구독까지 REMOVE+REG로 재확인한다.
         """
         target = {}
+        skipped = []
         for key, count in desired.items():
             if count <= 0:
                 continue
             if key not in target and len(target) >= config.REAL_REG_LIMIT:
-                log.warning("real-time reg limit %d, skip %s", config.REAL_REG_LIMIT, key[0])
+                skipped.append(key[0])
                 continue
             target[key] = int(count)
+        self._warn_reg_limit(skipped)
 
         current_keys = set(self._reg_codes)
         target_keys = set(target)
@@ -381,8 +402,9 @@ class WSClient:
             self._handle_condition(msg)
         elif trnm == "REAL":
             for item in msg.get("data", []):
-                self._discover_fids(item)  # 처음 본 FID 로그 (FID 발굴용)
-                self._count_real(item)
+                if log.isEnabledFor(logging.INFO):
+                    self._discover_fids(item)  # 처음 본 FID 로그 (FID 발굴용)
+                    self._count_real(item)
                 if item.get("type") == "02":  # 조건검색 실시간 편입/이탈
                     self._on_real_condition(item)
                     continue
@@ -396,6 +418,7 @@ class WSClient:
                 code, fields = parse_real_item(item)
                 if code and fields and self.on_real:
                     raw_item = item.get("item") or ""
+                    fields["_real_type"] = item.get("type") or ""
                     fields["_real_suffix"] = ("_NX" if raw_item.endswith("_NX") else
                                               "_AL" if raw_item.endswith("_AL") else "")
                     self.on_real(code, fields)
