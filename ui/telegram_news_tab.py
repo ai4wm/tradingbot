@@ -11,7 +11,8 @@ import logging
 import re
 
 from PySide6.QtCore import Qt, QTimer, QUrl
-from PySide6.QtGui import QColor, QDesktopServices
+from PySide6.QtGui import (
+    QColor, QDesktopServices, QKeySequence, QShortcut)
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QDialog, QHBoxLayout, QHeaderView,
     QInputDialog, QLabel, QLineEdit, QMessageBox, QPushButton, QTableWidget,
@@ -64,7 +65,36 @@ class TelegramPostDialog(QDialog):
         self._host_layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self._host, 1)
 
+        try:
+            self._zoom = float(self._owner._settings.value(
+                "telegram_detail_zoom", 1.0))
+        except (TypeError, ValueError):
+            self._zoom = 1.0
+        self._zoom = min(3.0, max(0.5, self._zoom))
+
         buttons = QHBoxLayout()
+        zoom_out = QPushButton("가－")
+        zoom_out.setFixedWidth(46)
+        zoom_out.setToolTip("글자 작게 (Ctrl+-)")
+        zoom_out.clicked.connect(lambda: self._change_zoom(-0.1))
+        zoom_in = QPushButton("가＋")
+        zoom_in.setFixedWidth(46)
+        zoom_in.setToolTip("글자 크게 (Ctrl++)")
+        zoom_in.clicked.connect(lambda: self._change_zoom(0.1))
+        self._zoom_label = QLabel()
+        self._zoom_label.setFixedWidth(48)
+        self._zoom_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._zoom_label.setToolTip("클릭하면 100%로 되돌립니다.")
+        buttons.addWidget(zoom_out)
+        buttons.addWidget(self._zoom_label)
+        buttons.addWidget(zoom_in)
+        for sequence, delta in (("Ctrl++", 0.1), ("Ctrl+=", 0.1),
+                                ("Ctrl+-", -0.1)):
+            QShortcut(QKeySequence(sequence), self,
+                      activated=lambda d=delta: self._change_zoom(d))
+        QShortcut(QKeySequence("Ctrl+0"), self,
+                  activated=lambda: self._change_zoom(0, reset=True))
+
         self._article_button = QPushButton("본문 기사 링크")
         self._article_button.clicked.connect(self._open_article)
         app_button = QPushButton("Telegram 앱으로 열기")
@@ -78,9 +108,24 @@ class TelegramPostDialog(QDialog):
         buttons.addWidget(close_button)
         layout.addLayout(buttons)
 
+        self._apply_zoom()
         geo = self._owner._settings.value("telegram_detail_geo")
         if geo is None or not self.restoreGeometry(geo):
-            self.resize(560, 720)
+            self.resize(900, 900)
+
+    def _change_zoom(self, delta: float, reset: bool = False):
+        self._zoom = 1.0 if reset else min(3.0, max(0.5, self._zoom + delta))
+        self._owner._settings.setValue(
+            "telegram_detail_zoom", round(self._zoom, 2))
+        self._apply_zoom()
+
+    def _apply_zoom(self):
+        self._zoom_label.setText(f"{self._zoom * 100:.0f}%")
+        if self._webview is not None:
+            self._webview.setZoomFactor(self._zoom)
+        font = self._text.font()
+        font.setPointSizeF(max(6.0, 10.0 * self._zoom))
+        self._text.setFont(font)
 
     def _ensure_webview(self):
         """처음 열 때만 웹뷰를 만든다. 안 쓰면 렌더러도 뜨지 않는다."""
@@ -97,6 +142,7 @@ class TelegramPostDialog(QDialog):
         if profile is not None:
             self._webview.setPage(QWebEnginePage(profile, self._webview))
         self._host_layout.addWidget(self._webview)
+        self._webview.setZoomFactor(self._zoom)
         return self._webview
 
     def show_post(self, context: dict):
@@ -128,9 +174,20 @@ class TelegramPostDialog(QDialog):
         if self._article_url:
             QDesktopServices.openUrl(QUrl(self._article_url))
 
-    def closeEvent(self, event):
+    def _save_geo(self):
         self._owner._settings.setValue(
             "telegram_detail_geo", self.saveGeometry())
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._save_geo()
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        self._save_geo()
+
+    def closeEvent(self, event):
+        self._save_geo()
         if self._webview is not None:
             # 웹뷰를 없애 렌더러 프로세스까지 정리한다. 창을 닫아둔 동안에는
             # 이 기능이 메모리를 전혀 차지하지 않는다.
