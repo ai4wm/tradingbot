@@ -3107,6 +3107,7 @@ class DetachedClockWindow(QWidget):
         # 배율 1.0일 때의 높이를 기준으로 삼아야 분석창과 글자 크기가 같다.
         self._owner._clock_scale = 1.0
         self._owner._clock_pad_x = 2
+        self._owner._clock_pad_y = 1
         # 긴 국면 문구가 창 너비를 끌고 가지 않도록 줄바꿈을 허용한다.
         label.setWordWrap(True)
         self._owner._update_analysis_clock()
@@ -3121,6 +3122,11 @@ class DetachedClockWindow(QWidget):
             self.resize(width, max(60, label.heightForWidth(width)))
         self._ratio = self.width() / max(1, self.height())
         self._apply_scale()
+        if not isinstance(size, QSize) or not size.isValid():
+            # 국면 문구 크기까지 정해진 뒤 실제 내용 높이에 맞춘다.
+            self.resize(self.width(), max(40, label.heightForWidth(self.width())))
+            self._base_height = self.height()
+            self._ratio = self.width() / max(1, self.height())
 
     def _content_width(self, label) -> int:
         """날짜·요일 줄 너비에 맞춘다. 국면 문구는 줄바꿈으로 흘린다."""
@@ -3181,9 +3187,22 @@ class DetachedClockWindow(QWidget):
         self._apply_scale()
 
     def _apply_scale(self):
-        """창 높이에 맞춰 시계 글자 크기를 다시 그린다."""
-        self._owner._clock_scale = self.height() / max(1, self._base_height)
-        self._owner._update_analysis_clock()
+        """창 크기에 맞춰 시계 글자 크기를 다시 그린다."""
+        owner = self._owner
+        owner._clock_scale = self.height() / max(1, self._base_height)
+        # 국면 문구만 한 줄에 들어가도록 따로 줄여 세로가 늘지 않게 한다.
+        text = getattr(owner, "_clock_phase_text", "")
+        available = self.width() - 2 * (owner._clock_pad_x + 2) - 4
+        base_px = owner._clock_px(12)
+        if text and available > 20:
+            font = QFont(self.font())
+            font.setPixelSize(base_px)
+            font.setBold(True)
+            needed = QFontMetrics(font).horizontalAdvance(text)
+            if needed > available:
+                base_px = max(7, int(base_px * available / needed))
+        owner._clock_phase_px = base_px
+        owner._update_analysis_clock()
 
     def _save_geo(self):
         self._owner._settings.setValue("clock_window_pos", self.pos())
@@ -3521,10 +3540,12 @@ class AnalysisWindow(
             phase_text = "매매 집중시간 아님"
             phase_background, phase_color = "#424A55", "#E2E7ED"
 
+        self._clock_phase_text = phase_text
+        phase_px = getattr(self, "_clock_phase_px", 0) or self._clock_px(12)
         phase_badge = (
-            f"<div style='margin-top:3px; background-color:{phase_background};"
+            f"<div style='margin-top:2px; background-color:{phase_background};"
             f" color:{phase_color};"
-            f" font-size:{self._clock_px(12)}px; font-weight:900;'>"
+            f" font-size:{phase_px}px; font-weight:900;'>"
             f"{phase_text}</div>"
         )
         self._analysis_clock_label.setStyleSheet(
@@ -3533,7 +3554,8 @@ class AnalysisWindow(
             f" background-color: {background};"
             f" border: 2px solid {border};"
             " border-radius: 7px;"
-            f" padding: 4px {getattr(self, '_clock_pad_x', 7)}px;"
+            f" padding: {getattr(self, '_clock_pad_y', 4)}px"
+            f" {getattr(self, '_clock_pad_x', 7)}px;"
             "}")
         self._analysis_clock_label.setText(
             f"<div style='font-size:{self._clock_px(13)}px;"
@@ -3585,6 +3607,8 @@ class AnalysisWindow(
         label.setWordWrap(False)
         self._clock_scale = 1.0
         self._clock_pad_x = 7
+        self._clock_pad_y = 4
+        self._clock_phase_px = 0
         self._update_analysis_clock()
         self._principle_bar.insertWidget(0, self._analysis_clock_label)
         self._analysis_clock_label.show()
