@@ -23,7 +23,7 @@ from analysis_db import (
 )
 from gui import NumericTableWidgetItem
 from rank import _beep
-from telegram_news import TelegramNewsStream
+from telegram_news import TelegramNewsStream, telegram_app_url
 from ui import (
     NEWS_NEW_ROLE, NEWS_NEW_TIME_BACKGROUND, NEWS_NEW_TIME_FOREGROUND,
     NEWS_NEW_TITLE_BACKGROUND, NEWS_NEW_TITLE_FOREGROUND,
@@ -283,7 +283,7 @@ class TelegramNewsTabMixin:
             if codes else "연결된 종목이 없습니다.")
         body_item = QTableWidgetItem(str(row.get("title") or ""))
         body_item.setToolTip(
-            f"{row.get('body') or ''}\n\n클릭: Telegram 원문 열기")
+            f"{row.get('body') or ''}\n\n클릭: Telegram 앱으로 원문 열기")
         body_item.setData(Qt.ItemDataRole.UserRole, str(row.get("url") or ""))
         for column, item in enumerate((
                 number_item, time_item, channel_item, stock_item, body_item)):
@@ -393,8 +393,17 @@ class TelegramNewsTabMixin:
             return
         item = self._telegram_table.item(row, 4)
         url = str(item.data(Qt.ItemDataRole.UserRole) or "") if item else ""
-        if url:
-            QDesktopServices.openUrl(QUrl(url))
+        self.open_telegram_post(url)
+
+    def open_telegram_post(self, url: str):
+        """Telegram 앱으로 먼저 열고, 앱이 없을 때만 웹으로 넘긴다."""
+        url = str(url or "").strip()
+        if not url:
+            return
+        app_url = telegram_app_url(url)
+        if app_url and QDesktopServices.openUrl(QUrl(app_url)):
+            return
+        QDesktopServices.openUrl(QUrl(url))
 
     def _telegram_table_right_clicked(self, position):
         """종목 열 우클릭 시 대표 종목을 관심종목에 넣고 종토방을 연다."""

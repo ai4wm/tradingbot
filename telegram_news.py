@@ -33,6 +33,17 @@ _HEADER_MARK = "🟦"
 _JOSA = frozenset("이가은는을를의에도와과로만서요랑")
 
 
+_TME_RE = re.compile(r"^https?://t\.me/([^/?#]+)/(\d+)")
+
+
+def telegram_app_url(url: str) -> str:
+    """t.me 주소를 Telegram 앱이 바로 여는 tg:// 주소로 바꾼다."""
+    match = _TME_RE.match(str(url or "").strip())
+    if match is None:
+        return ""
+    return f"tg://resolve?domain={match.group(1)}&post={match.group(2)}"
+
+
 def _has_standalone(text: str, name: str) -> bool:
     """2글자 이름은 더 긴 낱말의 일부(트레이딩→레이, CSP→CS)를 걸러낸다."""
     start = text.find(name)
@@ -376,6 +387,11 @@ def _demo():
     assert row["stock_names"] == "대덕전자", row
     assert _message_row("@c", "c", type("E", (), {
         "id": 1, "message": "", "date": None})(), index) is None
+
+    assert telegram_app_url("https://t.me/stockinfojji/7") == (
+        "tg://resolve?domain=stockinfojji&post=7")
+    assert telegram_app_url("https://example.com/a") == ""
+    assert telegram_app_url("") == ""
 
     asyncio.run(_demo_backfill())
     _demo_dedupe()
