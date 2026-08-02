@@ -3085,8 +3085,12 @@ class DetachedClockWindow(QWidget):
         self._owner = owner
         self._drag_offset = None
         self._resize_from = None
-        self._ratio = 0.0
-        self._base = None  # (창 높이, 글꼴 크기) 비율 기준
+        self._applying = False
+        self._base_width = 0
+        # 글자가 커지면 라벨 최소 크기도 커져 창을 다시 줄일 수 없게 된다.
+        # 창 자체의 상·하한을 못 박아 그 되먹임을 끊는다.
+        self.setMinimumSize(80, 30)
+        self.setMaximumSize(1600, 1200)
         # 배경을 비워 라벨의 둥근 모서리가 창 모양이 되게 한다.
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setMouseTracking(True)
@@ -3111,35 +3115,18 @@ class DetachedClockWindow(QWidget):
         # 긴 국면 문구가 창 너비를 끌고 가지 않도록 줄바꿈을 허용한다.
         label.setWordWrap(True)
         self._owner._update_analysis_clock()
-        self.resize(self._content_width(label), label.heightForWidth(
-            self._content_width(label)))
-        self._base_height = max(60, self.height())
+        # 배율 기준은 "너비"다. 높이에 묶으면 글자가 커질수록 줄바꿈이 늘어
+        # 높이가 다시 커지는 되먹임으로 창이 무한히 커진다.
+        self._base_width = max(80, self._content_width(label))
         size = self._owner._settings.value("clock_window_size")
-        if isinstance(size, QSize) and size.isValid():
-            self.resize(size)
-        else:
-            width = self._content_width(label)
-            self.resize(width, max(60, label.heightForWidth(width)))
-        self._ratio = self.width() / max(1, self.height())
+        width = (size.width() if isinstance(size, QSize) and size.isValid()
+                 else self._base_width)
+        self.resize(min(1600, max(80, width)), self._base_width)
         self._apply_scale()
-        # 창을 띄우기 전에는 줄 수가 확정되지 않아 실제 표시 뒤 한 번 맞춘다.
-        self._fit_pending = not (isinstance(size, QSize) and size.isValid())
 
     def showEvent(self, event):
         super().showEvent(event)
-        if not self._fit_pending:
-            return
-        self._fit_pending = False
-        label = self._label()
-        if label is None:
-            return
-        # 내용 높이를 그대로 기준 높이로 삼아야 배율이 1.0로 유지된다.
-        # (기준을 그대로 두고 높이만 줄이면 글자가 작아지고 다시 높이가
-        #  줄어드는 되먹임이 생긴다.)
-        height = max(40, label.heightForWidth(self.width()))
-        self._base_height = height
-        self.resize(self.width(), height)
-        self._ratio = self.width() / max(1, height)
+        self._apply_scale()  # 표시 뒤 실제 줄 수로 높이를 다시 맞춘다
 
     def _content_width(self, label) -> int:
         """날짜·요일 줄 너비에 맞춘다. 국면 문구는 줄바꿈으로 흘린다."""
@@ -3181,10 +3168,11 @@ class DetachedClockWindow(QWidget):
             else Qt.CursorShape.SizeAllCursor)
         if self._resize_from is not None:
             origin, size = self._resize_from
-            width = max(80, size.width()
-                        + (event.globalPosition().toPoint() - origin).x())
-            # 정비율 유지: 가로만 받아 세로를 계산한다.
-            self.resize(width, max(30, int(round(width / (self._ratio or 1)))))
+            width = min(1600, max(80, size.width()
+                                  + (event.globalPosition().toPoint()
+                                     - origin).x()))
+            # 너비만 받고 높이는 내용이 정한다(정비율).
+            self.resize(width, self.height())
         elif self._drag_offset is not None:
             self.move(event.globalPosition().toPoint() - self._drag_offset)
 
@@ -3204,8 +3192,18 @@ class DetachedClockWindow(QWidget):
 
     def _apply_scale(self):
         """창 크기에 맞춰 시계 글자 크기를 다시 그린다."""
+        if self._applying:
+            return  # 글자 변경이 다시 크기 변경을 부르는 되먹임 차단
+        self._applying = True
+        try:
+            self._apply_scale_once()
+        finally:
+            self._applying = False
+
+    def _apply_scale_once(self):
         owner = self._owner
-        owner._clock_scale = self.height() / max(1, self._base_height)
+        owner._clock_scale = min(
+            8.0, max(0.4, self.width() / max(1, self._base_width)))
         # 국면 문구만 한 줄에 들어가도록 따로 줄여 세로가 늘지 않게 한다.
         text = getattr(owner, "_clock_phase_text", "")
         available = self.width() - 2 * (owner._clock_pad_x + 2) - 4
@@ -3219,6 +3217,12 @@ class DetachedClockWindow(QWidget):
                 base_px = max(7, int(base_px * available / needed))
         owner._clock_phase_px = base_px
         owner._update_analysis_clock()
+        label = self._label()
+        if label is not None:
+            # 높이는 내용이 정한다. 사용자가 조절하는 값은 너비뿐이다.
+            wanted = min(1200, max(30, label.heightForWidth(self.width())))
+            if abs(wanted - self.height()) > 1:
+                self.resize(self.width(), wanted)
 
     def _save_geo(self):
         self._owner._settings.setValue("clock_window_pos", self.pos())
