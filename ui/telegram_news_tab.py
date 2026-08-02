@@ -143,6 +143,7 @@ class TelegramPostDialog(QDialog):
             self._webview.setPage(QWebEnginePage(profile, self._webview))
         self._host_layout.addWidget(self._webview)
         self._webview.setZoomFactor(self._zoom)
+        self._webview.loadFinished.connect(self._embed_loaded)
         return self._webview
 
     def show_post(self, context: dict):
@@ -156,19 +157,32 @@ class TelegramPostDialog(QDialog):
         title = str(context.get("title") or "")
         self._header.setText(f"{channel} · {title}" if channel else title)
 
+        # 임베드는 네트워크를 타므로 저장된 본문을 먼저 띄워 대기 시간을 없앤다.
+        self._text.setPlainText(body)
+        self._text.show()
         webview = self._ensure_webview() if self._url else None
         if webview is not None:
+            self._host.show()
+            webview.hide()
+            self._header.setText(self._header.text() + "  · 원문 불러오는 중…")
             # 공식 임베드 주소만 로그인 없이 본문과 이미지를 그대로 보여준다.
             webview.setUrl(QUrl(f"{self._url}?embed=1&userpic=true"))
-            webview.show()
-            self._text.hide()
         else:
-            self._text.setPlainText(body)
-            self._text.show()
             self._host.hide()
         self.show()
         self.raise_()
         self.activateWindow()
+
+    def _embed_loaded(self, succeeded: bool):
+        """임베드가 다 뜨면 미리 보여주던 텍스트와 바꾼다."""
+        self._header.setText(self._header.text().replace(
+            "  · 원문 불러오는 중…", ""))
+        if not succeeded or self._webview is None:
+            return
+        if self._webview.url().toString() in ("", "about:blank"):
+            return
+        self._text.hide()
+        self._webview.show()
 
     def _open_article(self):
         if self._article_url:
