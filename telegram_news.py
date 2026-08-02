@@ -112,6 +112,12 @@ def _message_row(channel: str, title: str, message,
     else:
         published_at = datetime.now().astimezone().isoformat(timespec="seconds")
     codes, names = extract_stocks(text, name_index)
+    if header:
+        # 발행처(예: "대신증권 리서치")는 본문 서명에도 다시 나오므로 뺀다.
+        kept = [(code, name) for code, name in zip(codes, names.split(", "))
+                if name not in header]
+        codes = tuple(code for code, _ in kept)
+        names = ", ".join(name for _, name in kept)
     link_name = channel.lstrip("@")
     return {
         "channel": channel,
@@ -358,6 +364,16 @@ def _demo():
     assert row["channel_title"] == "대신증권 리서치", row
     assert row["title"] == "두산, 잘 사왔다", row
     assert row["stock_codes"] == ("000150",), row
+
+    # 본문 서명에 다시 나오는 발행처도 종목으로 잡지 않는다.
+    signed = type("M", (), {
+        "id": 11,
+        "message": "🟦 [대신증권 리서치]\n\n대덕전자: 2Q 호조\n\n[대신증권 이경연]",
+        "date": _Message.date,
+    })()
+    row = _message_row("@stockinfojji", "지지뉴스", signed,
+                       {"대신증권": "003540", "대덕전자": "353200"})
+    assert row["stock_names"] == "대덕전자", row
     assert _message_row("@c", "c", type("E", (), {
         "id": 1, "message": "", "date": None})(), index) is None
 
