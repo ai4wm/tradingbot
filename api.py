@@ -7,12 +7,55 @@ REST 호출은 초당 1건 rate limit (config.REST_RATE_LIMIT).
 import asyncio
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 
 import httpx
 
 import config
 
 log = logging.getLogger("api")
+
+KST = timezone(timedelta(hours=9))
+
+
+def _maintenance_datetime(value: str) -> datetime:
+    return datetime.strptime(value, "%Y-%m-%d %H:%M").replace(tzinfo=KST)
+
+
+def active_kiwoom_maintenance(
+        now: datetime | None = None) -> tuple[datetime, datetime] | None:
+    """현재 적용 중인 키움 공지 점검 구간(KST)을 반환한다."""
+    current = now or datetime.now(KST)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=KST)
+    else:
+        current = current.astimezone(KST)
+    for start_text, end_text in config.KIWOOM_MAINTENANCE_WINDOWS:
+        start = _maintenance_datetime(start_text)
+        end = _maintenance_datetime(end_text)
+        if start <= current < end:
+            return start, end
+    return None
+
+
+def format_kiwoom_maintenance(
+        window: tuple[datetime, datetime] | None = None) -> str:
+    """사용자 화면과 오류에 공통으로 쓰는 정확한 점검 기간 문구."""
+    start, end = window or active_kiwoom_maintenance() or (None, None)
+    if start is None or end is None:
+        return "키움 서비스 점검 중"
+    return (
+        "키움 서비스 점검 중 · "
+        f"{start:%Y-%m-%d %H:%M} ~ {end:%Y-%m-%d %H:%M}"
+    )
+
+
+class KiwoomServiceMaintenance(RuntimeError):
+    """공지된 점검 시간에 외부 요청을 시도했음을 알리는 로컬 예외."""
+
+    def __init__(self, window: tuple[datetime, datetime]):
+        self.start, self.end = window
+        super().__init__(format_kiwoom_maintenance(window))
 
 # 거래대금상위 등에서 ETF/ETN 제외용 발행사 접두(레버리지/인버스가 상위 독식).
 # 일반주 종목명과 충돌하지 않는 브랜드만(예: '파워'는 파워로직스와 충돌 -> 제외).
@@ -68,6 +111,10 @@ class TokenManager:
     async def token(self) -> str:
         import time
         async with self._lock:
+            maintenance = active_kiwoom_maintenance()
+            if maintenance is not None:
+                # 공지된 종료 시각 전에는 토큰 서버에 요청 자체를 보내지 않는다.
+                raise KiwoomServiceMaintenance(maintenance)
             if not self._token or time.time() > self._expires_at - 600:  # 10분 전
                 await self._issue()
             return self._token
@@ -251,6 +298,7 @@ class RestClient:
             out.append({
                 **e,
                 "code": code,
+                "_real_suffix": real_suffix,
                 "name": _stock_name(code, r.get("stk_nm", "")),
                 "price": abs(_to_int(r.get("cur_prc"))),   # 부호 포함 -> abs
                 "rate": _to_float(r.get("flu_rt")),        # 등락율 (부호 유지: 색)

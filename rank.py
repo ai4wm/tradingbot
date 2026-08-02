@@ -55,6 +55,10 @@ TONES = {  # (주파수Hz, 길이ms) 나열 -> 멜로디. 시스템 테마 무�
     "balance1": [(880, 180), (880, 180)],  # 잔량 1단계: 주의
     "balance2": [(880, 180), (880, 180)],
     "balance3": [(880, 180), (880, 180)],
+    "ls_news": [(784, 120), (988, 220)],  # 이전 일반 뉴스 호출 호환용
+    "ls_news_with_code": [(988, 120), (1319, 220)],
+    "ls_news_without_code": [(784, 120), (988, 220)],
+    "naver_news": [(1047, 120), (1397, 120), (1760, 240)],
 }
 
 
@@ -94,6 +98,10 @@ KIWOOM_ALERT_FILES = {
     "balance1": Path(r"C:\KiwoomHero4\sound\sound7.wav"),
     "balance2": Path(r"C:\KiwoomHero4\sound\주문접수완료1.wav"),
     "balance3": Path(r"C:\KiwoomHero4\sound\주문접수완료1.wav"),
+    "ls_news": Path(r"C:\KiwoomHero4\sound\sound11.wav"),
+    "ls_news_with_code": Path(r"C:\KiwoomHero4\sound\sound8.wav"),
+    "ls_news_without_code": Path(r"C:\KiwoomHero4\sound\sound11.wav"),
+    "naver_news": Path(r"C:\KiwoomHero4\sound\sound12.wav"),
 }
 
 

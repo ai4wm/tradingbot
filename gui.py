@@ -50,6 +50,7 @@ TIME_COL = FIELDS.index("time")
 VOLUME_COL = FIELDS.index("vol")
 BID_QTY_COL = FIELDS.index("bid_qty")
 MINUTE_VALUE_COL = FIELDS.index("minute_value")
+MINUTE_VALUE_DISPLAY_STEP = 10_000_000  # 화면의 0.1억원과 정렬 구간을 일치시킨다.
 NON_LIMIT_IGNORED_SORT_COLS = {TIME_COL, BID_QTY_COL}
 STREAK_COL = FIELDS.index("streak")
 MCAP_COL = FIELDS.index("mcap")
@@ -404,6 +405,12 @@ def _in_opening_auction() -> bool:
     return "0830" <= time.strftime("%H%M") < "0900"
 
 
+def _minute_value_display_bucket(value) -> int:
+    """대금/분 화면 표시와 정렬이 함께 사용할 0.1억원 단위 값."""
+    raw = max(0, int(value or 0))
+    return (raw + MINUTE_VALUE_DISPLAY_STEP // 2) // MINUTE_VALUE_DISPLAY_STEP
+
+
 def _limit_tier(d: dict, opening_auction: bool = False) -> int:
     """상한가정렬 우선순위.
 
@@ -713,6 +720,19 @@ class TieredProxy(QSortFilterProxyModel):
                     return super().lessThan(fallback_right, fallback_left)
                 return super().lessThan(fallback_left, fallback_right)
             # 같은 우선순위 그룹끼리: 현재 정렬컬럼으로 일반 비교
+        if left.column() == MINUTE_VALUE_COL:
+            # 화면에는 0.1억원 단위로 보이는데 원 단위로 정렬하면 같은 숫자로
+            # 보이는 두 행이 체결마다 자리를 바꾼다. 표시 구간으로 비교하고,
+            # 같은 구간은 편입 순서로 고정해 순위가 흔들리지 않게 한다.
+            left_bucket = _minute_value_display_bucket(
+                left.data(Qt.UserRole))
+            right_bucket = _minute_value_display_bucket(
+                right.data(Qt.UserRole))
+            if left_bucket != right_bucket:
+                return left_bucket < right_bucket
+            if self.sortOrder() == Qt.DescendingOrder:
+                return left.row() > right.row()
+            return left.row() < right.row()
         return super().lessThan(left, right)
 
 
@@ -808,6 +828,8 @@ class StockModel(QAbstractTableModel):
         self.ticks: dict[str, deque] = {}    # (체결시각, 부호있는 개별체결량, 체결가) 최근 60초
         self.minute_value_ticks: dict[str, deque] = {}  # (체결시각, 체결대금) 최근 60초
         self._minute_volume_ready: set[str] = set()  # 누적거래량 최초 기준점 확보 종목
+        self._minute_volume_source: dict[str, str] = {}  # 종목별 KRX/NXT/통합 누적값 출처
+        self._minute_volume_day: dict[str, str] = {}  # 날짜가 바뀔 때만 누적값 기준 초기화
         self.quotes: dict[str, deque] = {}   # (시각, 1~5호가 (매도/매수 가격·잔량)) 최근 15초
         self.prediction_history: dict[str, deque] = {}  # 최근 5분 1초 체결 요약
         self.program_history: dict[str, deque] = {}  # 최근 5분 0w 매수/매도수량 차분
@@ -869,6 +891,8 @@ class StockModel(QAbstractTableModel):
         self.ticks.pop(code, None)
         self.minute_value_ticks.pop(code, None)
         self._minute_volume_ready.discard(code)
+        self._minute_volume_source.pop(code, None)
+        self._minute_volume_day.pop(code, None)
         self.quotes.pop(code, None)
         self.prediction_history.pop(code, None)
         self.program_history.pop(code, None)
@@ -961,6 +985,10 @@ class StockModel(QAbstractTableModel):
         stored = self.rows[code]
         tick_qty = fields.get("tick_qty")  # STORED 필터 전에 보존: +매수체결 / -매도체결
         real_type = str(fields.get("_real_type") or "")
+        volume_source = (
+            str(fields.get("_real_suffix") or "")
+            if "_real_suffix" in fields else None
+        )
         volume_in_fields = "vol" in fields
         if ("program_buy_qty" in fields and "program_sell_qty" in fields):
             self._ingest_program(
@@ -988,16 +1016,48 @@ class StockModel(QAbstractTableModel):
             self._exp_live.discard(code)  # 체결 재개 = 국면 종료 (단일가 종목은 유지)
             fields["exp_price"], fields["exp_qty"] = 0, 0
             log.info("expOFF %s vol", code)
-        dvol = fields.get("vol", 0) - stored["vol"]  # FID 15가 없을 때 체결 틱 폴백
         volume_ready = code in self._minute_volume_ready
+        stale_volume = False
         if volume_in_fields:
-            if fields.get("vol", 0) < stored["vol"]:
-                # 장/시세출처가 바뀌어 누적거래량이 초기화되면 이전 창도 함께 비운다.
+            fields["vol"] = max(0, int(fields.get("vol") or 0))
+            volume_day = time.strftime("%Y%m%d")
+            previous_source = self._minute_volume_source.get(code)
+            source_changed = (
+                volume_source is not None
+                and previous_source is not None
+                and volume_source != previous_source
+            )
+            day_changed = (
+                code in self._minute_volume_day
+                and self._minute_volume_day[code] != volume_day
+            )
+            if source_changed or day_changed:
+                # 사용자가 KRX/NXT/통합 시세를 실제로 바꾸거나 날짜가 바뀐
+                # 경우에만 새 누적거래량 기준을 잡는다.
                 self.minute_value_ticks.pop(code, None)
                 fields["minute_value"] = 0
                 volume_ready = False
-            self._minute_volume_ready.add(code)
-        ticked = tick_qty not in (None, 0) or dvol > 0
+            elif fields["vol"] < stored["vol"]:
+                # REST 백필이나 순서가 뒤바뀐 실시간 패킷은 최신 누적거래량보다
+                # 작을 수 있다. 이를 출처 초기화로 오인해 최근 60초 기록을
+                # 지우지 말고, 해당 누적값과 체결량만 무시한다.
+                log.debug(
+                    "stale cumulative volume ignored %s incoming=%d current=%d",
+                    code, fields["vol"], stored["vol"])
+                fields.pop("vol")
+                volume_in_fields = False
+                stale_volume = True
+            if volume_source is not None:
+                self._minute_volume_source[code] = volume_source
+            self._minute_volume_day[code] = volume_day
+            if volume_in_fields:
+                self._minute_volume_ready.add(code)
+        dvol = (
+            fields["vol"] - stored["vol"]
+            if volume_in_fields else 0
+        )  # FID 15가 없을 때 체결 틱 폴백
+        effective_tick_qty = 0 if stale_volume else tick_qty
+        ticked = effective_tick_qty not in (None, 0) or dvol > 0
         quote_changed = any(f in fields for f in BOOK_FIELDS)
         if quote_changed:
             levels = []
@@ -1017,7 +1077,7 @@ class StockModel(QAbstractTableModel):
         if ticked:
             dq = self.ticks.setdefault(code, deque())
             now = time.monotonic()
-            qty = int(tick_qty or 0)
+            qty = int(effective_tick_qty or 0)
             price = int(fields.get("price", stored["price"]))
             dq.append((now, qty, price))
             while dq and dq[0][0] < now - 60:
@@ -1728,7 +1788,8 @@ class StockModel(QAbstractTableModel):
         if field == "minute_value":
             value = max(0, int(stored.get(field) or 0))
             if role == Qt.DisplayRole:
-                return f"{value / 100_000_000:,.1f}억" if value else ""
+                display_bucket = _minute_value_display_bucket(value)
+                return f"{display_bucket / 10:,.1f}억" if value else ""
             if role == Qt.UserRole:
                 return value
             if role == Qt.TextAlignmentRole:
@@ -2225,6 +2286,7 @@ class ConditionScreen(QWidget):
     watch_toggled = Signal(str, bool)
     analysis_stock_requested = Signal(str)
     market_overview_requested = Signal()
+    realtime_news_requested = Signal()
 
     def __init__(self, prefix: str = "", parent=None):
         super().__init__(parent)
@@ -2287,12 +2349,27 @@ class ConditionScreen(QWidget):
         self.rank_btn = QPushButton("순위")
         self.rank_btn.setToolTip("실시간 종목조회순위 [0198] 창 열기/닫기")
         self.rank_btn.setFixedWidth(44)
+        self.news_btn = QPushButton("뉴스")
+        self.news_btn.setToolTip(
+            "분석창을 열고 LS증권 실시간 뉴스 탭으로 이동")
+        self.news_btn.setFixedWidth(44)
+        self.news_btn.clicked.connect(self.realtime_news_requested.emit)
         self.newwin_btn = QPushButton("창+")
         self.newwin_btn.setToolTip("조건검색 창 하나 더 열기 (다른 조건식 동시 감시)")
         self.newwin_btn.setFixedWidth(44)
         self.ip_label = QLabel()  # 공인 IP (App이 메인창만 채움). IP 바뀌면 빨강 강조
         self.ip_label.setVisible(False)
-        self.count_label = QLabel("종목수: 0")
+        self.count_label = QLabel()
+        self.count_label.setTextFormat(Qt.TextFormat.RichText)
+        self._update_count()
+        self.font_size_combo = QComboBox()
+        for font_size in (9, 10, 11, 12):
+            self.font_size_combo.addItem(str(font_size), font_size)
+        self.font_size_combo.setCurrentIndex(
+            self.font_size_combo.findData(10))
+        self.font_size_combo.setFixedWidth(68)
+        self.font_size_combo.setToolTip(
+            "앱 전체 기본 글자 크기 — 뉴스 본문 크기는 본문 창의 A−/A+로 별도 조절")
         self.theme_btn = QPushButton("🖥")  # 시스템/다크/라이트 앱 전체 테마 순환 (메인창만 배선)
         self.theme_btn.setFixedWidth(32)
         self.theme_btn.setToolTip("테마: 시스템")
@@ -2314,10 +2391,12 @@ class ConditionScreen(QWidget):
         top.addWidget(self.theme_sort)
         top.addWidget(self.unified_check)
         top.addWidget(self.rank_btn)
+        top.addWidget(self.news_btn)
         top.addWidget(self.newwin_btn)
         top.addStretch(1)  # 남는 공간은 오른쪽으로
         top.addWidget(self.ip_label)
         top.addWidget(self.count_label)
+        top.addWidget(self.font_size_combo)
         top.addWidget(self.theme_btn)
         top.addWidget(self.on_top_btn)  # 오른쪽 끝 = 창 크롬(핀) 자리
 
@@ -2510,7 +2589,7 @@ class ConditionScreen(QWidget):
         # 틱이 200ms보다 자주 오는 장중엔 계속 리셋돼 영영 안 불림 = 재정렬 멈춤 버그).
         self._resort_timer = QTimer(self)
         self._resort_timer.setSingleShot(True)
-        self._resort_timer.timeout.connect(self.proxy.invalidate)
+        self._resort_timer.timeout.connect(self._resort_proxy)
         self.model.dataChanged.connect(self._on_data_changed)
         self.model.rowsInserted.connect(self._on_data_changed)
         self.model.rowsRemoved.connect(self._on_data_changed)
@@ -3063,7 +3142,19 @@ class ConditionScreen(QWidget):
             self._resort_timer.start(200)
 
     def _update_count(self):
-        self.count_label.setText(f"종목수: {self.model.rowCount()}")
+        is_dark = self.palette().window().color().lightness() < 128
+        number_color = "#72D7FF" if is_dark else "#0057A8"
+        self.count_label.setText(
+            "종목수: "
+            f"<span style='color:{number_color}; font-weight:700;'>"
+            f"{self.model.rowCount()}</span>")
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if hasattr(self, "count_label") and event.type() in (
+                QEvent.Type.PaletteChange,
+                QEvent.Type.ApplicationPaletteChange):
+            self._update_count()
 
     def _save_layout(self):
         header = self.table.horizontalHeader()
@@ -3301,6 +3392,11 @@ class ConditionScreen(QWidget):
             or self.theme_sort.isChecked()
         )
         self.proxy.setDynamicSortFilter(not throttled)
+
+    def _resort_proxy(self):
+        """스로틀 시간이 끝나면 현재 열과 방향으로 정렬을 확실히 다시 적용한다."""
+        self.proxy.invalidate()
+        self._apply_sort()
 
     def _apply_sort(self):
         self._sync_dynamic_sort_mode()

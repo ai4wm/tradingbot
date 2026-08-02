@@ -5,6 +5,8 @@
 '창+' 버튼으로 독립 조건검색 창 추가(조건별 동시 감시, 시세 REG는 참조수 공유)."""
 import asyncio
 import ctypes
+import html
+import json
 import logging
 import math
 import os
@@ -22,12 +24,15 @@ from PySide6.QtCore import (
     QAbstractNativeEventFilter, QDate, QPoint, QRect, QSettings, QSize, Qt,
     QTimer, QUrl, QUrlQuery, Signal,
 )
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QPainter, QPalette, QPen
+from PySide6.QtGui import (
+    QColor, QDesktopServices, QFont, QKeySequence, QPainter, QPalette, QPen,
+    QShortcut, QTextCursor,
+)
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDateEdit, QDialog, QFormLayout,
     QGridLayout, QHBoxLayout, QLabel, QMainWindow, QLineEdit, QMessageBox, QProgressBar,
-    QHeaderView, QPushButton, QSplitter, QTableWidget, QTableWidgetItem, QTabWidget,
-    QVBoxLayout, QWidget,
+    QHeaderView, QPushButton, QSplitter, QTableWidget, QTextBrowser,
+    QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from analysis_db import (
@@ -58,6 +63,12 @@ from analysis_db import (
     resolve_analysis_stock, realtime_watch_codes, set_realtime_watch,
     realtime_watch_rows, save_news_items, reconcile_news_search_results,
     news_rows, log_content_request, news_request_count_today,
+    save_ls_realtime_news, ls_realtime_news_rows, search_ls_realtime_news,
+    parse_ls_news_search_query,
+    ls_realtime_news_detail,
+    update_ls_realtime_news_source, update_ls_realtime_news_detail,
+    update_ls_realtime_news_original_url,
+    split_ls_news_stock_codes,
     save_condition_snapshot, save_condition_snapshot_quotes,
     save_condition_theme_stats, active_theme_labels,
     recent_condition_snapshots, condition_theme_stats,
@@ -65,13 +76,24 @@ from analysis_db import (
     save_condition_theme_members, condition_theme_members,
     save_next_day_candidates, next_day_candidate_rows,
 )
-from api import RestClient
+from api import (
+    KST, RestClient,
+    active_kiwoom_maintenance, format_kiwoom_maintenance,
+)
 from classification_api import ClassificationClient
 from dart_api import DartClient
 from krx_api import KrxClient
 from naver_news_api import NaverNewsClient
 from global_market_api import GlobalMarketClient
 from gui import BALANCE_SELL_COL, ConditionScreen, PURPLE
+from ls_news_ws import (
+    LSNewsItem, LSNewsStream, NEWS_SOURCE_DOMAINS, NEWS_SOURCE_NAMES,
+    format_news_time,
+    extract_news_links, format_news_body, infer_news_original_url,
+    infer_news_source,
+    news_source_from_url, normalize_news_title, source_label,
+)
+from ls_news_server_sync import LSNewsServerSync
 from order import OrderEngine, split_quantity
 from rank import RankScreen, _beep
 from ws import WSClient
@@ -107,7 +129,74 @@ log = logging.getLogger("main")
 audit_log = logging.getLogger("trade.audit")
 audit_log.setLevel(logging.INFO)
 
-
+LS_NEWS_VISIBLE_LIMIT = 500
+LS_NEWS_NEW_ROLE = Qt.ItemDataRole.UserRole + 40
+LS_NEWS_NEW_TIME_BACKGROUND = "#31566D"
+LS_NEWS_NEW_TITLE_BACKGROUND = "#31566D"
+LS_NEWS_NEW_TIME_FOREGROUND = "#E7F6FF"
+LS_NEWS_NEW_TITLE_FOREGROUND = "#FFFFFF"
+LS_NEWS_REUTERS_ORIGINAL_LABELS = frozenset({
+    "원문바로가기",
+    "원문보기",
+})
+LS_NEWS_SOURCE_SEARCH_ENDPOINTS = {
+    "연합뉴스": ("https://www.yna.co.kr/search/index", "query"),
+    "한국거래소": (
+        "https://open.krx.co.kr/contents/COM/SearchMain.jsp"
+        "?headerSearchType=all",
+        "headerSearchWord",
+    ),
+    "이데일리": ("https://www.edaily.co.kr/search/news/", "keyword"),
+    "머니투데이": ("https://www.mt.co.kr/search", "keyword"),
+    "아시아경제": ("https://www.asiae.co.kr/search/index.htm", "kwd"),
+    "뉴스핌": ("https://www.newspim.com/search", "searchword"),
+    "매일경제": ("https://www.mk.co.kr/search", "word"),
+    "한국경제": ("https://search.hankyung.com/search/news", "query"),
+    "데이터투자": ("https://www.datatooza.com/search.php", "sn"),
+    "인포스탁": (
+        "https://www.infostockdaily.co.kr/news/searchForm.html", "sc_word"),
+    "팜뉴스": (
+        "https://www.pharmnews.com/news/articleList.html", "sc_word"),
+    "연합인포맥스": (
+        "https://news.einfomax.co.kr/news/articleList.html"
+        "?sc_area=A&view_type=sm",
+        "sc_word",
+    ),
+    "코리아헤럴드": ("https://www.koreaherald.com/search", "q"),
+    "뉴스웨이": ("https://www.newsway.co.kr/search", "q"),
+    "헤럴드경제": ("https://biz.heraldcorp.com/search", "q"),
+    "파이낸셜뉴스": ("https://www.fnnews.com/search", "search_txt"),
+    "이투데이": ("https://www.etoday.co.kr/search/", "keyword"),
+    "조선비즈": (
+        "https://biz.chosun.com/nsearch/"
+        "?siteid=chosunbiz&website=chosunbiz&opt_chk=true",
+        "query",
+    ),
+    "서울경제": (
+        "https://www.sedaily.com/search?v1=20260722", "word"),
+}
+LS_NEWS_SOURCE_SEARCH_HOST_NAMES = {
+    "www.yna.co.kr": "연합뉴스",
+    "open.krx.co.kr": "한국거래소",
+    "www.edaily.co.kr": "이데일리",
+    "www.mt.co.kr": "머니투데이",
+    "www.asiae.co.kr": "아시아경제",
+    "www.newspim.com": "뉴스핌",
+    "www.mk.co.kr": "매일경제",
+    "search.hankyung.com": "한국경제",
+    "www.datatooza.com": "데이터투자",
+    "www.infostockdaily.co.kr": "인포스탁",
+    "www.pharmnews.com": "팜뉴스",
+    "news.einfomax.co.kr": "연합인포맥스",
+    "www.koreaherald.com": "코리아헤럴드",
+    "www.newsway.co.kr": "뉴스웨이",
+    "biz.heraldcorp.com": "헤럴드경제",
+    "www.reuters.com": "로이터",
+    "www.fnnews.com": "파이낸셜뉴스",
+    "www.etoday.co.kr": "이투데이",
+    "biz.chosun.com": "조선비즈",
+    "www.sedaily.com": "서울경제",
+}
 def _is_process_admin() -> bool:
     if sys.platform != "win32":
         return False
@@ -230,6 +319,10 @@ THEME_UI = {
     "dark": ("🌙", "테마: 다크 — 클릭하면 라이트"),
     "light": ("☀", "테마: 라이트 — 클릭하면 시스템"),
 }
+APP_FONT_FAMILY = "굴림체"
+APP_FONT_SIZES = (9, 10, 11, 12)
+DEFAULT_APP_FONT_SIZE = 10
+APP_FONT_SIZE_KEY = "ui_font_size"
 NEWS_WEB_AUTO_RELOAD_PATHS = {
     "/item/board.naver",  # 종목토론 목록
     "/item/news.naver",   # 종목뉴스 목록
@@ -463,6 +556,20 @@ def _apply_theme(app: QApplication, mode: str):
     scheme = {"dark": Qt.ColorScheme.Dark, "light": Qt.ColorScheme.Light}.get(
         mode, Qt.ColorScheme.Unknown)
     app.styleHints().setColorScheme(scheme)
+
+
+def _normalize_app_font_size(value) -> int:
+    try:
+        size = int(float(value))
+    except (TypeError, ValueError):
+        return DEFAULT_APP_FONT_SIZE
+    return size if size in APP_FONT_SIZES else DEFAULT_APP_FONT_SIZE
+
+
+def _apply_app_font(app: QApplication, size: int):
+    font = QFont(APP_FONT_FAMILY, _normalize_app_font_size(size))
+    font.setStyleStrategy(QFont.PreferAntialias)
+    app.setFont(font)
 
 
 def _start_title_clock(win: QMainWindow, title: str, suffix: str = ""):
@@ -893,6 +1000,11 @@ class App:
         # 장중 조건검색값이나 시작 직후 자동 보완으로 종가를 확정하지 않는다.
         # 공인 IP 감시: 바뀌면 키움 화이트리스트에서 벗어나 API 차단 -> 상단바 경보
         self._public_ip = None
+        self._ls_news_startup_sync_task = None
+        self.ws_task = None
+        self._kiwoom_started = False
+        self._kiwoom_wait_task = None
+        self._title_suffix_before_maintenance = None
         self._ip_task = None
         self._ip_timer = QTimer()
         self._ip_timer.timeout.connect(
@@ -912,6 +1024,12 @@ class App:
             self.ws.condition_stex_tp = "A"
             screen.unified_check.setChecked(True)  # toggled 연결 전 = 시각 상태만
         screen.unified_check.toggled.connect(self._on_unified)
+        self._font_size = _normalize_app_font_size(
+            self._settings.value(APP_FONT_SIZE_KEY, DEFAULT_APP_FONT_SIZE))
+        font_index = screen.font_size_combo.findData(self._font_size)
+        screen.font_size_combo.setCurrentIndex(max(0, font_index))
+        screen.font_size_combo.activated.connect(
+            self._on_font_size_selected)
         screen.theme_btn.clicked.connect(self._cycle_theme)
         self._sync_theme_button()
         self._wire_common(screen)
@@ -931,9 +1049,20 @@ class App:
         self._settings.sync()
         self._sync_theme_button()
 
+    def _on_font_size_selected(self, index: int):
+        size = _normalize_app_font_size(
+            self.views[0].screen.font_size_combo.itemData(index))
+        if size == self._font_size:
+            return
+        self._font_size = size
+        _apply_app_font(QApplication.instance(), size)
+        self._settings.setValue(APP_FONT_SIZE_KEY, size)
+        self._settings.sync()
+
     def _wire_common(self, screen: ConditionScreen):
         screen.reload_btn.clicked.connect(self._reload_conditions)
         screen.rank_btn.clicked.connect(self._on_rank)
+        screen.realtime_news_requested.connect(self._open_realtime_news)
         screen.newwin_btn.clicked.connect(self._on_newwin)
         screen.order_target_selected.connect(
             lambda code, price, target=screen:
@@ -1023,6 +1152,15 @@ class App:
         analysis.show()
         analysis.raise_()
         analysis.activateWindow()
+
+    def _open_realtime_news(self):
+        """본창 뉴스 버튼에서 분석창의 LS 실시간 뉴스 탭을 바로 연다."""
+        analysis = self._ensure_analysis_window()
+        analysis.open_ls_realtime_news()
+        analysis.show()
+        analysis.raise_()
+        analysis.activateWindow()
+        QTimer.singleShot(0, analysis._ensure_titlebar_visible)
 
     def _refresh_market_overview(self):
         """DB 최신 국내지수·외국인 수급을 모든 조건검색창에 표시한다."""
@@ -1127,6 +1265,8 @@ class App:
             return
         for view in self.views:
             view.screen.model.set_watched_codes(watched)
+        if self._analysis is not None:
+            self._analysis._sync_ls_news_watched_codes(watched)
 
     def _toggle_realtime_watch(
             self, screen: ConditionScreen, code: str, enabled: bool):
@@ -1420,6 +1560,10 @@ class App:
             v._schedule_refresh()
 
     async def _check_ip(self):
+        maintenance = active_kiwoom_maintenance()
+        if maintenance is not None:
+            self._pause_for_kiwoom_maintenance(maintenance)
+            return
         try:
             ip = await self.rest.public_ip()
         except Exception as e:  # noqa: BLE001 - 외부 서비스 실패는 무시(다음 주기 재시도)
@@ -1439,12 +1583,79 @@ class App:
             log.warning("public IP changed -> %s (키움 화이트리스트 재등록 필요)", ip)
             _beep("jump")  # 초고음 3연타 경보
 
-    async def start(self):
+    def _start_ls_news_gap_sync(self):
+        """분석창을 열지 않은 시작에서도 서버 누락 뉴스를 백그라운드 저장한다."""
+        if (
+            self._ls_news_startup_sync_task is not None
+            and not self._ls_news_startup_sync_task.done()
+        ):
+            return
+        self._ls_news_startup_sync_task = asyncio.create_task(
+            self._sync_ls_news_gap_on_startup())
+
+    async def _sync_ls_news_gap_on_startup(self):
+        try:
+            result = await LSNewsServerSync().sync()
+            if result.get("status") != "disabled":
+                log.info(
+                    "LS server startup sync: checked=%s inserted=%s "
+                    "duplicates=%s cursor=%s/%s",
+                    result["processed"], result["inserted"],
+                    result["updated"], result["cursor"],
+                    result["upper_id"],
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - 실시간 앱 시작은 계속한다.
+            log.warning("LS server startup sync failed: %s", error)
+        finally:
+            self._ls_news_startup_sync_task = None
+
+    def _pause_for_kiwoom_maintenance(self, window):
+        """공지 점검 중에는 키움 연결을 끊고 종료 시각까지 한 번만 기다린다."""
+        win = self.views[0].screen.window()
+        if self._title_suffix_before_maintenance is None:
+            self._title_suffix_before_maintenance = getattr(
+                win, "_title_clock_suffix", "")
+        win._title_clock_suffix = ""
+        _set_title_clock_base(
+            win, f"⚠ {format_kiwoom_maintenance(window)}")
+
+        if self.ws_task is not None and not self.ws_task.done():
+            self.ws_task.cancel()
+        self.ws_task = None
+        self._kiwoom_started = False
+
+        if self._kiwoom_wait_task is None or self._kiwoom_wait_task.done():
+            self._kiwoom_wait_task = asyncio.create_task(
+                self._resume_kiwoom_after_maintenance(window[1]))
+            log.warning(
+                "%s; no token/REST/WebSocket request until announced end",
+                format_kiwoom_maintenance(window))
+
+    async def _resume_kiwoom_after_maintenance(self, end: datetime):
+        """공지 종료 시각까지 1회 대기한 뒤 키움 연결을 시작한다."""
+        delay = max(0.0, (end - datetime.now(KST)).total_seconds())
+        await asyncio.sleep(delay)
+        self._kiwoom_wait_task = None
+
+        # 타이틀을 정상 상태로 되돌린 뒤 딱 한 번 연결한다.
+        win = self.views[0].screen.window()
+        win._title_clock_suffix = self._title_suffix_before_maintenance or ""
+        self._title_suffix_before_maintenance = None
+        _set_title_clock_base(win, "[0156] 조건검색실시간")
+        await self._start_kiwoom_services()
+
+    async def _start_kiwoom_services(self):
+        if self._kiwoom_started:
+            return
+        maintenance = active_kiwoom_maintenance()
+        if maintenance is not None:
+            self._pause_for_kiwoom_maintenance(maintenance)
+            return
+        self._kiwoom_started = True
         asyncio.ensure_future(self._check_ip())  # 시작 즉시 IP 표시
         self.ws_task = asyncio.create_task(self.ws.run(self.rest.tokens.token))
-        for _ in range(int(self._settings.value("cond_windows", 0))):
-            self._open_window()  # 지난 세션의 추가 창 복원
-        self._restore_session_windows()
         try:
             self._account_summary = await self.rest.account_summary()
             for v in self.views:
@@ -1476,6 +1687,20 @@ class App:
                      ",".join(f"{c}={n}" for c, (n, _) in self._limit_cnt.items()))
         except Exception as e:  # noqa: BLE001
             log.warning("limit_counts failed: %s", e)
+
+    async def start(self):
+        for _ in range(int(self._settings.value("cond_windows", 0))):
+            self._open_window()  # 지난 세션의 추가 창 복원
+        self._restore_session_windows()
+        # 분석창이 복원된 경우에는 LS 웹소켓 연결 완료 콜백이 먼저 동기화한다.
+        # 분석창이 닫혀 있으면 서버 DB 보완만 즉시 백그라운드에서 시작한다.
+        if self._analysis is None:
+            self._start_ls_news_gap_sync()
+        maintenance = active_kiwoom_maintenance()
+        if maintenance is not None:
+            self._pause_for_kiwoom_maintenance(maintenance)
+            return
+        await self._start_kiwoom_services()
 
     def _restore_session_windows(self):
         """정상 종료 직전에 보이던 분석·순위창을 다시 연다."""
@@ -1964,7 +2189,9 @@ class App:
                 v.on_snapshot(codes)
 
     def _on_real(self, code: str, fields: dict):
-        source = fields.pop("_real_suffix", None)
+        # 모델도 누적거래량의 KRX/NXT/통합 출처를 알아야 늦은 REST 값과
+        # 사용자가 실제로 시장을 전환한 경우를 구분할 수 있다.
+        source = fields.get("_real_suffix", None)
         for v in self.views:
             expected = "_NX" if v.seq == NXT_RATE_SEQ else self.ws.real_suffix
             # REST/내부 갱신(source=None)은 기존처럼 전달하고, 웹소켓은 시장 출처가 맞는 창에만 전달.
@@ -2659,7 +2886,9 @@ class App:
         screen.global_hotkeys = True
         screen.newwin_btn.setVisible(False)  # 추가 창에선 창+/순위/통합 숨김 (메인창에서만)
         screen.rank_btn.setVisible(False)
+        screen.news_btn.setVisible(False)
         screen.unified_check.setVisible(False)  # 통합 시세는 전 창 공통 -> 메인창에서만 전환
+        screen.font_size_combo.setVisible(False)  # 글자 크기는 앱 전체 공통 -> 메인창에서만 전환
         screen.theme_btn.setVisible(False)  # 테마는 앱 전체 공통 -> 메인창에서만 전환
         win = ConditionWindow(prefix, on_close=self._on_window_closed)
         _start_title_clock(win, f"[0156-{n}] 조건검색실시간")
@@ -2929,6 +3158,384 @@ class RotationCycleWidget(QWidget):
                                  str(row.get("trade_date") or "")[-4:])
 
 
+class LatestLSNewsLabel(QLabel):
+    """분석창 상단에 최신 실시간 뉴스 제목 한 줄을 표시한다."""
+
+    clicked = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._headline = ""
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setWordWrap(False)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_headline(self, headline: str):
+        self._headline = " ".join(str(headline or "").split())
+        self.setToolTip(
+            f"{self._headline}\n\n클릭: 해당 뉴스 열기")
+        self._refresh_text()
+
+    def _refresh_text(self):
+        available_width = max(0, self.contentsRect().width() - 8)
+        visible_text = self.fontMetrics().elidedText(
+            self._headline,
+            Qt.TextElideMode.ElideRight,
+            available_width,
+        )
+        super().setText(visible_text)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._refresh_text()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
+class LSNewsDetailDialog(QDialog):
+    """LS 뉴스 제목에서 여는 비모달 본문 상세창."""
+
+    refresh_requested = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._original_url = ""
+        self._original_search_url = ""
+        self._body_plain = ""
+        self._body_links = ()
+        self._settings = QSettings("layout.ini", QSettings.IniFormat)
+        try:
+            saved_font_size = float(self._settings.value(
+                "analysis_ls_news_body_font_size", 11.0))
+        except (TypeError, ValueError):
+            saved_font_size = 11.0
+        self._body_font_size = min(18.0, max(8.0, saved_font_size))
+        self.setWindowTitle("LS 뉴스 본문")
+        self.setWindowModality(Qt.WindowModality.NonModal)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.resize(980, 720)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(8)
+        self._title_label = QLabel()
+        self._title_label.setTextFormat(Qt.TextFormat.PlainText)
+        self._title_label.setWordWrap(True)
+        self._title_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._title_label.setStyleSheet(
+            "QLabel { font-family: '맑은 고딕'; font-size: 20px; "
+            "font-weight: 800; line-height: 140%; }")
+        layout.addWidget(self._title_label)
+
+        self._meta_label = QLabel()
+        self._meta_label.setTextFormat(Qt.TextFormat.PlainText)
+        self._meta_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._meta_label.setStyleSheet("QLabel { color: #AEB8C4; }")
+        layout.addWidget(self._meta_label)
+
+        self._stocks_label = QLabel()
+        self._stocks_label.setTextFormat(Qt.TextFormat.PlainText)
+        self._stocks_label.setWordWrap(True)
+        self._stocks_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._stocks_label.setStyleSheet("QLabel { color: #8ED6FF; }")
+        layout.addWidget(self._stocks_label)
+
+        self._status_label = QLabel("본문 확인 중…")
+        self._status_label.setTextFormat(Qt.TextFormat.PlainText)
+        self._status_label.setStyleSheet(
+            "QLabel { color: #D5A33D; font-weight: 700; }")
+        layout.addWidget(self._status_label)
+
+        self._body_edit = QTextBrowser()
+        self._body_edit.setOpenLinks(False)
+        self._body_edit.setOpenExternalLinks(False)
+        self._body_edit.anchorClicked.connect(self._open_news_link)
+        self._body_edit.highlighted.connect(
+            lambda url: self._body_edit.setToolTip(url.toString()))
+        self._body_edit.setPlaceholderText("본문 내용이 없습니다.")
+        self._body_edit.document().setDefaultFont(QFont("맑은 고딕", 11))
+        self._body_edit.setStyleSheet(
+            "QTextBrowser { background-color: #242424; color: #ECEFF4; "
+            "border: 1px solid #484848; border-radius: 6px; }"
+            "QTextBrowser:focus { border-color: #B75AD8; }"
+        )
+        layout.addWidget(self._body_edit, 1)
+
+        buttons = QHBoxLayout()
+        self._refresh_button = QPushButton("본문 다시 불러오기")
+        self._refresh_button.clicked.connect(self.refresh_requested.emit)
+        self._smaller_button = QPushButton("A−")
+        self._smaller_button.setFixedWidth(42)
+        self._smaller_button.clicked.connect(
+            lambda: self._adjust_body_font_size(-1))
+        self._larger_button = QPushButton("A+")
+        self._larger_button.setFixedWidth(42)
+        self._larger_button.clicked.connect(
+            lambda: self._adjust_body_font_size(1))
+        self._update_body_font_buttons()
+        self._original_button = QPushButton("원문 검색")
+        self._original_button.setEnabled(False)
+        self._original_button.clicked.connect(
+            self._open_original_or_search)
+        copy_button = QPushButton("본문 복사")
+        copy_button.clicked.connect(
+            lambda: QApplication.clipboard().setText(
+                self._body_edit.toPlainText()))
+        close_button = QPushButton("닫기")
+        close_button.clicked.connect(self.close)
+        buttons.addWidget(self._refresh_button)
+        buttons.addWidget(self._smaller_button)
+        buttons.addWidget(self._larger_button)
+        buttons.addWidget(self._original_button)
+        buttons.addStretch(1)
+        buttons.addWidget(copy_button)
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+
+    def set_metadata(self, title: str, metadata: str, stocks: str):
+        self._title_label.setText(str(title or "제목 없음"))
+        self._meta_label.setText(str(metadata or ""))
+        self._stocks_label.setText(str(stocks or "관련 종목 없음"))
+
+    def set_loading(self, message: str = "LS에서 본문 불러오는 중…"):
+        self._status_label.setText(message)
+        self._status_label.setStyleSheet(
+            "QLabel { color: #D5A33D; font-weight: 700; }")
+        self._refresh_button.setEnabled(False)
+
+    def set_body(self, body: str, status: str):
+        plain_body = format_news_body(body)
+        links = extract_news_links(body)
+        self._body_plain = plain_body
+        self._body_links = links
+        self._render_body()
+        self._body_edit.moveCursor(QTextCursor.MoveOperation.Start)
+        status_parts = [status]
+        if plain_body:
+            status_parts.append(f"본문 {len(plain_body):,}자")
+        if links:
+            status_parts.append(f"링크 {len(links):,}개")
+        self._status_label.setText(" · ".join(status_parts))
+        self._status_label.setStyleSheet(
+            "QLabel { color: #55C981; font-weight: 700; }")
+        self._refresh_button.setEnabled(True)
+
+    def _adjust_body_font_size(self, change: int):
+        next_size = min(18.0, max(8.0, self._body_font_size + change))
+        if next_size == self._body_font_size:
+            return
+        self._body_font_size = next_size
+        self._settings.setValue(
+            "analysis_ls_news_body_font_size", self._body_font_size)
+        self._settings.sync()
+        self._render_body(preserve_scroll=True)
+        self._update_body_font_buttons()
+
+    def _render_body(self, preserve_scroll: bool = False):
+        scroll_bar = self._body_edit.verticalScrollBar()
+        old_maximum = scroll_bar.maximum()
+        old_ratio = (
+            scroll_bar.value() / old_maximum if old_maximum > 0 else 0.0)
+        self._body_edit.setHtml(self._reader_html(
+            self._body_plain,
+            self._body_links,
+            self._body_font_size,
+        ))
+        if preserve_scroll:
+            QTimer.singleShot(
+                0,
+                lambda: scroll_bar.setValue(round(
+                    old_ratio * scroll_bar.maximum())),
+            )
+
+    def _update_body_font_buttons(self):
+        size_label = f"{self._body_font_size:g}pt"
+        self._smaller_button.setEnabled(self._body_font_size > 8.0)
+        self._larger_button.setEnabled(self._body_font_size < 18.0)
+        self._smaller_button.setToolTip(
+            f"본문 글자를 작게 표시합니다. (현재 {size_label})")
+        self._larger_button.setToolTip(
+            f"본문 글자를 크게 표시합니다. (현재 {size_label})")
+
+    @staticmethod
+    def _linked_text_html(
+            block: str, links: tuple[tuple[str, str], ...]) -> str:
+        matches = []
+        for priority, (label, url) in enumerate(links):
+            start = 0
+            while label:
+                index = block.find(label, start)
+                if index < 0:
+                    break
+                matches.append((
+                    index, index + len(label), -len(label),
+                    priority, label, url,
+                ))
+                start = index + len(label)
+        matches.sort(key=lambda match: (
+            match[0], match[2], match[3]))
+
+        def escaped(value: str) -> str:
+            return html.escape(value).replace("\n", "<br>")
+
+        rendered = []
+        cursor = 0
+        for start, end, _length, _priority, label, url in matches:
+            if start < cursor:
+                continue
+            rendered.append(escaped(block[cursor:start]))
+            rendered.append(
+                f'<a href="{html.escape(url, quote=True)}">'
+                f"{escaped(label)}</a>")
+            cursor = end
+        rendered.append(escaped(block[cursor:]))
+        return "".join(rendered)
+
+    @classmethod
+    def _reader_html(
+            cls, plain_body: str,
+            links: tuple[tuple[str, str], ...] = (),
+            font_size: float = 11.0) -> str:
+        blocks = [
+            block.strip() for block in str(plain_body or "").split("\n\n")
+            if block.strip()
+        ]
+        rendered = []
+        for index, block in enumerate(blocks):
+            class_name = "article"
+            if index == 0 and (block.startswith("[") or len(block) <= 240):
+                class_name = "lead"
+            if block.startswith("[관련기사]"):
+                class_name = "related"
+            lowered = block.lower()
+            if index >= max(0, len(blocks) - 2) and (
+                    "copyright" in lowered or "저작권자" in block
+                    or "@" in block):
+                class_name = "footer"
+            content = cls._linked_text_html(block, links)
+            rendered.append(
+                f'<p class="{class_name}">{content}</p>')
+        secondary_font_size = max(8.0, font_size - 1.5)
+        return (
+            "<!DOCTYPE html><html><head><meta charset='utf-8'><style>"
+            "body { font-family: '맑은 고딕', 'Segoe UI', sans-serif; "
+            f"font-size: {font_size:g}pt; line-height: 165%; color: #ECEFF4; "
+            "margin: 20px 24px; }"
+            "p { margin: 0 0 15px 0; }"
+            ".lead { color: #FFFFFF; font-weight: 600; "
+            "background-color: #30343A; padding: 12px 14px; }"
+            f".related {{ color: #AEB8C4; font-size: {secondary_font_size:g}pt; "
+            "background-color: #20242A; padding: 12px 14px; }"
+            f".footer {{ color: #9099A6; font-size: {secondary_font_size:g}pt; }}"
+            "a { color: #72B7FF; text-decoration: underline; }"
+            "</style></head><body>"
+            + "".join(rendered)
+            + "</body></html>"
+        )
+
+    def _open_news_link(self, url: QUrl):
+        if url.scheme().lower() not in ("http", "https", "mailto"):
+            return
+        if self._open_infostock_search(url):
+            return
+        QDesktopServices.openUrl(url)
+
+    @staticmethod
+    def _open_infostock_search(url: QUrl) -> bool:
+        """GET 검색을 지원하지 않는 인포스탁 검색 폼을 POST로 연다."""
+        if (
+            url.host().casefold() != "www.infostockdaily.co.kr"
+            or url.path() != "/news/searchForm.html"
+        ):
+            return False
+        search_title = QUrlQuery(url).queryItemValue(
+            "sc_word", QUrl.ComponentFormattingOption.FullyDecoded).strip()
+        if not search_title:
+            return False
+        bridge_path = DB_PATH.parent / "ls_news_infostock_search.html"
+        escaped_title = html.escape(search_title, quote=True)
+        bridge_html = (
+            "<!doctype html><html lang='ko'><head><meta charset='utf-8'>"
+            "<title>인포스탁 기사 검색</title></head>"
+            "<body onload=\"document.getElementById('search').submit()\">"
+            "<form id='search' method='post' "
+            "action='https://www.infostockdaily.co.kr/news/articleList.html'>"
+            "<input type='hidden' name='sc_area' value='A'>"
+            "<input type='hidden' name='view_type' value='sm'>"
+            f"<input type='hidden' name='sc_word' value='{escaped_title}'>"
+            "<noscript><button type='submit'>인포스탁에서 검색</button>"
+            "</noscript></form></body></html>"
+        )
+        try:
+            bridge_path.parent.mkdir(parents=True, exist_ok=True)
+            bridge_path.write_text(bridge_html, encoding="utf-8")
+        except OSError:
+            log.exception("Infostock search bridge save failed")
+            return False
+        return QDesktopServices.openUrl(
+            QUrl.fromLocalFile(os.fspath(bridge_path)))
+
+    def set_original_link(
+            self, original_url: str = "", search_url: str = "",
+            resolving: bool = False):
+        original = QUrl(str(original_url or "").strip())
+        search = QUrl(str(search_url or "").strip())
+        self._original_url = (
+            original.toString()
+            if original.isValid()
+            and original.scheme().lower() in ("http", "https") else "")
+        self._original_search_url = (
+            search.toString()
+            if search.isValid()
+            and search.scheme().lower() in ("http", "https") else "")
+        if self._original_url:
+            self._original_button.setText("원문 열기 ↗")
+            self._original_button.setToolTip(
+                f"확인된 언론사 원문을 기본 브라우저로 엽니다.\n"
+                f"{self._original_url}")
+            self._original_button.setEnabled(True)
+        elif resolving:
+            self._original_button.setText("원문 확인 중…")
+            self._original_button.setToolTip(
+                "제목과 언론사를 대조해 정확한 원문 주소를 확인하고 있습니다.")
+            self._original_button.setEnabled(False)
+        else:
+            search_name = LS_NEWS_SOURCE_SEARCH_HOST_NAMES.get(
+                search.host().casefold(), "")
+            self._original_button.setText(
+                f"{search_name} 검색 ↗" if search_name else "원문 검색")
+            self._original_button.setToolTip(
+                (
+                    f"정확한 원문 주소가 없어 {search_name}에서 "
+                    "제목을 검색합니다.\n"
+                    f"{self._original_search_url}"
+                )
+                if search_name else
+                "정확한 원문 주소가 없어 제목으로 뉴스 검색 결과를 엽니다."
+            )
+            self._original_button.setEnabled(bool(self._original_search_url))
+
+    def _open_original_or_search(self):
+        target = self._original_url or self._original_search_url
+        if target:
+            self._open_news_link(QUrl(target))
+
+    def set_error(self, message: str):
+        self._status_label.setText(str(message or "본문을 불러오지 못했습니다."))
+        self._status_label.setStyleSheet(
+            "QLabel { color: #F06A6A; font-weight: 700; }")
+        self._refresh_button.setEnabled(True)
+
+
 class AnalysisWindow(QMainWindow):
     """실시간 뉴스·상한가·테마 전용 경량 분석창."""
 
@@ -2939,7 +3546,8 @@ class AnalysisWindow(QMainWindow):
     limit_count_collect_requested = Signal()
 
     TABS = (
-        ("실시간 뉴스·종토방", "직접 등록한 종목의 뉴스와 웹페이지를 확인합니다."),
+        ("실시간 뉴스", "LS증권에서 수신한 전체 실시간 뉴스를 확인합니다."),
+        ("종목뉴스·종토방", "직접 등록한 종목의 뉴스와 웹페이지를 확인합니다."),
         ("상한가", "상한가 종목 수집·조회·성과 분석 화면입니다."),
         ("테마", "테마 강도와 종목 확산 흐름을 분석합니다."),
     )
@@ -2959,6 +3567,17 @@ class AnalysisWindow(QMainWindow):
         self._dart_task = None
         self._rotation_collect_task = None
         self._rotation_refresh_task = None
+        self._ls_news_task = None
+        self._ls_news_stream = None
+        self._ls_news_server_sync_task = None
+        self._ls_news_server_sync_pending = False
+        self._ls_news_search_task: asyncio.Task | None = None
+        self._ls_news_search_serial = 0
+        self._ls_news_db_search_active = False
+        self._ls_news_db_search_query = ""
+        self._ls_news_detail_windows: dict[str, LSNewsDetailDialog] = {}
+        self._ls_news_detail_tasks: dict[str, asyncio.Task] = {}
+        self._ls_news_url_tasks: dict[str, asyncio.Task] = {}
         self._news_web_auto_timer = QTimer(self)
         self._news_web_auto_timer.timeout.connect(self._auto_reload_news_web)
         self.setWindowTitle("분석")
@@ -2999,27 +3618,18 @@ class AnalysisWindow(QMainWindow):
         self._update_analysis_clock()
         principle_bar.addWidget(self._analysis_clock_label)
 
-        self._principle_label = QLabel(
-            "<div style='font-size:22px; font-weight:900; color:#ffff00;'>"
-            "상한가 무너지면 무조건 시장가로 매도한다!</div>"
-            "<div style='font-size:17px; font-weight:800; color:#ffffff;"
-            " margin-top:7px;'>"
-            "한순간의 실수가 엄청난 고통을 준다.</div>"
-            "<div style='font-size:17px; font-weight:900; color:#80ffea;"
-            " margin-top:7px;'>"
-            "1억 잔고가 될 때까지는 절대로 단타는 하지 않는다.</div>")
-        self._principle_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._principle_label.setWordWrap(True)
-        self._principle_label.setMinimumHeight(102)
-        self._principle_label.setStyleSheet(
-            "QLabel {"
-            " color: #ffffff;"
-            " background-color: #c00000;"
-            " border: 3px solid #ffd600;"
-            " border-radius: 7px;"
-            " padding: 7px 12px;"
-            "}")
-        principle_bar.addWidget(self._principle_label, 1)
+        self._latest_ls_news_context: dict | None = None
+        self._latest_ls_news_label = LatestLSNewsLabel()
+        self._latest_ls_news_label.setMinimumHeight(86)
+        self._latest_ls_news_label.clicked.connect(
+            self._open_latest_ls_news)
+        self._latest_ls_news_highlight_timer = QTimer(self)
+        self._latest_ls_news_highlight_timer.setSingleShot(True)
+        self._latest_ls_news_highlight_timer.timeout.connect(
+            self._clear_latest_ls_news_highlight)
+        self._set_latest_ls_news_highlight(False)
+        self._latest_ls_news_label.set_headline("실시간 뉴스 대기 중")
+        principle_bar.addWidget(self._latest_ls_news_label, 1)
 
         self._analysis_on_top_btn = QPushButton("📌")
         self._analysis_on_top_btn.setCheckable(True)
@@ -3052,7 +3662,9 @@ class AnalysisWindow(QMainWindow):
         for title, description in self.TABS:
             page = QWidget()
             layout = QVBoxLayout(page)
-            if title == "실시간 뉴스·종토방":
+            if title == "실시간 뉴스":
+                self._build_ls_realtime_news_page(layout)
+            elif title == "종목뉴스·종토방":
                 self._build_realtime_news_page(layout)
             elif title == "상한가":
                 self._build_limit_up_page(layout)
@@ -3085,10 +3697,13 @@ class AnalysisWindow(QMainWindow):
         QTimer.singleShot(0, self._ensure_titlebar_visible)
         if self._settings.value("analysis_on_top", "false") == "true":
             self._analysis_on_top_btn.setChecked(True)
+        self.watchlist_changed.connect(self._sync_ls_news_watched_codes)
         self._refresh_realtime_watch_table()
         self._refresh_realtime_news_table()
         if self._selected_watch_code:
             self._open_selected_watch_board()
+        self._load_saved_ls_news()
+        QTimer.singleShot(0, self._start_ls_news_stream)
 
     def _ensure_titlebar_visible(self):
         screens = QApplication.screens()
@@ -3376,7 +3991,7 @@ class AnalysisWindow(QMainWindow):
     async def _refresh_all_analysis_tabs(self):
         """DB 상태와 현재 보이는 탭만 그린다. 숨은 탭은 진입 시 갱신한다."""
         title = self._tabs.tabText(self._tabs.currentIndex())
-        if title == "실시간 뉴스·종토방":
+        if title == "종목뉴스·종토방":
             self._refresh_realtime_watch_table()
             self._refresh_realtime_news_table()
         elif title == "상한가":
@@ -3386,7 +4001,7 @@ class AnalysisWindow(QMainWindow):
 
     def _analysis_tab_changed(self, index: int):
         title = self._tabs.tabText(index)
-        if title == "실시간 뉴스·종토방":
+        if title == "종목뉴스·종토방":
             self._refresh_realtime_watch_table()
             self._refresh_realtime_news_table()
         elif title == "상한가":
@@ -4064,6 +4679,1731 @@ class AnalysisWindow(QMainWindow):
             self._market_refresh_btn.setEnabled(True)
             self._market_refresh_task = None
 
+    def _build_ls_realtime_news_page(self, layout: QVBoxLayout):
+        """LS NWS 전체 제목을 수신 즉시 최신순으로 보여주는 최소 화면."""
+        status_row = QHBoxLayout()
+        self._ls_news_connection = QLabel("● 연결 준비")
+        self._ls_news_connection.setStyleSheet(
+            "QLabel { color: #8A94A6; font-weight: 700; }")
+        self._ls_news_count = QLabel("수신 0건")
+        self._ls_news_count.setToolTip(f"저장 위치: {DB_PATH}")
+        self._ls_news_server_sync_status = QLabel("서버 ↻")
+        self._ls_news_server_sync_status.setMinimumWidth(105)
+        self._ls_news_server_sync_status.setAlignment(
+            Qt.AlignmentFlag.AlignCenter)
+        self._ls_news_server_sync_status.setStyleSheet(
+            "QLabel { color: #8A94A6; background-color: #292D33; "
+            "border: 1px solid #4B525C; border-radius: 3px; "
+            "padding: 2px 6px; font-weight: 700; }")
+        self._ls_news_server_sync_status.setToolTip(
+            "앱이 꺼져 있던 동안 우분투 DB에 쌓인 뉴스의 확인을 기다립니다.")
+        self.statusBar().addPermanentWidget(
+            self._ls_news_server_sync_status)
+        self._ls_news_search = QLineEdit()
+        self._ls_news_search.setPlaceholderText(
+            "검색 · 공백=모두 · |=하나라도 · -=제외")
+        self._ls_news_search.setClearButtonEnabled(True)
+        self._ls_news_search.setMinimumWidth(240)
+        self._ls_news_search.setToolTip(
+            "현재 화면의 제목·종목명·종목코드·뉴스출처를 검색합니다.\n"
+            "\n검색 방법\n"
+            "• 반도체 실적 → 모두 포함\n"
+            "• 반도체 | 배터리 → 하나라도 포함\n"
+            "• 반도체 -미국 → 미국 제외\n"
+            "• \"유상증자 결정\" → 정확한 문구 포함\n"
+            "\n제외어 앞은 공백으로 구분합니다.\n"
+            "Enter 또는 DB 검색 버튼: 전체 DB 검색 · Esc: 검색 해제")
+        self._ls_news_search.textChanged.connect(
+            self._ls_news_search_text_changed)
+        self._ls_news_search.returnPressed.connect(
+            lambda: QTimer.singleShot(0, self._start_ls_news_db_search))
+        self._ls_news_db_search_button = QPushButton("검색")
+        self._ls_news_db_search_button.setFixedWidth(72)
+        self._ls_news_db_search_button.setToolTip(
+            "입력한 검색어로 저장된 LS 뉴스 전체를 검색합니다.\n"
+            "최신순으로 최대 500건을 표시합니다.")
+        self._ls_news_db_search_button.clicked.connect(
+            self._start_ls_news_db_search)
+        self._ls_news_search_clear_shortcut = QShortcut(
+            QKeySequence(Qt.Key.Key_Escape), self._ls_news_search)
+        self._ls_news_search_clear_shortcut.setContext(
+            Qt.ShortcutContext.WidgetShortcut)
+        self._ls_news_search_clear_shortcut.activated.connect(
+            self._ls_news_search.clear)
+        self._ls_news_sound = QCheckBox("소리")
+        self._ls_news_sound.setToolTip(
+            "체크하면 새 실시간 뉴스가 화면에 추가될 때 알림음을 재생합니다.\n"
+            "종목코드 있음: "
+            r"C:\KiwoomHero4\sound\sound8.wav"
+            "\n종목코드 없음: "
+            r"C:\KiwoomHero4\sound\sound11.wav"
+            "\n네이버 API 관심종목 새 뉴스: "
+            r"C:\KiwoomHero4\sound\sound12.wav")
+        self._ls_news_sound.setChecked(
+            str(self._settings.value(
+                "analysis_ls_news_sound", "false"
+            )).strip().lower() in {"1", "true", "yes"}
+        )
+        self._ls_news_sound.toggled.connect(self._set_ls_news_sound)
+        self._ls_news_stock_only = QCheckBox("종목")
+        self._ls_news_stock_only.setToolTip(
+            "종목코드가 연결된 뉴스만 표시합니다.")
+        self._ls_news_stock_only.setChecked(
+            str(self._settings.value(
+                "analysis_ls_news_stock_only", "false"
+            )).strip().lower() in {"1", "true", "yes"}
+        )
+        self._ls_news_stock_only.toggled.connect(
+            self._set_ls_news_stock_filter)
+        self._ls_news_clear_new_button = QPushButton("신규해제")
+        self._ls_news_clear_new_button.setEnabled(False)
+        self._ls_news_clear_new_button.setToolTip(
+            "새 실시간 뉴스의 강조색만 해제합니다.\n"
+            "뉴스 목록과 DB 저장 데이터는 그대로 유지합니다.")
+        self._ls_news_clear_new_button.clicked.connect(
+            self._clear_ls_news_new_markers)
+        self._ls_news_watched_only = QCheckBox("관심종목")
+        self._ls_news_watched_only.setToolTip(
+            "체크하면 뉴스에 연결된 전체 종목코드 중 하나라도\n"
+            "관심종목에 포함된 뉴스만 표시합니다.\n"
+            "대표종목이 아닌 관련 종목도 필터에 포함됩니다.")
+        self._ls_news_watched_only.setChecked(
+            str(self._settings.value(
+                "analysis_ls_news_watched_only", "false"
+            )).strip().lower() in {"1", "true", "yes"}
+        )
+        self._ls_news_watched_only.toggled.connect(
+            self._set_ls_news_watched_filter)
+        status_row.addWidget(self._ls_news_connection)
+        status_row.addWidget(self._ls_news_count)
+        status_row.addWidget(self._ls_news_search, 1)
+        status_row.addWidget(self._ls_news_db_search_button)
+        status_row.addWidget(self._ls_news_sound)
+        status_row.addWidget(self._ls_news_stock_only)
+        status_row.addWidget(self._ls_news_watched_only)
+        status_row.addWidget(self._ls_news_clear_new_button)
+        layout.addLayout(status_row)
+
+        self._ls_news_table = QTableWidget(0, 5)
+        self._ls_news_table.setHorizontalHeaderLabels(
+            ("번호", "시간", "종목명", "제목", "뉴스출처"))
+        self._ls_news_table.horizontalHeaderItem(2).setToolTip(
+            "좌클릭: 대표 종목코드 복사\n"
+            "우클릭: 대표 종목을 관심종목에 추가하고 종토방 열기")
+        self._ls_news_table.horizontalHeaderItem(3).setToolTip(
+            "뉴스 제목을 클릭하면 본문 상세창을 엽니다.")
+        self._ls_news_table.setSortingEnabled(False)
+        self._ls_news_table.setAlternatingRowColors(True)
+        self._ls_news_table.setWordWrap(False)
+        self._ls_news_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers)
+        self._ls_news_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows)
+        self._ls_news_table.setSelectionMode(
+            QTableWidget.SelectionMode.SingleSelection)
+        self._ls_news_table.verticalHeader().setVisible(False)
+        self._ls_news_table.verticalHeader().setDefaultSectionSize(24)
+        header = self._ls_news_table.horizontalHeader()
+        header.setSectionsMovable(False)
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        saved_header = self._settings.value("analysis_ls_news_header_v2")
+        if saved_header is None or not header.restoreState(saved_header):
+            for column, width in enumerate((48, 105, 120, 650, 120)):
+                self._ls_news_table.setColumnWidth(column, width)
+        self._ls_news_header_timer = QTimer(self)
+        self._ls_news_header_timer.setSingleShot(True)
+        self._ls_news_header_timer.timeout.connect(
+            self._save_ls_news_header)
+        header.sectionResized.connect(
+            lambda *_: self._ls_news_header_timer.start(400))
+        self._ls_news_table.cellClicked.connect(
+            self._ls_news_table_clicked)
+        self._ls_news_table.cellDoubleClicked.connect(
+            self._ls_news_table_double_clicked)
+        self._ls_news_table.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self._ls_news_table.customContextMenuRequested.connect(
+            self._ls_news_table_context_menu)
+        layout.addWidget(self._ls_news_table, 1)
+
+        self._ls_news_received = 0
+        self._ls_news_new_count = 0
+        self._ls_news_db_error = ""
+        self._ls_news_loading_saved = False
+        self._ls_news_stock_names: dict[str, str] = {}
+        try:
+            self._ls_news_watched_codes = realtime_watch_codes()
+        except Exception as error:  # noqa: BLE001 - 뉴스 수신 화면은 계속 연다.
+            self._ls_news_watched_codes = set()
+            log.warning("LS news watched codes load failed: %s", error)
+        self._ls_news_seen_keys: set[str] = set()
+        self._ls_news_seen_order: deque[str] = deque()
+        self._ls_news_source_names = dict(NEWS_SOURCE_NAMES)
+        try:
+            saved_sources = json.loads(str(self._settings.value(
+                "analysis_ls_news_sources", "{}") or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            saved_sources = {}
+        if isinstance(saved_sources, dict):
+            self._ls_news_source_names.update({
+                str(source_id).strip(): str(name).strip()
+                for source_id, name in saved_sources.items()
+                if (
+                    str(source_id).strip()
+                    and str(name).strip()
+                    and str(source_id).strip() not in NEWS_SOURCE_NAMES
+                )
+            })
+        self._ls_news_source_pending: set[str] = set()
+        self._ls_news_source_attempts: dict[str, int] = {}
+        self._ls_news_source_tasks: set[asyncio.Task] = set()
+
+    def _start_ls_news_stream(self):
+        if self._ls_news_task and not self._ls_news_task.done():
+            return
+        self._ls_news_stream = LSNewsStream()
+        self._ls_news_task = asyncio.ensure_future(
+            self._ls_news_stream.run(
+                self._append_ls_news, self._set_ls_news_status))
+
+    def _schedule_ls_news_server_sync(self):
+        """LS 연결 뒤 서버 커서부터 누락 제목을 한 번 보완한다."""
+        if (
+            self._ls_news_server_sync_task is not None
+            and not self._ls_news_server_sync_task.done()
+        ):
+            self._ls_news_server_sync_pending = True
+            return
+        self._ls_news_server_sync_pending = False
+        self._ls_news_server_sync_task = asyncio.ensure_future(
+            self._sync_ls_news_from_server())
+
+    def _set_ls_news_server_sync_status(
+            self, text: str, state: str, tooltip: str = ""):
+        if not hasattr(self, "_ls_news_server_sync_status"):
+            return
+        color = {
+            "waiting": "#8A94A6",
+            "running": "#D5A33D",
+            "completed": "#55C981",
+            "failed": "#F06A6A",
+            "disabled": "#8A94A6",
+        }.get(state, "#8A94A6")
+        background = {
+            "running": "#3A321D",
+            "completed": "#1E3828",
+            "failed": "#422327",
+        }.get(state, "#292D33")
+        self._ls_news_server_sync_status.setText(text)
+        self._ls_news_server_sync_status.setStyleSheet(
+            f"QLabel {{ color: {color}; background-color: {background}; "
+            "border: 1px solid #4B525C; border-radius: 3px; "
+            "padding: 2px 6px; font-weight: 700; }")
+        self._ls_news_server_sync_status.setToolTip(tooltip)
+
+    def _show_ls_news_server_sync_progress(self, result: dict):
+        upper = int(result.get("upper_id") or 0)
+        cursor = int(result.get("cursor") or 0)
+        remaining = max(0, upper - cursor)
+        processed = int(result.get("processed") or 0)
+        inserted = int(result.get("inserted") or 0)
+        updated = int(result.get("updated") or 0)
+        self._set_ls_news_server_sync_status(
+            f"서버 … {processed:,}",
+            "running",
+            f"서버 커서 {cursor:,} / 시작 시 상한 {upper:,}\n"
+            f"확인 {processed:,}건 · 누락 저장 {inserted:,}건 "
+            f"· 중복 {updated:,}건\n남은 ID 약 {remaining:,}",
+        )
+        self.statusBar().showMessage(
+            f"서버 누락 뉴스 동기화 · 확인 {processed:,}건"
+            f" · 신규 저장 {inserted:,}건"
+            f" · 남은 ID 약 {remaining:,}")
+
+    async def _sync_ls_news_from_server(self):
+        try:
+            self._set_ls_news_server_sync_status(
+                "서버 …", "running",
+                "우분투 서버의 마지막 뉴스 ID를 확인하고 있습니다.")
+            result = await LSNewsServerSync().sync(
+                self._show_ls_news_server_sync_progress)
+            if result.get("status") == "disabled":
+                self._set_ls_news_server_sync_status(
+                    "서버 -", "disabled",
+                    "LS_NEWS_SYNC_ENABLED 설정이 꺼져 있습니다.")
+                return
+            processed = int(result.get("processed") or 0)
+            inserted = int(result.get("inserted") or 0)
+            updated = int(result.get("updated") or 0)
+            upper = int(result.get("upper_id") or 0)
+            cursor = int(result.get("cursor") or 0)
+            if processed:
+                # 수만 건을 표에 직접 추가하지 않고 저장 완료 뒤 최신 500건만 갱신한다.
+                self._reload_ls_news_current_rows(preserve_new=True)
+            completed_now = datetime.now()
+            label = f"서버 ✓ {completed_now:%H:%M}"
+            self._set_ls_news_server_sync_status(
+                label,
+                "completed",
+                f"완료 시각 {completed_now:%Y-%m-%d %H:%M:%S}\n"
+                f"확인 {processed:,}건 · 누락 저장 {inserted:,}건 "
+                f"· 중복 {updated:,}건\n"
+                f"서버 커서 {cursor:,} / 시작 시 상한 {upper:,}",
+            )
+            self.statusBar().showMessage(
+                f"서버 누락 뉴스 동기화 완료 · 확인 {processed:,}건"
+                f" · 누락 저장 {inserted:,}건 · 중복 {updated:,}건",
+                30000,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - LS 실시간 수신은 계속한다.
+            log.warning("LS server gap sync failed: %s", error)
+            self._set_ls_news_server_sync_status(
+                "서버 !", "failed",
+                f"{datetime.now():%Y-%m-%d %H:%M:%S}\n{error}",
+            )
+            self.statusBar().showMessage(
+                f"서버 누락 뉴스 동기화 실패: {error}", 30000)
+        finally:
+            self._ls_news_server_sync_task = None
+            if self._ls_news_server_sync_pending:
+                self._ls_news_server_sync_pending = False
+                QTimer.singleShot(0, self._schedule_ls_news_server_sync)
+
+    def _set_ls_news_status(self, state: str, message: str):
+        if not hasattr(self, "_ls_news_connection"):
+            return
+        color = {
+            "connected": "#39B86B",
+            "connecting": "#D59B2D",
+            "retrying": "#E05D5D",
+            "missing": "#E05D5D",
+            "stopped": "#8A94A6",
+        }.get(state, "#8A94A6")
+        self._ls_news_connection.setText(f"● {message}")
+        self._ls_news_connection.setStyleSheet(
+            f"QLabel {{ color: {color}; font-weight: 700; }}")
+        if state in {"connected", "missing"}:
+            # 연결을 먼저 확보해 동기화 도중 도착하는 새 뉴스도 놓치지 않는다.
+            self._schedule_ls_news_server_sync()
+
+    def _set_latest_ls_news_highlight(self, highlighted: bool):
+        if not hasattr(self, "_latest_ls_news_label"):
+            return
+        if highlighted:
+            background = "#315C72"
+            border = "#79D2FF"
+        else:
+            background = "#20303A"
+            border = "#52788B"
+        self._latest_ls_news_label.setStyleSheet(
+            "QLabel {"
+            " color: #FFFFFF;"
+            f" background-color: {background};"
+            f" border: 3px solid {border};"
+            " border-radius: 7px;"
+            " padding: 8px 14px;"
+            " font-size: 24px;"
+            " font-weight: 900;"
+            "}")
+
+    def _clear_latest_ls_news_highlight(self):
+        self._set_latest_ls_news_highlight(False)
+
+    def _show_latest_ls_news(self, context: dict):
+        title = " ".join(str(context.get("title") or "").split())
+        if not title:
+            return
+        self._latest_ls_news_context = {
+            **dict(context), "provider": "LS",
+        }
+        self._latest_ls_news_label.set_headline(title)
+        self._set_latest_ls_news_highlight(True)
+        self._latest_ls_news_highlight_timer.start(3500)
+
+    def _show_latest_naver_news(self, row: dict):
+        """네이버 API 신규 뉴스를 상단 공용 전광판에 표시한다."""
+        title = " ".join(str(row.get("current_title") or "").split())
+        if not title:
+            return
+        stock_code = str(row.get("stock_code") or "").strip()
+        stock_name = str(row.get("stock_name") or stock_code).strip()
+        self._latest_ls_news_context = {
+            "provider": "NAVER",
+            "title": title,
+            "stock_code": stock_code,
+            "stock_name": stock_name,
+            "url": str(
+                row.get("naver_url") or row.get("original_url") or ""
+            ).strip(),
+        }
+        headline = f"[네이버] {stock_name} · {title}" if stock_name else title
+        self._latest_ls_news_label.set_headline(headline)
+        self._set_latest_ls_news_highlight(True)
+        self._latest_ls_news_highlight_timer.start(3500)
+
+    def _open_latest_ls_news(self):
+        if not self._latest_ls_news_context:
+            return
+        context = dict(self._latest_ls_news_context)
+        if context.get("provider") == "NAVER":
+            stock_code = str(context.get("stock_code") or "").strip()
+            if stock_code:
+                self.open_realtime_watch(stock_code, fetch_news=False)
+            url = str(context.get("url") or "").strip()
+            if url:
+                self._show_news_web_url(url, "article")
+            return
+        self.open_ls_realtime_news()
+        self._open_ls_news_detail(context)
+
+    def _append_ls_news(self, item: LSNewsItem, persist: bool = True,
+                        news_key: str = "", original_url: str = ""):
+        if not hasattr(self, "_ls_news_table"):
+            return
+        dedupe_key = item.realkey or (
+            f"{item.date}|{item.time}|{item.source_id}|{item.title}")
+        if dedupe_key in self._ls_news_seen_keys:
+            return
+        self._ls_news_seen_keys.add(dedupe_key)
+        self._ls_news_seen_order.append(dedupe_key)
+        while len(self._ls_news_seen_order) > 5000:
+            self._ls_news_seen_keys.discard(
+                self._ls_news_seen_order.popleft())
+
+        source_name = self._ls_news_source_names.get(
+            item.source_id, source_label(item.source_id))
+        if persist:
+            try:
+                saved = save_ls_realtime_news(
+                    {
+                        "date": item.date,
+                        "time": item.time,
+                        "title": item.title,
+                        "source_id": item.source_id,
+                        "source_name": source_name,
+                        "realkey": item.realkey,
+                        "code": item.code,
+                        "body_size": item.body_size,
+                    },
+                    ensure_schema=False,
+                )
+                news_key = str(saved.get("news_key") or news_key)
+                self._ls_news_db_error = ""
+            except Exception as error:  # noqa: BLE001 - 화면 수신은 유지한다.
+                self._ls_news_db_error = str(error)
+                log.exception("LS realtime news DB save failed")
+
+        valid_stock_codes = tuple(
+            code for code in split_ls_news_stock_codes(item.code)
+            if len(code) == 6 and code.isdigit()
+        )
+        if persist:
+            self._ls_news_received += 1
+            self._schedule_ls_news_source_resolution(item)
+        if self._ls_news_stock_only.isChecked() and not valid_stock_codes:
+            if not self._ls_news_loading_saved:
+                self._update_ls_news_count()
+            return
+        if (
+            self._ls_news_watched_only.isChecked()
+            and not any(
+                code in self._ls_news_watched_codes
+                for code in valid_stock_codes
+            )
+        ):
+            if not self._ls_news_loading_saved:
+                self._update_ls_news_count()
+            return
+
+        table = self._ls_news_table
+        was_at_top = table.verticalScrollBar().value() <= 1
+        table.insertRow(0)
+        number_item = NumericTableWidgetItem("1", 1)
+        number_item.setTextAlignment(
+            Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+        time_item = QTableWidgetItem(format_news_time(item.date, item.time))
+        time_item.setTextAlignment(
+            Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+        stock_label, stock_codes, stock_tooltip = (
+            self._ls_news_stock_display(
+                valid_stock_codes
+                if self._ls_news_stock_only.isChecked() else item.code))
+        stock_item = QTableWidgetItem(stock_label)
+        stock_item.setTextAlignment(
+            Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+        stock_item.setData(Qt.ItemDataRole.UserRole, list(stock_codes))
+        stock_item.setData(Qt.ItemDataRole.UserRole + 1, stock_tooltip)
+        if stock_codes:
+            stock_tooltip += (
+                "\n\n좌클릭: 대표 종목코드 복사"
+                "\n우클릭: 대표 종목 관심종목 추가 · 종토방 열기")
+        stock_item.setToolTip(stock_tooltip)
+        title_item = QTableWidgetItem(item.title)
+        title_item.setToolTip(
+            f"{item.title}\n\n클릭: 앱 본문 열기\n"
+            "더블클릭·Ctrl+클릭: 확인된 원문을 기본 브라우저로 열기")
+        title_item.setData(Qt.ItemDataRole.UserRole, item.realkey)
+        title_item.setData(Qt.ItemDataRole.UserRole + 1,
+                           news_key or item.realkey)
+        title_item.setData(
+            Qt.ItemDataRole.UserRole + 2, str(original_url or "").strip())
+        source_item = QTableWidgetItem(source_name)
+        source_item.setTextAlignment(
+            Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+        source_item.setData(Qt.ItemDataRole.UserRole, item.source_id)
+        source_item.setToolTip(
+            f"LS 뉴스 매체 식별자: {item.source_id or '-'}")
+        table.setItem(0, 0, number_item)
+        table.setItem(0, 1, time_item)
+        table.setItem(0, 2, stock_item)
+        table.setItem(0, 3, title_item)
+        table.setItem(0, 4, source_item)
+        matches_search = self._ls_news_row_matches_search(0)
+        table.setRowHidden(0, not matches_search)
+        if self._ls_news_db_search_active and not matches_search:
+            table.removeRow(0)
+            if not self._ls_news_loading_saved:
+                self._update_ls_news_count()
+            return
+        if persist and matches_search:
+            self._mark_ls_news_row_new(0)
+            context = self._ls_news_row_context(0)
+            if context is not None:
+                self._show_latest_ls_news(context)
+
+        while table.rowCount() > LS_NEWS_VISIBLE_LIMIT:
+            last_row = table.rowCount() - 1
+            if self._ls_news_row_is_new(last_row):
+                self._ls_news_new_count = max(
+                    0, self._ls_news_new_count - 1)
+            table.removeRow(last_row)
+        if not self._ls_news_loading_saved:
+            self._renumber_ls_news_table()
+        self._update_ls_news_new_button()
+        if not self._ls_news_loading_saved:
+            self._update_ls_news_count()
+        if was_at_top:
+            table.scrollToTop()
+        if (
+            persist and matches_search and self._ls_news_sound.isChecked()
+        ):
+            _beep(
+                "ls_news_with_code"
+                if valid_stock_codes else "ls_news_without_code")
+
+    def _load_saved_ls_news(self):
+        """저장된 최근 LS 뉴스를 현재 목록에 최신순으로 복원한다."""
+        try:
+            rows = ls_realtime_news_rows(
+                LS_NEWS_VISIBLE_LIMIT,
+                stock_only=self._ls_news_stock_only.isChecked(),
+                watched_only=self._ls_news_watched_only.isChecked(),
+            )
+            self._ls_news_db_error = ""
+        except Exception as error:  # noqa: BLE001 - 실시간 연결은 계속한다.
+            self._ls_news_db_error = str(error)
+            log.exception("saved LS realtime news load failed")
+            self._update_ls_news_count()
+            return
+        self._append_ls_news_rows(rows)
+        self._update_ls_news_count()
+
+    def _append_ls_news_rows(self, rows: list[dict]):
+        """DB 조회 행을 종목·출처 캐시와 함께 현재 표에 추가한다."""
+        for row in rows:
+            source_id = str(row.get("source_id") or "").strip()
+            source_name = str(row.get("source_name") or "").strip()
+            stock_code = str(row.get("stock_code") or "").strip()
+            stock_name = str(row.get("stock_name") or "").strip()
+            if stock_code and stock_name:
+                self._ls_news_stock_names[stock_code] = stock_name
+            if (
+                source_id and source_name
+                and source_id not in NEWS_SOURCE_NAMES
+                and source_name != source_label(source_id)
+            ):
+                self._ls_news_source_names[source_id] = source_name
+        self._ls_news_loading_saved = True
+        try:
+            for row in reversed(rows):
+                related_codes = str(
+                    row.get("related_stock_codes") or "").strip()
+                code_value = (
+                    related_codes
+                    if split_ls_news_stock_codes(related_codes)
+                    else str(row.get("stock_code") or "")
+                )
+                self._append_ls_news(
+                    LSNewsItem(
+                        date=str(row.get("news_date") or ""),
+                        time=str(row.get("news_time") or ""),
+                        title=str(row.get("title") or ""),
+                        source_id=str(row.get("source_id") or ""),
+                        realkey=str(row.get("realkey") or ""),
+                        code=code_value,
+                        body_size=int(row.get("body_size") or 0),
+                    ),
+                    persist=False,
+                    news_key=str(row.get("news_key") or ""),
+                    original_url=str(row.get("original_url") or ""),
+                )
+        finally:
+            self._ls_news_loading_saved = False
+            self._renumber_ls_news_table()
+
+    def _renumber_ls_news_table(self):
+        """현재 표시 순서대로 실시간 뉴스 행 번호를 다시 매긴다."""
+        if not hasattr(self, "_ls_news_table"):
+            return
+        table = self._ls_news_table
+        visible_number = 0
+        for row in range(table.rowCount()):
+            item = table.item(row, 0)
+            if item is None:
+                item = NumericTableWidgetItem("", 0)
+                table.setItem(row, 0, item)
+            if table.isRowHidden(row):
+                item.setText("")
+                item.setData(Qt.ItemDataRole.UserRole, 0)
+            else:
+                visible_number += 1
+                item.setText(str(visible_number))
+                item.setData(Qt.ItemDataRole.UserRole, visible_number)
+            item.setTextAlignment(
+                Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+
+    def _set_ls_news_stock_filter(self, checked: bool):
+        """전체·종목 뉴스 표시를 전환하고 DB의 최근 목록을 다시 채운다."""
+        self._settings.setValue(
+            "analysis_ls_news_stock_only", "true" if checked else "false")
+        self._settings.sync()
+        self._reload_ls_news_after_filter_change()
+
+    def _set_ls_news_watched_filter(self, checked: bool):
+        """연결된 전체 종목 중 관심종목이 있는 뉴스만 표시한다."""
+        self._settings.setValue(
+            "analysis_ls_news_watched_only", "true" if checked else "false")
+        self._settings.sync()
+        self._sync_ls_news_watched_codes(reload=False)
+        self._reload_ls_news_after_filter_change()
+
+    def _sync_ls_news_watched_codes(
+            self, watched_codes=None, *, reload: bool = True):
+        """관심종목 캐시를 갱신하고 활성 필터 목록을 즉시 다시 채운다."""
+        try:
+            current = (
+                realtime_watch_codes()
+                if watched_codes is None else set(watched_codes)
+            )
+        except Exception as error:  # noqa: BLE001 - 기존 캐시를 유지한다.
+            log.warning("LS news watched codes refresh failed: %s", error)
+            return
+        normalized = {
+            str(code).strip() for code in current
+            if len(str(code).strip()) == 6 and str(code).strip().isdigit()
+        }
+        changed = normalized != self._ls_news_watched_codes
+        self._ls_news_watched_codes = normalized
+        if (
+            changed and reload
+            and hasattr(self, "_ls_news_watched_only")
+            and self._ls_news_watched_only.isChecked()
+        ):
+            self._reload_ls_news_after_filter_change()
+
+    def _reload_ls_news_after_filter_change(self):
+        """종목·관심종목 필터 변경을 최근 목록과 DB 검색에 함께 반영한다."""
+        if not hasattr(self, "_ls_news_table"):
+            return
+        search_query = self._ls_news_search.text().strip()
+        rerun_db_search = bool(search_query) and (
+            self._ls_news_db_search_active
+            or (
+                self._ls_news_search_task is not None
+                and not self._ls_news_search_task.done()
+            )
+        )
+        self._cancel_ls_news_db_search()
+        self._ls_news_db_search_active = False
+        self._ls_news_db_search_query = ""
+        self._reload_ls_news_current_rows()
+        if rerun_db_search:
+            QTimer.singleShot(0, self._start_ls_news_db_search)
+
+    def _set_ls_news_sound(self, checked: bool):
+        """LS 실시간 뉴스 알림음 사용 여부를 저장한다."""
+        self._settings.setValue(
+            "analysis_ls_news_sound", "true" if checked else "false")
+        self._settings.sync()
+
+    def _reload_ls_news_current_rows(self, preserve_new: bool = False):
+        """현재 필터의 최신 500건을 복원하며 필요하면 신규 강조를 보존한다."""
+        if not hasattr(self, "_ls_news_table"):
+            return
+        new_keys = set()
+        if preserve_new:
+            for row in range(self._ls_news_table.rowCount()):
+                if not self._ls_news_row_is_new(row):
+                    continue
+                title_item = self._ls_news_table.item(row, 3)
+                if title_item is not None:
+                    key = str(
+                        title_item.data(Qt.ItemDataRole.UserRole + 1)
+                        or title_item.data(Qt.ItemDataRole.UserRole)
+                        or ""
+                    ).strip()
+                    if key:
+                        new_keys.add(key)
+        self._ls_news_table.setUpdatesEnabled(False)
+        try:
+            self._ls_news_table.setRowCount(0)
+            self._reset_ls_news_new_markers_state()
+            self._ls_news_seen_keys.clear()
+            self._ls_news_seen_order.clear()
+            self._load_saved_ls_news()
+            if new_keys:
+                for row in range(self._ls_news_table.rowCount()):
+                    title_item = self._ls_news_table.item(row, 3)
+                    if title_item is None:
+                        continue
+                    key = str(
+                        title_item.data(Qt.ItemDataRole.UserRole + 1)
+                        or title_item.data(Qt.ItemDataRole.UserRole)
+                        or ""
+                    ).strip()
+                    if key in new_keys:
+                        self._mark_ls_news_row_new(row)
+        finally:
+            self._ls_news_table.setUpdatesEnabled(True)
+        self._ls_news_table.scrollToTop()
+
+    def _cancel_ls_news_db_search(self):
+        """진행 중인 전체 DB 검색 결과가 화면에 반영되지 않게 취소한다."""
+        self._ls_news_search_serial += 1
+        task = self._ls_news_search_task
+        self._ls_news_search_task = None
+        if task is not None and not task.done():
+            task.cancel()
+        if hasattr(self, "_ls_news_db_search_button"):
+            self._ls_news_db_search_button.setEnabled(True)
+            self._ls_news_db_search_button.setText("검색")
+
+    def _ls_news_search_text_changed(self, text: str):
+        """검색어 수정 시 DB 검색 모드를 끝내고 최신 목록 필터로 돌아간다."""
+        if self._ls_news_db_search_active:
+            self._cancel_ls_news_db_search()
+            self._ls_news_db_search_active = False
+            self._ls_news_db_search_query = ""
+            self._reload_ls_news_current_rows()
+            return
+        if self._ls_news_search_task is not None:
+            self._cancel_ls_news_db_search()
+        self._apply_ls_news_search_filter(text)
+
+    def _start_ls_news_db_search(self):
+        """Enter 입력 시 전체 LS 뉴스 DB 검색을 백그라운드에서 시작한다."""
+        query = " ".join(self._ls_news_search.text().split())
+        if not query:
+            if self._ls_news_db_search_active:
+                self._ls_news_db_search_active = False
+                self._ls_news_db_search_query = ""
+                self._reload_ls_news_current_rows()
+            return
+        self._cancel_ls_news_db_search()
+        serial = self._ls_news_search_serial
+        stock_only = self._ls_news_stock_only.isChecked()
+        watched_only = self._ls_news_watched_only.isChecked()
+        self._ls_news_count.setText(f"전체 DB에서 ‘{query}’ 검색 중…")
+        self._ls_news_count.setToolTip(
+            f"저장된 LS 뉴스 전체 검색 중\n검색어: {query}")
+        task = asyncio.ensure_future(self._run_ls_news_db_search(
+            serial, query, stock_only, watched_only))
+        self._ls_news_search_task = task
+        self._ls_news_db_search_button.setEnabled(False)
+        self._ls_news_db_search_button.setText("검색 중…")
+
+    async def _run_ls_news_db_search(
+            self, serial: int, query: str, stock_only: bool,
+            watched_only: bool):
+        """SQLite 전체 검색을 UI 이벤트 루프 밖에서 실행하고 결과를 표시한다."""
+        current_task = asyncio.current_task()
+        try:
+            rows = await asyncio.to_thread(
+                search_ls_realtime_news,
+                query,
+                LS_NEWS_VISIBLE_LIMIT,
+                stock_only=stock_only,
+                watched_only=watched_only,
+            )
+            if (
+                serial != self._ls_news_search_serial
+                or " ".join(self._ls_news_search.text().split()) != query
+                or self._ls_news_stock_only.isChecked() != stock_only
+                or self._ls_news_watched_only.isChecked() != watched_only
+            ):
+                return
+            self._ls_news_db_search_active = True
+            self._ls_news_db_search_query = query
+            self._ls_news_table.setUpdatesEnabled(False)
+            try:
+                self._ls_news_table.setRowCount(0)
+                self._reset_ls_news_new_markers_state()
+                self._ls_news_seen_keys.clear()
+                self._ls_news_seen_order.clear()
+                self._append_ls_news_rows(rows)
+            finally:
+                self._ls_news_table.setUpdatesEnabled(True)
+            self._ls_news_table.scrollToTop()
+            self._update_ls_news_count()
+            suffix = " (최대 500건)" if len(rows) >= 500 else ""
+            self.statusBar().showMessage(
+                f"전체 DB 검색 완료 · {len(rows):,}건{suffix} · "
+                "검색어를 지우면 실시간 목록으로 복귀합니다.",
+                5000,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - 실시간 목록은 유지한다.
+            if serial == self._ls_news_search_serial:
+                log.exception("LS news full DB search failed")
+                self.statusBar().showMessage(
+                    f"전체 DB 검색 실패: {error}", 5000)
+                self._update_ls_news_count()
+        finally:
+            if self._ls_news_search_task is current_task:
+                self._ls_news_search_task = None
+                self._ls_news_db_search_button.setEnabled(True)
+                self._ls_news_db_search_button.setText("검색")
+
+    def _ls_news_row_matches_search(self, row: int) -> bool:
+        """현재 행이 포함·OR·제외 검색식과 일치하는지 확인한다."""
+        include_groups, exclude_terms = parse_ls_news_search_query(
+            self._ls_news_search.text())
+        if not include_groups and not exclude_terms:
+            return True
+        stock_item = self._ls_news_table.item(row, 2)
+        title_item = self._ls_news_table.item(row, 3)
+        source_item = self._ls_news_table.item(row, 4)
+        searchable = " ".join((
+            str(stock_item.data(Qt.ItemDataRole.UserRole + 1) or "")
+            if stock_item else "",
+            title_item.text() if title_item else "",
+            source_item.text() if source_item else "",
+        )).casefold()
+        included = all(
+            any(term.casefold() in searchable for term in group)
+            for group in include_groups
+        )
+        excluded = any(
+            term.casefold() in searchable for term in exclude_terms)
+        return included and not excluded
+
+    def _apply_ls_news_search_filter(self, _text: str = ""):
+        """검색어 변경 즉시 현재 500개 행의 표시 여부를 갱신한다."""
+        if not hasattr(self, "_ls_news_table"):
+            return
+        for row in range(self._ls_news_table.rowCount()):
+            self._ls_news_table.setRowHidden(
+                row, not self._ls_news_row_matches_search(row))
+        self._renumber_ls_news_table()
+        self._update_ls_news_count()
+
+    def _update_ls_news_count(self):
+        if not hasattr(self, "_ls_news_count"):
+            return
+        error_status = " · DB 저장 오류" if self._ls_news_db_error else ""
+        if self._ls_news_db_search_active:
+            self._ls_news_count.setText(
+                f"수신 {self._ls_news_received:,}건 · 전체 DB 검색 "
+                f"{self._ls_news_table.rowCount():,}건{error_status}")
+            tooltip = (
+                f"저장 위치: {DB_PATH}\n"
+                f"전체 DB 검색어: {self._ls_news_db_search_query}\n"
+                "최대 500건 · 검색어 수정/삭제 시 실시간 목록 복귀"
+            )
+            if self._ls_news_db_error:
+                tooltip += f"\n최근 저장 오류: {self._ls_news_db_error}"
+            self._ls_news_count.setToolTip(tooltip)
+            return
+        search_status = ""
+        if self._ls_news_search.text().strip():
+            visible_rows = sum(
+                not self._ls_news_table.isRowHidden(row)
+                for row in range(self._ls_news_table.rowCount())
+            )
+            search_status = f" · 검색 {visible_rows:,}건"
+        self._ls_news_count.setText(
+            f"수신 {self._ls_news_received:,}건 · 화면 최근 "
+            f"{self._ls_news_table.rowCount():,}건{search_status}"
+            f"{error_status}")
+        tooltip = f"저장 위치: {DB_PATH}"
+        if self._ls_news_db_error:
+            tooltip += f"\n최근 저장 오류: {self._ls_news_db_error}"
+        self._ls_news_count.setToolTip(tooltip)
+
+    def _ls_news_row_context(self, row: int) -> dict | None:
+        title_item = self._ls_news_table.item(row, 3)
+        if title_item is None:
+            return None
+        realkey = str(
+            title_item.data(Qt.ItemDataRole.UserRole) or "").strip()
+        news_key = str(
+            title_item.data(Qt.ItemDataRole.UserRole + 1) or "").strip()
+        time_item = self._ls_news_table.item(row, 1)
+        stock_item = self._ls_news_table.item(row, 2)
+        source_item = self._ls_news_table.item(row, 4)
+        context = {
+            "title": title_item.text(),
+            "time": time_item.text() if time_item else "-",
+            "stocks": stock_item.toolTip() if stock_item else "연결 종목 없음",
+            "stock_codes": (
+                stock_item.data(Qt.ItemDataRole.UserRole)
+                if stock_item else []),
+            "source_name": source_item.text() if source_item else "출처 미상",
+            "source_id": (
+                str(source_item.data(Qt.ItemDataRole.UserRole) or "")
+                if source_item else ""),
+            "realkey": realkey,
+            "news_key": news_key,
+            "original_url": str(
+                title_item.data(Qt.ItemDataRole.UserRole + 2)
+                or "").strip(),
+        }
+        search_source = (
+            "로이터" if context["source_id"] == "28"
+            else context["source_name"]
+        )
+        context["search_url"] = self._ls_news_search_url(
+            context["title"], search_source)
+        return context
+
+    @staticmethod
+    def _ls_news_search_url(
+            title: str, source_name: str = "") -> str:
+        def encoded_search_url(
+                endpoint: str,
+                items: tuple[tuple[str, str], ...]) -> str:
+            url = QUrl(endpoint)
+            encoded = bytes(url.toEncoded()).decode("ascii")
+            separator = "&" if url.hasQuery() else "?"
+            encoded_items = "&".join(
+                f"{bytes(QUrl.toPercentEncoding(name)).decode('ascii')}="
+                f"{bytes(QUrl.toPercentEncoding(value)).decode('ascii')}"
+                for name, value in items
+            )
+            return f"{encoded}{separator}{encoded_items}"
+
+        title = str(title or "").strip()
+        source_name = str(source_name or "").strip()
+        if source_name == "로이터":
+            # 로이터는 번역된 한글 송고 제목으로 검색하지 않는다. 본문에
+            # 포함된 '원문 바로가기' 주소가 확인될 때만 원문 버튼을 켠다.
+            return ""
+        source_search = LS_NEWS_SOURCE_SEARCH_ENDPOINTS.get(source_name)
+        if title and source_search:
+            endpoint, query_name = source_search
+            return encoded_search_url(endpoint, ((query_name, title),))
+
+        terms = [title]
+        if (
+            source_name and source_name != "출처 미상"
+            and not source_name.startswith("매체 ")
+        ):
+            terms.append(source_name)
+        query_text = " ".join(term for term in terms if term)
+        if not query_text:
+            return ""
+        return encoded_search_url(
+            "https://search.naver.com/search.naver",
+            (("where", "news"), ("query", query_text)),
+        )
+
+    def _open_ls_news_original_from_context(self, context: dict) -> bool:
+        original_url = str(context.get("original_url") or "").strip()
+        if not original_url:
+            try:
+                saved = ls_realtime_news_detail(
+                    realkey=str(context.get("realkey") or ""),
+                    news_key=str(context.get("news_key") or ""),
+                )
+            except Exception:  # noqa: BLE001 - 일반 본문 열기로 계속한다.
+                saved = None
+            original_url = str(
+                (saved or {}).get("original_url") or "").strip()
+        url = QUrl(original_url)
+        if (
+            not original_url or not url.isValid()
+            or url.scheme().lower() not in ("http", "https")
+        ):
+            return False
+        context["original_url"] = original_url
+        QDesktopServices.openUrl(url)
+        return True
+
+    def _ls_news_table_clicked(self, row: int, column: int):
+        if column == 2:
+            representative = self._ls_news_representative_stock(row)
+            if representative is None:
+                return
+            code, stock_name = representative
+            QApplication.clipboard().setText(code)
+            self.statusBar().showMessage(
+                f"{stock_name} 대표 종목코드 {code} 복사됨", 2500)
+            return
+        if column != 3:
+            return
+        context = self._ls_news_row_context(row)
+        if context is None:
+            return
+        if (
+            QApplication.keyboardModifiers()
+            & Qt.KeyboardModifier.ControlModifier
+            and self._open_ls_news_original_from_context(context)
+        ):
+            return
+        self._open_ls_news_detail(context)
+
+    def _ls_news_table_double_clicked(self, row: int, column: int):
+        if column != 3:
+            return
+        context = self._ls_news_row_context(row)
+        if context is not None:
+            self._open_ls_news_original_from_context(context)
+
+    def _ls_news_representative_stock(
+            self, row: int) -> tuple[str, str] | None:
+        """뉴스 행에 연결된 첫 번째 유효 종목코드와 종목명을 반환한다."""
+        stock_item = self._ls_news_table.item(row, 2)
+        if stock_item is None:
+            return None
+        stock_codes = tuple(
+            code for code in split_ls_news_stock_codes(
+                stock_item.data(Qt.ItemDataRole.UserRole))
+            if len(code) == 6 and code.isdigit()
+        )
+        if not stock_codes:
+            return None
+        code = stock_codes[0]
+        stock_name = str(self._ls_news_stock_names.get(code) or "").strip()
+        if not stock_name or stock_name == code:
+            stock = resolve_analysis_stock(code)
+            resolved_name = str(
+                (stock or {}).get("stock_name") or "").strip()
+            if resolved_name:
+                stock_name = resolved_name
+                self._ls_news_stock_names[code] = resolved_name
+        return code, stock_name or code
+
+    def _ls_news_table_context_menu(self, position):
+        """종목명 우클릭 시 대표 종목을 감시에 넣고 종토방으로 이동한다."""
+        item = self._ls_news_table.itemAt(position)
+        if item is None or item.column() != 2:
+            return
+        representative = self._ls_news_representative_stock(item.row())
+        if representative is None:
+            return
+        code, stock_name = representative
+        try:
+            already_registered = code in realtime_watch_codes()
+            if not already_registered:
+                set_realtime_watch(
+                    code, True, "LS_REALTIME_NEWS",
+                    stock_name="" if stock_name == code else stock_name,
+                )
+        except ValueError as error:
+            QMessageBox.warning(self, "관심종목 추가", str(error))
+            return
+
+        if not already_registered:
+            self.watchlist_changed.emit()
+        self.open_realtime_watch(code, fetch_news=False)
+        action = "선택" if already_registered else "추가"
+        self._news_status.setText(
+            f"{stock_name}({code}) 관심종목 {action} · 종목토론을 열었습니다.")
+        self.statusBar().showMessage(
+            f"{stock_name} 관심종목 {action} · 종토방 이동", 3000)
+
+    def _open_ls_news_detail(self, context: dict):
+        realkey = str(context.get("realkey") or "").strip()
+        news_key = str(context.get("news_key") or "").strip()
+        window_key = news_key or realkey or (
+            f"{context['time']}|{context['title']}")
+        dialog = self._ls_news_detail_windows.get(window_key)
+        if dialog is not None:
+            dialog.show()
+            dialog.raise_()
+            dialog.activateWindow()
+            return
+
+        dialog = LSNewsDetailDialog(self)
+        dialog.set_metadata(
+            context["title"],
+            f"{context['time']} · {context['source_name']}",
+            context["stocks"],
+        )
+        dialog.set_original_link(
+            str(context.get("original_url") or ""),
+            str(context.get("search_url") or ""),
+            resolving=not bool(context.get("original_url")),
+        )
+        dialog.refresh_requested.connect(
+            lambda key=window_key, target=dialog, values=context:
+            self._start_ls_news_detail_load(
+                key, target, values, force=True))
+        dialog.finished.connect(
+            lambda _result, key=window_key, target=dialog:
+            self._forget_ls_news_detail_window(key, target))
+        self._ls_news_detail_windows[window_key] = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        self._start_ls_news_detail_load(window_key, dialog, context)
+        self._start_ls_news_original_url_resolution(
+            window_key, dialog, context)
+
+    def _forget_ls_news_detail_window(
+            self, window_key: str, dialog: LSNewsDetailDialog):
+        if self._ls_news_detail_windows.get(window_key) is dialog:
+            self._ls_news_detail_windows.pop(window_key, None)
+        task = self._ls_news_detail_tasks.pop(window_key, None)
+        if task is not None and not task.done():
+            task.cancel()
+        url_task = self._ls_news_url_tasks.pop(window_key, None)
+        if url_task is not None and not url_task.done():
+            url_task.cancel()
+
+    def _start_ls_news_detail_load(
+            self, window_key: str, dialog: LSNewsDetailDialog,
+            context: dict, force: bool = False):
+        existing = self._ls_news_detail_tasks.get(window_key)
+        if existing is not None and not existing.done():
+            return
+        dialog.set_loading(
+            "LS에서 본문 다시 불러오는 중…" if force
+            else "본문 확인 중…")
+        task = asyncio.ensure_future(
+            self._load_ls_news_detail(
+                window_key, dialog, context, force=force))
+        self._ls_news_detail_tasks[window_key] = task
+        task.add_done_callback(
+            lambda completed, key=window_key:
+            self._ls_news_detail_task_finished(key, completed))
+
+    def _ls_news_detail_task_finished(
+            self, window_key: str, task: asyncio.Task):
+        if self._ls_news_detail_tasks.get(window_key) is task:
+            self._ls_news_detail_tasks.pop(window_key, None)
+
+    def _start_ls_news_original_url_resolution(
+            self, window_key: str, dialog: LSNewsDetailDialog,
+            context: dict):
+        original_url = str(context.get("original_url") or "").strip()
+        search_url = str(context.get("search_url") or "")
+        if original_url:
+            dialog.set_original_link(original_url, search_url)
+            return
+        existing = self._ls_news_url_tasks.get(window_key)
+        if existing is not None and not existing.done():
+            return
+        dialog.set_original_link("", search_url, resolving=True)
+        task = asyncio.ensure_future(
+            self._resolve_ls_news_original_url(
+                window_key, dialog, context))
+        self._ls_news_url_tasks[window_key] = task
+        task.add_done_callback(
+            lambda completed, key=window_key:
+            self._ls_news_url_task_finished(key, completed))
+
+    def _ls_news_url_task_finished(
+            self, window_key: str, task: asyncio.Task):
+        if self._ls_news_url_tasks.get(window_key) is task:
+            self._ls_news_url_tasks.pop(window_key, None)
+
+    @staticmethod
+    def _ls_news_source_names_equal(left: str, right: str) -> bool:
+        normalize = lambda value: "".join(  # noqa: E731 - 짧은 비교 전용
+            character.lower() for character in str(value or "")
+            if character.isalnum())
+        return bool(normalize(left)) and normalize(left) == normalize(right)
+
+    @staticmethod
+    def _ls_news_url_checked_recently(value: str) -> bool:
+        try:
+            checked_at = datetime.fromisoformat(str(value or ""))
+            if checked_at.tzinfo is None:
+                checked_at = checked_at.astimezone()
+            return (
+                datetime.now().astimezone() - checked_at
+                < timedelta(minutes=10)
+            )
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _ls_news_candidate_time_matches(
+            expected: str, candidate: str) -> bool:
+        if not expected or not candidate:
+            return True
+        try:
+            expected_at = datetime.fromisoformat(str(expected))
+            candidate_at = datetime.fromisoformat(str(candidate))
+            if expected_at.tzinfo is None:
+                expected_at = expected_at.astimezone()
+            if candidate_at.tzinfo is None:
+                candidate_at = candidate_at.astimezone()
+            return abs(
+                (expected_at - candidate_at).total_seconds()) <= 72 * 3600
+        except (TypeError, ValueError):
+            return True
+
+    def _remember_ls_news_original_url(
+            self, realkey: str, news_key: str, original_url: str):
+        realkey = str(realkey or "").strip()
+        news_key = str(news_key or "").strip()
+        original_url = str(original_url or "").strip()
+        if not original_url:
+            return
+        for row in range(self._ls_news_table.rowCount()):
+            title_item = self._ls_news_table.item(row, 3)
+            if title_item is None:
+                continue
+            item_realkey = str(
+                title_item.data(Qt.ItemDataRole.UserRole) or "").strip()
+            item_news_key = str(
+                title_item.data(Qt.ItemDataRole.UserRole + 1) or "").strip()
+            if (
+                (realkey and item_realkey == realkey)
+                or (news_key and item_news_key == news_key)
+            ):
+                title_item.setData(
+                    Qt.ItemDataRole.UserRole + 2, original_url)
+                title_item.setToolTip(
+                    f"{title_item.text()}\n\n클릭: 앱 본문 열기\n"
+                    "더블클릭·Ctrl+클릭: 원문을 기본 브라우저로 열기\n"
+                    f"{original_url}")
+
+    def _set_ls_news_original_result(
+            self, window_key: str, dialog: LSNewsDetailDialog,
+            context: dict, original_url: str = ""):
+        if self._ls_news_detail_windows.get(window_key) is not dialog:
+            return
+        search_url = str(context.get("search_url") or "")
+        original_url = str(original_url or "").strip()
+        if original_url:
+            context["original_url"] = original_url
+            self._remember_ls_news_original_url(
+                str(context.get("realkey") or ""),
+                str(context.get("news_key") or ""),
+                original_url,
+            )
+        dialog.set_original_link(original_url, search_url, resolving=False)
+
+    async def _resolve_ls_news_original_url(
+            self, window_key: str, dialog: LSNewsDetailDialog,
+            context: dict):
+        try:
+            saved = ls_realtime_news_detail(
+                realkey=str(context.get("realkey") or ""),
+                news_key=str(context.get("news_key") or ""),
+            ) or {}
+            original_url = str(saved.get("original_url") or "").strip()
+            if original_url:
+                self._set_ls_news_original_result(
+                    window_key, dialog, context, original_url)
+                return
+
+            title = str(
+                saved.get("title") or context.get("title") or "").strip()
+            body = str(saved.get("body") or "")
+            source_name = str(
+                saved.get("source_name")
+                or context.get("source_name") or "").strip()
+            source_id = str(
+                saved.get("source_id")
+                or context.get("source_id") or "").strip()
+            configured_source = NEWS_SOURCE_NAMES.get(source_id, "")
+            if configured_source:
+                source_name = configured_source
+            else:
+                inferred_source = infer_news_source(body)
+                if inferred_source:
+                    source_name = inferred_source
+            is_reuters = (
+                source_id == "28"
+                or self._ls_news_source_names_equal(source_name, "로이터")
+            )
+            if is_reuters:
+                source_name = "로이터"
+            context["search_url"] = self._ls_news_search_url(
+                title, source_name)
+
+            body_links = extract_news_links(body)
+            if is_reuters:
+                for label, candidate_url in body_links:
+                    candidate = QUrl(str(candidate_url or "").strip())
+                    is_fnguide_original = (
+                        candidate.host().casefold() == "trnews.fnguide.com"
+                        and candidate.path().casefold()
+                        == "/home/originalarticle"
+                        and QUrlQuery(candidate).hasQueryItem("id")
+                    )
+                    if (
+                        not candidate.isValid()
+                        or candidate.scheme().lower() not in ("http", "https")
+                        or (
+                            normalize_news_title(label)
+                            not in LS_NEWS_REUTERS_ORIGINAL_LABELS
+                            and not is_fnguide_original
+                        )
+                    ):
+                        continue
+                    direct_url = candidate.toString()
+                    try:
+                        update_ls_realtime_news_original_url(
+                            direct_url, "BODY_ORIGINAL_LINK", 1.0,
+                            realkey=str(context.get("realkey") or ""),
+                            news_key=str(context.get("news_key") or ""),
+                        )
+                    except Exception:  # noqa: BLE001 - 화면 연결은 유지한다.
+                        log.exception(
+                            "LS Reuters original URL save failed")
+                    self._set_ls_news_original_result(
+                        window_key, dialog, context, direct_url)
+                    return
+                try:
+                    update_ls_realtime_news_original_url(
+                        "", "BODY_ORIGINAL_LINK_NOT_FOUND", 0,
+                        realkey=str(context.get("realkey") or ""),
+                        news_key=str(context.get("news_key") or ""),
+                    )
+                except Exception:  # noqa: BLE001 - 버튼 비활성화는 유지한다.
+                    log.exception(
+                        "LS Reuters missing original link state save failed")
+                self._set_ls_news_original_result(
+                    window_key, dialog, context)
+                return
+
+            inferred_original_url = infer_news_original_url(body)
+            if inferred_original_url:
+                try:
+                    update_ls_realtime_news_original_url(
+                        inferred_original_url, "BODY_MEDIA_PATH", 0.99,
+                        realkey=str(context.get("realkey") or ""),
+                        news_key=str(context.get("news_key") or ""),
+                    )
+                except Exception:  # noqa: BLE001 - 화면 연결은 유지한다.
+                    log.exception(
+                        "LS original URL media path save failed")
+                self._set_ls_news_original_result(
+                    window_key, dialog, context, inferred_original_url)
+                return
+
+            target_title = normalize_news_title(title)
+            if target_title and source_name:
+                for label, candidate_url in body_links:
+                    if (
+                        normalize_news_title(label) == target_title
+                        and self._ls_news_source_names_equal(
+                            news_source_from_url(candidate_url), source_name)
+                    ):
+                        try:
+                            update_ls_realtime_news_original_url(
+                                candidate_url, "BODY_EXACT", 1.0,
+                                realkey=str(context.get("realkey") or ""),
+                                news_key=str(context.get("news_key") or ""),
+                            )
+                        except Exception:  # noqa: BLE001 - 화면 연결은 유지한다.
+                            log.exception(
+                                "LS original URL body match save failed")
+                        self._set_ls_news_original_result(
+                            window_key, dialog, context, candidate_url)
+                        return
+
+            if self._ls_news_url_checked_recently(
+                    str(saved.get("original_url_checked_at") or "")):
+                self._set_ls_news_original_result(
+                    window_key, dialog, context)
+                return
+
+            known_sources = set(NEWS_SOURCE_DOMAINS.values())
+            if (
+                not target_title
+                or not any(self._ls_news_source_names_equal(
+                    source_name, known) for known in known_sources)
+                or not config.NAVER_CLIENT_ID
+                or not config.NAVER_CLIENT_SECRET
+                or news_request_count_today() >= 20000
+            ):
+                self._set_ls_news_original_result(
+                    window_key, dialog, context)
+                return
+
+            started = time.monotonic()
+            items = []
+            try:
+                items = await NaverNewsClient(
+                    config.NAVER_CLIENT_ID,
+                    config.NAVER_CLIENT_SECRET,
+                ).search(title, display=20)
+                elapsed = int((time.monotonic() - started) * 1000)
+                log_content_request(
+                    None, f"LS 원문: {title}", 200, len(items), 0, elapsed)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001 - 검색 버튼으로 대체한다.
+                elapsed = int((time.monotonic() - started) * 1000)
+                try:
+                    log_content_request(
+                        None, f"LS 원문: {title}", 0, 0, 0,
+                        elapsed, str(error))
+                except Exception:  # noqa: BLE001 - 원래 오류를 유지한다.
+                    log.exception("LS original URL request log failed")
+                try:
+                    update_ls_realtime_news_original_url(
+                        "", "NAVER_ERROR", 0,
+                        realkey=str(context.get("realkey") or ""),
+                        news_key=str(context.get("news_key") or ""),
+                    )
+                except Exception:  # noqa: BLE001
+                    log.exception("LS original URL error state save failed")
+                self._set_ls_news_original_result(
+                    window_key, dialog, context)
+                return
+
+            matched_url = ""
+            for item in items:
+                candidate_url = str(
+                    item.get("original_url") or "").strip()
+                if (
+                    candidate_url
+                    and normalize_news_title(item.get("title")) == target_title
+                    and self._ls_news_source_names_equal(
+                        news_source_from_url(candidate_url), source_name)
+                    and self._ls_news_candidate_time_matches(
+                        str(saved.get("published_at") or ""),
+                        str(item.get("published_at_source") or ""))
+                ):
+                    matched_url = candidate_url
+                    break
+            try:
+                update_ls_realtime_news_original_url(
+                    matched_url,
+                    "NAVER_EXACT" if matched_url else "NAVER_NOT_FOUND",
+                    1.0 if matched_url else 0,
+                    realkey=str(context.get("realkey") or ""),
+                    news_key=str(context.get("news_key") or ""),
+                )
+            except Exception:  # noqa: BLE001 - 화면 결과는 유지한다.
+                log.exception("LS original URL match save failed")
+            self._set_ls_news_original_result(
+                window_key, dialog, context, matched_url)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - 본문 기능은 유지한다.
+            log.info(
+                "LS original URL resolution failed key=%s type=%s",
+                str(context.get("realkey") or ""), type(error).__name__)
+            self._set_ls_news_original_result(
+                window_key, dialog, context)
+
+    def _set_ls_news_detail_metadata(
+            self, dialog: LSNewsDetailDialog, record: dict,
+            context: dict):
+        title = str(record.get("title") or context.get("title") or "")
+        news_date = str(record.get("news_date") or "")
+        news_time = str(record.get("news_time") or "")
+        display_time = (
+            format_news_time(news_date, news_time)
+            if news_date or news_time else str(context.get("time") or "-"))
+        source_name = str(
+            record.get("source_name") or context.get("source_name")
+            or "출처 미상")
+        realkey = str(record.get("realkey") or context.get("realkey") or "")
+        metadata = f"{display_time} · {source_name}"
+        if realkey:
+            metadata += f" · 뉴스번호 {realkey}"
+
+        related_codes = (
+            record.get("related_stock_codes")
+            or record.get("stock_code")
+            or context.get("stock_codes")
+            or "")
+        if split_ls_news_stock_codes(related_codes):
+            _label, _codes, stocks = self._ls_news_stock_display(
+                related_codes)
+        else:
+            stocks = str(context.get("stocks") or "연결 종목 없음")
+        dialog.set_metadata(title, metadata, stocks)
+
+    async def _load_ls_news_detail(
+            self, window_key: str, dialog: LSNewsDetailDialog,
+            context: dict, force: bool = False):
+        saved = None
+        try:
+            saved = ls_realtime_news_detail(
+                realkey=str(context.get("realkey") or ""),
+                news_key=str(context.get("news_key") or ""),
+            )
+        except Exception:  # noqa: BLE001 - REST 상세조회로 계속한다.
+            log.exception("saved LS news detail load failed")
+        if saved and str(saved.get("body") or "").strip() and not force:
+            if self._ls_news_detail_windows.get(window_key) is not dialog:
+                return
+            self._set_ls_news_detail_metadata(dialog, saved, context)
+            dialog.set_body(str(saved["body"]), "DB 저장 본문")
+            self._start_ls_news_original_url_resolution(
+                window_key, dialog, context)
+            return
+
+        realkey = str(context.get("realkey") or "").strip()
+        if not realkey:
+            if self._ls_news_detail_windows.get(window_key) is dialog:
+                dialog.set_error(
+                    "뉴스번호가 없어 LS 본문을 조회할 수 없습니다.")
+            return
+        try:
+            stream = self._ls_news_stream or LSNewsStream()
+            detail = await stream.news_detail(realkey)
+            if not str(detail.body or "").strip():
+                raise RuntimeError("LS 상세조회 응답에 본문이 없습니다.")
+            detail_saved = False
+            try:
+                detail_saved = update_ls_realtime_news_detail(
+                    realkey, detail.body, detail.stock_codes)
+            except Exception:  # noqa: BLE001 - 본문 표시는 계속한다.
+                log.exception("LS news detail save failed")
+
+            inferred_source = infer_news_source(detail.body)
+            source_id = str(
+                (saved or {}).get("source_id")
+                or context.get("source_id") or "").strip()
+            resolved_source = (
+                NEWS_SOURCE_NAMES.get(source_id) or inferred_source)
+            if resolved_source and source_id:
+                self._remember_ls_news_source(source_id, resolved_source)
+
+            refreshed = None
+            try:
+                refreshed = ls_realtime_news_detail(
+                    realkey=realkey,
+                    news_key=str(context.get("news_key") or ""),
+                )
+            except Exception:  # noqa: BLE001 - 받아온 본문을 직접 표시한다.
+                log.exception("refreshed LS news detail load failed")
+            record = dict(refreshed or saved or {})
+            record["body"] = detail.body
+            # t3102의 sTitle은 정상 제목 뒤에 고정폭 바이너리가
+            # 붙어 오는 케이스가 있다. 화면에는 NWS로 받아 DB에
+            # 저장한 정상 제목을 계속 사용한다.
+            if not record.get("related_stock_codes") and detail.stock_codes:
+                record["related_stock_codes"] = json.dumps(
+                    detail.stock_codes, ensure_ascii=False)
+            if resolved_source:
+                record["source_name"] = resolved_source
+            if self._ls_news_detail_windows.get(window_key) is not dialog:
+                return
+            self._set_ls_news_detail_metadata(dialog, record, context)
+            status = (
+                "LS 상세조회 완료 · DB 저장"
+                if detail_saved
+                else "LS 상세조회 완료 · DB 미저장"
+            )
+            dialog.set_body(detail.body, status)
+            self._start_ls_news_original_url_resolution(
+                window_key, dialog, context)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - 실시간 제목 수신은 유지한다.
+            log.info(
+                "LS news detail view failed key=%s type=%s",
+                realkey, type(error).__name__)
+            if self._ls_news_detail_windows.get(window_key) is dialog:
+                dialog.set_error(f"본문 조회 실패: {error}")
+
+    def _ls_news_stock_display(
+            self, code: str) -> tuple[str, tuple[str, ...], str]:
+        """단일·복수 NWS 종목코드를 짧은 표시명과 전체 설명으로 만든다."""
+        stock_codes = split_ls_news_stock_codes(code)
+        if not stock_codes:
+            return "-", (), "연결 종목 없음"
+        stock_names = []
+        for stock_code in stock_codes:
+            if stock_code not in self._ls_news_stock_names:
+                stock = resolve_analysis_stock(stock_code)
+                stock_name = str(
+                    (stock or {}).get("stock_name") or "").strip()
+                self._ls_news_stock_names[stock_code] = (
+                    stock_name or stock_code)
+            stock_names.append(self._ls_news_stock_names[stock_code])
+        label = stock_names[0]
+        if len(stock_names) > 1:
+            label += f" {len(stock_names) - 1}"
+        tooltip_lines = [
+            (
+                f"{stock_name} ({stock_code})"
+                if stock_name != stock_code else stock_code
+            )
+            for stock_name, stock_code in zip(stock_names, stock_codes)
+        ]
+        tooltip = (
+            f"관련 종목 {len(stock_codes)}개\n" + "\n".join(tooltip_lines)
+            if len(stock_codes) > 1 else tooltip_lines[0]
+        )
+        return label, stock_codes, tooltip
+
+    def _save_ls_news_header(self, *_args):
+        if not hasattr(self, "_ls_news_table"):
+            return
+        self._settings.setValue(
+            "analysis_ls_news_header_v2",
+            self._ls_news_table.horizontalHeader().saveState(),
+        )
+        self._settings.sync()
+
+    def _schedule_ls_news_source_resolution(self, item: LSNewsItem):
+        source_id = str(item.source_id or "").strip()
+        if (
+            not source_id or source_id in self._ls_news_source_names
+            or source_id in self._ls_news_source_pending
+            or self._ls_news_source_attempts.get(source_id, 0) >= 3
+            or not item.realkey or self._ls_news_stream is None
+        ):
+            return
+        self._ls_news_source_pending.add(source_id)
+        task = asyncio.ensure_future(
+            self._resolve_ls_news_source(source_id, item.realkey))
+        self._ls_news_source_tasks.add(task)
+        task.add_done_callback(self._ls_news_source_tasks.discard)
+
+    def _remember_ls_news_source(self, source_id: str, source_name: str):
+        source_id = str(source_id or "").strip()
+        source_name = str(source_name or "").strip()
+        if not source_id or not source_name:
+            return
+        # 검증된 뉴스구분자는 제휴 기사의 원문 매체명으로 덮지 않는다.
+        # 예: 21번 인포스탁 피드에 팜뉴스 기사가 포함될 수 있다.
+        source_name = NEWS_SOURCE_NAMES.get(source_id, source_name)
+        self._ls_news_source_names[source_id] = source_name
+        self._settings.setValue(
+            "analysis_ls_news_sources",
+            json.dumps(
+                self._ls_news_source_names, ensure_ascii=False,
+                sort_keys=True),
+        )
+        self._settings.sync()
+        try:
+            update_ls_realtime_news_source(source_id, source_name)
+        except Exception:  # noqa: BLE001 - 화면 보정은 계속한다.
+            log.exception("LS realtime news source DB update failed")
+        for row in range(self._ls_news_table.rowCount()):
+            source_item = self._ls_news_table.item(row, 4)
+            if (
+                source_item is not None
+                and source_item.data(Qt.ItemDataRole.UserRole) == source_id
+            ):
+                source_item.setText(source_name)
+        if self._ls_news_search.text().strip():
+            self._apply_ls_news_search_filter()
+
+    async def _resolve_ls_news_source(self, source_id: str, realkey: str):
+        try:
+            detail = await self._ls_news_stream.news_detail(realkey)
+            try:
+                update_ls_realtime_news_detail(
+                    realkey, detail.body, detail.stock_codes)
+            except Exception:  # noqa: BLE001 - 매체명 보정은 계속한다.
+                log.exception("LS realtime news detail DB update failed")
+            source_name = infer_news_source(detail.body)
+            if not source_name:
+                self._ls_news_source_attempts[source_id] = (
+                    self._ls_news_source_attempts.get(source_id, 0) + 1)
+                return
+            self._remember_ls_news_source(source_id, source_name)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - 제목 수신은 계속 유지한다.
+            self._ls_news_source_attempts[source_id] = (
+                self._ls_news_source_attempts.get(source_id, 0) + 1)
+            log.info(
+                "LS news source resolution failed id=%s type=%s",
+                source_id, type(error).__name__)
+        finally:
+            self._ls_news_source_pending.discard(source_id)
+
+    def _ls_news_row_is_new(self, row: int) -> bool:
+        if not hasattr(self, "_ls_news_table"):
+            return False
+        time_item = self._ls_news_table.item(row, 1)
+        return bool(
+            time_item is not None
+            and time_item.data(LS_NEWS_NEW_ROLE)
+        )
+
+    def _update_ls_news_new_button(self):
+        if not hasattr(self, "_ls_news_clear_new_button"):
+            return
+        count = max(0, int(self._ls_news_new_count))
+        self._ls_news_clear_new_button.setText(
+            f"신규해제 ({count:,})" if count else "신규해제")
+        self._ls_news_clear_new_button.setEnabled(count > 0)
+
+    def _reset_ls_news_new_markers_state(self):
+        self._ls_news_new_count = 0
+        self._update_ls_news_new_button()
+
+    def _mark_ls_news_row_new(self, row: int):
+        """실시간으로 표시된 한 행을 사용자가 해제할 때까지 강조한다."""
+        if self._ls_news_row_is_new(row):
+            return
+        time_item = self._ls_news_table.item(row, 1)
+        if time_item is None:
+            return
+        time_item.setData(LS_NEWS_NEW_ROLE, True)
+        time_item.setBackground(QColor(LS_NEWS_NEW_TIME_BACKGROUND))
+        time_item.setForeground(QColor(LS_NEWS_NEW_TIME_FOREGROUND))
+        title_item = self._ls_news_table.item(row, 3)
+        if title_item is not None:
+            title_item.setBackground(QColor(LS_NEWS_NEW_TITLE_BACKGROUND))
+            title_item.setForeground(QColor(LS_NEWS_NEW_TITLE_FOREGROUND))
+            font = title_item.font()
+            font.setBold(True)
+            title_item.setFont(font)
+        self._ls_news_new_count += 1
+        self._update_ls_news_new_button()
+
+    def _clear_ls_news_new_markers(self):
+        """목록은 유지하고 새 실시간 뉴스의 강조 표시만 모두 해제한다."""
+        if not hasattr(self, "_ls_news_table"):
+            return
+        cleared = 0
+        for row in range(self._ls_news_table.rowCount()):
+            if not self._ls_news_row_is_new(row):
+                continue
+            cleared += 1
+            time_item = self._ls_news_table.item(row, 1)
+            if time_item is not None:
+                time_item.setData(LS_NEWS_NEW_ROLE, None)
+            for column in (1, 3):
+                item = self._ls_news_table.item(row, column)
+                if item is not None:
+                    item.setData(Qt.ItemDataRole.BackgroundRole, None)
+                    item.setData(Qt.ItemDataRole.ForegroundRole, None)
+            title_item = self._ls_news_table.item(row, 3)
+            if title_item is not None:
+                font = title_item.font()
+                font.setBold(False)
+                title_item.setFont(font)
+        self._reset_ls_news_new_markers_state()
+        if cleared:
+            self.statusBar().showMessage(
+                f"신규 뉴스 강조 {cleared:,}건을 해제했습니다. "
+                "목록과 DB는 유지됩니다.",
+                3000,
+            )
+
     def _build_realtime_news_page(self, layout: QVBoxLayout):
         controls = QHBoxLayout()
         self._news_watch_search = QLineEdit()
@@ -4146,7 +6486,7 @@ class AnalysisWindow(QMainWindow):
             self._news_watch_context_menu)
 
         news_columns = (
-            "게시시각", "제목", "재료", "상태", "언론사",
+            "게시시각", "종목", "제목", "재료", "상태", "언론사",
         )
         self._realtime_news_table = QTableWidget(0, len(news_columns))
         self._realtime_news_table.setHorizontalHeaderLabels(news_columns)
@@ -4172,7 +6512,21 @@ class AnalysisWindow(QMainWindow):
         news_pane = QWidget()
         news_layout = QVBoxLayout(news_pane)
         news_layout.setContentsMargins(0, 0, 0, 0)
-        news_layout.addWidget(QLabel("네이버 공식 검색 API 뉴스"))
+        news_header = QHBoxLayout()
+        news_header.addWidget(QLabel("네이버 공식 검색 API 뉴스"))
+        self._news_scope = QComboBox()
+        self._news_scope.addItem("관심종목 전체뉴스", "all")
+        self._news_scope.addItem("선택한 종목뉴스만", "selected")
+        saved_news_scope = str(self._settings.value(
+            "analysis_news_scope", "selected") or "selected")
+        saved_scope_index = self._news_scope.findData(saved_news_scope)
+        self._news_scope.setCurrentIndex(
+            saved_scope_index if saved_scope_index >= 0 else 1)
+        self._news_scope.currentIndexChanged.connect(
+            self._news_scope_changed)
+        news_header.addWidget(self._news_scope)
+        news_header.addStretch(1)
+        news_layout.addLayout(news_header)
         news_layout.addWidget(self._realtime_news_table)
 
         web_pane = QWidget()
@@ -4471,9 +6825,24 @@ class AnalysisWindow(QMainWindow):
     def _refresh_realtime_news_table(self):
         if not hasattr(self, "_realtime_news_table"):
             return
-        rows = news_rows(self._selected_watch_code, 300)
-        new_ids = self._news_new_ids_by_code.get(
-            self._selected_watch_code, set())
+        show_all_watched = (
+            hasattr(self, "_news_scope")
+            and self._news_scope.currentData() == "all"
+        )
+        if show_all_watched:
+            rows = news_rows("", 300, watched_only=True)
+            watched_codes = realtime_watch_codes()
+            new_ids = set().union(*(
+                self._news_new_ids_by_code.get(code, set())
+                for code in watched_codes
+            )) if watched_codes else set()
+        else:
+            rows = (
+                news_rows(self._selected_watch_code, 300)
+                if self._selected_watch_code else []
+            )
+            new_ids = self._news_new_ids_by_code.get(
+                self._selected_watch_code, set())
         table = self._realtime_news_table
         is_dark = (
             table.palette().color(QPalette.ColorRole.Base).lightness() < 128)
@@ -4496,8 +6865,8 @@ class AnalysisWindow(QMainWindow):
                 status = "정상"
             values = (
                 self._display_timestamp(row["published_at_source"]),
-                row["current_title"], row["material_type"], status,
-                row["publisher"],
+                row["stock_name"], row["current_title"],
+                row["material_type"], status, row["publisher"],
             )
             url = row["naver_url"] or row["original_url"]
             for column, value in enumerate(values):
@@ -4517,7 +6886,7 @@ class AnalysisWindow(QMainWindow):
                 elif is_today:
                     item.setBackground(QColor("#FFF0A6"))
                     item.setForeground(QColor("#5D3A00"))
-                if column == 1:
+                if column == 2:
                     item.setToolTip(row["current_summary"] or "")
                     if is_new and not is_removed and not is_missing:
                         title_font = item.font()
@@ -4529,7 +6898,7 @@ class AnalysisWindow(QMainWindow):
                         title_font = item.font()
                         title_font.setBold(True)
                         item.setFont(title_font)
-                elif column == 3:
+                elif column == 4:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                     if is_removed:
                         item.setForeground(QColor("#C62828"))
@@ -4546,9 +6915,16 @@ class AnalysisWindow(QMainWindow):
                 table.setItem(row_index, column, item)
         table.setSortingEnabled(True)
         table.resizeColumnsToContents()
-        if table.columnCount() > 1:
+        if table.columnCount() > 2:
             table.setColumnWidth(
-                1, min(620, max(300, table.columnWidth(1))))
+                2, min(620, max(300, table.columnWidth(2))))
+
+    def _news_scope_changed(self, _index: int):
+        """네이버 공식 뉴스 표의 관심종목 전체/선택종목 범위를 전환한다."""
+        scope = str(self._news_scope.currentData() or "selected")
+        self._settings.setValue("analysis_news_scope", scope)
+        self._settings.sync()
+        self._refresh_realtime_news_table()
 
     def _add_news_watch(self):
         query = self._news_watch_search.text().strip()
@@ -4614,7 +6990,7 @@ class AnalysisWindow(QMainWindow):
         self.statusBar().showMessage(f"{code} 복사됨", 2000)
 
     def _realtime_news_table_clicked(self, row: int, column: int):
-        if column != 1:
+        if column != 2:
             return
         item = self._realtime_news_table.item(row, 0)
         url = (
@@ -4685,6 +7061,7 @@ class AnalysisWindow(QMainWindow):
         client = NaverNewsClient(
             config.NAVER_CLIENT_ID, config.NAVER_CLIENT_SECRET)
         total_new = total_updated = errors = 0
+        latest_new_news = None
         try:
             for index, code in enumerate(codes, 1):
                 stock = resolve_analysis_stock(code)
@@ -4704,9 +7081,26 @@ class AnalysisWindow(QMainWindow):
                     ]
                     saved = save_news_items(
                         code, stock_name, matched_items)
-                    self._news_new_ids_by_code[code] = {
+                    code_new_ids = {
                         int(news_id) for news_id in saved["new_ids"]
                     }
+                    self._news_new_ids_by_code[code] = code_new_ids
+                    if code_new_ids:
+                        candidate = next((
+                            row for row in news_rows(code, 300)
+                            if int(row["news_id"]) in code_new_ids
+                        ), None)
+                        if candidate is not None and (
+                            latest_new_news is None
+                            or (
+                                str(candidate["published_at_source"] or ""),
+                                int(candidate["news_id"]),
+                            ) > (
+                                str(latest_new_news["published_at_source"] or ""),
+                                int(latest_new_news["news_id"]),
+                            )
+                        ):
+                            latest_new_news = candidate
                     reconcile_news_search_results(code, items)
                     elapsed = int((time.monotonic() - started) * 1000)
                     log_content_request(
@@ -4733,13 +7127,20 @@ class AnalysisWindow(QMainWindow):
                 f"{total_updated:,} · 오류 {errors:,} · 오늘 API "
                 f"{news_request_count_today():,}/25,000회")
             if total_new:
+                if latest_new_news is not None:
+                    self._show_latest_naver_news(latest_new_news)
+                if (
+                    hasattr(self, "_ls_news_sound")
+                    and self._ls_news_sound.isChecked()
+                ):
+                    _beep("naver_news")
                 self.new_news_found.emit(total_new)
 
     def flash_realtime_news_tab(self):
         """분석창이 보일 때 실시간 뉴스 탭을 짧게 점멸한다."""
         index = next((
             i for i in range(self._tabs.count())
-            if self._tabs.tabText(i) == "실시간 뉴스·종토방"
+            if self._tabs.tabText(i) == "종목뉴스·종토방"
         ), -1)
         if index < 0:
             return
@@ -4769,6 +7170,13 @@ class AnalysisWindow(QMainWindow):
                 break
         self._request_market_page_refresh()
 
+    def open_ls_realtime_news(self):
+        """LS 실시간 뉴스 탭을 선택한다."""
+        for index in range(self._tabs.count()):
+            if self._tabs.tabText(index) == "실시간 뉴스":
+                self._tabs.setCurrentIndex(index)
+                break
+
     def _selected_watch_name(self) -> str:
         stock = resolve_analysis_stock(self._selected_watch_code)
         return stock["stock_name"] if stock else ""
@@ -4777,7 +7185,7 @@ class AnalysisWindow(QMainWindow):
         """뉴스 탭에서 종목을 선택하고 저장 뉴스와 종토방을 함께 연다."""
         self._selected_watch_code = str(code or "")
         for index in range(self._tabs.count()):
-            if self._tabs.tabText(index) == "실시간 뉴스·종토방":
+            if self._tabs.tabText(index) == "종목뉴스·종토방":
                 self._tabs.setCurrentIndex(index)
                 break
         self._refresh_realtime_watch_table()
@@ -4909,18 +7317,111 @@ class AnalysisWindow(QMainWindow):
                     window.setTimeout(applyTodayHighlight, 500);
                     window.setTimeout(applyTodayHighlight, 1500);
                 """
-                script = f"""
+            script = f"""
                 (() => {{
-                    const target =
-                        document.querySelector('ul.tabs_submenu') ||
-                        document.querySelector('.section.inner_sub');
-                    if (target) {{
-                        const top =
-                            target.getBoundingClientRect().top + window.scrollY;
-                        window.scrollTo(0, Math.max(0, top - 4));
+                    const itemMenuPaths = new Set([
+                        '/item/main.naver', '/item/sise.naver',
+                        '/item/fchart.naver', '/item/frgn.naver',
+                        '/item/news.naver', '/item/coinfo.naver',
+                        '/item/board.naver', '/item/dart.naver',
+                        '/item/short_trade.naver'
+                    ]);
+                    const findItemMenu = () => {{
+                        // 목록과 본문에 공통으로 있는 정확한 종목 중간 메뉴를
+                        // 먼저 사용한다. inner_sub는 게시글 본문 영역이므로
+                        // 본문보기에서 스크롤 기준으로 사용하면 위치가 달라진다.
+                        const exactMenu = document.querySelector(
+                            'ul.tabs_submenu.tab_total_submenu'
+                        );
+                        if (exactMenu) return exactMenu;
+
+                        const candidates = Array.from(
+                            document.querySelectorAll(
+                                'ul.tabs_submenu, [class*="tabs_submenu"]'
+                            )
+                        );
+                        let bestTarget = null;
+                        let bestScore = 0;
+                        for (const candidate of candidates) {{
+                            const matchedPaths = new Set();
+                            for (const link of candidate.querySelectorAll(
+                                'a[href]'
+                            )) {{
+                                try {{
+                                    const path = new URL(
+                                        link.getAttribute('href'), location.href
+                                    ).pathname.replace(/\/$/, '');
+                                    if (itemMenuPaths.has(path)) {{
+                                        matchedPaths.add(path);
+                                    }}
+                                }} catch (_error) {{}}
+                            }}
+                            if (matchedPaths.size > bestScore) {{
+                                bestScore = matchedPaths.size;
+                                bestTarget = candidate;
+                            }}
+                        }}
+                        return bestScore >= 3 ? bestTarget : null;
+                    }};
+
+                    const alignItemMenu = () => {{
+                        const target = findItemMenu();
+                        if (!target) return false;
+                        const top = Math.max(
+                            0,
+                            target.getBoundingClientRect().top
+                                + window.scrollY - 4
+                        );
+                        window.scrollTo(0, top);
+                        return true;
+                    }};
+
+                    try {{
+                        history.scrollRestoration = 'manual';
+                    }} catch (_error) {{}}
+                    const aligned = alignItemMenu();
+
+                    if (location.pathname.replace(/\/$/, '') ===
+                        '/item/board_read.naver') {{
+                        // Chromium이 내용보기에서 목록의 이전 스크롤 위치를
+                        // 뒤늦게 복원하거나 광고 영역 높이가 변해도 공통 메뉴가
+                        // 목록과 같은 자리에 있도록 잠깐만 보정한다.
+                        if (window.__analysisBoardMenuAlignTimer) {{
+                            window.clearInterval(
+                                window.__analysisBoardMenuAlignTimer
+                            );
+                        }}
+                        let remainingAlignments = 24;
+                        let userMovedPage = false;
+                        const cancelAlignment = () => {{
+                            userMovedPage = true;
+                            if (window.__analysisBoardMenuAlignTimer) {{
+                                window.clearInterval(
+                                    window.__analysisBoardMenuAlignTimer
+                                );
+                                window.__analysisBoardMenuAlignTimer = null;
+                            }}
+                        }};
+                        for (const eventName of [
+                            'wheel', 'touchstart', 'pointerdown', 'keydown'
+                        ]) {{
+                            window.addEventListener(
+                                eventName, cancelAlignment,
+                                {{ once: true, capture: true }}
+                            );
+                        }}
+                        window.__analysisBoardMenuAlignTimer =
+                            window.setInterval(() => {{
+                                if (userMovedPage ||
+                                    --remainingAlignments <= 0) {{
+                                    cancelAlignment();
+                                    return;
+                                }}
+                                alignItemMenu();
+                            }}, 100);
                     }}
                     {today_highlight}
-                    return true;
+                    return aligned;
                 }})();
             """
         elif self._news_scroll_mode == "article":
@@ -4958,9 +7459,16 @@ class AnalysisWindow(QMainWindow):
             if self._news_webview.url().toString() == loaded_url:
                 self._news_webview.page().runJavaScript(script)
 
-        # 서버 HTML 로드 직후와 지연 렌더링 뒤 한 번씩 맞춘다.
-        QTimer.singleShot(0, scroll_loaded_page)
-        QTimer.singleShot(500, scroll_loaded_page)
+        # 종목토론 내용보기는 자바스크립트가 약 2.4초 동안 레이아웃 변화를
+        # 추적한다. 바깥 타이머를 다시 걸면 사용자의 직접 스크롤 이후에도
+        # 위치를 되돌릴 수 있으므로 내용보기에는 한 번만 실행한다.
+        delays = (
+            (0,)
+            if current_url.path() == "/item/board_read.naver"
+            else (0, 500)
+        )
+        for delay in delays:
+            QTimer.singleShot(delay, scroll_loaded_page)
 
     def _news_web_action(self, action: str):
         if self._news_webview is None:
@@ -5284,7 +7792,9 @@ class AnalysisWindow(QMainWindow):
 
         self._theme_summary = QLabel("테마 0개")
         layout.addWidget(self._theme_summary)
-        columns = ("출처", "테마", "구성종목", "상한가종목", "종목 목록")
+        columns = (
+            "번호", "출처", "테마", "구성종목", "상한가종목", "종목 목록",
+        )
         table = QTableWidget(0, len(columns))
         table.setHorizontalHeaderLabels(columns)
         table.setSortingEnabled(True)
@@ -5315,6 +7825,7 @@ class AnalysisWindow(QMainWindow):
             total_members += int(row["member_count"] or 0)
             members = str(row["members"] or "").replace(",", ", ")
             values = (
+                row_index + 1,
                 source_names.get(row["source"], row["source"]),
                 row["theme_name"],
                 int(row["member_count"] or 0),
@@ -5323,15 +7834,18 @@ class AnalysisWindow(QMainWindow):
             )
             for column, value in enumerate(values):
                 if column == 0:
+                    item = NumericTableWidgetItem(str(value), value)
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                elif column == 1:
                     item = NumericTableWidgetItem(
                         str(value or ""),
                         source_priority.get(row["source"], 99),
                     )
-                elif column in (2, 3):
+                elif column in (3, 4):
                     item = NumericTableWidgetItem(f"{value:,}", value)
                 else:
                     item = QTableWidgetItem(str(value or ""))
-                if column == 1 and row["source"] == "NAVER":
+                if column == 2 and row["source"] == "NAVER":
                     source_code = str(row["source_code"] or "").strip()
                     if source_code:
                         item.setData(
@@ -5339,13 +7853,14 @@ class AnalysisWindow(QMainWindow):
                         )
                         item.setToolTip(
                             "클릭하면 네이버 금융 테마 상세 페이지를 엽니다.")
-                if column == 4:
+                if column == 5:
                     item.setToolTip(members)
                 table.setItem(row_index, column, item)
         table.setSortingEnabled(True)
         table.resizeColumnsToContents()
-        table.setColumnWidth(1, min(260, max(140, table.columnWidth(1))))
-        table.setColumnWidth(4, 500)
+        table.setColumnWidth(0, 48)
+        table.setColumnWidth(2, min(260, max(140, table.columnWidth(2))))
+        table.setColumnWidth(5, 500)
         table.sortItems(0, Qt.SortOrder.AscendingOrder)
         self._theme_summary.setText(
             f"현재 테마 {len(rows):,}개 · 종목 연결 {total_members:,}건")
@@ -5433,7 +7948,7 @@ class AnalysisWindow(QMainWindow):
             + (" · 100종목 제한 가능성" if latest["truncated"] else "")
         )
     def _theme_table_clicked(self, row: int, column: int):
-        if column != 1:
+        if column != 2:
             return
         item = self._theme_table.item(row, column)
         source_code = (
@@ -6780,12 +9295,13 @@ class AnalysisWindow(QMainWindow):
         self._limit_summary = QLabel("상한가 0건")
         layout.addWidget(self._limit_summary)
         columns = (
-            "거래일", "종목코드", "종목명", "시장", "상한가진입", "종가",
-            "등락률", "거래량", "거래대금", "연속", "감시", "공시", "테마",
+            "번호", "거래일", "종목코드", "종목명", "시장", "상한가진입",
+            "종가", "등락률", "거래량", "거래대금", "연속", "감시", "공시",
+            "테마",
         )
         self._limit_table = QTableWidget(0, len(columns))
         self._limit_table.setHorizontalHeaderLabels(columns)
-        self._limit_table.horizontalHeaderItem(4).setToolTip(
+        self._limit_table.horizontalHeaderItem(5).setToolTip(
             "거래일별로 묶어 같은 날 먼저 상한가에 진입한 순서로 정렬")
         self._limit_table.setSortingEnabled(True)
         self._limit_table.setAlternatingRowColors(True)
@@ -6793,7 +9309,7 @@ class AnalysisWindow(QMainWindow):
         self._limit_table.verticalHeader().setVisible(False)
         # 마지막 컬럼도 자동 확장하지 않고 사용자가 경계선을 끌어 폭을 조절한다.
         self._limit_table.horizontalHeader().setStretchLastSection(False)
-        saved_header = self._settings.value("analysis_limit_header_v2")
+        saved_header = self._settings.value("analysis_limit_header_v3")
         self._limit_header_restored = bool(
             saved_header is not None
             and self._limit_table.horizontalHeader().restoreState(saved_header)
@@ -6814,9 +9330,9 @@ class AnalysisWindow(QMainWindow):
         """진입시간 정렬 중에는 아직 수집되지 않은 행을 제외한다."""
         table = self._limit_table
         for row in range(table.rowCount()):
-            entry_item = table.item(row, 4)
+            entry_item = table.item(row, 5)
             missing = not entry_item or entry_item.text().strip() in ("", "-")
-            table.setRowHidden(row, column == 4 and missing)
+            table.setRowHidden(row, column == 5 and missing)
 
     def _limit_dates(self) -> tuple[str, str]:
         return (
@@ -6838,8 +9354,9 @@ class AnalysisWindow(QMainWindow):
         table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
             values = (
-                row["trade_date"], row["stock_code"], row["stock_name"],
-                row["market"], row["last_entry_time"] or "-",
+                row_index + 1, row["trade_date"], row["stock_code"],
+                row["stock_name"], row["market"],
+                row["last_entry_time"] or "-",
                 f"{row['close_price'] or 0:,}",
                 f"{row['change_rate'] or 0:.2f}%",
                 f"{row['volume'] or 0:,}", f"{row['trading_value'] or 0:,}",
@@ -6849,14 +9366,15 @@ class AnalysisWindow(QMainWindow):
             )
             for column, value in enumerate(values):
                 number = {
-                    5: row["close_price"] or 0,
-                    6: row["change_rate"] or 0,
-                    7: row["volume"] or 0,
-                    8: row["trading_value"] or 0,
-                    9: row["consecutive_days"] or 0,
-                    11: row["disclosure_count"] or 0,
+                    0: row_index + 1,
+                    6: row["close_price"] or 0,
+                    7: row["change_rate"] or 0,
+                    8: row["volume"] or 0,
+                    9: row["trading_value"] or 0,
+                    10: row["consecutive_days"] or 0,
+                    12: row["disclosure_count"] or 0,
                 }.get(column)
-                if column == 4:
+                if column == 5:
                     entry_digits = "".join(
                         character for character in str(row["last_entry_time"] or "")
                         if character.isdigit()
@@ -6868,14 +9386,16 @@ class AnalysisWindow(QMainWindow):
                     )
                     item = NumericTableWidgetItem(value, entry_order)
                 elif number is not None:
-                    item = NumericTableWidgetItem(value, number)
+                    item = NumericTableWidgetItem(str(value), number)
                 else:
                     item = QTableWidgetItem(value)
                 item.setData(
                     Qt.ItemDataRole.UserRole + 2, row["stock_code"])
                 item.setData(
                     Qt.ItemDataRole.UserRole + 3, row["stock_name"])
-                if column == 10:
+                if column == 0:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if column == 11:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                     item.setForeground(
                         QColor("#f4b400")
@@ -6883,17 +9403,19 @@ class AnalysisWindow(QMainWindow):
                         else QColor("#808080"))
                     item.setToolTip(
                         "클릭하면 실시간 뉴스 감시를 등록하거나 해제합니다.")
-                if column == 12 and row["theme_names"]:
+                if column == 13 and row["theme_names"]:
                     item.setToolTip(row["theme_names"])
-                if column in (5, 6, 7, 8, 9, 11):
+                if column in (6, 7, 8, 9, 10, 12):
                     item.setTextAlignment(
                         Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 table.setItem(row_index, column, item)
         table.setSortingEnabled(True)
         if not self._limit_header_restored:
             table.resizeColumnsToContents()
+            table.setColumnWidth(0, 48)
             table.setColumnWidth(
-                12, min(280, max(140, table.columnWidth(12))))
+                13, min(280, max(140, table.columnWidth(13))))
+            table.sortItems(0, Qt.SortOrder.AscendingOrder)
             self._limit_header_restored = True
             self._save_limit_header()
         stock_count = len({row["stock_code"] for row in rows})
@@ -6909,7 +9431,7 @@ class AnalysisWindow(QMainWindow):
         if not hasattr(self, "_limit_table"):
             return
         self._settings.setValue(
-            "analysis_limit_header_v2",
+            "analysis_limit_header_v3",
             self._limit_table.horizontalHeader().saveState(),
         )
         self._settings.sync()
@@ -6917,14 +9439,14 @@ class AnalysisWindow(QMainWindow):
     def _limit_table_clicked(self, row: int, column: int):
         """종목코드 복사, 기업정보 및 공시 열기를 컬럼별로 처리한다."""
         stock_code = self._limit_stock_code(row)
-        if column == 1 and stock_code:
+        if column == 2 and stock_code:
             QApplication.clipboard().setText(stock_code)
             self.statusBar().showMessage(
                 f"종목코드 {stock_code}를 복사했습니다.", 3000)
-        elif column == 2 and stock_code:
+        elif column == 3 and stock_code:
             QDesktopServices.openUrl(QUrl(
                 f"https://finance.naver.com/item/coinfo.naver?code={stock_code}"))
-        elif column == 10 and stock_code:
+        elif column == 11 and stock_code:
             watched = stock_code in realtime_watch_codes()
             try:
                 set_realtime_watch(
@@ -6942,13 +9464,13 @@ class AnalysisWindow(QMainWindow):
             state = "등록" if not watched else "해제"
             self.statusBar().showMessage(
                 f"{stock_code} 실시간 뉴스 감시를 {state}했습니다.", 3000)
-        elif column == 11:
+        elif column == 12:
             self._open_disclosures_for_row(row)
 
     def _limit_table_right_clicked(self, position: QPoint):
         """종목명을 오른쪽 클릭하면 네이버 종목 토론실을 연다."""
         item = self._limit_table.itemAt(position)
-        if item is None or item.column() != 2:
+        if item is None or item.column() != 3:
             return
         stock_code = (
             item.data(Qt.ItemDataRole.UserRole + 2) or "")
@@ -6971,9 +9493,9 @@ class AnalysisWindow(QMainWindow):
                 self, "상한가 기록 삭제",
                 "상한가 표에서 삭제할 행을 먼저 선택해 주세요.")
             return
-        date_item = self._limit_table.item(row, 0)
-        code_item = self._limit_table.item(row, 1)
-        name_item = self._limit_table.item(row, 2)
+        date_item = self._limit_table.item(row, 1)
+        code_item = self._limit_table.item(row, 2)
+        name_item = self._limit_table.item(row, 3)
         trade_date = str(date_item.text() if date_item else "").strip()
         stock_code = self._limit_stock_code(row)
         if not stock_code and code_item is not None:
@@ -7266,7 +9788,8 @@ class AnalysisWindow(QMainWindow):
             f"테마 {stats['themes']:,} / 연결 {stats['stock_themes']:,} / "
             f"시장지수 {stats['market_index_prices']:,} / "
             f"시장수급 {stats['market_investor_flows']:,} / "
-            f"해외지표 {stats['external_market_ticks']:,}")
+            f"해외지표 {stats['external_market_ticks']:,} / "
+            f"LS뉴스 {stats['ls_realtime_news']:,}")
         self._db_date_label.setText(stats["last_trade_date"] or "-")
         self._db_run_label.setText(stats["last_run"] or "-")
 
@@ -7804,6 +10327,14 @@ class AnalysisWindow(QMainWindow):
                 self, "키움 장중정보 보완",
                 "프로그램을 정상 실행한 분석창에서 사용할 수 있습니다.")
             return
+        maintenance = active_kiwoom_maintenance()
+        if maintenance is not None:
+            message = format_kiwoom_maintenance(maintenance)
+            self._collection_status.setText(message)
+            if not silent:
+                QMessageBox.information(
+                    self, "키움 장중정보 보완", message)
+            return
         if self._collection_task and not self._collection_task.done():
             return
         date_from = self._date_from.date().toString("yyyyMMdd")
@@ -7834,6 +10365,9 @@ class AnalysisWindow(QMainWindow):
         self._collection_progress.setRange(0, len(events))
         self._collection_progress.setValue(0)
         try:
+            # 배치 시작 전에 토큰을 한 번 확인한다. 서비스 전체 장애라면 종목별로
+            # 같은 토큰 발급을 반복하지 않고 이 지점에서 한 건의 오류로 끝낸다.
+            await self._rest.tokens.token()
             for index, event in enumerate(events, 1):
                 if self._collection_cancelled:
                     status, message = "CANCELLED", "사용자가 중지함"
@@ -7864,6 +10398,7 @@ class AnalysisWindow(QMainWindow):
                 await asyncio.sleep(0)
         except Exception as error:  # noqa: BLE001
             status, message = "FAILED", str(error)
+            errors += 1
             log.exception("limit entry collection failed")
         finally:
             update_collection(
@@ -8116,6 +10651,7 @@ class AnalysisWindow(QMainWindow):
     def closeEvent(self, event):
         self._save_market_splitters()
         self._save_news_splitters()
+        self._save_ls_news_header()
         self._save_news_watch_header()
         self._save_limit_header()
         self._save_geo()
@@ -8235,11 +10771,14 @@ def main():
     os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = webengine_flags
 
     qapp = QApplication(sys.argv)
-    theme = str(QSettings("layout.ini", QSettings.IniFormat).value("theme_mode", "system"))
+    settings = QSettings("layout.ini", QSettings.IniFormat)
+    theme = str(settings.value("theme_mode", "system"))
     _apply_theme(qapp, theme if theme in THEME_MODES else "system")
-    f = QFont("굴림체", 9)
-    f.setStyleStrategy(QFont.NoAntialias)  # 영웅문식 비트맵 렌더링, 전 위젯 통일
-    qapp.setFont(f)  # 그리드/툴바/헤더/툴팁 전부. 타이틀바는 OS 소관(변경 불가)
+    _apply_app_font(
+        qapp,
+        _normalize_app_font_size(settings.value(
+            APP_FONT_SIZE_KEY, DEFAULT_APP_FONT_SIZE)),
+    )
     loop = qasync.QEventLoop(qapp)
     asyncio.set_event_loop(loop)
 

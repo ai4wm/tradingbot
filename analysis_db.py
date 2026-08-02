@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 import re
 from contextlib import closing
@@ -14,7 +16,7 @@ from pathlib import Path
 
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "market_analysis.db"
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 22
 ANALYSIS_STOCK_TYPES = (
     "COMMON", "PREFERRED", "SPAC", "FOREIGN", "REIT", "INFRA",
 )
@@ -318,6 +320,43 @@ CREATE TABLE IF NOT EXISTS realtime_watchlist (
     updated_at TEXT NOT NULL,
     last_news_checked_at TEXT,
     FOREIGN KEY (stock_code) REFERENCES stocks(stock_code)
+);
+
+CREATE TABLE IF NOT EXISTS ls_realtime_news (
+    news_key TEXT PRIMARY KEY,
+    realkey TEXT NOT NULL DEFAULT '',
+    server_id INTEGER,
+    news_date TEXT NOT NULL DEFAULT '',
+    news_time TEXT NOT NULL DEFAULT '',
+    published_at TEXT,
+    source_id TEXT NOT NULL DEFAULT '',
+    source_name TEXT NOT NULL DEFAULT '',
+    stock_code TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    body TEXT NOT NULL DEFAULT '',
+    related_stock_codes TEXT NOT NULL DEFAULT '[]',
+    body_size INTEGER NOT NULL DEFAULT 0,
+    original_url TEXT NOT NULL DEFAULT '',
+    original_url_source TEXT NOT NULL DEFAULT '',
+    original_url_confidence REAL NOT NULL DEFAULT 0,
+    original_url_checked_at TEXT NOT NULL DEFAULT '',
+    received_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ls_realtime_news_stocks (
+    news_key TEXT NOT NULL,
+    stock_code TEXT NOT NULL,
+    ordinal INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (news_key, stock_code),
+    FOREIGN KEY (news_key) REFERENCES ls_realtime_news(news_key)
+        ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS sync_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS news_items (
@@ -648,6 +687,14 @@ CREATE INDEX IF NOT EXISTS idx_stock_predictions_date_rank
     ON stock_predictions(as_of_date, horizon_days, probability_rank);
 CREATE INDEX IF NOT EXISTS idx_news_items_published
     ON news_items(published_at_source DESC);
+CREATE INDEX IF NOT EXISTS idx_ls_realtime_news_published
+    ON ls_realtime_news(news_date DESC, news_time DESC, received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ls_realtime_news_stock
+    ON ls_realtime_news(stock_code, news_date DESC, news_time DESC);
+CREATE INDEX IF NOT EXISTS idx_ls_realtime_news_stocks_code
+    ON ls_realtime_news_stocks(stock_code, news_key);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ls_realtime_news_realkey
+    ON ls_realtime_news(realkey) WHERE realkey<>'';
 CREATE INDEX IF NOT EXISTS idx_news_stock_maps_code
     ON news_stock_maps(stock_code, news_id);
 CREATE INDEX IF NOT EXISTS idx_news_duplicate_cluster
@@ -719,9 +766,63 @@ def initialize(db_path: Path = DB_PATH) -> Path:
                 connection.execute(
                     "ALTER TABLE condition_theme_stats ADD COLUMN "
                     "trading_value INTEGER NOT NULL DEFAULT 0")
+            ls_news_columns = {
+                row[1] for row in connection.execute(
+                    "PRAGMA table_info(ls_realtime_news)").fetchall()
+            }
+            for column, definition in (
+                    ("server_id", "INTEGER"),
+                    ("original_url", "TEXT NOT NULL DEFAULT ''"),
+                    ("original_url_source", "TEXT NOT NULL DEFAULT ''"),
+                    ("original_url_confidence", "REAL NOT NULL DEFAULT 0"),
+                    ("original_url_checked_at",
+                     "TEXT NOT NULL DEFAULT ''")):
+                if column not in ls_news_columns:
+                    connection.execute(
+                        f"ALTER TABLE ls_realtime_news "
+                        f"ADD COLUMN {column} {definition}")
             row = connection.execute(
                 "SELECT version FROM schema_info ORDER BY rowid DESC LIMIT 1"
             ).fetchone()
+            previous_version = int(row["version"]) if row is not None else 0
+            if previous_version < 20:
+                saved_news_rows = connection.execute(
+                    """SELECT news_key, stock_code, related_stock_codes
+                         FROM ls_realtime_news"""
+                ).fetchall()
+                normalized_news_rows = []
+                stock_map_rows = []
+                for saved_row in saved_news_rows:
+                    codes = list(split_ls_news_stock_codes(
+                        saved_row["stock_code"]))
+                    for related_code in split_ls_news_stock_codes(
+                            saved_row["related_stock_codes"]):
+                        if related_code not in codes:
+                            codes.append(related_code)
+                    news_key = str(saved_row["news_key"])
+                    normalized_news_rows.append((
+                        codes[0] if codes else "",
+                        json.dumps(codes, ensure_ascii=False),
+                        news_key,
+                    ))
+                    stock_map_rows.extend(
+                        (news_key, code, ordinal)
+                        for ordinal, code in enumerate(codes)
+                    )
+                if normalized_news_rows:
+                    connection.executemany(
+                        """UPDATE ls_realtime_news
+                              SET stock_code=?, related_stock_codes=?
+                            WHERE news_key=?""",
+                        normalized_news_rows,
+                    )
+                if stock_map_rows:
+                    connection.executemany(
+                        """INSERT OR IGNORE INTO ls_realtime_news_stocks(
+                               news_key, stock_code, ordinal)
+                           VALUES (?, ?, ?)""",
+                        stock_map_rows,
+                    )
             if row is None or row["version"] != SCHEMA_VERSION:
                 connection.execute(
                     "INSERT INTO schema_info(version, applied_at) VALUES (?, ?)",
@@ -1414,6 +1515,7 @@ def database_stats(db_path: Path = DB_PATH) -> dict:
             "market_index_prices": 0,
             "market_investor_flows": 0,
             "external_market_ticks": 0,
+            "ls_realtime_news": 0,
             "last_trade_date": "",
             "last_run": "",
         }
@@ -1442,6 +1544,9 @@ def database_stats(db_path: Path = DB_PATH) -> dict:
         ).fetchone()[0]
         result["external_market_ticks"] = connection.execute(
             "SELECT COUNT(*) FROM external_market_ticks"
+        ).fetchone()[0]
+        result["ls_realtime_news"] = connection.execute(
+            "SELECT COUNT(*) FROM ls_realtime_news"
         ).fetchone()[0]
         row = connection.execute(
             """SELECT data_type, status, started_at
@@ -4225,6 +4330,624 @@ def realtime_watch_rows(db_path: Path = DB_PATH) -> list[dict]:
         return [dict(row) for row in rows]
 
 
+def _normalize_single_ls_news_stock_code(code: str) -> str:
+    stock_code = str(code or "").strip()
+    if (
+        stock_code[:1].upper() == "A" and stock_code[1:].isdigit()
+    ):
+        stock_code = stock_code[1:]
+    if (
+        len(stock_code) > 6 and stock_code.isdigit()
+        and not stock_code[:-6].strip("0")
+    ):
+        stock_code = stock_code[-6:]
+    return stock_code
+
+
+def split_ls_news_stock_codes(value) -> tuple[str, ...]:
+    """NWS의 단일·12자리 연속·JSON 종목코드를 순서대로 분리한다."""
+    if isinstance(value, (list, tuple, set)):
+        raw_items = list(value)
+    else:
+        raw = str(value or "").strip()
+        if not raw:
+            return ()
+        raw_items = None
+        if raw[:1] == "[":
+            try:
+                decoded = json.loads(raw)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                decoded = None
+            if isinstance(decoded, list):
+                raw_items = decoded
+        if raw_items is None and (
+            len(raw) >= 12 and len(raw) % 12 == 0 and raw.isdigit()
+        ):
+            chunks = [raw[index:index + 12]
+                      for index in range(0, len(raw), 12)]
+            if all(chunk[:6] == "000000" for chunk in chunks):
+                raw_items = chunks
+        if raw_items is None:
+            raw_items = re.split(r"[,;|/\s]+", raw)
+
+    codes = []
+    for raw_item in raw_items:
+        code = _normalize_single_ls_news_stock_code(raw_item)
+        if code and code not in codes:
+            codes.append(code)
+    return tuple(codes)
+
+
+def normalize_ls_news_stock_code(code: str) -> str:
+    """LS NWS 코드 중 첫 번째 종목을 KRX 6자리로 맞춘다."""
+    codes = split_ls_news_stock_codes(code)
+    return codes[0] if codes else ""
+
+
+def _ls_news_published_at(news_date: str, news_time: str) -> str:
+    date_digits = "".join(
+        character for character in str(news_date or "")
+        if character.isdigit())
+    time_digits = "".join(
+        character for character in str(news_time or "")
+        if character.isdigit())
+    if len(date_digits) < 8 or len(time_digits) < 6:
+        return ""
+    try:
+        value = datetime.strptime(
+            date_digits[:8] + time_digits[:6], "%Y%m%d%H%M%S")
+    except ValueError:
+        return ""
+    local_timezone = datetime.now().astimezone().tzinfo
+    return value.replace(tzinfo=local_timezone).isoformat(timespec="seconds")
+
+
+def _upsert_ls_realtime_news(
+        connection: sqlite3.Connection, row: dict, now: str) -> dict:
+    """열린 트랜잭션에서 LS 뉴스 한 건과 전체 종목 연결을 병합한다."""
+    realkey = str(row.get("realkey") or "").strip()
+    news_date = str(row.get("date") or row.get("news_date") or "").strip()
+    news_time = str(row.get("time") or row.get("news_time") or "").strip()
+    source_id = str(row.get("source_id") or "").strip()
+    incoming_codes = split_ls_news_stock_codes(
+        row.get("codes") or row.get("code") or "")
+    stock_code = incoming_codes[0] if incoming_codes else ""
+    title = " ".join(str(row.get("title") or "").split())
+    fallback_value = "|".join((
+        news_date, news_time, source_id, ",".join(incoming_codes), title,
+    ))
+    news_key = realkey or (
+        "fallback:" + hashlib.sha256(
+            fallback_value.encode("utf-8")).hexdigest())
+    try:
+        body_size = int(row.get("body_size") or 0)
+    except (TypeError, ValueError):
+        body_size = 0
+    try:
+        server_id = int(row.get("server_id"))
+        if server_id <= 0:
+            server_id = None
+    except (TypeError, ValueError):
+        server_id = None
+    existed = connection.execute(
+        """SELECT stock_code, related_stock_codes
+             FROM ls_realtime_news WHERE news_key=?""",
+        (news_key,),
+    ).fetchone()
+    merged_codes = []
+    if existed is not None:
+        for code in split_ls_news_stock_codes(existed["stock_code"]):
+            if code not in merged_codes:
+                merged_codes.append(code)
+        for code in split_ls_news_stock_codes(
+                existed["related_stock_codes"]):
+            if code not in merged_codes:
+                merged_codes.append(code)
+    for code in incoming_codes:
+        if code not in merged_codes:
+            merged_codes.append(code)
+    stock_code = merged_codes[0] if merged_codes else ""
+    related_codes_json = json.dumps(merged_codes, ensure_ascii=False)
+    published_at = (
+        str(row.get("published_at") or "").strip()
+        or _ls_news_published_at(news_date, news_time)
+        or None
+    )
+    received_at = str(row.get("received_at") or "").strip() or now
+    values = (
+        news_key,
+        realkey,
+        server_id,
+        news_date,
+        news_time,
+        published_at,
+        source_id,
+        str(row.get("source_name") or "").strip(),
+        stock_code,
+        title,
+        str(row.get("body") or ""),
+        related_codes_json,
+        max(0, body_size),
+        received_at,
+        now,
+    )
+    connection.execute(
+        """INSERT INTO ls_realtime_news(
+               news_key, realkey, server_id, news_date, news_time,
+               published_at, source_id, source_name, stock_code, title,
+               body, related_stock_codes, body_size, received_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(news_key) DO UPDATE SET
+               realkey=CASE WHEN excluded.realkey<>''
+                            THEN excluded.realkey ELSE realkey END,
+               server_id=COALESCE(excluded.server_id, server_id),
+               news_date=CASE WHEN excluded.news_date<>''
+                              THEN excluded.news_date ELSE news_date END,
+               news_time=CASE WHEN excluded.news_time<>''
+                              THEN excluded.news_time ELSE news_time END,
+               published_at=COALESCE(excluded.published_at, published_at),
+               source_id=CASE WHEN excluded.source_id<>''
+                              THEN excluded.source_id ELSE source_id END,
+               source_name=CASE WHEN excluded.source_name<>''
+                                THEN excluded.source_name ELSE source_name END,
+               stock_code=CASE WHEN excluded.stock_code<>''
+                               THEN excluded.stock_code ELSE stock_code END,
+               related_stock_codes=CASE
+                   WHEN excluded.related_stock_codes<>'[]'
+                   THEN excluded.related_stock_codes
+                   ELSE related_stock_codes END,
+               title=CASE WHEN excluded.title<>''
+                          THEN excluded.title ELSE title END,
+               body=CASE WHEN excluded.body<>''
+                         THEN excluded.body ELSE body END,
+               body_size=MAX(body_size, excluded.body_size),
+               updated_at=excluded.updated_at""",
+        values,
+    )
+    if merged_codes:
+        connection.executemany(
+            """INSERT INTO ls_realtime_news_stocks(
+                   news_key, stock_code, ordinal)
+               VALUES (?, ?, ?)
+               ON CONFLICT(news_key, stock_code) DO UPDATE SET
+                   ordinal=MIN(ordinal, excluded.ordinal)""",
+            (
+                (news_key, code, ordinal)
+                for ordinal, code in enumerate(merged_codes)
+            ),
+        )
+    return {"news_key": news_key, "inserted": existed is None}
+
+
+def save_ls_realtime_news(row: dict, db_path: Path = DB_PATH, *,
+                          ensure_schema: bool = True) -> dict:
+    """LS NWS 제목 패킷을 원본 식별자 기준으로 중복 없이 저장한다."""
+    if ensure_schema:
+        initialize(db_path)
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    with closing(connect(db_path)) as connection, connection:
+        return _upsert_ls_realtime_news(connection, row, now)
+
+
+LS_NEWS_SERVER_CURSOR_KEY = "ls_news_last_server_id"
+LS_NEWS_SERVER_SOURCE_KEY = "ls_news_sync_source"
+
+
+def ls_news_server_cursor(db_path: Path = DB_PATH) -> int:
+    """마지막으로 커밋까지 끝난 우분투 뉴스 ID를 반환한다."""
+    initialize(db_path)
+    with closing(connect(db_path)) as connection:
+        row = connection.execute(
+            "SELECT value FROM sync_state WHERE key=?",
+            (LS_NEWS_SERVER_CURSOR_KEY,),
+        ).fetchone()
+        if row is not None:
+            try:
+                return max(0, int(row["value"]))
+            except (TypeError, ValueError):
+                pass
+        row = connection.execute(
+            "SELECT MAX(server_id) AS server_id FROM ls_realtime_news"
+        ).fetchone()
+        return max(0, int(row["server_id"] or 0))
+
+
+def merge_ls_news_server_rows(
+        rows: list[dict], source: str,
+        db_path: Path = DB_PATH) -> dict:
+    """서버 증분 한 묶음과 커서를 같은 트랜잭션으로 커밋한다."""
+    if not rows:
+        return {"processed": 0, "inserted": 0, "updated": 0,
+                "cursor": ls_news_server_cursor(db_path)}
+    initialize(db_path)
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    processed = inserted = 0
+    cursor = 0
+    with closing(connect(db_path)) as connection, connection:
+        saved_cursor = connection.execute(
+            "SELECT value FROM sync_state WHERE key=?",
+            (LS_NEWS_SERVER_CURSOR_KEY,),
+        ).fetchone()
+        if saved_cursor is not None:
+            try:
+                cursor = max(0, int(saved_cursor["value"]))
+            except (TypeError, ValueError):
+                cursor = 0
+        if not cursor:
+            max_row = connection.execute(
+                "SELECT MAX(server_id) AS server_id FROM ls_realtime_news"
+            ).fetchone()
+            cursor = max(0, int(max_row["server_id"] or 0))
+        for row in rows:
+            server_id = int(row.get("server_id") or 0)
+            if server_id <= cursor:
+                raise ValueError("서버 뉴스 ID가 오름차순이 아닙니다.")
+            result = _upsert_ls_realtime_news(connection, row, now)
+            inserted += int(bool(result["inserted"]))
+            processed += 1
+            cursor = server_id
+        connection.execute(
+            """INSERT INTO sync_state(key, value, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(key) DO UPDATE SET
+                   value=excluded.value, updated_at=excluded.updated_at""",
+            (LS_NEWS_SERVER_CURSOR_KEY, str(cursor), now),
+        )
+        connection.execute(
+            """INSERT INTO sync_state(key, value, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(key) DO UPDATE SET
+                   value=excluded.value, updated_at=excluded.updated_at""",
+            (LS_NEWS_SERVER_SOURCE_KEY, str(source), now),
+        )
+    return {
+        "processed": processed,
+        "inserted": inserted,
+        "updated": processed - inserted,
+        "cursor": cursor,
+    }
+
+
+def ls_realtime_news_rows(limit: int = 1000,
+                          db_path: Path = DB_PATH, *,
+                          stock_only: bool = False,
+                          watched_only: bool = False) -> list[dict]:
+    """DB에 저장된 LS 뉴스를 최신순으로 반환한다(목록용, 본문 제외)."""
+    initialize(db_path)
+    filters = []
+    if stock_only:
+        filters.append(
+            """EXISTS (
+                   SELECT 1
+                     FROM ls_realtime_news_stocks filter_stock
+                    WHERE filter_stock.news_key=n.news_key
+                      AND LENGTH(filter_stock.stock_code)=6
+                      AND filter_stock.stock_code NOT GLOB '*[^0-9]*'
+               )""")
+    if watched_only:
+        # 대표종목뿐 아니라 뉴스에 연결된 전체 코드 중 하나라도 관심종목이면 표시한다.
+        filters.append(
+            """EXISTS (
+                   SELECT 1
+                     FROM ls_realtime_news_stocks watched_stock
+                     JOIN realtime_watchlist watch
+                       ON watch.stock_code=watched_stock.stock_code
+                    WHERE watched_stock.news_key=n.news_key
+               )""")
+    where_clause = "WHERE " + " AND ".join(filters) if filters else ""
+    with closing(connect(db_path)) as connection:
+        rows = connection.execute(
+            f"""SELECT n.news_key, n.realkey, n.news_date, n.news_time,
+                      n.published_at, n.source_id, n.source_name,
+                      n.stock_code, COALESCE(s.stock_name, '') AS stock_name,
+                      n.related_stock_codes, n.title, n.body_size,
+                      n.original_url, n.original_url_source,
+                      n.original_url_confidence, n.original_url_checked_at,
+                      n.received_at, n.updated_at,
+                      CASE WHEN n.body<>'' THEN 1 ELSE 0 END AS has_body
+                 FROM ls_realtime_news n
+                 LEFT JOIN stocks s ON s.stock_code=n.stock_code
+                 {where_clause}
+                 ORDER BY n.news_date DESC, n.news_time DESC,
+                          n.received_at DESC, n.news_key DESC
+                 LIMIT ?""",
+            (max(1, min(5000, int(limit))),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+_LS_NEWS_SEARCH_TOKEN_RE = re.compile(r'-?"[^"]*"|\||-?[^\s|]+')
+
+
+def parse_ls_news_search_query(
+        query: str, max_terms: int = 20,
+) -> tuple[tuple[tuple[str, ...], ...], tuple[str, ...]]:
+    """뉴스 검색식을 AND 그룹·제외어로 나눈다.
+
+    공백으로 나눈 검색어는 모두 포함(AND), ``|``로 연결한 검색어는
+    하나라도 포함(OR), 앞에 ``-``를 붙인 검색어는 제외(NOT)한다.
+    큰따옴표 안의 여러 단어는 하나의 연속 문구로 취급한다.
+    """
+    include_groups: list[list[str]] = []
+    exclude_terms: list[str] = []
+    join_previous = False
+    term_count = 0
+    max_terms = max(1, min(100, int(max_terms)))
+
+    for token in _LS_NEWS_SEARCH_TOKEN_RE.findall(str(query or "")):
+        if token == "|":
+            join_previous = bool(include_groups)
+            continue
+
+        excluded = token.startswith("-") and len(token) > 1
+        value = token[1:] if excluded else token
+        if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
+            value = value[1:-1]
+        value = " ".join(value.split()).strip()
+        if not value:
+            continue
+        if term_count >= max_terms:
+            break
+        term_count += 1
+
+        if excluded:
+            if value not in exclude_terms:
+                exclude_terms.append(value)
+            join_previous = False
+            continue
+        if join_previous and include_groups:
+            if value not in include_groups[-1]:
+                include_groups[-1].append(value)
+        else:
+            include_groups.append([value])
+        join_previous = False
+
+    return (
+        tuple(tuple(group) for group in include_groups if group),
+        tuple(exclude_terms),
+    )
+
+
+def search_ls_realtime_news(query: str, limit: int = 500,
+                            db_path: Path = DB_PATH, *,
+                            stock_only: bool = False,
+                            watched_only: bool = False) -> list[dict]:
+    """LS 뉴스 전체 DB에서 검색식에 맞는 뉴스를 최신순으로 찾는다."""
+    include_groups, exclude_terms = parse_ls_news_search_query(query)
+    if not include_groups and not exclude_terms:
+        return ls_realtime_news_rows(
+            limit, db_path=db_path, stock_only=stock_only,
+            watched_only=watched_only)
+
+    initialize(db_path)
+    where_clauses = []
+    parameters: list[str | int] = []
+    if stock_only:
+        where_clauses.append(
+            """EXISTS (
+                   SELECT 1
+                     FROM ls_realtime_news_stocks filter_stock
+                    WHERE filter_stock.news_key=n.news_key
+                      AND LENGTH(filter_stock.stock_code)=6
+                      AND filter_stock.stock_code NOT GLOB '*[^0-9]*'
+               )""")
+    if watched_only:
+        where_clauses.append(
+            """EXISTS (
+                   SELECT 1
+                     FROM ls_realtime_news_stocks watched_stock
+                     JOIN realtime_watchlist watch
+                       ON watch.stock_code=watched_stock.stock_code
+                    WHERE watched_stock.news_key=n.news_key
+               )""")
+
+    with closing(connect(db_path)) as connection:
+        def term_clause(term: str) -> str:
+            escaped = (
+                term.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            pattern = f"%{escaped}%"
+            stock_codes = [
+                str(row[0]) for row in connection.execute(
+                    """SELECT stock_code
+                         FROM stocks
+                        WHERE stock_code LIKE ? ESCAPE '\\'
+                           OR stock_name LIKE ? ESCAPE '\\'
+                        ORDER BY CASE
+                            WHEN stock_code=? OR stock_name=? THEN 0 ELSE 1
+                        END, stock_name
+                        LIMIT 40""",
+                    (pattern, pattern, term, term),
+                ).fetchall()
+            ]
+            alternatives = [
+                "n.title LIKE ? ESCAPE '\\'",
+                "n.source_name LIKE ? ESCAPE '\\'",
+                "n.stock_code LIKE ? ESCAPE '\\'",
+            ]
+            parameters.extend((pattern, pattern, pattern))
+            if stock_codes:
+                placeholders = ",".join("?" for _ in stock_codes)
+                alternatives.append(
+                    "EXISTS ("
+                    "SELECT 1 FROM ls_realtime_news_stocks search_stock "
+                    "WHERE search_stock.news_key=n.news_key "
+                    f"AND search_stock.stock_code IN ({placeholders})"
+                    ")"
+                )
+                parameters.extend(stock_codes)
+            return "(" + " OR ".join(alternatives) + ")"
+
+        for group in include_groups:
+            where_clauses.append(
+                "(" + " OR ".join(term_clause(term) for term in group) + ")"
+            )
+        for term in exclude_terms:
+            where_clauses.append("NOT " + term_clause(term))
+
+        parameters.append(max(1, min(500, int(limit))))
+        rows = connection.execute(
+            f"""SELECT n.news_key, n.realkey, n.news_date, n.news_time,
+                       n.published_at, n.source_id, n.source_name,
+                       n.stock_code, COALESCE(s.stock_name, '') AS stock_name,
+                       n.related_stock_codes, n.title, n.body_size,
+                       n.original_url, n.original_url_source,
+                       n.original_url_confidence, n.original_url_checked_at,
+                       n.received_at, n.updated_at,
+                       CASE WHEN n.body<>'' THEN 1 ELSE 0 END AS has_body
+                  FROM ls_realtime_news n
+                  LEFT JOIN stocks s ON s.stock_code=n.stock_code
+                 WHERE {" AND ".join(where_clauses)}
+                 ORDER BY n.news_date DESC, n.news_time DESC,
+                          n.received_at DESC, n.news_key DESC
+                 LIMIT ?""",
+            parameters,
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def ls_realtime_news_detail(realkey: str = "", news_key: str = "",
+                            db_path: Path = DB_PATH) -> dict | None:
+    """상세창에서 사용할 저장 본문과 뉴스 메타데이터를 반환한다."""
+    initialize(db_path)
+    realkey = str(realkey or "").strip()
+    news_key = str(news_key or "").strip()
+    if not realkey and not news_key:
+        return None
+    where = "n.news_key=?" if news_key else "n.realkey=?"
+    value = news_key or realkey
+    with closing(connect(db_path)) as connection:
+        row = connection.execute(
+            f"""SELECT n.news_key, n.realkey, n.news_date, n.news_time,
+                       n.source_id, n.source_name, n.stock_code,
+                       n.related_stock_codes, n.title, n.body, n.body_size,
+                       n.published_at, n.original_url,
+                       n.original_url_source, n.original_url_confidence,
+                       n.original_url_checked_at,
+                       n.received_at, n.updated_at
+                  FROM ls_realtime_news n
+                 WHERE {where}
+                 LIMIT 1""",
+            (value,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+
+def update_ls_realtime_news_source(source_id: str, source_name: str,
+                                   db_path: Path = DB_PATH) -> int:
+    """확인된 LS 매체명을 동일 매체 ID의 저장 뉴스 전체에 반영한다."""
+    source_id = str(source_id or "").strip()
+    source_name = str(source_name or "").strip()
+    if not source_id or not source_name:
+        return 0
+    initialize(db_path)
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    with closing(connect(db_path)) as connection, connection:
+        cursor = connection.execute(
+            """UPDATE ls_realtime_news
+                  SET source_name=?, updated_at=?
+                WHERE source_id=? AND source_name<>?""",
+            (source_name, now, source_id, source_name),
+        )
+        return max(0, int(cursor.rowcount))
+
+
+def update_ls_realtime_news_original_url(
+        original_url: str, url_source: str = "", confidence: float = 0,
+        *, realkey: str = "", news_key: str = "",
+        db_path: Path = DB_PATH) -> bool:
+    """검증한 원문 URL 또는 마지막 확인 시각을 LS 뉴스에 저장한다."""
+    realkey = str(realkey or "").strip()
+    news_key = str(news_key or "").strip()
+    if not realkey and not news_key:
+        return False
+    original_url = str(original_url or "").strip()
+    url_source = str(url_source or "").strip()
+    try:
+        confidence = min(1.0, max(0.0, float(confidence)))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    initialize(db_path)
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    where = "news_key=?" if news_key else "realkey=?"
+    value = news_key or realkey
+    with closing(connect(db_path)) as connection, connection:
+        cursor = connection.execute(
+            f"""UPDATE ls_realtime_news
+                   SET original_url=?,
+                       original_url_source=?,
+                       original_url_confidence=?,
+                       original_url_checked_at=?,
+                       updated_at=?
+                 WHERE {where}""",
+            (
+                original_url, url_source, confidence, now, now, value,
+            ),
+        )
+        return cursor.rowcount > 0
+
+
+def update_ls_realtime_news_detail(
+        realkey: str, body: str, stock_codes=(),
+        db_path: Path = DB_PATH) -> bool:
+    """t3102로 확인한 본문과 복수 연관 종목코드를 저장한다."""
+    realkey = str(realkey or "").strip()
+    if not realkey:
+        return False
+    incoming_codes = split_ls_news_stock_codes(stock_codes)
+    initialize(db_path)
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    with closing(connect(db_path)) as connection, connection:
+        saved = connection.execute(
+            """SELECT news_key, stock_code, related_stock_codes
+                 FROM ls_realtime_news WHERE realkey=?""",
+            (realkey,),
+        ).fetchone()
+        if saved is None:
+            return False
+        merged_codes = []
+        for value in (saved["stock_code"], saved["related_stock_codes"]):
+            for code in split_ls_news_stock_codes(value):
+                if code not in merged_codes:
+                    merged_codes.append(code)
+        for code in incoming_codes:
+            if code not in merged_codes:
+                merged_codes.append(code)
+        related_codes_json = json.dumps(
+            merged_codes, ensure_ascii=False)
+        cursor = connection.execute(
+            """UPDATE ls_realtime_news
+                  SET body=CASE WHEN ?<>'' THEN ? ELSE body END,
+                      stock_code=CASE WHEN ?<>'' THEN ? ELSE stock_code END,
+                      related_stock_codes=CASE WHEN ?<>'[]' THEN ?
+                                               ELSE related_stock_codes END,
+                      updated_at=?
+                WHERE realkey=?""",
+            (
+                str(body or ""), str(body or ""),
+                merged_codes[0] if merged_codes else "",
+                merged_codes[0] if merged_codes else "",
+                related_codes_json, related_codes_json,
+                now, realkey,
+            ),
+        )
+        if merged_codes:
+            connection.executemany(
+                """INSERT INTO ls_realtime_news_stocks(
+                       news_key, stock_code, ordinal)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(news_key, stock_code) DO UPDATE SET
+                       ordinal=MIN(ordinal, excluded.ordinal)""",
+                (
+                    (str(saved["news_key"]), code, ordinal)
+                    for ordinal, code in enumerate(merged_codes)
+                ),
+            )
+        return cursor.rowcount > 0
+
+
 def _market_session(published_at: str) -> str:
     try:
         value = datetime.fromisoformat(str(published_at or ""))
@@ -4485,7 +5208,8 @@ def reconcile_news_search_results(
 
 
 def news_rows(stock_code: str = "", limit: int = 300,
-              db_path: Path = DB_PATH) -> list[dict]:
+              db_path: Path = DB_PATH, *,
+              watched_only: bool = False) -> list[dict]:
     initialize(db_path)
     stock_code = str(stock_code or "").strip()
     relevance = """(
@@ -4495,11 +5219,19 @@ def news_rows(stock_code: str = "", limit: int = 300,
             LOWER(m.matched_text)
         )>0
     )"""
-    where = (
-        f"WHERE m.stock_code=? AND {relevance}"
-        if stock_code else f"WHERE {relevance}"
-    )
-    params = (stock_code, int(limit)) if stock_code else (int(limit),)
+    if stock_code:
+        where = f"WHERE m.stock_code=? AND {relevance}"
+        params = (stock_code, int(limit))
+    elif watched_only:
+        where = (
+            "WHERE m.stock_code IN ("
+            "SELECT stock_code FROM realtime_watchlist"
+            f") AND {relevance}"
+        )
+        params = (int(limit),)
+    else:
+        where = f"WHERE {relevance}"
+        params = (int(limit),)
     with closing(connect(db_path)) as connection:
         rows = connection.execute(
             f"""SELECT n.news_id, m.stock_code, s.stock_name,
