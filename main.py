@@ -3064,15 +3064,101 @@ class RotationCycleWidget(QWidget):
 
 
 class DetachedClockWindow(QWidget):
-    """분석창에서 떼어낸 시계 전용 창: 항상 위, 닫으면 분석창으로 복귀."""
+    """떼어낸 시계 창: 타이틀바 없이 아무 데나 끌어 옮기고 우하단으로 크기 조절."""
+
+    GRIP = 14  # 우하단 크기 조절 영역(px)
 
     def __init__(self, owner: "AnalysisWindow"):
-        super().__init__(None, Qt.WindowType.Tool)
+        super().__init__(
+            None,
+            Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint,
+        )
         self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
         self.setWindowTitle("시계")
+        self.setToolTip(
+            "끌어서 이동 · 우하단 모서리로 크기 조절(정비율)\n"
+            "더블클릭하면 분석창으로 되돌립니다.")
         self._owner = owner
+        self._drag_offset = None
+        self._resize_from = None
+        self._ratio = 0.0
+        self._base = None  # (창 높이, 글꼴 크기) 비율 기준
+        self.setMouseTracking(True)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
+
+    def adopt(self, label):
+        """시계 라벨을 넘겨받고 저장된 크기를 복원한다."""
+        self.layout().addWidget(label)
+        self.setMouseTracking(True)
+        label.setMouseTracking(True)
+        self._base = (max(1, self.sizeHint().height()),
+                      label.font().pointSizeF())
+        size = self._owner._settings.value("clock_window_size")
+        if isinstance(size, QSize) and size.isValid():
+            self.resize(size)
+        else:
+            self.adjustSize()
+        self._ratio = self.width() / max(1, self.height())
+
+    def _label(self):
+        item = self.layout().itemAt(0)
+        return item.widget() if item is not None else None
+
+    def _in_grip(self, pos) -> bool:
+        return (pos.x() >= self.width() - self.GRIP
+                and pos.y() >= self.height() - self.GRIP)
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        if self._in_grip(event.position().toPoint()):
+            self._resize_from = (event.globalPosition().toPoint(), self.size())
+        else:
+            self._drag_offset = (event.globalPosition().toPoint()
+                                 - self.frameGeometry().topLeft())
+
+    def mouseMoveEvent(self, event):
+        point = event.position().toPoint()
+        self.setCursor(
+            Qt.CursorShape.SizeFDiagCursor if self._in_grip(point)
+            else Qt.CursorShape.SizeAllCursor)
+        if self._resize_from is not None:
+            origin, size = self._resize_from
+            width = max(80, size.width()
+                        + (event.globalPosition().toPoint() - origin).x())
+            # 정비율 유지: 가로만 받아 세로를 계산한다.
+            self.resize(width, max(30, int(round(width / (self._ratio or 1)))))
+        elif self._drag_offset is not None:
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+
+    def mouseReleaseEvent(self, _event):
+        if self._resize_from is not None or self._drag_offset is not None:
+            self._save_geo()
+        self._resize_from = None
+        self._drag_offset = None
+
+    def mouseDoubleClickEvent(self, _event):
+        if self._owner._clock_window is self:
+            self._owner._attach_clock()  # 더블클릭 = 합치기
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        label = self._label()
+        if label is None or not self._base:
+            return
+        base_height, base_size = self._base
+        if base_size <= 0:
+            return
+        font = label.font()
+        font.setPointSizeF(
+            max(6.0, base_size * self.height() / base_height))
+        label.setFont(font)
+
+    def _save_geo(self):
+        self._owner._settings.setValue("clock_window_pos", self.pos())
+        self._owner._settings.setValue("clock_window_size", self.size())
+        self._owner._settings.sync()
 
     def moveEvent(self, e):
         super().moveEvent(e)
@@ -3440,7 +3526,9 @@ class AnalysisWindow(
             return
         window = DetachedClockWindow(self)
         self._principle_bar.removeWidget(self._analysis_clock_label)
-        window.layout().addWidget(self._analysis_clock_label)
+        # 분석창으로 되돌릴 때 원래 글꼴을 그대로 복원한다.
+        self._clock_label_font = self._analysis_clock_label.font()
+        window.adopt(self._analysis_clock_label)
         self._clock_window = window
         pos = self._settings.value("clock_window_pos")
         if isinstance(pos, QPoint):
@@ -3455,6 +3543,9 @@ class AnalysisWindow(
             return
         self._clock_window = None
         window.layout().removeWidget(self._analysis_clock_label)
+        font = getattr(self, "_clock_label_font", None)
+        if font is not None:
+            self._analysis_clock_label.setFont(font)
         self._principle_bar.insertWidget(0, self._analysis_clock_label)
         self._analysis_clock_label.show()
         window.close()
