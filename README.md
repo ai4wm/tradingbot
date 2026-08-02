@@ -1,6 +1,6 @@
 # Trading Bot
 
-키움 REST·웹소켓을 중심으로 조건검색, 실시간 시세, 주문·잔고 관리와 시장 분석을 제공하는 Windows용 PySide6 데스크톱 앱입니다. LS증권 실시간 뉴스, 네이버 종목뉴스, KRX·DART 데이터도 함께 사용합니다.
+키움 REST·웹소켓을 중심으로 조건검색, 실시간 시세, 주문·잔고 관리와 시장 분석을 제공하는 Windows용 PySide6 데스크톱 앱입니다. LS증권 실시간 뉴스, 네이버 종목뉴스, 텔레그램 채널 뉴스와 KRX·DART 데이터도 함께 사용합니다.
 
 ## 주요 기능
 
@@ -10,9 +10,12 @@
 - 분할매수, 주문 취소, 보유종목 단계별 매도와 비상청산 보조
 - LS증권 실시간 뉴스 및 누락 뉴스 서버 동기화
 - 네이버 관심종목 뉴스와 종목토론실
+- 텔레그램 채널 뉴스 소급·실시간 수집과 앱 안 원문 보기
+- 뉴스 상단 전광판, 종목코드 유무별 알림음, 신규 글 강조
 - KRX 상한가 이력, DART 공시, 테마·수급·시장 지표 분석
 - 상한가 후보 예측 및 워크포워드 검증
 - 창별 레이아웃, 테마와 글꼴 크기 저장
+- 분석창 시계 분리(반투명·정비율 크기 조절·위치 저장)
 
 실제 주문은 화면의 `주문허용`을 직접 체크한 동안에만 전송됩니다. 실계좌에서 사용하기 전에 주문 수량과 계좌 설정을 반드시 확인해야 합니다.
 
@@ -62,7 +65,12 @@ Copy-Item .env.example .env
 
 | 파일 | 역할 |
 |---|---|
-| `main.py` | 앱 조립, 창 수명주기, 분석 화면과 작업 제어 |
+| `main.py` | 앱 조립, 창 수명주기, 분석창 뼈대와 분리 시계 |
+| `ui/realtime_news_tab.py` | LS 실시간 뉴스 탭, 상단 전광판, 본문 상세창 |
+| `ui/stock_news_tab.py` | 네이버 종목뉴스 탭과 종목토론실 |
+| `ui/telegram_news_tab.py` | 텔레그램 뉴스 탭과 원문 상세창 |
+| `ui/limit_up_tab.py` | 상한가 탭 |
+| `ui/theme_tab.py` | 테마 탭 |
 | `gui.py` | 조건검색 표, 주문·잔고 화면과 표시 모델 |
 | `api.py` | 키움 REST 클라이언트와 시장 조회 |
 | `ws.py` | 키움 웹소켓, 조건검색과 실시간 등록 |
@@ -70,6 +78,7 @@ Copy-Item .env.example .env
 | `analysis_db.py` | 분석용 SQLite 스키마와 조회·저장 |
 | `ls_news_ws.py` | LS증권 실시간 뉴스 수신 |
 | `ls_news_server_sync.py` | 앱 종료 중 누락된 LS 뉴스 보완 |
+| `telegram_news.py` | 텔레그램 채널 뉴스 수집과 종목 추출 |
 | `prediction_model.py` | 상한가 후보 학습과 예측 |
 | `walkforward_validation.py` | 예측 모델 워크포워드 검증 |
 
@@ -81,13 +90,16 @@ Copy-Item .env.example .env
 - `layout.ini`: 창 위치, 열 너비와 사용자 설정
 - `bot.log`: 실행 로그
 - `data/market_analysis.db`: 분석 데이터베이스
+- `data/telegram.session`: 텔레그램 로그인 세션
+- `data/web_profile`: 앱 안 웹 화면 캐시
 
 위 파일은 실행 환경의 로컬 상태이며 저장소 문서의 기준으로 사용하지 않습니다.
 
 ## 기본 점검
 
 ```powershell
-.\.venv\Scripts\python.exe -m py_compile config.py api.py ws.py gui.py rank.py main.py analysis_db.py prediction_model.py ls_news_ws.py ls_news_server_sync.py
+.\.venv\Scripts\python.exe -m py_compile config.py api.py ws.py gui.py rank.py main.py analysis_db.py prediction_model.py ls_news_ws.py ls_news_server_sync.py telegram_news.py ui\realtime_news_tab.py ui\stock_news_tab.py ui\telegram_news_tab.py ui\limit_up_tab.py ui\theme_tab.py
+.\.venv\Scripts\python.exe telegram_news.py
 git diff --check
 ```
 
