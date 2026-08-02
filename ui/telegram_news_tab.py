@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 
 from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
-    QLineEdit, QMessageBox, QPushButton, QTableWidget, QTableWidgetItem,
-    QVBoxLayout,
+    QApplication, QCheckBox, QDialog, QHBoxLayout, QHeaderView,
+    QInputDialog, QLabel, QLineEdit, QMessageBox, QPushButton, QTableWidget,
+    QTableWidgetItem, QTextBrowser, QVBoxLayout, QWidget,
 )
 
 from analysis_db import (
@@ -32,6 +33,112 @@ from ui import (
 
 log = logging.getLogger("telegram_news_tab")
 VISIBLE_LIMIT = 500
+
+
+_LINK_RE = re.compile(r"https?://[^\s]+")
+
+
+class TelegramPostDialog(QDialog):
+    """텔레그램 원문 상세창. 웹뷰 하나를 재사용하고 닫으면 비운다."""
+
+    def __init__(self, owner):
+        super().__init__(owner)
+        self._owner = owner
+        self._webview = None
+        self._url = ""
+        self._article_url = ""
+        self.setWindowTitle("텔레그램 원문")
+        self.setModal(False)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        self._header = QLabel()
+        self._header.setWordWrap(True)
+        self._header.setStyleSheet("QLabel { font-weight: 700; }")
+        layout.addWidget(self._header)
+        self._text = QTextBrowser()
+        self._text.setOpenExternalLinks(True)
+        self._text.hide()
+        layout.addWidget(self._text, 1)
+        self._host = QWidget()
+        self._host_layout = QVBoxLayout(self._host)
+        self._host_layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._host, 1)
+
+        buttons = QHBoxLayout()
+        self._article_button = QPushButton("본문 기사 링크")
+        self._article_button.clicked.connect(self._open_article)
+        app_button = QPushButton("Telegram 앱으로 열기")
+        app_button.clicked.connect(
+            lambda: self._owner.open_telegram_post(self._url))
+        close_button = QPushButton("닫기")
+        close_button.clicked.connect(self.close)
+        buttons.addWidget(self._article_button)
+        buttons.addStretch(1)
+        buttons.addWidget(app_button)
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+
+        geo = self._owner._settings.value("telegram_detail_geo")
+        if geo is None or not self.restoreGeometry(geo):
+            self.resize(560, 720)
+
+    def _ensure_webview(self):
+        """처음 열 때만 웹뷰를 만든다. 안 쓰면 렌더러도 뜨지 않는다."""
+        if self._webview is not None:
+            return self._webview
+        try:
+            from PySide6.QtWebEngineCore import QWebEnginePage
+            from PySide6.QtWebEngineWidgets import QWebEngineView
+        except ImportError:
+            return None
+        self._webview = QWebEngineView(self._host)
+        # 종토방 웹뷰 프로파일을 같이 써서 캐시 디렉터리를 늘리지 않는다.
+        profile = getattr(self._owner, "_news_web_profile", None)
+        if profile is not None:
+            self._webview.setPage(QWebEnginePage(profile, self._webview))
+        self._host_layout.addWidget(self._webview)
+        return self._webview
+
+    def show_post(self, context: dict):
+        self._url = str(context.get("url") or "")
+        body = str(context.get("body") or "")
+        links = _LINK_RE.findall(body)
+        self._article_url = links[0] if links else ""
+        self._article_button.setEnabled(bool(self._article_url))
+        self._article_button.setToolTip(self._article_url or "본문에 링크가 없습니다.")
+        channel = str(context.get("channel") or "")
+        title = str(context.get("title") or "")
+        self._header.setText(f"{channel} · {title}" if channel else title)
+
+        webview = self._ensure_webview() if self._url else None
+        if webview is not None:
+            # 공식 임베드 주소만 로그인 없이 본문과 이미지를 그대로 보여준다.
+            webview.setUrl(QUrl(f"{self._url}?embed=1&userpic=true"))
+            webview.show()
+            self._text.hide()
+        else:
+            self._text.setPlainText(body)
+            self._text.show()
+            self._host.hide()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _open_article(self):
+        if self._article_url:
+            QDesktopServices.openUrl(QUrl(self._article_url))
+
+    def closeEvent(self, event):
+        self._owner._settings.setValue(
+            "telegram_detail_geo", self.saveGeometry())
+        if self._webview is not None:
+            # 웹뷰를 없애 렌더러 프로세스까지 정리한다. 창을 닫아둔 동안에는
+            # 이 기능이 메모리를 전혀 차지하지 않는다.
+            self._webview.setUrl(QUrl("about:blank"))
+            self._host_layout.removeWidget(self._webview)
+            self._webview.deleteLater()
+            self._webview = None
+        super().closeEvent(event)
 
 
 class TelegramNewsTabMixin:
@@ -283,8 +390,12 @@ class TelegramNewsTabMixin:
             if codes else "연결된 종목이 없습니다.")
         body_item = QTableWidgetItem(str(row.get("title") or ""))
         body_item.setToolTip(
-            f"{row.get('body') or ''}\n\n클릭: Telegram 앱으로 원문 열기")
+            f"{row.get('body') or ''}\n\n클릭: 앱 안에서 원문 상세 보기")
         body_item.setData(Qt.ItemDataRole.UserRole, str(row.get("url") or ""))
+        body_item.setData(Qt.ItemDataRole.UserRole + 1, str(row.get("body") or ""))
+        body_item.setData(
+            Qt.ItemDataRole.UserRole + 2,
+            str(row.get("channel_title") or row.get("channel") or ""))
         for column, item in enumerate((
                 number_item, time_item, channel_item, stock_item, body_item)):
             table.setItem(0, column, item)
@@ -365,13 +476,15 @@ class TelegramNewsTabMixin:
         if not title:
             return
         codes = tuple(row.get("stock_codes") or ())
+        channel = str(row.get("channel_title") or row.get("channel") or "")
         self._latest_ls_news_context = {
             "provider": "TELEGRAM",
             "title": title,
             "stock_code": codes[0] if codes else "",
             "url": str(row.get("url") or ""),
+            "body": str(row.get("body") or ""),
+            "channel": channel,
         }
-        channel = str(row.get("channel_title") or row.get("channel") or "")
         self._latest_ls_news_label.set_headline(f"[TG] {channel} · {title}")
         self._set_latest_ls_news_highlight(True)
         self._latest_ls_news_highlight_timer.start(3500)
@@ -392,8 +505,24 @@ class TelegramNewsTabMixin:
         if column != 4:
             return
         item = self._telegram_table.item(row, 4)
-        url = str(item.data(Qt.ItemDataRole.UserRole) or "") if item else ""
-        self.open_telegram_post(url)
+        if item is None:
+            return
+        self.open_telegram_detail({
+            "url": str(item.data(Qt.ItemDataRole.UserRole) or ""),
+            "body": str(item.data(Qt.ItemDataRole.UserRole + 1) or ""),
+            "channel": str(item.data(Qt.ItemDataRole.UserRole + 2) or ""),
+            "title": item.text(),
+        })
+
+    def open_telegram_detail(self, context: dict):
+        """상세창 하나를 재사용해 원문을 앱 안에서 보여준다."""
+        if not (context.get("url") or context.get("body")):
+            return
+        window = getattr(self, "_telegram_detail_window", None)
+        if window is None:
+            window = TelegramPostDialog(self)
+            self._telegram_detail_window = window
+        window.show_post(context)
 
     def open_telegram_post(self, url: str):
         """Telegram 앱으로 먼저 열고, 앱이 없을 때만 웹으로 넘긴다."""

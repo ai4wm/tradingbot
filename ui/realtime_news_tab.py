@@ -854,8 +854,8 @@ class RealtimeNewsTabMixin:
             return
         context = dict(self._latest_ls_news_context)
         if context.get("provider") == "TELEGRAM":
-            # 앱 우선으로 열도록 텔레그램 탭의 공용 경로를 쓴다.
-            self.open_telegram_post(str(context.get("url") or ""))
+            # 목록 클릭과 같은 상세창을 쓴다.
+            self.open_telegram_detail(context)
             return
         if context.get("provider") == "NAVER":
             stock_code = str(context.get("stock_code") or "").strip()
