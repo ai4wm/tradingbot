@@ -3127,6 +3127,20 @@ class DetachedClockWindow(QWidget):
     def showEvent(self, event):
         super().showEvent(event)
         self._apply_scale()  # 표시 뒤 실제 줄 수로 높이를 다시 맞춘다
+        self._ensure_on_screen()
+
+    def _ensure_on_screen(self):
+        """타이틀바가 없어 화면 밖으로 나가면 잡을 수 없다. 안으로 되돌린다."""
+        areas = [screen.availableGeometry()
+                 for screen in QApplication.screens()]
+        if not areas:
+            return
+        frame = self.frameGeometry()
+        if any(area.intersects(frame) for area in areas):
+            return
+        area = areas[0]
+        self.move(area.right() - self.width() - 24, area.top() + 24)
+        self._save_geo()
 
     def _content_width(self, label) -> int:
         """날짜·요일 줄 너비에 맞춘다. 국면 문구는 줄바꿈으로 흘린다."""
