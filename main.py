@@ -26,9 +26,9 @@ from PySide6.QtGui import (
     QColor, QDesktopServices, QFont, QPainter, QPalette, QPen,
 )
 from PySide6.QtWidgets import (
-    QApplication, QDialog, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
-    QProgressBar, QPushButton, QTableWidget, QTableWidgetItem, QTabWidget,
-    QVBoxLayout, QWidget,
+    QApplication, QDialog, QHBoxLayout, QLabel, QLayout, QMainWindow,
+    QMessageBox, QProgressBar, QPushButton, QTableWidget, QTableWidgetItem,
+    QTabWidget, QVBoxLayout, QWidget,
 )
 
 from analysis_db import (
@@ -3063,6 +3063,9 @@ class RotationCycleWidget(QWidget):
                                  str(row.get("trade_date") or "")[-4:])
 
 
+QWIDGETSIZE_MAX = 16777215  # Qt 위젯 크기 상한. 고정 폭 해제에 쓴다.
+
+
 class DetachedClockWindow(QWidget):
     """떼어낸 시계 창: 타이틀바 없이 아무 데나 끌어 옮기고 우하단으로 크기 조절."""
 
@@ -3088,18 +3091,27 @@ class DetachedClockWindow(QWidget):
         layout.setContentsMargins(4, 4, 4, 4)
 
     def adopt(self, label):
-        """시계 라벨을 넘겨받고 저장된 크기를 복원한다."""
+        """시계 라벨을 넘겨받고 크기 제한을 풀어 창 크기를 복원한다."""
+        # 분석창에서 쓰던 고정 폭·최소 높이를 풀어야 창 크기를 바꿀 수 있다.
+        label.setFixedWidth(QWIDGETSIZE_MAX)
+        label.setMinimumSize(0, 0)
+        label.setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX)
+        # 라벨이 마우스를 먹으면 창을 끌 수 없다.
+        label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.layout().setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
         self.layout().addWidget(label)
         self.setMouseTracking(True)
-        label.setMouseTracking(True)
-        self._base = (max(1, self.sizeHint().height()),
-                      label.font().pointSizeF())
+        # 배율 1.0일 때의 높이를 기준으로 삼아야 분석창과 글자 크기가 같다.
+        self._owner._clock_scale = 1.0
+        self._owner._update_analysis_clock()
+        self._base_height = max(60, self.sizeHint().height())
         size = self._owner._settings.value("clock_window_size")
         if isinstance(size, QSize) and size.isValid():
             self.resize(size)
         else:
-            self.adjustSize()
+            self.resize(283, self._base_height)
         self._ratio = self.width() / max(1, self.height())
+        self._apply_scale()
 
     def _label(self):
         item = self.layout().itemAt(0)
@@ -3144,16 +3156,12 @@ class DetachedClockWindow(QWidget):
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
-        label = self._label()
-        if label is None or not self._base:
-            return
-        base_height, base_size = self._base
-        if base_size <= 0:
-            return
-        font = label.font()
-        font.setPointSizeF(
-            max(6.0, base_size * self.height() / base_height))
-        label.setFont(font)
+        self._apply_scale()
+
+    def _apply_scale(self):
+        """창 높이에 맞춰 시계 글자 크기를 다시 그린다."""
+        self._owner._clock_scale = self.height() / max(1, self._base_height)
+        self._owner._update_analysis_clock()
 
     def _save_geo(self):
         self._owner._settings.setValue("clock_window_pos", self.pos())
@@ -3416,6 +3424,10 @@ class AnalysisWindow(
             "analysis geometry moved on-screen: x=%s y=%s size=%sx%s",
             x, y, width, height)
 
+    def _clock_px(self, size: int) -> int:
+        """분리 시계 배율을 반영한 글자 크기(px)."""
+        return max(7, int(round(size * getattr(self, "_clock_scale", 1.0))))
+
     def _update_analysis_clock(self):
         now = datetime.now().astimezone()
         weekdays = (
@@ -3440,7 +3452,8 @@ class AnalysisWindow(
                 background, foreground = "#424A55", "#E2E7ED"
             return (
                 f"<span style='background-color:{background};"
-                f" color:{foreground}; font-size:12px; font-weight:800;'>"
+                f" color:{foreground};"
+                f" font-size:{self._clock_px(12)}px; font-weight:800;'>"
                 f"&nbsp;{market} {state}&nbsp;</span>"
             )
 
@@ -3488,7 +3501,8 @@ class AnalysisWindow(
 
         phase_badge = (
             f"<div style='margin-top:3px; background-color:{phase_background};"
-            f" color:{phase_color}; font-size:12px; font-weight:900;'>"
+            f" color:{phase_color};"
+            f" font-size:{self._clock_px(12)}px; font-weight:900;'>"
             f"{phase_text}</div>"
         )
         self._analysis_clock_label.setStyleSheet(
@@ -3500,12 +3514,13 @@ class AnalysisWindow(
             " padding: 4px 7px;"
             "}")
         self._analysis_clock_label.setText(
-            "<div style='font-size:13px; font-weight:800;'>"
+            f"<div style='font-size:{self._clock_px(13)}px;"
+            " font-weight:800;'>"
             f"{now:%Y-%m-%d} "
             f"<span style='color:{day_color};'>{weekday}{day_state}</span>"
             "</div>"
-            "<div style='font-size:26px; font-weight:900;"
-            " letter-spacing:1px;'>"
+            f"<div style='font-size:{self._clock_px(26)}px;"
+            " font-weight:900; letter-spacing:1px;'>"
             f"{now:%H:%M:%S}</div>"
             f"<div>{badge('KRX', krx_state)}&nbsp;"
             f"{badge('NXT', nxt_state)}</div>"
@@ -3526,8 +3541,6 @@ class AnalysisWindow(
             return
         window = DetachedClockWindow(self)
         self._principle_bar.removeWidget(self._analysis_clock_label)
-        # 분석창으로 되돌릴 때 원래 글꼴을 그대로 복원한다.
-        self._clock_label_font = self._analysis_clock_label.font()
         window.adopt(self._analysis_clock_label)
         self._clock_window = window
         pos = self._settings.value("clock_window_pos")
@@ -3543,9 +3556,12 @@ class AnalysisWindow(
             return
         self._clock_window = None
         window.layout().removeWidget(self._analysis_clock_label)
-        font = getattr(self, "_clock_label_font", None)
-        if font is not None:
-            self._analysis_clock_label.setFont(font)
+        label = self._analysis_clock_label
+        label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        label.setFixedWidth(275)
+        label.setMinimumHeight(86)
+        self._clock_scale = 1.0
+        self._update_analysis_clock()
         self._principle_bar.insertWidget(0, self._analysis_clock_label)
         self._analysis_clock_label.show()
         window.close()
