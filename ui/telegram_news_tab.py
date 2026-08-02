@@ -135,6 +135,10 @@ class TelegramNewsTabMixin:
             lambda *_: self._telegram_header_timer.start(400))
         self._telegram_table.cellClicked.connect(
             self._telegram_table_clicked)
+        self._telegram_table.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self._telegram_table.customContextMenuRequested.connect(
+            self._telegram_table_right_clicked)
         layout.addWidget(self._telegram_table, 1)
         self._telegram_seen: set[tuple[str, int]] = set()
         self._telegram_new_count = 0
@@ -269,7 +273,9 @@ class TelegramNewsTabMixin:
         stock_item = QTableWidgetItem(str(row.get("stock_names") or ""))
         stock_item.setData(Qt.ItemDataRole.UserRole, list(codes))
         stock_item.setToolTip(
-            ("종목코드: " + ", ".join(codes) + "\n\n클릭: 관심종목·종토방 열기")
+            ("종목코드: " + ", ".join(codes)
+             + "\n\n좌클릭: 대표 종목코드 복사"
+             "\n우클릭: 종목뉴스·종토방 탭으로 이동")
             if codes else "연결된 종목이 없습니다.")
         body_item = QTableWidgetItem(str(row.get("title") or ""))
         body_item.setToolTip(
@@ -366,14 +372,18 @@ class TelegramNewsTabMixin:
         self._set_latest_ls_news_highlight(True)
         self._latest_ls_news_highlight_timer.start(3500)
 
+    def _telegram_row_stock_code(self, row: int) -> str:
+        item = self._telegram_table.item(row, 3)
+        codes = list(item.data(Qt.ItemDataRole.UserRole) or []) if item else []
+        return str(codes[0]) if codes else ""
+
     def _telegram_table_clicked(self, row: int, column: int):
         if column == 3:
-            item = self._telegram_table.item(row, 3)
-            codes = list(item.data(Qt.ItemDataRole.UserRole) or []) if item \
-                else []
-            if codes:
-                QApplication.clipboard().setText(codes[0])
-                self.open_realtime_watch(codes[0])
+            stock_code = self._telegram_row_stock_code(row)
+            if stock_code:
+                QApplication.clipboard().setText(stock_code)
+                self.statusBar().showMessage(
+                    f"종목코드 {stock_code}를 복사했습니다.", 3000)
             return
         if column != 4:
             return
@@ -381,3 +391,12 @@ class TelegramNewsTabMixin:
         url = str(item.data(Qt.ItemDataRole.UserRole) or "") if item else ""
         if url:
             QDesktopServices.openUrl(QUrl(url))
+
+    def _telegram_table_right_clicked(self, position):
+        """종목 열을 오른쪽 클릭하면 종목뉴스·종토방 탭으로 이동한다."""
+        item = self._telegram_table.itemAt(position)
+        if item is None or item.column() != 3:
+            return
+        stock_code = self._telegram_row_stock_code(item.row())
+        if stock_code:
+            self.open_realtime_watch(stock_code)
