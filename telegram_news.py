@@ -23,8 +23,12 @@ from analysis_db import stock_name_index, telegram_news_cursors
 log = logging.getLogger("telegram_news")
 
 _CODE_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
-_SPACE_RE = re.compile(r"\s+")
+_SPACE_RE = re.compile(r"[^\S\n]+")
 _WORD_CHAR = re.compile(r"[0-9A-Za-z가-힣]")
+# 채널이 직접 붙인 종목 목록. 본문 추측보다 항상 우선한다.
+_RELATED_RE = re.compile(r"\[관련\s*종목\]\s*([^\n]+)")
+# 첫 줄에 오는 채널 말머리(예: "🟦 하나증권(중국)", "🟦 [대신증권 리서치]").
+_HEADER_MARK = "🟦"
 # 종목명 뒤에 바로 붙는 한 글자 조사는 낱말 경계로 인정한다.
 _JOSA = frozenset("이가은는을를의에도와과로만서요랑")
 
@@ -53,6 +57,15 @@ def extract_stocks(text: str, name_index: dict[str, str]
     """본문에서 종목코드와 종목명을 뽑는다. (코드 튜플, 표시용 종목명)"""
     codes: list[str] = []
     names: list[str] = []
+    related = _RELATED_RE.search(text)
+    if related is not None:
+        for token in re.split(r"[|,·/]", related.group(1)):
+            code = name_index.get(token.strip())
+            if code and code not in codes:
+                codes.append(code)
+                names.append(token.strip())
+        if codes:
+            return tuple(codes), ", ".join(names)
     code_to_name = {code: name for name, code in name_index.items()}
     for code in _CODE_RE.findall(text):
         if code in code_to_name and code not in codes:
@@ -78,9 +91,19 @@ def extract_stocks(text: str, name_index: dict[str, str]
 
 def _message_row(channel: str, title: str, message,
                  name_index: dict[str, str]) -> dict | None:
-    text = _SPACE_RE.sub(" ", str(getattr(message, "message", "") or "")).strip()
-    if not text:
+    raw = _SPACE_RE.sub(
+        " ", str(getattr(message, "message", "") or "").replace("\xa0", " "))
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if not lines:
         return None
+    # 말머리는 채널 소분류일 뿐이라 제목·종목 추출 대상에서 뺀다.
+    header = ""
+    if lines[0].startswith(_HEADER_MARK):
+        header = lines[0].lstrip(_HEADER_MARK).strip(" []")
+        lines = lines[1:]
+        if not lines:
+            return None
+    text = "\n".join(lines)
     published = getattr(message, "date", None)
     if isinstance(published, datetime):
         published_at = published.replace(
@@ -92,10 +115,10 @@ def _message_row(channel: str, title: str, message,
     link_name = channel.lstrip("@")
     return {
         "channel": channel,
-        "channel_title": title or channel,
+        "channel_title": header or title or channel,
         "message_id": int(message.id),
         "published_at": published_at,
-        "title": text[:200],
+        "title": lines[0][:200],
         "body": text,
         "stock_codes": codes,
         "stock_names": names,
@@ -245,6 +268,12 @@ def _demo():
     assert extract_stocks("두산이 급등", short)[0] == ("000150",)
     assert extract_stocks("레이 신고가", short)[0] == ("228670",)
 
+    # 채널이 붙인 [관련 종목] 목록은 본문 추측보다 우선한다.
+    related = {"삼성전자": "005930", "SK하이닉스": "000660", "네이버": "035420"}
+    codes, names = extract_stocks(
+        "코스피 하락폭 만회\n\n[관련 종목] SK하이닉스 | 삼성전자", related)
+    assert codes == ("000660", "005930"), codes
+
     class _Message:
         id = 7
         message = "  한샘  급등 "
@@ -254,6 +283,19 @@ def _demo():
     assert row["stock_codes"] == ("009240",), row
     assert row["title"] == "한샘 급등", row
     assert row["url"] == "https://t.me/stockinfojji/7", row
+
+    # 말머리(발행처)는 제목과 종목 추출에서 빠지고 채널 표시로만 남는다.
+    header_message = type("M", (), {
+        "id": 9,
+        "message": "🟦 [대신증권 리서치]\n\n두산, 잘 사왔다\n\n본문 이어짐",
+        "date": _Message.date,
+    })()
+    row = _message_row(
+        "@stockinfojji", "지지뉴스", header_message,
+        {"대신증권": "003540", "두산": "000150"})
+    assert row["channel_title"] == "대신증권 리서치", row
+    assert row["title"] == "두산, 잘 사왔다", row
+    assert row["stock_codes"] == ("000150",), row
     assert _message_row("@c", "c", type("E", (), {
         "id": 1, "message": "", "date": None})(), index) is None
     print("ok")
