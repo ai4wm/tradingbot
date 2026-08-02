@@ -3122,11 +3122,24 @@ class DetachedClockWindow(QWidget):
             self.resize(width, max(60, label.heightForWidth(width)))
         self._ratio = self.width() / max(1, self.height())
         self._apply_scale()
-        if not isinstance(size, QSize) or not size.isValid():
-            # 국면 문구 크기까지 정해진 뒤 실제 내용 높이에 맞춘다.
-            self.resize(self.width(), max(40, label.heightForWidth(self.width())))
-            self._base_height = self.height()
-            self._ratio = self.width() / max(1, self.height())
+        # 창을 띄우기 전에는 줄 수가 확정되지 않아 실제 표시 뒤 한 번 맞춘다.
+        self._fit_pending = not (isinstance(size, QSize) and size.isValid())
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._fit_pending:
+            return
+        self._fit_pending = False
+        label = self._label()
+        if label is None:
+            return
+        # 내용 높이를 그대로 기준 높이로 삼아야 배율이 1.0로 유지된다.
+        # (기준을 그대로 두고 높이만 줄이면 글자가 작아지고 다시 높이가
+        #  줄어드는 되먹임이 생긴다.)
+        height = max(40, label.heightForWidth(self.width()))
+        self._base_height = height
+        self.resize(self.width(), height)
+        self._ratio = self.width() / max(1, height)
 
     def _content_width(self, label) -> int:
         """날짜·요일 줄 너비에 맞춘다. 국면 문구는 줄바꿈으로 흘린다."""
@@ -3134,7 +3147,10 @@ class DetachedClockWindow(QWidget):
         font.setPixelSize(self._owner._clock_px(13))
         font.setBold(True)
         metrics = QFontMetrics(font)
-        date_line = f"{datetime.now():%Y-%m-%d} 일요일휴장"
+        # 실제로 그려지는 날짜 줄로 재야 "· 주말" 같은 꼬리표가 잘리지 않는다.
+        date_line = getattr(
+            self._owner, "_clock_date_text",
+            f"{datetime.now():%Y-%m-%d} 일요일 · 거래 종료")
         time_font = QFont(font)
         time_font.setPixelSize(self._owner._clock_px(26))
         widest = max(metrics.horizontalAdvance(date_line),
@@ -3540,6 +3556,7 @@ class AnalysisWindow(
             phase_text = "매매 집중시간 아님"
             phase_background, phase_color = "#424A55", "#E2E7ED"
 
+        self._clock_date_text = f"{now:%Y-%m-%d} {weekday}{day_state}"
         self._clock_phase_text = phase_text
         phase_px = getattr(self, "_clock_phase_px", 0) or self._clock_px(12)
         phase_badge = (
