@@ -255,6 +255,68 @@ class TelegramNewsStream:
             log.info("telegram backfill %s: %d", channel, len(rows))
 
 
+async def _demo_backfill():
+    """소급 수집이 마지막 저장 ID 이후만, 오래된 순서로 넘기는지 확인한다."""
+    class _Msg:
+        def __init__(self, mid):
+            self.id = mid
+            self.message = f"메시지 {mid}"
+            self.date = datetime(2026, 8, 2, 9, 0, tzinfo=timezone.utc)
+
+    class _Client:
+        def __init__(self):
+            self.calls = []
+
+        def iter_messages(self, entity, limit=None, min_id=0):
+            self.calls.append({"limit": limit, "min_id": min_id})
+            # 텔레그램과 같이 최신순으로 돌려준다.
+            picked = [m for m in reversed(entity.messages) if m.id > min_id]
+
+            async def _gen():
+                for message in picked[:limit]:
+                    yield message
+            return _gen()
+
+    entity = type("E", (), {"title": "채널", "messages": [_Msg(i) for i in range(1, 9)]})()
+    stream = TelegramNewsStream()
+    client = _Client()
+
+    seen = []
+    await stream._backfill(client, "@c", entity, 0, {}, lambda row, new: seen.append(row))
+    assert client.calls[-1]["limit"] == config.TG_FIRST_RUN_LIMIT, client.calls
+    assert [row["message_id"] for row in seen] == list(range(1, 9)), seen
+
+    seen.clear()
+    await stream._backfill(client, "@c", entity, 6, {}, lambda row, new: seen.append(row))
+    assert client.calls[-1]["min_id"] == 6, client.calls
+    assert [row["message_id"] for row in seen] == [7, 8], seen
+
+    seen.clear()
+    await stream._backfill(client, "@c", entity, 8, {}, lambda row, new: seen.append(row))
+    assert seen == [], seen
+
+
+def _demo_dedupe():
+    """같은 채널·메시지 ID는 다시 저장되지 않고 커서가 마지막 ID를 가리킨다."""
+    import tempfile
+    from pathlib import Path
+
+    from analysis_db import save_telegram_news, telegram_news_cursors
+
+    with tempfile.TemporaryDirectory() as folder:
+        db = Path(folder) / "test.db"
+        row = {
+            "channel": "@c", "message_id": 5, "channel_title": "채널",
+            "published_at": "2026-08-02T09:00:00+09:00", "title": "제목",
+            "body": "본문", "stock_codes": ("005930",),
+            "stock_names": "삼성전자", "url": "https://t.me/c/5",
+        }
+        assert save_telegram_news(row, db) is True
+        assert save_telegram_news(row, db) is False
+        assert save_telegram_news({**row, "message_id": 9}, db) is True
+        assert telegram_news_cursors(db) == {"@c": 9}
+
+
 def _demo():
     index = {"삼성전자": "005930", "한샘": "009240", "에코프로": "086520"}
     codes, names = extract_stocks("삼성전자(005930) 강세, 에코프로도 상승", index)
@@ -298,6 +360,9 @@ def _demo():
     assert row["stock_codes"] == ("000150",), row
     assert _message_row("@c", "c", type("E", (), {
         "id": 1, "message": "", "date": None})(), index) is None
+
+    asyncio.run(_demo_backfill())
+    _demo_dedupe()
     print("ok")
 
 
