@@ -60,6 +60,8 @@ TONES = {  # (주파수Hz, 길이ms) 나열 -> 멜로디. 시스템 테마 무�
     "ls_news_without_code": [(784, 120), (988, 220)],
     "naver_news": [(1047, 120), (1397, 120), (1760, 240)],
     "telegram_news": [(1245, 120), (1568, 200)],
+    "telegram_news_with_code": [(1245, 120), (1568, 200)],
+    "telegram_news_without_code": [(880, 120), (1108, 200)],
 }
 
 
@@ -104,6 +106,8 @@ KIWOOM_ALERT_FILES = {
     "ls_news_without_code": Path(r"C:\KiwoomHero4\sound\sound11.wav"),
     "naver_news": Path(r"C:\KiwoomHero4\sound\sound12.wav"),
     "telegram_news": Path(r"C:\KiwoomHero4\sound\sound10.wav"),
+    "telegram_news_with_code": Path(r"C:\KiwoomHero4\sound\sound10.wav"),
+    "telegram_news_without_code": Path(r"C:\KiwoomHero4\sound\sound9.wav"),
 }
 
 

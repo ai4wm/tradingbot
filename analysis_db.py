@@ -5018,13 +5018,15 @@ def save_telegram_news(row: dict, db_path: Path = DB_PATH, *,
         return cursor.rowcount > 0
 
 
-def telegram_news_rows(limit: int = 300, *, watched_only: bool = False,
-                       query: str = "",
+def telegram_news_rows(limit: int = 300, *, stock_only: bool = False,
+                       watched_only: bool = False, query: str = "",
                        db_path: Path = DB_PATH) -> list[dict]:
-    """최신순 텔레그램 뉴스. 관심종목 필터와 단순 포함 검색만 지원한다."""
+    """최신순 텔레그램 뉴스. 종목·관심종목 필터와 단순 포함 검색을 지원한다."""
     initialize(db_path)
     conditions = []
     params: list = []
+    if stock_only:
+        conditions.append("t.stock_codes <> '[]'")
     if watched_only:
         # ponytail: 6자리 코드가 유일해 JSON 배열 문자열 포함 검사로 충분하다.
         conditions.append(

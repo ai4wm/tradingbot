@@ -56,7 +56,10 @@ class TelegramNewsTabMixin:
         self._telegram_sound = QCheckBox("소리")
         self._telegram_sound.setToolTip(
             "체크하면 새 텔레그램 글이 도착할 때 알림음을 재생합니다.\n"
-            r"C:\KiwoomHero4\sound\sound10.wav")
+            "종목코드 있음: "
+            r"C:\KiwoomHero4\sound\sound10.wav"
+            "\n종목코드 없음: "
+            r"C:\KiwoomHero4\sound\sound9.wav")
         self._telegram_sound.setChecked(
             str(self._settings.value(
                 "analysis_telegram_sound", "false"
@@ -65,6 +68,16 @@ class TelegramNewsTabMixin:
         self._telegram_sound.toggled.connect(
             lambda checked: self._settings.setValue(
                 "analysis_telegram_sound", "true" if checked else "false"))
+        self._telegram_stock_only = QCheckBox("종목")
+        self._telegram_stock_only.setToolTip(
+            "종목코드가 연결된 글만 표시합니다.")
+        self._telegram_stock_only.setChecked(
+            str(self._settings.value(
+                "analysis_telegram_stock_only", "false"
+            )).strip().lower() in {"1", "true", "yes"}
+        )
+        self._telegram_stock_only.toggled.connect(
+            self._set_telegram_stock_filter)
         self._telegram_watched_only = QCheckBox("관심종목")
         self._telegram_watched_only.setToolTip(
             "글에 연결된 종목 중 하나라도 관심종목이면 표시합니다.")
@@ -86,6 +99,7 @@ class TelegramNewsTabMixin:
             "목록과 DB 저장 데이터는 그대로 유지합니다.")
         self._telegram_clear_new_button.clicked.connect(
             self._clear_telegram_new_markers)
+        status_row.addWidget(self._telegram_stock_only)
         status_row.addWidget(self._telegram_watched_only)
         status_row.addWidget(self._telegram_clear_new_button)
         layout.addLayout(status_row)
@@ -124,6 +138,11 @@ class TelegramNewsTabMixin:
         layout.addWidget(self._telegram_table, 1)
         self._telegram_seen: set[tuple[str, int]] = set()
         self._telegram_new_count = 0
+
+    def _set_telegram_stock_filter(self, checked: bool):
+        self._settings.setValue(
+            "analysis_telegram_stock_only", "true" if checked else "false")
+        self._reload_telegram_news()
 
     def _set_telegram_watched_filter(self, checked: bool):
         self._settings.setValue(
@@ -176,6 +195,7 @@ class TelegramNewsTabMixin:
         try:
             rows = telegram_news_rows(
                 VISIBLE_LIMIT,
+                stock_only=self._telegram_stock_only.isChecked(),
                 watched_only=self._telegram_watched_only.isChecked(),
                 query=self._telegram_search.text(),
             )
@@ -205,8 +225,8 @@ class TelegramNewsTabMixin:
             inserted = True
         if not inserted:
             return
-        if self._telegram_watched_only.isChecked() and not row.get(
-                "stock_codes"):
+        codes = tuple(row.get("stock_codes") or ())
+        if self._telegram_stock_only.isChecked() and not codes:
             return
         if self._telegram_watched_only.isChecked() and not any(
                 code in self._ls_news_watched_codes
@@ -227,7 +247,8 @@ class TelegramNewsTabMixin:
         if is_new:
             self._show_latest_telegram_news(row)
             if self._telegram_sound.isChecked():
-                _beep("telegram_news")
+                _beep("telegram_news_with_code" if codes
+                      else "telegram_news_without_code")
 
     def _insert_telegram_row(self, row: dict, highlight: bool):
         table = self._telegram_table
