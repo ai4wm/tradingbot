@@ -5035,8 +5035,9 @@ def telegram_news_rows(limit: int = 300, *, stock_only: bool = False,
     for word in str(query or "").split():
         conditions.append(
             "(t.title LIKE ? OR t.body LIKE ? OR t.stock_names LIKE ? "
-            "OR t.channel LIKE ? OR t.channel_title LIKE ?)")
-        params.extend([f"%{word}%"] * 5)
+            "OR t.stock_codes LIKE ? OR t.channel LIKE ? "
+            "OR t.channel_title LIKE ?)")
+        params.extend([f"%{word}%"] * 6)
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     with closing(connect(db_path)) as connection:
         rows = connection.execute(

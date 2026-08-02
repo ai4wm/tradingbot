@@ -244,7 +244,7 @@ class TelegramNewsTabMixin:
         if query_words:
             haystack = " ".join((
                 str(row.get("title") or ""), str(row.get("body") or ""),
-                str(row.get("stock_names") or ""),
+                str(row.get("stock_names") or ""), " ".join(codes),
                 str(row.get("channel") or ""),
                 str(row.get("channel_title") or ""),
             ))
