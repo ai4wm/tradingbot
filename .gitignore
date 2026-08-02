@@ -1,5 +1,6 @@
 .env
 .venv/
+.codegraph/
 __pycache__/
 *.pyc
 bot.log*

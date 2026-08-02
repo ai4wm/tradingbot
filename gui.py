@@ -2311,7 +2311,9 @@ class ConditionScreen(QWidget):
         self.refresh_btn.setToolTip("재조회 — 현재 조건의 편입 종목을 지금 다시 받아옵니다")
         self.refresh_btn.setFixedWidth(32)
         self.auto_refresh = QCheckBox("재조회")  # 동시호가 때 편입/이탈 수동갱신용
-        self.auto_refresh.setToolTip("동시호가 때 편입/이탈이 실시간으로 안 와서 주기적으로 재조회")
+        self.auto_refresh.setToolTip(
+            "동시호가 때 편입/이탈이 실시간으로 안 와서 주기적으로 재조회"
+            " · 본창은 오전 09:02:20에 자동 해제")
         self.refresh_interval = QSpinBox()
         self.refresh_interval.setRange(2, 30)  # 2초 미만은 유량초과 위험
         self.refresh_interval.setValue(3)

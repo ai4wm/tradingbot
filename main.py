@@ -609,6 +609,7 @@ class View:
         self._settings = QSettings("layout.ini", QSettings.IniFormat)
         self._auto_timer = QTimer(screen)
         self._auto_timer.timeout.connect(self.on_refresh)
+        self._auto_refresh_cutoff_timer = None
 
         screen.condition_combo.activated.connect(self._on_condition_selected)
         screen.rank_period.activated.connect(self.on_refresh)  # 기준시간 변경 -> 즉시 재폴
@@ -619,6 +620,12 @@ class View:
             self._auto_timer.start(screen.refresh_interval.value() * 1000)
         screen.auto_refresh.toggled.connect(self._on_auto_refresh)
         screen.refresh_interval.valueChanged.connect(self._on_interval_changed)
+        if not self.prefix:
+            self._auto_refresh_cutoff_timer = QTimer(screen)
+            self._auto_refresh_cutoff_timer.setSingleShot(True)
+            self._auto_refresh_cutoff_timer.timeout.connect(
+                self._on_main_auto_refresh_cutoff)
+            self._schedule_main_auto_refresh_cutoff(clear_stale=True)
         self._beep_t = 0.0  # 편입소리 스로틀 (개장 이벤트 폭주 때 소리 도배 방지)
         screen.sound_check.setChecked(self._settings.value(self.prefix + "sound", "false") == "true")
         screen.sound_check.toggled.connect(self._on_sound)
@@ -818,6 +825,29 @@ class View:
         self._settings.sync()
         if self._auto_timer.isActive():
             self._auto_timer.start(sec * 1000)
+
+    def _schedule_main_auto_refresh_cutoff(self, clear_stale: bool = False):
+        """본창 재조회 체크를 매일 09:02:20에 해제하도록 예약한다."""
+        if self.prefix or self._auto_refresh_cutoff_timer is None:
+            return
+        now = datetime.now(KST)
+        cutoff = now.replace(
+            hour=9, minute=2, second=20, microsecond=0)
+        if clear_stale and now >= cutoff:
+            self.screen.auto_refresh.setChecked(False)
+        if now >= cutoff:
+            cutoff += timedelta(days=1)
+        delay_ms = max(
+            1, int((cutoff - now).total_seconds() * 1000))
+        self._auto_refresh_cutoff_timer.start(delay_ms)
+
+    def _on_main_auto_refresh_cutoff(self):
+        """추가 창에는 영향을 주지 않고 본창의 자동 재조회만 끈다."""
+        was_checked = self.screen.auto_refresh.isChecked()
+        self.screen.auto_refresh.setChecked(False)
+        if was_checked:
+            log.info("main auto-requery OFF at 09:02:20")
+        self._schedule_main_auto_refresh_cutoff()
 
     # --- 편입/이탈 ---------------------------------------------------------
     def on_snapshot(self, codes: list[str]):
