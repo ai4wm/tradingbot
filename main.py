@@ -3086,9 +3086,11 @@ class DetachedClockWindow(QWidget):
         self._resize_from = None
         self._ratio = 0.0
         self._base = None  # (창 높이, 글꼴 크기) 비율 기준
+        # 배경을 비워 라벨의 둥근 모서리가 창 모양이 되게 한다.
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setMouseTracking(True)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setContentsMargins(0, 0, 0, 0)
 
     def adopt(self, label):
         """시계 라벨을 넘겨받고 크기 제한을 풀어 창 크기를 복원한다."""
