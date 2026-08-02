@@ -3566,6 +3566,27 @@ class LSNewsDetailDialog(QDialog):
         self._refresh_button.setEnabled(True)
 
 
+class DetachedClockWindow(QWidget):
+    """분석창에서 떼어낸 시계 전용 창: 항상 위, 닫으면 분석창으로 복귀."""
+
+    def __init__(self, owner: "AnalysisWindow"):
+        super().__init__(None, Qt.WindowType.Tool)
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        self.setWindowTitle("시계")
+        self._owner = owner
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+
+    def moveEvent(self, e):
+        super().moveEvent(e)
+        self._owner._settings.setValue("clock_window_pos", self.pos())
+
+    def closeEvent(self, e):
+        if self._owner._clock_window is self:
+            self._owner._attach_clock()  # 닫기 = 합치기
+        super().closeEvent(e)
+
+
 class AnalysisWindow(QMainWindow):
     """실시간 뉴스·상한가·테마 전용 경량 분석창."""
 
@@ -3647,6 +3668,8 @@ class AnalysisWindow(QMainWindow):
         self._analysis_clock_timer.start(1000)
         self._update_analysis_clock()
         principle_bar.addWidget(self._analysis_clock_label)
+        self._principle_bar = principle_bar
+        self._clock_window: DetachedClockWindow | None = None
 
         self._latest_ls_news_context: dict | None = None
         self._latest_ls_news_label = LatestLSNewsLabel()
@@ -3661,6 +3684,13 @@ class AnalysisWindow(QMainWindow):
         self._latest_ls_news_label.set_headline("실시간 뉴스 대기 중")
         principle_bar.addWidget(self._latest_ls_news_label, 1)
 
+        self._clock_detach_btn = QPushButton("🕒")
+        self._clock_detach_btn.setCheckable(True)
+        self._clock_detach_btn.setFixedSize(32, 32)
+        self._clock_detach_btn.setToolTip(
+            "시계 분리 — 시계만 항상 위 작은 창으로 띄우기")
+        self._clock_detach_btn.toggled.connect(self._clock_detach_toggle)
+
         self._analysis_on_top_btn = QPushButton("📌")
         self._analysis_on_top_btn.setCheckable(True)
         self._analysis_on_top_btn.setFixedSize(32, 32)
@@ -3668,8 +3698,12 @@ class AnalysisWindow(QMainWindow):
             "항상 맨 위 — 분석창을 다른 창들 위에 계속 고정")
         self._analysis_on_top_btn.toggled.connect(
             self._analysis_on_top_toggle)
-        principle_bar.addWidget(
-            self._analysis_on_top_btn, 0, Qt.AlignmentFlag.AlignTop)
+        corner_buttons = QVBoxLayout()
+        corner_buttons.setSpacing(4)
+        corner_buttons.addWidget(self._analysis_on_top_btn)
+        corner_buttons.addWidget(self._clock_detach_btn)
+        corner_buttons.addStretch(1)
+        principle_bar.addLayout(corner_buttons)
         central_layout.addLayout(principle_bar)
 
         collection_row = QHBoxLayout()
@@ -3727,6 +3761,8 @@ class AnalysisWindow(QMainWindow):
         QTimer.singleShot(0, self._ensure_titlebar_visible)
         if self._settings.value("analysis_on_top", "false") == "true":
             self._analysis_on_top_btn.setChecked(True)
+        if self._settings.value("clock_detached", "false") == "true":
+            self._clock_detach_btn.setChecked(True)
         self.watchlist_changed.connect(self._sync_ls_news_watched_codes)
         self._refresh_realtime_watch_table()
         self._refresh_realtime_news_table()
@@ -3874,6 +3910,43 @@ class AnalysisWindow(QMainWindow):
             f"{badge('NXT', nxt_state)}</div>"
             f"{phase_badge}"
         )
+
+    def _clock_detach_toggle(self, on: bool):
+        if on:
+            self._detach_clock()
+        else:
+            self._attach_clock()
+
+    def _detach_clock(self):
+        if self._clock_window is not None:
+            return
+        window = DetachedClockWindow(self)
+        self._principle_bar.removeWidget(self._analysis_clock_label)
+        window.layout().addWidget(self._analysis_clock_label)
+        self._clock_window = window
+        pos = self._settings.value("clock_window_pos")
+        if isinstance(pos, QPoint):
+            window.move(pos)
+        window.show()
+        self._settings.setValue("clock_detached", "true")
+        self._settings.sync()
+
+    def _attach_clock(self):
+        window = self._clock_window
+        if window is None:
+            return
+        self._clock_window = None
+        window.layout().removeWidget(self._analysis_clock_label)
+        self._principle_bar.insertWidget(0, self._analysis_clock_label)
+        self._analysis_clock_label.show()
+        window.close()
+        window.deleteLater()
+        self._settings.setValue("clock_detached", "false")
+        self._settings.sync()
+        if self._clock_detach_btn.isChecked():
+            self._clock_detach_btn.blockSignals(True)
+            self._clock_detach_btn.setChecked(False)
+            self._clock_detach_btn.blockSignals(False)
 
     def _analysis_on_top_toggle(self, on: bool):
         geo = self.geometry()
@@ -10685,6 +10758,12 @@ class AnalysisWindow(QMainWindow):
         self._save_news_watch_header()
         self._save_limit_header()
         self._save_geo()
+        if self._clock_window is not None:
+            # 시계 위젯을 되돌려 고아 창을 남기지 않되, 분리 상태 설정은
+            # 남겨 다음 실행에서 분리된 시계 창을 그대로 복원한다.
+            self._attach_clock()
+            self._settings.setValue("clock_detached", "true")
+            self._settings.sync()
         super().closeEvent(event)
 
 
