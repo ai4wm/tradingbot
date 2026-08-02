@@ -4353,7 +4353,7 @@ def _normalize_single_ls_news_stock_code(code: str) -> str:
     ):
         stock_code = stock_code[1:]
     if (
-        len(stock_code) > 6 and stock_code.isdigit()
+        len(stock_code) > 6 and stock_code.isalnum()
         and not stock_code[:-6].strip("0")
     ):
         stock_code = stock_code[-6:]
@@ -4377,7 +4377,7 @@ def split_ls_news_stock_codes(value) -> tuple[str, ...]:
             if isinstance(decoded, list):
                 raw_items = decoded
         if raw_items is None and (
-            len(raw) >= 12 and len(raw) % 12 == 0 and raw.isdigit()
+            len(raw) >= 12 and len(raw) % 12 == 0 and raw.isalnum()
         ):
             chunks = [raw[index:index + 12]
                       for index in range(0, len(raw), 12)]

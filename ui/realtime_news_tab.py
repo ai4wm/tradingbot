@@ -2066,7 +2066,10 @@ class RealtimeNewsTabMixin:
                 self._ls_news_stock_names[stock_code] = (
                     stock_name or stock_code)
             stock_names.append(self._ls_news_stock_names[stock_code])
-        label = stock_names[0]
+        label = next(
+            (name for name, stock_code in zip(stock_names, stock_codes)
+             if name != stock_code),
+            stock_names[0])
         if len(stock_names) > 1:
             label += f" {len(stock_names) - 1}"
         tooltip_lines = [
