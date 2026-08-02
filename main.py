@@ -23,7 +23,8 @@ from PySide6.QtCore import (
     QTimer, QUrl, Signal,
 )
 from PySide6.QtGui import (
-    QColor, QDesktopServices, QFont, QPainter, QPalette, QPen,
+    QColor, QDesktopServices, QFont, QFontMetrics, QPainter, QPalette,
+    QPen,
 )
 from PySide6.QtWidgets import (
     QApplication, QDialog, QHBoxLayout, QLabel, QLayout, QMainWindow,
@@ -3106,16 +3107,33 @@ class DetachedClockWindow(QWidget):
         # 배율 1.0일 때의 높이를 기준으로 삼아야 분석창과 글자 크기가 같다.
         self._owner._clock_scale = 1.0
         self._owner._clock_pad_x = 2
+        # 긴 국면 문구가 창 너비를 끌고 가지 않도록 줄바꿈을 허용한다.
+        label.setWordWrap(True)
         self._owner._update_analysis_clock()
-        self.adjustSize()
-        self._base_height = max(60, self.sizeHint().height())
+        self.resize(self._content_width(label), label.heightForWidth(
+            self._content_width(label)))
+        self._base_height = max(60, self.height())
         size = self._owner._settings.value("clock_window_size")
         if isinstance(size, QSize) and size.isValid():
             self.resize(size)
         else:
-            self.resize(self.sizeHint())
+            width = self._content_width(label)
+            self.resize(width, max(60, label.heightForWidth(width)))
         self._ratio = self.width() / max(1, self.height())
         self._apply_scale()
+
+    def _content_width(self, label) -> int:
+        """날짜·요일 줄 너비에 맞춘다. 국면 문구는 줄바꿈으로 흘린다."""
+        font = QFont(label.font())
+        font.setPixelSize(self._owner._clock_px(13))
+        font.setBold(True)
+        metrics = QFontMetrics(font)
+        date_line = f"{datetime.now():%Y-%m-%d} 일요일휴장"
+        time_font = QFont(font)
+        time_font.setPixelSize(self._owner._clock_px(26))
+        widest = max(metrics.horizontalAdvance(date_line),
+                     QFontMetrics(time_font).horizontalAdvance("00:00:00"))
+        return widest + 2 * (self._owner._clock_pad_x + 2) + 6
 
     def _label(self):
         item = self.layout().itemAt(0)
@@ -3564,6 +3582,7 @@ class AnalysisWindow(
         label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         label.setFixedWidth(275)
         label.setMinimumHeight(86)
+        label.setWordWrap(False)
         self._clock_scale = 1.0
         self._clock_pad_x = 7
         self._update_analysis_clock()
