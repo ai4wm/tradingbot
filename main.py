@@ -3105,13 +3105,15 @@ class DetachedClockWindow(QWidget):
         self.setMouseTracking(True)
         # 배율 1.0일 때의 높이를 기준으로 삼아야 분석창과 글자 크기가 같다.
         self._owner._clock_scale = 1.0
+        self._owner._clock_pad_x = 2
         self._owner._update_analysis_clock()
+        self.adjustSize()
         self._base_height = max(60, self.sizeHint().height())
         size = self._owner._settings.value("clock_window_size")
         if isinstance(size, QSize) and size.isValid():
             self.resize(size)
         else:
-            self.resize(283, self._base_height)
+            self.resize(self.sizeHint())
         self._ratio = self.width() / max(1, self.height())
         self._apply_scale()
 
@@ -3513,7 +3515,7 @@ class AnalysisWindow(
             f" background-color: {background};"
             f" border: 2px solid {border};"
             " border-radius: 7px;"
-            " padding: 4px 7px;"
+            f" padding: 4px {getattr(self, '_clock_pad_x', 7)}px;"
             "}")
         self._analysis_clock_label.setText(
             f"<div style='font-size:{self._clock_px(13)}px;"
@@ -3563,6 +3565,7 @@ class AnalysisWindow(
         label.setFixedWidth(275)
         label.setMinimumHeight(86)
         self._clock_scale = 1.0
+        self._clock_pad_x = 7
         self._update_analysis_clock()
         self._principle_bar.insertWidget(0, self._analysis_clock_label)
         self._analysis_clock_label.show()
