@@ -17,3 +17,5 @@ data/walkforward_*.out
 data/walkforward_*.err
 data/walkforward_*_report.json
 data/walkforward_*_report.md
+data/*.session
+data/*.session-journal

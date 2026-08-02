@@ -353,6 +353,20 @@ CREATE TABLE IF NOT EXISTS ls_realtime_news_stocks (
         ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS telegram_news (
+    channel TEXT NOT NULL,
+    message_id INTEGER NOT NULL,
+    channel_title TEXT NOT NULL DEFAULT '',
+    published_at TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    body TEXT NOT NULL DEFAULT '',
+    stock_codes TEXT NOT NULL DEFAULT '[]',
+    stock_names TEXT NOT NULL DEFAULT '',
+    url TEXT NOT NULL DEFAULT '',
+    received_at TEXT NOT NULL,
+    PRIMARY KEY (channel, message_id)
+);
+
 CREATE TABLE IF NOT EXISTS sync_state (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL DEFAULT '',
@@ -713,6 +727,8 @@ CREATE INDEX IF NOT EXISTS idx_market_investor_flows_market_date
     ON market_investor_flows(market, trade_date);
 CREATE INDEX IF NOT EXISTS idx_external_market_ticks_latest
     ON external_market_ticks(indicator_code, observed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_telegram_news_published
+    ON telegram_news(published_at DESC);
 """
 
 
@@ -4946,6 +4962,95 @@ def update_ls_realtime_news_detail(
                 ),
             )
         return cursor.rowcount > 0
+
+
+def stock_name_index(db_path: Path = DB_PATH) -> dict[str, str]:
+    """종목명 → 종목코드 사전. 텔레그램 본문의 종목 추출에 사용한다."""
+    initialize(db_path)
+    with closing(connect(db_path)) as connection:
+        return {
+            str(row["stock_name"]).strip(): str(row["stock_code"]).strip()
+            for row in connection.execute(
+                "SELECT stock_code, stock_name FROM stocks "
+                "WHERE stock_name <> ''").fetchall()
+        }
+
+
+def telegram_news_cursors(db_path: Path = DB_PATH) -> dict[str, int]:
+    """채널별 마지막 저장 메시지 ID. 앱 종료 중 누락분 소급 수집 기준이다."""
+    initialize(db_path)
+    with closing(connect(db_path)) as connection:
+        return {
+            str(row["channel"]): int(row["last_id"] or 0)
+            for row in connection.execute(
+                "SELECT channel, MAX(message_id) AS last_id "
+                "FROM telegram_news GROUP BY channel").fetchall()
+        }
+
+
+def save_telegram_news(row: dict, db_path: Path = DB_PATH, *,
+                       ensure_schema: bool = True) -> bool:
+    """채널+메시지 ID 조합으로 중복을 막고 저장한다. 새 글이면 True."""
+    if ensure_schema:
+        initialize(db_path)
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    with closing(connect(db_path)) as connection, connection:
+        cursor = connection.execute(
+            """INSERT INTO telegram_news(
+                   channel, message_id, channel_title, published_at,
+                   title, body, stock_codes, stock_names, url, received_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(channel, message_id) DO NOTHING""",
+            (
+                str(row.get("channel") or ""),
+                int(row.get("message_id") or 0),
+                str(row.get("channel_title") or ""),
+                str(row.get("published_at") or ""),
+                str(row.get("title") or ""),
+                str(row.get("body") or ""),
+                json.dumps(list(row.get("stock_codes") or ()),
+                           ensure_ascii=False),
+                str(row.get("stock_names") or ""),
+                str(row.get("url") or ""),
+                now,
+            ),
+        )
+        return cursor.rowcount > 0
+
+
+def telegram_news_rows(limit: int = 300, *, watched_only: bool = False,
+                       query: str = "",
+                       db_path: Path = DB_PATH) -> list[dict]:
+    """최신순 텔레그램 뉴스. 관심종목 필터와 단순 포함 검색만 지원한다."""
+    initialize(db_path)
+    conditions = []
+    params: list = []
+    if watched_only:
+        # ponytail: 6자리 코드가 유일해 JSON 배열 문자열 포함 검사로 충분하다.
+        conditions.append(
+            "EXISTS (SELECT 1 FROM realtime_watchlist w "
+            "WHERE instr(t.stock_codes, w.stock_code) > 0)")
+    for word in str(query or "").split():
+        conditions.append(
+            "(t.title LIKE ? OR t.body LIKE ? OR t.stock_names LIKE ? "
+            "OR t.channel LIKE ? OR t.channel_title LIKE ?)")
+        params.extend([f"%{word}%"] * 5)
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    with closing(connect(db_path)) as connection:
+        rows = connection.execute(
+            f"""SELECT * FROM telegram_news t {where}
+                ORDER BY published_at DESC, message_id DESC LIMIT ?""",
+            (*params, max(1, int(limit))),
+        ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        try:
+            item["stock_codes"] = tuple(json.loads(item["stock_codes"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            item["stock_codes"] = ()
+        result.append(item)
+    return result
 
 
 def _market_session(published_at: str) -> str:

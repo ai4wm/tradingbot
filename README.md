@@ -49,6 +49,9 @@ Copy-Item .env.example .env
 | `NAVER_CLIENT_ID`, `NAVER_CLIENT_SECRET` | 네이버 관심종목 뉴스 |
 | `DART_API_KEY` | 전자공시 수집 |
 | `KRX_API_KEY` | KRX 데이터 수집 |
+| `TG_API_ID`, `TG_API_HASH` | 텔레그램 채널 뉴스(Telethon 사용자 API) |
+| `TG_PHONE` | 텔레그램 최초 로그인 전화번호(생략 시 실행 중 입력) |
+| `TG_CHANNELS` | 수집할 텔레그램 채널 목록(쉼표 구분) |
 | `LS_NEWS_SYNC_ENABLED` | 외부 LS 뉴스 DB 누락분 동기화 여부 |
 | `LS_NEWS_SYNC_SSH_HOST` | 외부 수집 서버의 SSH 호스트 또는 별칭 |
 | `LS_NEWS_SYNC_DB_PATH` | 외부 서버의 뉴스 SQLite 경로 |

@@ -43,6 +43,20 @@ LS_NEWS_SYNC_DB_PATH = os.getenv(
 ).strip()
 LS_NEWS_SYNC_BATCH_SIZE = 500
 
+# 텔레그램 채널 뉴스(Telethon 사용자 API). 세션 파일은 Git에 커밋하지 않는다.
+TG_API_ID = os.getenv("TG_API_ID", "").strip()
+TG_API_HASH = os.getenv("TG_API_HASH", "").strip()
+TG_PHONE = os.getenv("TG_PHONE", "").strip()
+TG_CHANNELS = tuple(
+    name.strip() for name in os.getenv("TG_CHANNELS", "").split(",")
+    if name.strip()
+)
+TG_SESSION_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "data", "telegram.session")
+# 채널별 첫 실행 소급 수집 건수. 이후에는 저장된 마지막 메시지 ID부터 채운다.
+TG_FIRST_RUN_LIMIT = 50
+TG_BACKFILL_LIMIT = 500
+
 REAL_REG_LIMIT = 95  # 실시간 등록 종목 수 상한
 REST_RATE_LIMIT = 1.0  # 초당 REST 호출 수 (TR당 1req/s)
 TICK_MAX_PAGES = 6  # 상한가 진입 틱조회 최대 페이지 (초과 시 분봉 분단위 폴백). 6페이지=최악 ~6초
