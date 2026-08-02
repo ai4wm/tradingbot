@@ -22,8 +22,8 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QHBoxLayout, QHeaderView, QLabel,
     QDialog, QGridLayout, QLineEdit, QMainWindow, QProxyStyle, QPushButton, QSpinBox,
-    QStyle, QStyledItemDelegate, QStyleOptionViewItem, QTableView, QToolTip,
-    QVBoxLayout, QWidget,
+    QStyle, QStyledItemDelegate, QStyleOptionViewItem, QTableView,
+    QTableWidgetItem, QToolTip, QVBoxLayout, QWidget,
 )
 
 log = logging.getLogger("gui")
@@ -154,6 +154,21 @@ def _theme_group_precedence(group: tuple[str, str]) -> int:
     if group[1] == "2차전지":
         return 2
     return 1
+
+
+class NumericTableWidgetItem(QTableWidgetItem):
+    """표시는 서식을 유지하면서 실제 숫자로 정렬하는 셀."""
+
+    def __init__(self, text: str, value):
+        super().__init__(text)
+        self.setData(Qt.ItemDataRole.UserRole, value)
+
+    def __lt__(self, other):
+        left = self.data(Qt.ItemDataRole.UserRole)
+        right = other.data(Qt.ItemDataRole.UserRole)
+        if left is not None and right is not None:
+            return left < right
+        return super().__lt__(other)
 
 
 @dataclass(slots=True)
