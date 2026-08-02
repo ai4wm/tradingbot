@@ -13,7 +13,7 @@ from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
 )
 
 from analysis_db import save_telegram_news, telegram_news_rows
@@ -21,7 +21,7 @@ from gui import NumericTableWidgetItem
 from rank import _beep
 from telegram_news import TelegramNewsStream
 from ui import (
-    NEWS_NEW_TIME_BACKGROUND, NEWS_NEW_TIME_FOREGROUND,
+    NEWS_NEW_ROLE, NEWS_NEW_TIME_BACKGROUND, NEWS_NEW_TIME_FOREGROUND,
     NEWS_NEW_TITLE_BACKGROUND, NEWS_NEW_TITLE_FOREGROUND,
 )
 
@@ -79,12 +79,20 @@ class TelegramNewsTabMixin:
         status_row.addWidget(self._telegram_count)
         status_row.addWidget(self._telegram_search, 1)
         status_row.addWidget(self._telegram_sound)
+        self._telegram_clear_new_button = QPushButton("신규해제")
+        self._telegram_clear_new_button.setEnabled(False)
+        self._telegram_clear_new_button.setToolTip(
+            "새 텔레그램 글의 강조색만 해제합니다.\n"
+            "목록과 DB 저장 데이터는 그대로 유지합니다.")
+        self._telegram_clear_new_button.clicked.connect(
+            self._clear_telegram_new_markers)
         status_row.addWidget(self._telegram_watched_only)
+        status_row.addWidget(self._telegram_clear_new_button)
         layout.addLayout(status_row)
 
-        self._telegram_table = QTableWidget(0, 6)
+        self._telegram_table = QTableWidget(0, 5)
         self._telegram_table.setHorizontalHeaderLabels(
-            ("번호", "게시 시각", "채널", "종목", "내용", "원문"))
+            ("번호", "게시 시각", "채널", "종목", "내용"))
         self._telegram_table.setSortingEnabled(False)
         self._telegram_table.setAlternatingRowColors(True)
         self._telegram_table.setWordWrap(False)
@@ -100,21 +108,22 @@ class TelegramNewsTabMixin:
         header.setSectionsMovable(False)
         header.setStretchLastSection(False)
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        saved_header = self._settings.value("analysis_telegram_header")
+        saved_header = self._settings.value("analysis_telegram_header_v2")
         if saved_header is None or not header.restoreState(saved_header):
-            for column, width in enumerate((48, 130, 130, 130, 600, 60)):
+            for column, width in enumerate((48, 130, 130, 130, 660)):
                 self._telegram_table.setColumnWidth(column, width)
         self._telegram_header_timer = QTimer(self)
         self._telegram_header_timer.setSingleShot(True)
         self._telegram_header_timer.timeout.connect(
             lambda: self._settings.setValue(
-                "analysis_telegram_header", header.saveState()))
+                "analysis_telegram_header_v2", header.saveState()))
         header.sectionResized.connect(
             lambda *_: self._telegram_header_timer.start(400))
         self._telegram_table.cellClicked.connect(
             self._telegram_table_clicked)
         layout.addWidget(self._telegram_table, 1)
         self._telegram_seen: set[tuple[str, int]] = set()
+        self._telegram_new_count = 0
 
     def _set_telegram_watched_filter(self, checked: bool):
         self._settings.setValue(
@@ -175,9 +184,11 @@ class TelegramNewsTabMixin:
             self._set_telegram_status("error", f"DB 오류: {error}")
             return
         self._telegram_table.setRowCount(0)
+        self._telegram_new_count = 0
         for row in reversed(rows):
             self._insert_telegram_row(row, highlight=False)
         self._renumber_telegram_table()
+        self._update_telegram_new_button()
 
     def _append_telegram_news(self, row: dict, is_new: bool):
         """수집 콜백. 저장에 성공한 새 글만 화면과 전광판에 올린다."""
@@ -243,15 +254,11 @@ class TelegramNewsTabMixin:
         body_item.setToolTip(
             f"{row.get('body') or ''}\n\n클릭: Telegram 원문 열기")
         body_item.setData(Qt.ItemDataRole.UserRole, str(row.get("url") or ""))
-        link_item = QTableWidgetItem("열기" if row.get("url") else "")
-        link_item.setTextAlignment(
-            Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
-        link_item.setData(Qt.ItemDataRole.UserRole, str(row.get("url") or ""))
         for column, item in enumerate((
-                number_item, time_item, channel_item, stock_item,
-                body_item, link_item)):
+                number_item, time_item, channel_item, stock_item, body_item)):
             table.setItem(0, column, item)
         if highlight:
+            time_item.setData(NEWS_NEW_ROLE, True)
             time_item.setBackground(QColor(NEWS_NEW_TIME_BACKGROUND))
             time_item.setForeground(QColor(NEWS_NEW_TIME_FOREGROUND))
             body_item.setBackground(QColor(NEWS_NEW_TITLE_BACKGROUND))
@@ -259,10 +266,59 @@ class TelegramNewsTabMixin:
             font = body_item.font()
             font.setBold(True)
             body_item.setFont(font)
+            self._telegram_new_count += 1
         while table.rowCount() > VISIBLE_LIMIT:
-            table.removeRow(table.rowCount() - 1)
+            last_row = table.rowCount() - 1
+            if self._telegram_row_is_new(last_row):
+                self._telegram_new_count = max(0, self._telegram_new_count - 1)
+            table.removeRow(last_row)
+        self._update_telegram_new_button()
         if was_at_top:
             table.scrollToTop()
+
+    def _telegram_row_is_new(self, row: int) -> bool:
+        time_item = self._telegram_table.item(row, 1)
+        return bool(time_item is not None and time_item.data(NEWS_NEW_ROLE))
+
+    def _update_telegram_new_button(self):
+        if not hasattr(self, "_telegram_clear_new_button"):
+            return
+        count = max(0, int(self._telegram_new_count))
+        self._telegram_clear_new_button.setText(
+            f"신규해제 ({count:,})" if count else "신규해제")
+        self._telegram_clear_new_button.setEnabled(count > 0)
+
+    def _clear_telegram_new_markers(self):
+        """목록은 유지하고 새 텔레그램 글의 강조 표시만 해제한다."""
+        if not hasattr(self, "_telegram_table"):
+            return
+        cleared = 0
+        for row in range(self._telegram_table.rowCount()):
+            if not self._telegram_row_is_new(row):
+                continue
+            cleared += 1
+            for column in (1, 4):
+                item = self._telegram_table.item(row, column)
+                if item is None:
+                    continue
+                item.setData(Qt.ItemDataRole.BackgroundRole, None)
+                item.setData(Qt.ItemDataRole.ForegroundRole, None)
+            time_item = self._telegram_table.item(row, 1)
+            if time_item is not None:
+                time_item.setData(NEWS_NEW_ROLE, None)
+            body_item = self._telegram_table.item(row, 4)
+            if body_item is not None:
+                font = body_item.font()
+                font.setBold(False)
+                body_item.setFont(font)
+        self._telegram_new_count = 0
+        self._update_telegram_new_button()
+        if cleared:
+            self.statusBar().showMessage(
+                f"신규 텔레그램 글 강조 {cleared:,}건을 해제했습니다. "
+                "목록과 DB는 유지됩니다.",
+                3000,
+            )
 
     def _renumber_telegram_table(self):
         table = self._telegram_table
@@ -298,7 +354,9 @@ class TelegramNewsTabMixin:
                 QApplication.clipboard().setText(codes[0])
                 self.open_realtime_watch(codes[0])
             return
-        item = self._telegram_table.item(row, 4 if column == 4 else 5)
+        if column != 4:
+            return
+        item = self._telegram_table.item(row, 4)
         url = str(item.data(Qt.ItemDataRole.UserRole) or "") if item else ""
         if url:
             QDesktopServices.openUrl(QUrl(url))
