@@ -228,21 +228,6 @@ APP_FONT_FAMILY = "굴림체"
 APP_FONT_SIZES = (9, 10, 11, 12)
 DEFAULT_APP_FONT_SIZE = 10
 APP_FONT_SIZE_KEY = "ui_font_size"
-NEWS_WEB_AUTO_RELOAD_PATHS = {
-    "/item/board.naver",  # 종목토론 목록
-    "/item/news.naver",   # 종목뉴스 목록
-    "/item/dart.naver",   # 종목공시 목록
-}
-
-
-def _is_news_web_auto_reload_url(url: QUrl) -> bool:
-    """자동 새로고침이 필요한 네이버 종목 목록 화면인지 판정한다."""
-    return (
-        url.host().lower() == "finance.naver.com"
-        and url.path() in NEWS_WEB_AUTO_RELOAD_PATHS
-    )
-
-
 def _market_context(data: dict) -> dict:
     """저장된 국내 지수·시장수급·등락 종목수로 설명 가능한 국면을 판정한다."""
     indices = {row["market"]: row for row in data.get("indices", [])}

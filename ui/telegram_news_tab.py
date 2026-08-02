@@ -12,11 +12,15 @@ import logging
 from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QApplication, QCheckBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
+    QLineEdit, QMessageBox, QPushButton, QTableWidget, QTableWidgetItem,
+    QVBoxLayout,
 )
 
-from analysis_db import save_telegram_news, telegram_news_rows
+from analysis_db import (
+    realtime_watch_codes, save_telegram_news, set_realtime_watch,
+    telegram_news_rows,
+)
 from gui import NumericTableWidgetItem
 from rank import _beep
 from telegram_news import TelegramNewsStream
@@ -275,7 +279,7 @@ class TelegramNewsTabMixin:
         stock_item.setToolTip(
             ("종목코드: " + ", ".join(codes)
              + "\n\n좌클릭: 대표 종목코드 복사"
-             "\n우클릭: 종목뉴스·종토방 탭으로 이동")
+             "\n우클릭: 대표 종목 관심종목 추가 · 종토방 열기")
             if codes else "연결된 종목이 없습니다.")
         body_item = QTableWidgetItem(str(row.get("title") or ""))
         body_item.setToolTip(
@@ -393,10 +397,31 @@ class TelegramNewsTabMixin:
             QDesktopServices.openUrl(QUrl(url))
 
     def _telegram_table_right_clicked(self, position):
-        """종목 열을 오른쪽 클릭하면 종목뉴스·종토방 탭으로 이동한다."""
+        """종목 열 우클릭 시 대표 종목을 관심종목에 넣고 종토방을 연다."""
         item = self._telegram_table.itemAt(position)
         if item is None or item.column() != 3:
             return
-        stock_code = self._telegram_row_stock_code(item.row())
-        if stock_code:
-            self.open_realtime_watch(stock_code)
+        row = item.row()
+        stock_code = self._telegram_row_stock_code(row)
+        if not stock_code:
+            return
+        name_item = self._telegram_table.item(row, 3)
+        stock_name = str(name_item.text() if name_item else "").split(",")[0]
+        stock_name = stock_name.strip() or stock_code
+        try:
+            already_registered = stock_code in realtime_watch_codes()
+            if not already_registered:
+                set_realtime_watch(
+                    stock_code, True, "TELEGRAM_NEWS",
+                    stock_name="" if stock_name == stock_code else stock_name,
+                )
+        except ValueError as error:
+            QMessageBox.warning(self, "관심종목 추가", str(error))
+            return
+
+        if not already_registered:
+            self.watchlist_changed.emit()
+        self.open_realtime_watch(stock_code, fetch_news=False)
+        action = "선택" if already_registered else "추가"
+        self.statusBar().showMessage(
+            f"{stock_name}({stock_code}) 관심종목 {action} · 종토방 이동", 3000)

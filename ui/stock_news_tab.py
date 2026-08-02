@@ -35,6 +35,21 @@ from rank import _beep
 log = logging.getLogger("stock_news_tab")
 
 
+NEWS_WEB_AUTO_RELOAD_PATHS = {
+    "/item/board.naver",  # 종목토론 목록
+    "/item/news.naver",   # 종목뉴스 목록
+    "/item/dart.naver",   # 종목공시 목록
+}
+
+
+def _is_news_web_auto_reload_url(url: QUrl) -> bool:
+    """자동 새로고침이 필요한 네이버 종목 목록 화면인지 판정한다."""
+    return (
+        url.host().lower() == "finance.naver.com"
+        and url.path() in NEWS_WEB_AUTO_RELOAD_PATHS
+    )
+
+
 class StockNewsTabMixin:
     """관심종목 뉴스 수집과 네이버 웹뷰 표시를 담당한다."""
 
