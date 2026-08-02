@@ -3112,6 +3112,11 @@ class DetachedClockWindow(QWidget):
         self._owner._clock_scale = 1.0
         self._owner._clock_pad_x = 2
         self._owner._clock_pad_y = 1
+        try:
+            self._owner._clock_alpha = int(
+                self._owner._settings.value("clock_window_alpha", 180))
+        except (TypeError, ValueError):
+            self._owner._clock_alpha = 180
         # 긴 국면 문구가 창 너비를 끌고 가지 않도록 줄바꿈을 허용한다.
         label.setWordWrap(True)
         self._owner._update_analysis_clock()
@@ -3195,6 +3200,19 @@ class DetachedClockWindow(QWidget):
             self._save_geo()
         self._resize_from = None
         self._drag_offset = None
+
+    def wheelEvent(self, event):
+        """휠로 배경 불투명도를 조절하고 바로 저장한다."""
+        step = 15 if event.angleDelta().y() > 0 else -15
+        alpha = min(255, max(60, int(self._owner._clock_alpha) + step))
+        self._owner._clock_alpha = alpha
+        self._owner._settings.setValue("clock_window_alpha", alpha)
+        self._owner._settings.sync()
+        self._owner._update_analysis_clock()
+        self.setToolTip(
+            f"배경 불투명도 {alpha * 100 // 255}% (휠로 조절)\n"
+            "끌어서 이동 · 우하단 모서리로 크기 조절\n"
+            "더블클릭하면 분석창으로 되돌립니다.")
 
     def mouseDoubleClickEvent(self, _event):
         if self._owner._clock_window is self:
@@ -3583,6 +3601,12 @@ class AnalysisWindow(
             f" font-size:{phase_px}px; font-weight:900;'>"
             f"{phase_text}</div>"
         )
+        alpha = int(getattr(self, "_clock_alpha", 255))
+        if alpha < 255:
+            fill = QColor(background)
+            fill.setAlpha(alpha)
+            background = (f"rgba({fill.red()},{fill.green()},"
+                          f"{fill.blue()},{alpha})")
         self._analysis_clock_label.setStyleSheet(
             "QLabel {"
             " color: #F4F7FA;"
@@ -3644,6 +3668,7 @@ class AnalysisWindow(
         self._clock_pad_x = 7
         self._clock_pad_y = 4
         self._clock_phase_px = 0
+        self._clock_alpha = 255
         self._update_analysis_clock()
         self._principle_bar.insertWidget(0, self._analysis_clock_label)
         self._analysis_clock_label.show()
