@@ -186,7 +186,9 @@ class LSNewsDetailDialog(QDialog):
         self.setWindowTitle("LS 뉴스 본문")
         self.setWindowModality(Qt.WindowModality.NonModal)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
-        self.resize(980, 720)
+        geo = self._settings.value("analysis_ls_news_detail_geo")
+        if geo is None or not self.restoreGeometry(geo):
+            self.resize(980, 720)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 12, 14, 12)
@@ -495,6 +497,23 @@ class LSNewsDetailDialog(QDialog):
         target = self._original_url or self._original_search_url
         if target:
             self._open_news_link(QUrl(target))
+
+    def _save_geo(self):
+        self._settings.setValue(
+            "analysis_ls_news_detail_geo", self.saveGeometry())
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._save_geo()
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        self._save_geo()
+
+    def closeEvent(self, event):
+        self._save_geo()
+        self._settings.sync()
+        super().closeEvent(event)
 
     def set_error(self, message: str):
         self._status_label.setText(str(message or "본문을 불러오지 못했습니다."))
