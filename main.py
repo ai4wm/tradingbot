@@ -4815,6 +4815,14 @@ class AnalysisWindow(
             self._settings.setValue("analysis_pos", self.pos())
         self._settings.sync()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        # 창을 닫을 때 시계를 합쳐 두므로, 다시 열 때 분리 상태를 되살린다.
+        # 같은 창 객체를 재사용해 __init__이 다시 돌지 않기 때문이다.
+        if (self._clock_window is None
+                and self._settings.value("clock_detached", "false") == "true"):
+            self._clock_detach_btn.setChecked(True)
+
     def closeEvent(self, event):
         self._save_market_splitters()
         self._save_news_splitters()
