@@ -3094,7 +3094,12 @@ class DetachedClockWindow(QWidget):
         self._owner._settings.setValue("clock_window_pos", self.pos())
 
     def closeEvent(self, e):
-        if self._owner._clock_window is self:
+        if self._owner._shutting_down:
+            # 앱 종료 중 Qt가 닫는 것은 합치기가 아니다. 분리 상태를 남겨
+            # 다음 실행에서 시계 창을 그대로 복원한다.
+            self._owner._settings.setValue("clock_detached", "true")
+            self._owner._settings.sync()
+        elif self._owner._clock_window is self:
             self._owner._attach_clock()  # 닫기 = 합치기
         super().closeEvent(e)
 
@@ -3187,6 +3192,10 @@ class AnalysisWindow(
         principle_bar.addWidget(self._analysis_clock_label)
         self._principle_bar = principle_bar
         self._clock_window: DetachedClockWindow | None = None
+        self._shutting_down = False
+        application = QApplication.instance()
+        if application is not None:
+            application.aboutToQuit.connect(self._mark_shutting_down)
 
         self._latest_ls_news_context: dict | None = None
         self._latest_ls_news_label = LatestLSNewsLabel()
@@ -3431,6 +3440,9 @@ class AnalysisWindow(
             f"{badge('NXT', nxt_state)}</div>"
             f"{phase_badge}"
         )
+
+    def _mark_shutting_down(self):
+        self._shutting_down = True
 
     def _clock_detach_toggle(self, on: bool):
         if on:
