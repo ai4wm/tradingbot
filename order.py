@@ -74,6 +74,9 @@ class OrderEngine:
         self.on_update = on_update
         self.batches: dict[str, OrderBatch] = {}
         self._by_order_no: dict[str, tuple[OrderBatch, ChildOrder]] = {}
+        # batches는 종목코드 키라 재주문이 이전 배치를 덮어쓴다. 오늘 이미
+        # 쓴 돈이 예약금에서 사라지지 않도록 밀려난 배치의 사용액을 누적한다.
+        self._retired_notional = 0
         self._queue = asyncio.PriorityQueue()
         self._serial = 0
         self._worker_task = None
@@ -90,11 +93,16 @@ class OrderEngine:
     def submit(self, code: str, name: str, price: int,
                quantities: list[int], auto_cancel: bool) -> OrderBatch:
         old = self.batches.get(code)
-        if (old and not old.error
-                and (old.remaining_qty > 0 or old.sent_count < len(old.children))):
+        # 살아 있는 자식이 하나라도 있으면 중복 주문이다. sent_count로 보면
+        # 전송 전에 취소한 분할 주문이 영영 끝나지 않은 것으로 남아 그 종목의
+        # 재주문이 세션 내내 막힌다.
+        if old and not old.error and any(
+                not child.done for child in old.children):
             raise ValueError("이미 진행 중인 주문이 있습니다")
         if not price or not quantities or any(q <= 0 for q in quantities):
             raise ValueError("주문가격 또는 수량이 올바르지 않습니다")
+        if old is not None:
+            self._retired_notional += self._batch_notional(old)
         batch = OrderBatch(code, name, price, auto_cancel, quantities)
         self.batches[code] = batch
         for child in batch.children:
@@ -254,11 +262,15 @@ class OrderEngine:
         if self.on_update:
             self.on_update(batch, state)
 
+    @staticmethod
+    def _batch_notional(batch: OrderBatch) -> int:
+        total = 0
+        for child in batch.children:
+            if child.order_no or (not batch.error and not child.done):
+                total += (child.filled_qty + child.remaining_qty) * batch.price
+        return total
+
     def committed_notional(self) -> int:
         """취소 확정 전 잔량과 이미 체결된 수량을 합산한 당일 사용액."""
-        total = 0
-        for batch in self.batches.values():
-            for child in batch.children:
-                if child.order_no or (not batch.error and not child.done):
-                    total += (child.filled_qty + child.remaining_qty) * batch.price
-        return total
+        return self._retired_notional + sum(
+            self._batch_notional(batch) for batch in self.batches.values())

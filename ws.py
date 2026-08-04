@@ -158,6 +158,7 @@ class WSClient:
         self.on_vi = None                 # (code, active, 발동가) - VI 발동/해제
         self.on_order = None              # type=00 주문접수/체결/취소
         self.on_condition_list = None     # (list[(seq, name)])
+        self.on_connected = None          # () - 로그인+주문체결 등록 직후 1회
         self._ws = None
         self._token_fn = None            # async () -> token
         self._active_seqs: set[str] = set()  # 등록된 조건식들 (창마다 1개, 재등록용)
@@ -359,6 +360,8 @@ class WSClient:
             log.info("ws connected + LOGIN ok")
             self._connected.set()
             await self._send(build_reg([""], ["00"], grp_no="2"))
+            if self.on_connected:
+                self.on_connected()
             await self._resubscribe()
             async for raw in ws:
                 await self._dispatch(json.loads(raw))
@@ -488,6 +491,12 @@ class WSClient:
         """CNSRREQ 응답 = 현재 편입 전체 스냅샷. 통째로 넘겨 diff는 main이 한다
         (행 삭제/재생성 없이 편입/이탈만 반영 -> 예상값 등 실시간 상태 유지).
         실시간 편입/이탈은 REAL type=02(_on_real_condition)로 따로 옴."""
+        # 오류 응답에는 data가 없다. 이를 '편입 0종목'으로 넘기면 main.on_snapshot이
+        # 현재 목록 전체를 이탈로 판정해 자동삭제 켜진 화면을 통째로 비운다.
+        # 재접속 직후 _resubscribe의 재등록이 실패할 때 실제로 그렇게 사라졌다.
+        if str(msg.get("return_code", "0")) not in ("0", ""):
+            log.warning("CNSRREQ failed, keeping current list: %s", msg)
+            return
         seq = str(msg.get("seq", ""))
         if not seq and len(self._active_seqs) == 1:  # 응답에 seq 없으면 단일 등록으로 판정
             seq = next(iter(self._active_seqs))

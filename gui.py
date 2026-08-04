@@ -131,7 +131,9 @@ def _theme_family(theme: str) -> str:
     value = str(theme or "").casefold()
     # 수동 등록한 AI·챗봇·피지컬AI는 서로 다른 수급 테마다.
     # 이들을 하나로 합치면 피지컬AI/로봇 장세에서 일반 AI 종목이 섞인다.
-    if value in {
+    # 같은 테마를 '피지컬 AI/…'와 '피지컬 AI·…' 두 표기로 등록하므로
+    # 구분자를 맞춘 뒤 비교해야 수동 등록분이 계열로 빨려들지 않는다.
+    if value.replace("·", "/") in {
         "인공지능(ai)", "ai 챗봇(챗gpt 등)",
         "피지컬 ai/휴머노이드 로봇",
     }:
@@ -245,6 +247,40 @@ class PreserveTextColorDelegate(QStyledItemDelegate):
         opt = QStyleOptionViewItem(option)
         opt.state &= ~(QStyle.State_Selected | QStyle.State_HasFocus)
         super().paint(painter, opt, index)
+        if selected:
+            _draw_selection_lines(painter, option.rect, option.palette)
+
+
+class ClipTextDelegate(PreserveTextColorDelegate):
+    """긴 글자를 `…`로 줄이지 않고 셀 경계에서 그대로 잘라 보여 준다.
+
+    NameDelegate와 같은 이유로 textElideMode를 쓰지 않는다. 일부 Windows
+    스타일이 ElideNone을 무시하므로 배경·선택만 스타일에 맡기고 글자는 직접
+    그려 `…` 변환 경로를 아예 타지 않게 한다."""
+
+    def paint(self, painter, option, index):
+        selected = _is_current_row(option, index)
+        opt = QStyleOptionViewItem(option)
+        opt.state &= ~(QStyle.State_Selected | QStyle.State_HasFocus)
+        self.initStyleOption(opt, index)
+        text = opt.text
+        opt.text = ""
+        style = opt.widget.style() if opt.widget else QApplication.style()
+        style.drawControl(QStyle.CE_ItemViewItem, opt, painter, opt.widget)
+        # Qt가 CE_ItemViewItem에서 쓰는 좌우 여백과 같은 값으로 맞춰, 델리게이트만
+        # 바뀌고 글자 위치는 다른 열과 어긋나지 않게 한다.
+        margin = style.pixelMetric(
+            QStyle.PM_FocusFrameHMargin, None, opt.widget) + 1
+        text_rect = style.subElementRect(
+            QStyle.SE_ItemViewItemText, opt, opt.widget).adjusted(
+                margin, 0, -margin, 0)
+        painter.save()
+        painter.setClipRect(option.rect)
+        painter.setFont(opt.font)
+        painter.setPen(opt.palette.text().color())
+        painter.drawText(
+            text_rect, opt.displayAlignment | Qt.TextSingleLine, text)
+        painter.restore()
         if selected:
             _draw_selection_lines(painter, option.rect, option.palette)
 
@@ -537,16 +573,25 @@ class TieredProxy(QSortFilterProxyModel):
 
         # 상한가 진입 테마는 가장 이른 진입시각이 우선이며, 나머지 테마는
         # 현재 조건검색 종목 중 최고 등락률이 높은 순서로 배치한다.
+        # 최고 등락률까지 같으면 '대장을 뺀 나머지'의 평균으로 가른다. 한 종목이
+        # 여러 테마에 걸리면 그 종목이 모든 테마의 최고가 되어 동점이 나는데,
+        # 이때 종목수나 이름순으로 정하면 재료와 무관한 테마가 대표로 붙는다.
+        # 나머지까지 따라 오르는 쪽이 실제로 함께 움직이는 테마다. 자기 혼자인
+        # 테마는 0이 되어 밀리므로, 평균만 쓸 때처럼 단독 테마가 이기지 않는다.
         strengths: dict[tuple[str, str], tuple] = {}
         for group, codes in groups.items():
             rows = [model.rows[code] for code in codes]
             limit_times = [self._theme_entry_time(row) for row in rows
                            if self._theme_at_limit(row)]
-            top_rate = max(float(row.get("rate") or 0) for row in rows)
+            rates = [float(row.get("rate") or 0) for row in rows]
+            top_rate = max(rates)
+            rest_rate = ((sum(rates) - top_rate) / (len(rates) - 1)
+                         if len(rates) > 1 else 0.0)
             strengths[group] = (
                 0 if limit_times else 1,
                 min(limit_times) if limit_times else 999999,
                 -top_rate,
+                -rest_rate,
                 -len(codes),
                 f"{group[0]}:{group[1]}",
             )
@@ -572,12 +617,12 @@ class TieredProxy(QSortFilterProxyModel):
                 candidates,
                 key=lambda item: (
                     _theme_group_precedence(item),
-                    strengths.get(item, (2, 999999, 0, 0, item[1])),
+                    strengths.get(item, (2, 999999, 0, 0, 0, item[1])),
                 ),
             ) if candidates else ("none", "미분류")
             self._theme_group_keys[code] = group
             theme_strength = strengths.get(
-                group, (2, 999999, 0, 0, group[1]))
+                group, (2, 999999, 0, 0, 0, group[1]))
             at_limit = self._theme_at_limit(row)
             self._theme_sort_keys[code] = (
                 theme_strength,
@@ -2302,6 +2347,7 @@ class ConditionScreen(QWidget):
     analysis_stock_requested = Signal(str)
     market_overview_requested = Signal()
     realtime_news_requested = Signal()
+    account_summary_requested = Signal()
 
     def __init__(self, prefix: str = "", parent=None):
         super().__init__(parent)
@@ -2374,8 +2420,6 @@ class ConditionScreen(QWidget):
         self.newwin_btn = QPushButton("창+")
         self.newwin_btn.setToolTip("조건검색 창 하나 더 열기 (다른 조건식 동시 감시)")
         self.newwin_btn.setFixedWidth(44)
-        self.ip_label = QLabel()  # 공인 IP (App이 메인창만 채움). IP 바뀌면 빨강 강조
-        self.ip_label.setVisible(False)
         self.count_label = QLabel()
         self.count_label.setTextFormat(Qt.TextFormat.RichText)
         self._update_count()
@@ -2411,7 +2455,6 @@ class ConditionScreen(QWidget):
         top.addWidget(self.news_btn)
         top.addWidget(self.newwin_btn)
         top.addStretch(1)  # 남는 공간은 오른쪽으로
-        top.addWidget(self.ip_label)
         top.addWidget(self.count_label)
         top.addWidget(self.font_size_combo)
         top.addWidget(self.theme_btn)
@@ -2464,6 +2507,8 @@ class ConditionScreen(QWidget):
         self._cash_orderable = 0
         self._misu_orderable = 0
         self._order_reserved = 0
+        self._available_base = 0
+        self._summary_base = 0
         self._order_target_code = ""
         self._orderable_detail = None
         self._margin_preferred = (
@@ -2476,7 +2521,12 @@ class ConditionScreen(QWidget):
 
         account_bar = QHBoxLayout()
         account_bar.setSpacing(6)
-        account_bar.addWidget(QLabel("추정자산"))
+        self.estimated_asset_btn = QPushButton("추정자산")
+        self.estimated_asset_btn.setFixedHeight(22)
+        self.estimated_asset_btn.setToolTip("클릭하면 추정자산·주문가능금액을 다시 조회합니다.")
+        self.estimated_asset_btn.clicked.connect(
+            self.account_summary_requested.emit)
+        account_bar.addWidget(self.estimated_asset_btn)
         account_bar.addWidget(self.estimated_asset_value)
         account_bar.addWidget(QLabel("계좌가능"))
         account_bar.addWidget(self.account_available_value)
@@ -2496,6 +2546,18 @@ class ConditionScreen(QWidget):
         # 주문 실행줄 — 종목을 고른 뒤 이 줄에서 분할/취소/주문방식을 즉시 결정한다.
         self.order_target_value = QLabel("종목을 선택하세요")
         self.order_target_value.setMinimumWidth(130)
+        # 선택 종목의 체결(보유)·미체결. 앱이 웹소켓 주문체결로 유지하는 장부를
+        # 그대로 보여 주므로 표시를 위해 계좌를 다시 조회하지 않는다.
+        # 주문줄이 이미 꽉 차서 예상주문 줄 오른쪽에 붙인다.
+        self.pending_order_value = QLabel("체결·미체결 -")
+        self.pending_order_value.setTextFormat(Qt.RichText)
+        self.pending_order_value.setMinimumHeight(20)
+        self.pending_order_value.setStyleSheet(
+            "QLabel{padding:1px 5px;border:1px solid #C8C8C8;"
+            "background:#F5F5F5;color:#222}")
+        self.pending_order_value.setToolTip(
+            "선택 종목의 보유수량과 미체결 매수·매도 (앱·영웅문 주문 모두 포함)\n"
+            "묶임 = 미체결 매도로 잡혀 지금 팔 수 없는 수량")
 
         self.split_group = QButtonGroup(self)
         self.split_group.setExclusive(True)
@@ -2580,6 +2642,7 @@ class ConditionScreen(QWidget):
         order_preview_bar = QHBoxLayout()
         order_preview_bar.setContentsMargins(0, 0, 0, 0)
         order_preview_bar.addWidget(self.order_preview_value)
+        order_preview_bar.addWidget(self.pending_order_value)
 
         # 그리드
         self.proxy = TieredProxy()
@@ -2638,6 +2701,7 @@ class ConditionScreen(QWidget):
         self.table.setItemDelegate(PreserveTextColorDelegate(self.table))
         self.table.setItemDelegateForColumn(BAR_COL, BarDelegate(self.table))
         self.table.setItemDelegateForColumn(NAME_COL, NameDelegate(self.table))
+        self.table.setItemDelegateForColumn(THEME_COL, ClipTextDelegate(self.table))
         self.table.setItemDelegateForColumn(ORDER_COL, OrderDelegate(self.table))
         self.table.setSelectionBehavior(QTableView.SelectRows)
         self.table.setSelectionMode(QTableView.NoSelection)  # Windows 네이티브 선택 세로 바 차단
@@ -2737,10 +2801,22 @@ class ConditionScreen(QWidget):
     def _money_text(value: int) -> str:
         return f"{max(0, int(value)):,}원"
 
+    def _effective_reserved(self) -> int:
+        """계좌 조회값이 아직 반영하지 못한 앱 주문액만 남긴다.
+
+        키움 주문가능금액은 미체결 접수분 증거금을 이미 뺀 값이라, 응답이
+        나간 시점까지의 앱 주문액을 또 빼면 같은 주문을 두 번 차감한다.
+        """
+        return max(0, self._order_reserved - self._available_base)
+
     def _refresh_order_funds_display(self):
         usable = self._usable_order_funds()
-        remaining = max(0, usable - self._order_reserved)
+        effective = self._effective_reserved()
+        remaining = max(0, usable - effective)
         self.order_reserved_value.setText(self._money_text(self._order_reserved))
+        self.order_reserved_value.setToolTip(
+            f"앱 주문 누적 {self._order_reserved:,}원 · "
+            f"계좌조회 미반영 {effective:,}원")
         self.order_remaining_value.setText(self._money_text(remaining))
         self._refresh_order_target_display()
 
@@ -2752,10 +2828,37 @@ class ConditionScreen(QWidget):
             manual_limit = self._account_available
         return min(self._account_available, manual_limit)
 
+    def set_pending_orders(self, code: str, buy: tuple[int, int],
+                           sell: tuple[int, int], position: tuple[int, int]):
+        """선택 종목의 체결(보유)·미체결 요약을 예상주문 줄 오른쪽에 표시한다.
+
+        buy/sell은 (건수, 수량), position은 (보유, 매도가능)이다."""
+        if code != self._order_target_code:
+            return
+        held, sellable = position
+        parts = []
+        if held:
+            locked = max(0, held - sellable)
+            parts.append(
+                f"체결 <b>{held:,}주</b>"
+                + (f" (묶임 {locked:,})" if locked else ""))
+        if buy[0]:
+            parts.append(
+                f"<span style='color:#D66A00'>미체결매수 {buy[0]}건 "
+                f"{buy[1]:,}주</span>")
+        if sell[0]:
+            parts.append(
+                f"<span style='color:#1E88E5'>미체결매도 {sell[0]}건 "
+                f"{sell[1]:,}주</span>")
+        self.pending_order_value.setText(
+            "&nbsp;&nbsp;·&nbsp;&nbsp;".join(parts) if parts
+            else "체결·미체결 없음")
+
     def _refresh_order_target_display(self):
         code = self._order_target_code
         if not code or code not in self.model.rows:
             self.order_target_value.setText("종목을 선택하세요")
+            self.pending_order_value.setText("체결·미체결 -")
             self.orderable_qty_value.setText("-")
             self.orderable_qty_value.setToolTip("주문 대상종목을 선택하세요")
             self.margin_rate_value.setText("증거금 -")
@@ -2776,7 +2879,8 @@ class ConditionScreen(QWidget):
         else:
             misu = self.margin_order_check.isChecked()
             api_qty = detail["margin_qty"] if misu else detail["cash_qty"]
-            remaining = max(0, self._usable_order_funds() - self._order_reserved)
+            remaining = max(
+                0, self._usable_order_funds() - self._effective_reserved())
             limited_qty = remaining // upper
             qty = min(api_qty, limited_qty)
             self.orderable_qty_value.setText(f"{qty:,}주")
@@ -2824,6 +2928,7 @@ class ConditionScreen(QWidget):
             detail["margin_amount"] if self.margin_order_check.isChecked()
             else detail["cash_amount"])
         self._account_available = selected_amount
+        self._available_base = int(detail.get("reserved_base") or 0)
         self.account_available_value.setText(self._money_text(selected_amount))
         self._refresh_order_funds_display()
 
@@ -2850,7 +2955,8 @@ class ConditionScreen(QWidget):
         api_qty = (
             detail["margin_qty"] if self.margin_order_check.isChecked()
             else detail["cash_qty"])
-        remaining = max(0, self._usable_order_funds() - self._order_reserved)
+        remaining = max(
+            0, self._usable_order_funds() - self._effective_reserved())
         return min(api_qty, remaining // upper)
 
     def _refresh_order_actions(self, *_):
@@ -2994,9 +3100,11 @@ class ConditionScreen(QWidget):
         if detail and detail["code"] == self._order_target_code:
             self._account_available = (
                 detail["margin_amount"] if checked else detail["cash_amount"])
+            self._available_base = int(detail.get("reserved_base") or 0)
         else:
             self._account_available = (
                 self._misu_orderable if checked else self._cash_orderable)
+            self._available_base = self._summary_base
         self.account_available_value.setText(self._money_text(self._account_available))
         self._refresh_order_funds_display()
 
@@ -3010,6 +3118,8 @@ class ConditionScreen(QWidget):
         self._account_available = (
             self._misu_orderable if self.margin_order_check.isChecked()
             else self._cash_orderable)
+        self._summary_base = int(summary.get("reserved_base") or 0)
+        self._available_base = self._summary_base
         self.estimated_asset_value.setText(self._money_text(estimated))
         self.account_available_value.setText(self._money_text(self._account_available))
         withdrawable = summary.get("withdrawable")
@@ -3209,6 +3319,10 @@ class ConditionScreen(QWidget):
         cell = self.model.index(row, EXIT_HOTKEY_COL)
         self.model.dataChanged.emit(cell, cell)
 
+    # 저장된 청산키를 복원할 때 main이 호출한다. 종목이 아직 편입 전이면
+    # 셀이 없으므로 조용히 넘어가고, 편입될 때 모델 값으로 그려진다.
+    refresh_exit_hotkey_cell = _refresh_exit_hotkey_cell
+
     def eventFilter(self, watched, event):
         try:
             return self._handle_table_key_event(watched, event)
@@ -3331,9 +3445,14 @@ class ConditionScreen(QWidget):
                     code, self.model.order_status.get(code, ""), False)
                 self.cancel_requested.emit(code)
                 return
+            # 취소가 끝난 종목도 다시 주문할 수 있어야 한다. '자 취소',
+            # '취소전송', '취소없음'이 모두 해당한다. 취소 확인이 아직 안 온
+            # 주문(order_cancellable)이 남았으면 그대로 둔다.
             if (order_status in ("장종료", "오류", "수량부족", "분할부족",
-                                 "취소없음", "대상없음")
-                    or order_status.endswith("완료")):
+                                 "대상없음")
+                    or order_status.endswith("완료")
+                    or ("취소" in order_status
+                        and code not in self.model.order_cancellable)):
                 self.model.set_order_status(code, "")
                 self.order_status_value.setText("")
                 self.order_status_acknowledged.emit(code)
@@ -3479,17 +3598,6 @@ class ConditionScreen(QWidget):
         self.theme_sort.setChecked(
             self._settings.value(self._mkey("theme_sort"), "false") == "true")
         return True
-
-    def set_ip(self, ip: str, changed: bool):
-        """상단바 공인 IP 표시. changed=True면 빨강 배경+볼드로 확 띄움 (API 차단 경보).
-        한번 바뀌면 재시작까지 빨강 유지 (키움에 IP 재등록 필요하니까)."""
-        self.ip_label.setVisible(True)
-        if changed:
-            self.ip_label.setText(f" ⚠ IP 변경됨 {ip} — API 재등록 필요 ")
-            self.ip_label.setStyleSheet("background:#e83030; color:white; font-weight:bold;")
-        else:
-            self.ip_label.setText(f"IP {ip}")
-            self.ip_label.setStyleSheet("color:#33C24D;")
 
     def set_rank_period(self, mode: str):
         """순위 계열 기준시간 콤보 내용 교체 + 저장값 복원 (창별·모드별).

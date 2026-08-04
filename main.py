@@ -5,6 +5,7 @@
 '창+' 버튼으로 독립 조건검색 창 추가(조건별 동시 감시, 시세 REG는 참조수 공유)."""
 import asyncio
 import ctypes
+import json
 import logging
 import math
 import os
@@ -44,14 +45,15 @@ from analysis_db import (
     dart_inferred_classifications, save_investor_flows,
     pending_condition_investor_flow_stocks, market_dashboard,
     save_market_index_prices, save_market_investor_flows,
-    save_external_market_quotes, realtime_watch_codes, set_realtime_watch,
+    save_external_market_quotes, realtime_watch_codes, realtime_watch_rows,
+    set_realtime_watch,
     save_condition_snapshot, save_condition_snapshot_quotes,
     save_condition_theme_stats, active_theme_labels,
     recent_condition_snapshots, condition_theme_stats,
     save_condition_theme_members, save_next_day_candidates,
 )
 from api import (
-    KST, RestClient,
+    KST, ORDER_BURST, OrderSendUnknown, RestClient,
     active_kiwoom_maintenance, format_kiwoom_maintenance,
 )
 from classification_api import ClassificationClient
@@ -207,6 +209,9 @@ class WindowsGlobalHotkeys(QAbstractNativeEventFilter):
 MAX_WINDOWS = 3  # 실시간 등록 ~100종목 한도 내 (조건당 20~30종목 기준)
 RANK_SEQ = "RANK"      # [순위]조회순위 (ka00198 폴 -> on_snapshot)
 HOLDINGS_SEQ = "HOLDINGS"  # [계좌]보유종목 (kt00018)
+WATCH_SEQ = "WATCH"        # [관심]종토방 관심종목 (analysis_db 감시목록)
+# 서버 조건검색이 아니라 로컬/REST 목록으로 채우는 메뉴 (그리드는 보유종목 모드 공유)
+LOCAL_SEQS = {HOLDINGS_SEQ, WATCH_SEQ}
 NXT_RATE_SEQ = "NXT_RATE"  # [NXT]등락률순위 (ka10027, NXT 전용)
 VSURGE_SEQ = "VSURGE"  # [급증]거래량급증 (ka10023)
 TVAL_SEQ = "TVAL"      # [대금]거래대금상위 (ka10032)
@@ -526,25 +531,27 @@ class View:
         combo = self.screen.condition_combo
         selected_seq = self.seq
         combo.clear()
-        combo.addItem("[순위]조회순위", RANK_SEQ)   # 맨 위 고정: REST 순위 계열
+        combo.addItem("[관심]종토방 관심종목", WATCH_SEQ)  # 맨 위 고정
+        combo.addItem("[순위]조회순위", RANK_SEQ)   # REST 순위 계열
         combo.addItem("[계좌]보유종목", HOLDINGS_SEQ)
         combo.addItem("[NXT]등락률순위", NXT_RATE_SEQ)
         combo.addItem("[급증]거래량급증", VSURGE_SEQ)
         combo.addItem("[대금]거래대금상위", TVAL_SEQ)
         f = QFont(combo.font())
         f.setBold(True)
-        for i, color in ((0, "#FFDD00"), (1, "#D6A5FF"), (2, "#33C24D"),
-                         (3, "#FF8C00"), (4, "#38B8FF")):  # 볼드+색으로 조건식과 구분
+        for i, color in ((0, "#FF69B4"), (1, "#FFDD00"), (2, "#D6A5FF"),
+                         (3, "#33C24D"), (4, "#FF8C00"),
+                         (5, "#38B8FF")):  # 볼드+색으로 조건식과 구분
             combo.setItemData(i, f, Qt.FontRole)
             combo.setItemData(i, QColor(color), Qt.ForegroundRole)
-        combo.insertSeparator(5)  # 진짜 조건식과 구분선
+        combo.insertSeparator(6)  # 진짜 조건식과 구분선
         for seq, name in items:
             combo.addItem(name, seq)
         if self.seq is None:
             last = self._settings.value(self.prefix + "last_condition")
             idx = combo.findData(last) if last is not None else -1
-            if idx < 0:  # 저장 없음: 첫 진짜 조건식 (0~4=내장메뉴,5=구분선)
-                idx = 6 if combo.count() > 6 else 0
+            if idx < 0:  # 저장 없음: 첫 진짜 조건식 (0~5=내장메뉴,6=구분선)
+                idx = 7 if combo.count() > 7 else 0
             combo.setCurrentIndex(idx)  # setCurrentIndex는 activated 안 터짐 -> 수동 등록
             asyncio.ensure_future(self._switch_condition(combo.itemData(idx)))
         else:  # 재조회/재접속: 현재 조건 선택 복원
@@ -554,7 +561,7 @@ class View:
             else:
                 # 영웅문에서 현재 조건식을 삭제한 뒤 목록을 재조회한 경우,
                 # 콤보는 자동으로 0번을 표시하지만 실제 구독은 예전 조건에 남는 문제가 있다.
-                idx = 6 if combo.count() > 6 else 0
+                idx = 7 if combo.count() > 7 else 0
                 combo.setCurrentIndex(idx)
                 asyncio.ensure_future(self._switch_condition(combo.itemData(idx)))
 
@@ -572,9 +579,10 @@ class View:
             # 창 닫기와 조건 전환이 겹쳐도 이전 참조수가 새 REG를 삼키지 않게
             # 다음 묶음에서 서버 등록을 현재 화면 기준으로 전량 재확인한다.
             self.app.force_real_sync()
-        elif seq not in RANK_SEQS and seq != HOLDINGS_SEQ:  # 같은 조건식 재조회
+        elif seq not in RANK_SEQS and seq not in LOCAL_SEQS:  # 같은 조건식 재조회
             await self.app.clear_condition_if_sole(self.seq, self)
-        mode = "rank" if seq in RANK_SEQS else "holdings" if seq == HOLDINGS_SEQ else "normal"
+        mode = ("rank" if seq in RANK_SEQS else
+                "holdings" if seq in LOCAL_SEQS else "normal")
         switched = self.screen.set_view_mode(mode)
         if seq in RANK_SEQS:  # 기준시간 콤보 내용을 서브모드에 맞게 교체 (계열 간 직접 전환 포함)
             self.screen.set_rank_period(RANK_SUBMODE[seq])
@@ -582,7 +590,7 @@ class View:
         # 본창에서 선택한 일반 조건식은 창을 닫거나 다른 화면을 보더라도
         # 백그라운드 수집 대상으로 기억한다. 순위/보유종목 메뉴는 제외한다.
         if (self.app.views and self is self.app.views[0]
-                and self.seq not in RANK_SEQS and self.seq != HOLDINGS_SEQ):
+                and self.seq not in RANK_SEQS and self.seq not in LOCAL_SEQS):
             self._settings.setValue("background_condition_seq", self.seq)
             condition_name = next(
                 (str(name) for item_seq, name in self.app._cond_items
@@ -600,6 +608,9 @@ class View:
             return
         if seq == HOLDINGS_SEQ:
             await self._poll_holdings()
+            return
+        if seq == WATCH_SEQ:
+            await self._poll_watchlist()
             return
         # 조건식 실시간 등록은 서버가 조건번호별로 하나만 유지한다. 같은 조건을
         # 두 번째 창에서 다시 CNSRREQ하면 일부 응답이 빈 스냅샷으로 와서, seq가
@@ -629,7 +640,7 @@ class View:
                 pass
         self._refresh_task = None
         suffix = self._real_suffix()
-        if self.seq is not None and self.seq != HOLDINGS_SEQ:
+        if self.seq is not None and self.seq not in LOCAL_SEQS:
             await self.app.clear_condition_if_sole(self.seq, self)
         self.seq = None
         codes = list(self.screen.model.codes)
@@ -680,6 +691,18 @@ class View:
         # 행 추가 시 예약되는 백필과 별개로 이름 반영 뒤 한 번 더 보장한다.
         self._schedule_refresh()
 
+    async def _poll_watchlist(self):
+        """종목뉴스 탭 관심종목(감시목록)을 조건검색 그리드에 그대로 띄운다."""
+        try:
+            rows = realtime_watch_rows()
+        except Exception as e:  # noqa: BLE001
+            log.warning("watchlist poll%s: %s", self.prefix or "", e)
+            return
+        self.on_snapshot([r["stock_code"] for r in rows])
+        for r in rows:
+            self.screen.on_tick(r["stock_code"], {"name": r["stock_name"]})
+        self._schedule_refresh()
+
     # --- 재조회 -----------------------------------------------------------
     def on_refresh(self):
         seq = self.screen.condition_combo.currentData()
@@ -689,7 +712,7 @@ class View:
     def _mkey(self, name: str) -> str:
         """화면별 재조회 설정 키 (gui._mkey와 동일 규칙)."""
         mode_prefix = ("rankmode_" if self.seq in RANK_SEQS else
-                       "holdingsmode_" if self.seq == HOLDINGS_SEQ else "")
+                       "holdingsmode_" if self.seq in LOCAL_SEQS else "")
         return self.prefix + mode_prefix + name
 
     def _on_sound(self, on: bool):
@@ -756,8 +779,7 @@ class View:
         if added:
             self.screen.on_included_many(added)
         for code in added:
-            if code in self.app._account_auto_cancel_armed:
-                self.screen.model.set_account_auto_cancel_armed(code, True)
+            self.app._restore_stock_order_settings(self.screen, code)
         if added:
             # 실시간 종목 등록은 현재 모든 창의 모델을 기준으로 한 번만 동기화한다.
             self.app.queue_real("", add=True, suffix=self._real_suffix())
@@ -769,8 +791,7 @@ class View:
     def on_event(self, code: str, is_insert: bool):
         if is_insert:
             self.screen.on_included(code, {"name": code})
-            if code in self.app._account_auto_cancel_armed:
-                self.screen.model.set_account_auto_cancel_armed(code, True)
+            self.app._restore_stock_order_settings(self.screen, code)
             self.app.queue_real(code, add=True, suffix=self._real_suffix())
             self._schedule_refresh()
             self._maybe_beep()
@@ -888,9 +909,28 @@ class App:
         # 체결량이 100주에 도달하면 그 주문번호의 잔량 전부를 취소한다.
         # 종목 내 다른 분할 주문 체결량은 합산하지 않는다.
         self._account_auto_cancel_armed: set[str] = set()
+        # 창 접두사별 청산키 원본 스펙. 창을 다시 만들 때 그대로 재등록한다.
+        self._exit_hotkey_specs: dict[str, dict[str, dict]] = {}
+        self._load_order_settings()
         self._account_auto_cancel_filled: dict[tuple[str, str], int] = {}
         self._account_auto_cancel_fill_ids: set[tuple[str, str, str]] = set()
         self._account_auto_cancel_tasks: dict[tuple[str, str], asyncio.Task] = {}
+        # 종목별 미체결 매수 장부(주문번호 -> 잔량, 거래소). 웹소켓 주문체결로만
+        # 갱신하므로 매도 직전에 REST 조회 없이 즉시 읽을 수 있다. 조회 큐는
+        # 초당 1건이라 여기서 ka10075를 부르면 매도가 그만큼 밀린다.
+        self._open_buy_orders: dict[str, dict[str, tuple[int, str]]] = {}
+        # 취소를 이미 보낸 주문번호. 자동취소와 잔량매도·청산이 같은 주문에
+        # 중복 취소를 보내 5건/초 창을 낭비하지 않게 한다.
+        self._cancel_sent_orders: set[str] = set()
+        # 미체결 매도 장부와 보유·매도가능 수량. 상한가가 무너질 때 계좌조회
+        # (kt00018, 조회 큐 1건/초)를 기다리지 않고 즉시 매도량을 정하기 위해
+        # 접속 시 한 번 조회해 세우고 이후 웹소켓 체결로만 갱신한다.
+        self._open_sell_orders: dict[str, dict[str, tuple[int, str]]] = {}
+        self._position_book: dict[str, dict[str, int]] = {}
+        self._position_fill_ids: set[tuple[str, str]] = set()
+        # 종목별 매도 접수 기록 (주문번호, 수량). 응답이 유실된 매도를 다시
+        # 보내기 전에, 거래소가 실제로 접수했는지 여기서 확인한다.
+        self._sell_accepts: dict[str, list[tuple[str, int]]] = {}
         # 화면 변경을 0.3초 모은 뒤, 현재 보이는 행 전체와 WS 등록 상태를 동기화한다.
         # 편입/이탈 이벤트 횟수로 참조수를 증감하면 중복 이벤트나 창 전환 경합 때
         # 실제 화면과 참조수가 어긋날 수 있으므로 화면 모델을 단일 진실로 삼는다.
@@ -919,8 +959,9 @@ class App:
             QTimer.singleShot(10000, self._auto_news_collection)
         # 상한가 원천은 분석창의 KRX·키움 수집 버튼으로만 저장한다.
         # 장중 조건검색값이나 시작 직후 자동 보완으로 종가를 확정하지 않는다.
-        # 공인 IP 감시: 바뀌면 키움 화이트리스트에서 벗어나 API 차단 -> 상단바 경보
+        # 공인 IP 감시: 바뀌면 키움 화이트리스트에서 벗어나 API 차단 -> 타이틀바 경보
         self._public_ip = None
+        self._ip_changed = False  # 한번 바뀌면 재시작까지 경보 유지
         self._ls_news_startup_sync_task = None
         self.ws_task = None
         self._kiwoom_started = False
@@ -932,6 +973,17 @@ class App:
             lambda: setattr(self, "_ip_task", asyncio.ensure_future(self._check_ip()))
             if not (self._ip_task and not self._ip_task.done()) else None)
         self._ip_timer.start(60000)
+        # 추정자산·주문가능금액은 시작 때 한 번만 읽으면 매매 뒤에도 옛 값이
+        # 그대로 남는다. 주기 갱신과 체결 직후 갱신을 함께 건다.
+        self._account_summary_task = None
+        self._account_summary_timer = QTimer()
+        self._account_summary_timer.timeout.connect(
+            self._refresh_account_summary)
+        self._account_summary_timer.start(60000)
+        self._account_summary_debounce = QTimer()
+        self._account_summary_debounce.setSingleShot(True)
+        self._account_summary_debounce.timeout.connect(
+            self._refresh_account_summary)
 
         self.ws.on_condition_list = self._on_condition_list
         self.ws.on_condition_event = self._on_condition_event
@@ -939,6 +991,7 @@ class App:
         self.ws.on_real = self._on_real
         self.ws.on_vi = self._on_vi
         self.ws.on_order = self._on_account_order_event
+        self.ws.on_connected = self._on_ws_connected
         # 통합 시세·조건검색: 전 창 공통 설정. 첫 REG/CNSRREQ 전에 확정한다.
         if self._settings.value("unified_real", "false") == "true":
             self.ws.real_suffix = self.rest.suffix = "_AL"
@@ -984,6 +1037,7 @@ class App:
         screen.reload_btn.clicked.connect(self._reload_conditions)
         screen.rank_btn.clicked.connect(self._on_rank)
         screen.realtime_news_requested.connect(self._open_realtime_news)
+        screen.account_summary_requested.connect(self._refresh_account_summary)
         screen.newwin_btn.clicked.connect(self._on_newwin)
         screen.order_target_selected.connect(
             lambda code, price, target=screen:
@@ -1010,6 +1064,7 @@ class App:
         screen.analysis_stock_requested.connect(
             lambda code, target=screen:
             self._open_condition_analysis_stock(target, code))
+        self._restore_screen_order_settings(screen)
 
     def _sync_order_enabled(
             self, enabled: bool, source: ConditionScreen | None = None):
@@ -1027,10 +1082,13 @@ class App:
             self._order_enabled, source.prefix if source else "-")
 
     def _set_global_exit_hotkey(
-            self, screen: ConditionScreen, code: str, spec):
+            self, screen: ConditionScreen, code: str, spec, persist: bool = True):
         token = (id(screen), code)
         if spec is None:
             self._global_hotkeys.unregister(token)
+            self._exit_hotkey_specs.get(screen.prefix, {}).pop(code, None)
+            if persist:
+                self._save_order_settings()
             audit_log.info(
                 "exit hotkey cleared code=%s screen=%s",
                 code, screen.prefix)
@@ -1038,6 +1096,16 @@ class App:
         ok = self._global_hotkeys.register(
             token, spec, (screen, code, str(spec.get("label") or "")))
         if ok:
+            # 한 창 안에서 같은 키는 한 종목만 쓰므로 중복 스펙을 먼저 걷어낸다.
+            specs = self._exit_hotkey_specs.setdefault(screen.prefix, {})
+            combined = int(spec.get("key") or 0) | int(spec.get("modifiers") or 0)
+            for other, assigned in tuple(specs.items()):
+                if other != code and (int(assigned.get("key") or 0)
+                                      | int(assigned.get("modifiers") or 0)) == combined:
+                    specs.pop(other, None)
+            specs[code] = dict(spec)
+            if persist:
+                self._save_order_settings()
             log.warning(
                 "global exit hotkey registered code=%s key=%s screen=%s "
                 "admin=%s pid=%s",
@@ -1082,6 +1150,33 @@ class App:
         analysis.raise_()
         analysis.activateWindow()
         QTimer.singleShot(0, analysis._ensure_titlebar_visible)
+
+    def _refresh_account_summary(self):
+        """주기·체결 뒤 추정자산과 주문가능금액을 다시 읽는다."""
+        if not self._kiwoom_started:
+            return
+        if self._account_summary_task and not self._account_summary_task.done():
+            return
+        self._account_summary_task = asyncio.ensure_future(
+            self._load_account_summary())
+
+    async def _load_account_summary(self):
+        # 서버 주문가능금액은 미체결 접수분 증거금을 이미 뺀 값이다. 요청 직전
+        # 로컬 누적 주문액을 함께 넘겨 화면이 같은 주문을 두 번 빼지 않게 한다.
+        base = self.orders.committed_notional()
+        try:
+            summary = await self.rest.account_summary()
+        except Exception as e:  # noqa: BLE001
+            log.warning("account summary failed: %s", e)
+            return
+        summary["reserved_base"] = base
+        self._account_summary = summary
+        for view in self.views:
+            view.screen.set_account_summary(summary)
+        audit_log.info(
+            "account summary estimated=%s cash_orderable=%s deposit=%s",
+            summary["estimated_assets"], summary["cash_orderable"],
+            summary["cash_deposit"])
 
     def _refresh_market_overview(self):
         """DB 최신 국내지수·외국인 수급을 모든 조건검색창에 표시한다."""
@@ -1186,6 +1281,8 @@ class App:
             return
         for view in self.views:
             view.screen.model.set_watched_codes(watched)
+            if view.seq == WATCH_SEQ:  # 관심종목 화면은 목록 자체가 바뀐다
+                asyncio.ensure_future(view._poll_watchlist())
         if self._analysis is not None:
             self._analysis._sync_ls_news_watched_codes(watched)
 
@@ -1233,6 +1330,9 @@ class App:
 
     def _queue_orderable_quantity(
             self, screen: ConditionScreen, code: str, price: int):
+        # 종목을 고른 즉시 미체결을 먼저 보여 준다. 주문가능수량은 조회가
+        # 끝나야 나오지만 미체결은 장부에 이미 있어 기다릴 필요가 없다.
+        self._push_pending_orders(code)
         key = (code, price)
         cached = self._orderable_cache.get(key)
         if cached is not None:
@@ -1250,6 +1350,7 @@ class App:
 
     async def _load_orderable_quantity(
             self, screen: ConditionScreen, code: str, price: int):
+        base = self.orders.committed_notional()
         try:
             detail = await self.rest.orderable_quantity(code, price)
         except asyncio.CancelledError:
@@ -1259,6 +1360,7 @@ class App:
             screen.set_orderable_quantity_error(code, price, str(e))
             return
         else:
+            detail["reserved_base"] = base
             self._orderable_cache[(code, price)] = detail
             screen.set_orderable_quantity(code, price, detail)
         finally:
@@ -1331,6 +1433,7 @@ class App:
             return
 
     async def _load_orderable_prefetch(self, code: str, price: int):
+        base = self.orders.committed_notional()
         try:
             detail = await self.rest.orderable_quantity(code, price)
         except asyncio.CancelledError:
@@ -1344,6 +1447,7 @@ class App:
             else:
                 log.warning("orderable prefetch %s@%s: %s", code, price, e)
         else:
+            detail["reserved_base"] = base
             self._orderable_cache[(code, price)] = detail
             self._orderable_prefetch_failed.pop((code, price), None)
             # 선조회 도중 사용자가 이 종목을 골랐다면 즉시 화면에도 반영한다.
@@ -1492,17 +1596,22 @@ class App:
             return
         if not ip or ip == self._public_ip:
             return
-        screen = self.views[0].screen  # 메인창에만 표시
         changed = self._public_ip is not None  # None=최초 확인(정상), 값 있으면 실제 변경
         self._public_ip = ip
-        screen.set_ip(ip, changed)
+        self._ip_changed = self._ip_changed or changed
         _set_title_clock_base(
-            screen.window(),
-            (f"⚠ IP변경 {ip} — " if changed else "") + "[0156] 조건검색실시간" +
-            ("" if changed else f" — {ip}"))
+            self.views[0].screen.window(), self._main_title())  # 메인창에만 표시
         if changed:
             log.warning("public IP changed -> %s (키움 화이트리스트 재등록 필요)", ip)
             _beep("jump")  # 초고음 3연타 경보
+
+    def _main_title(self) -> str:
+        """공인 IP는 타이틀바에 항상 남기고, 변경분은 앞에 경보로 붙인다."""
+        if not self._public_ip:
+            return "[0156] 조건검색실시간"
+        if self._ip_changed:
+            return f"⚠ IP변경 {self._public_ip} — [0156] 조건검색실시간"
+        return f"[0156] 조건검색실시간 — {self._public_ip}"
 
     def _start_ls_news_gap_sync(self):
         """분석창을 열지 않은 시작에서도 서버 누락 뉴스를 백그라운드 저장한다."""
@@ -1564,7 +1673,7 @@ class App:
         win = self.views[0].screen.window()
         win._title_clock_suffix = self._title_suffix_before_maintenance or ""
         self._title_suffix_before_maintenance = None
-        _set_title_clock_base(win, "[0156] 조건검색실시간")
+        _set_title_clock_base(win, self._main_title())
         await self._start_kiwoom_services()
 
     async def _start_kiwoom_services(self):
@@ -1577,15 +1686,7 @@ class App:
         self._kiwoom_started = True
         asyncio.ensure_future(self._check_ip())  # 시작 즉시 IP 표시
         self.ws_task = asyncio.create_task(self.ws.run(self.rest.tokens.token))
-        try:
-            self._account_summary = await self.rest.account_summary()
-            for v in self.views:
-                v.screen.set_account_summary(self._account_summary)
-            log.info("account summary loaded: estimated=%s orderable=%s",
-                     self._account_summary["estimated_assets"],
-                     self._account_summary["cash_orderable"])
-        except Exception as e:  # noqa: BLE001
-            log.warning("account summary failed: %s", e)
+        await self._load_account_summary()
         try:
             self._market = await self.rest.market_info()
             for v in self.views:
@@ -1787,7 +1888,7 @@ class App:
         # 있으므로, 여러 조건식은 설정값으로 명시한 경우에만 허용한다.
         view = self.views[0] if self.views else None
         seq = str(view.seq or "") if view else ""
-        if not seq or seq in RANK_SEQS or seq == HOLDINGS_SEQ:
+        if not seq or seq in RANK_SEQS or seq in LOCAL_SEQS:
             return []
         return [(seq, names.get(seq, seq))]
 
@@ -2147,11 +2248,21 @@ class App:
                 for view in self.views if code in view.screen.model.rows
             ), 0)
             self._queue_emergency_reconcile(code, latest_price or None)
+        order_no = str(event.get("order_no") or "")
+        if not order_no:
+            return
+        if (int(event.get("fill_qty") or 0) > 0
+                or "취소" in str(event.get("status") or "")):
+            # 체결이 나면 추정자산·주문가능금액이 달라진다. 취소도 묶였던
+            # 증거금이 풀리므로 같이 다시 읽어야 다음 주문 수량이 맞는다.
+            # 연속 체결에서 조회가 몰리지 않게 3초 모아 한 번만 읽는다.
+            self._account_summary_debounce.start(3000)
+        if event.get("side") == "sell":
+            self._track_open_sell(code, order_no, event)
+            return
         if event.get("side") != "buy":
             return
-        order_no = str(event.get("order_no") or "")
-        if not order_no or not code:
-            return
+        self._track_open_buy(code, order_no, event)
         if code not in self._account_auto_cancel_armed:
             return
         fill_qty = max(0, int(event.get("fill_qty") or 0))
@@ -2191,9 +2302,273 @@ class App:
             lambda _task, key=order_key:
             self._account_auto_cancel_tasks.pop(key, None))
 
+    def _track_order_book(self, book: dict, code: str, order_no: str,
+                          event: dict) -> int:
+        """웹소켓 주문 이벤트로 미체결 장부를 갱신하고 취소된 잔량을 돌려준다.
+
+        신규 주문은 원주문번호가 0000000으로 오고, 취소 주문은 원주문번호에
+        대상 주문번호가 실린다. 취소 확인(잔량 0)이 오면 원주문을 지운다.
+        체결로 사라진 경우는 취소가 아니므로 0을 돌려준다.
+        """
+        remaining = event.get("remaining_qty")
+        if remaining is None:
+            return 0
+        remaining = max(0, int(remaining))
+        original = str(event.get("original_order_no") or "").strip()
+        is_self = (not original or original == order_no
+                   or set(original) == {"0"})
+        orders = book.setdefault(code, {})
+        cancelled = 0
+        if is_self:
+            if remaining > 0:
+                orders[order_no] = (
+                    remaining, str(event.get("exchange") or "KRX") or "KRX")
+            else:
+                orders.pop(order_no, None)
+        elif remaining <= 0:  # 취소·정정 확인 -> 원주문 소멸
+            cancelled = orders.pop(original, (0, ""))[0]
+            orders.pop(order_no, None)
+            self._cancel_sent_orders.discard(original)
+        if remaining <= 0:
+            self._cancel_sent_orders.discard(order_no)
+        if not orders:
+            book.pop(code, None)
+        return cancelled
+
+    def _track_open_buy(self, code: str, order_no: str, event: dict):
+        """매수 이벤트: 미체결 장부와 보유수량을 함께 갱신한다."""
+        self._track_order_book(self._open_buy_orders, code, order_no, event)
+        filled = self._new_fill_qty(order_no, event)
+        position = self._position_book.get(code)
+        if filled and position is not None:
+            # 당일 매수 체결분은 그대로 매도할 수 있다.
+            position["held"] += filled
+            position["sellable"] += filled
+        # 장부를 다 고친 뒤에 표시한다. 먼저 부르면 보유수량이 한 박자 늦는다.
+        self._push_pending_orders(code)
+
+    def _track_open_sell(self, code: str, order_no: str, event: dict):
+        """매도 이벤트: 미체결 매도와 보유·매도가능 수량을 갱신한다."""
+        before = (self._open_sell_orders.get(code) or {}).get(
+            order_no, (0, ""))[0]
+        cancelled = self._track_order_book(
+            self._open_sell_orders, code, order_no, event)
+        after = (self._open_sell_orders.get(code) or {}).get(
+            order_no, (0, ""))[0]
+        if before == 0 and after > 0:  # 새 매도 접수 (잔고 장부와 무관하게 기록)
+            accepts = self._sell_accepts.setdefault(code, [])
+            accepts.append((order_no, after))
+            del accepts[:-20]
+        position = self._position_book.get(code)
+        if position is not None:
+            if before == 0 and after > 0:  # 접수된 수량만큼 묶인다
+                position["sellable"] = max(0, position["sellable"] - after)
+            if cancelled:                  # 매도 취소 -> 다시 팔 수 있다
+                position["sellable"] += cancelled
+            filled = self._new_fill_qty(order_no, event)
+            if filled:
+                position["held"] = max(0, position["held"] - filled)
+        # 장부를 다 고친 뒤에 표시한다. 먼저 부르면 보유수량이 한 박자 늦는다.
+        self._push_pending_orders(code)
+
+    async def _send_sell_order(self, code: str, qty: int, price: int,
+                               market_sell: bool, reason: str,
+                               attempts: int = 3) -> dict:
+        """매도를 보내고, 응답이 유실되면 접수 여부를 확인한 뒤에만 재전송한다.
+
+        타임아웃이라고 그냥 다시 보내면 중복 매도가 된다. 거래소가 보내주는
+        매도 접수 이벤트를 근거로 미접수를 확인한 경우에만 재전송한다.
+        """
+        for attempt in range(1, attempts + 1):
+            marker = len(self._sell_accepts.get(code) or ())
+            try:
+                return await self.rest.sell_order(
+                    code, qty, int(price), market=market_sell)
+            except OrderSendUnknown as error:
+                accepted = await self._wait_sell_accepted(code, marker, qty)
+                if accepted:
+                    log.warning(
+                        "%s sell response lost but accepted code=%s qty=%s "
+                        "order=%s (%s)", reason, code, qty, accepted, error)
+                    return {"order_no": accepted}
+                if attempt >= attempts:
+                    log.warning(
+                        "%s sell unconfirmed after %s attempts code=%s qty=%s",
+                        reason, attempts, code, qty)
+                    raise
+                log.warning(
+                    "%s sell not accepted; resend %s/%s code=%s qty=%s (%s)",
+                    reason, attempt, attempts - 1, code, qty, error)
+
+    async def _wait_sell_accepted(self, code: str, marker: int,
+                                  qty: int, timeout: float = 0.3) -> str:
+        """접수 이벤트가 오는지 짧게 기다린다. 오면 주문번호, 없으면 빈 문자열."""
+        deadline = time.monotonic() + timeout
+        while True:
+            for order_no, accepted_qty in (
+                    self._sell_accepts.get(code) or ())[marker:]:
+                if accepted_qty == qty:
+                    return order_no
+            if time.monotonic() >= deadline:
+                return ""
+            await asyncio.sleep(0.02)
+
+    def _new_fill_qty(self, order_no: str, event: dict) -> int:
+        """같은 체결번호가 두 번 와도 한 번만 세도록 거른다."""
+        filled = max(0, int(event.get("fill_qty") or 0))
+        if not filled:
+            return 0
+        fill_id = str(event.get("fill_id") or "").strip()
+        if fill_id:
+            token = (order_no, fill_id)
+            if token in self._position_fill_ids:
+                return 0
+            self._position_fill_ids.add(token)
+        return filled
+
+    def _on_ws_connected(self):
+        """접속·재접속 직후 미체결·잔고 장부를 계좌 기준으로 다시 맞춘다."""
+        asyncio.ensure_future(self._prime_account_books())
+
+    async def _prime_account_books(self):
+        await self._prime_open_buy_book()
+        await self._prime_position_book()
+
+    async def _prime_position_book(self):
+        """보유·매도가능 수량을 계좌에서 한 번 읽어 장부를 세운다.
+
+        이후에는 웹소켓 체결로만 갱신하므로 매도 직전 조회가 필요 없다.
+        """
+        try:
+            rows = await self.rest.holding_positions()
+        except Exception:  # noqa: BLE001
+            log.exception("position book prime failed")
+            return
+        self._position_book = {
+            str(row["code"]): {
+                "held": max(0, int(row.get("held_qty") or 0)),
+                "sellable": max(0, int(row.get("sellable_qty") or 0)),
+            }
+            for row in rows
+        }
+        self._position_fill_ids.clear()
+        log.warning("position book primed codes=%s", len(self._position_book))
+
+    async def _prime_open_buy_book(self):
+        """앱 시작·재접속 구간에 놓친 미체결 매수를 계좌 조회로 채운다.
+
+        이후에는 웹소켓 주문체결만으로 유지되므로, 매도 직전에는 조회가 없다.
+        영웅문에서 낸 주문도 여기서 함께 들어온다.
+        """
+        try:
+            orders = await self.rest.open_buy_orders()
+        except Exception:  # noqa: BLE001
+            log.exception("open-buy book prime failed")
+            return
+        book: dict[str, dict[str, tuple[int, str]]] = {}
+        for order in orders:
+            book.setdefault(str(order["code"]), {})[str(order["order_no"])] = (
+                max(0, int(order.get("remaining_qty") or 0)),
+                str(order.get("exchange") or "KRX"))
+        # 조회 도중 웹소켓으로 들어온 최신 상태를 덮어쓰지 않는다.
+        for code, orders_by_no in book.items():
+            live = self._open_buy_orders.setdefault(code, {})
+            for order_no, value in orders_by_no.items():
+                live.setdefault(order_no, value)
+        log.warning(
+            "open-buy book primed orders=%s codes=%s",
+            len(orders), len(book))
+
+    def _push_pending_orders(self, code: str):
+        """선택 종목의 체결·미체결 장부를 예상주문 줄에 반영한다.
+
+        모두 웹소켓 주문체결로 유지되는 메모리 장부라 계좌를 조회하지 않는다.
+        조회 큐는 초당 1건이라 여기서 REST를 부르면 매도가 그만큼 밀린다."""
+        code = str(code or "").strip().split("_")[0].removeprefix("A")
+        if not code:
+            return
+
+        def summary(book):
+            orders = [qty for qty, _ in (book.get(code) or {}).values() if qty > 0]
+            return len(orders), sum(orders)
+
+        buy = summary(self._open_buy_orders)
+        sell = summary(self._open_sell_orders)
+        booked = self._position_book.get(code) or {}
+        position = (max(0, int(booked.get("held") or 0)),
+                    max(0, int(booked.get("sellable") or 0)))
+        for view in self.views:
+            view.screen.set_pending_orders(code, buy, sell, position)
+
+    def _pending_open_buys(self, code: str) -> list[tuple[str, int, str]]:
+        """장부의 미체결 매수를 (주문번호, 잔량, 거래소)로 돌려준다. 조회 없음."""
+        return [
+            (order_no, qty, exchange)
+            for order_no, (qty, exchange)
+            in (self._open_buy_orders.get(code) or {}).items()
+        ]
+
+    def _cancel_open_buys_now(
+            self, code: str, orders: list[tuple[str, int, str]],
+            reason: str,
+            cap: int | None = ORDER_BURST - 1) -> list[tuple[str, int, str]]:
+        """미체결 매수 취소를 즉시 전송하고, 못 보낸 나머지를 돌려준다.
+
+        주문 TR은 1초에 5건이라 9분할처럼 취소가 많으면 매도가 창 밖으로
+        밀린다. 한 번에 ORDER_BURST-1건까지만 보내 매도 자리를 남기고,
+        나머지는 호출부가 매도를 보낸 뒤에 이어서 보낸다.
+        """
+        fresh = [
+            order for order in orders
+            if order[0] not in self._cancel_sent_orders]
+        head, tail = (fresh[:cap], fresh[cap:]) if cap else (fresh, [])
+        for order_no, qty, exchange in head:
+            self._cancel_sent_orders.add(order_no)
+            asyncio.ensure_future(
+                self._cancel_one_open_buy(code, order_no, qty, exchange, reason))
+        if head:
+            log.warning(
+                "%s open-buy cancel dispatched code=%s orders=%s qty=%s "
+                "deferred=%s",
+                reason, code, len(head), sum(qty for _, qty, _ex in head),
+                len(tail))
+        return tail
+
+    async def _cancel_one_open_buy(
+            self, code: str, order_no: str, qty: int, exchange: str,
+            reason: str):
+        try:
+            await self.rest.cancel_order(code, order_no, 0, exchange)
+        except Exception:  # noqa: BLE001
+            # 이미 체결·취소된 주문일 수 있다. 다음 기회에 다시 시도하도록
+            # 전송 표시를 지운다.
+            self._cancel_sent_orders.discard(order_no)
+            log.exception(
+                "%s open-buy cancel failed code=%s order=%s qty=%s",
+                reason, code, order_no, qty)
+
+    async def _sweep_open_buys(self, code: str, reason: str):
+        """매도 전송 뒤 계좌 미체결을 한 번 더 확인해 장부 누락을 메운다.
+
+        ponytail: 장부는 웹소켓 기반이라 앱 재시작·재접속 구간을 못 본다.
+        느린 ka10075는 매도가 나간 뒤에만 쓴다.
+        """
+        try:
+            count, qty = await self.rest.cancel_open_buy_orders(code)
+        except Exception:  # noqa: BLE001
+            log.exception("%s open-buy sweep failed code=%s", reason, code)
+            return
+        if count:
+            log.warning(
+                "%s open-buy sweep cancelled code=%s orders=%s qty=%s",
+                reason, code, count, qty)
+
     async def _auto_cancel_account(
             self, code: str, order_no: str, remaining_qty: int | None,
             exchange: str | None = None):
+        if order_no in self._cancel_sent_orders:
+            # 잔량매도·청산이 이미 같은 주문을 취소했다. 5건/초 창을 아낀다.
+            return
         try:
             # 체결 이벤트의 주문번호·잔량으로 직접 취소한다. 계좌 미체결 조회가
             # 지연되거나 일부만 반환되어도 100주를 체결한 해당 주문을 놓치지 않는다.
@@ -2201,6 +2576,7 @@ class App:
                 qty = max(0, int(remaining_qty))
                 if qty:
                     # 키움 취소수량 0은 이 원주문번호의 잔량 전부를 뜻한다.
+                    self._cancel_sent_orders.add(order_no)
                     await self.rest.cancel_order(
                         code, order_no, 0, str(exchange))
                     count = 1
@@ -2214,12 +2590,94 @@ class App:
                 "orders=%s qty=%s",
                 code, order_no, count, qty)
         except Exception:  # noqa: BLE001
+            self._cancel_sent_orders.discard(order_no)
             log.exception(
                 "account auto-cancel failed code=%s event_order=%s",
                 code, order_no)
             return
         # 자동취소 감시는 유지한다. 다른 분할 주문도 각자 100주가 체결되면
         # 그 주문번호의 잔량만 같은 방식으로 취소한다.
+
+    # --- 종목별 주문설정 보존 -------------------------------------------
+    # 3단매도·자동취소·청산키는 앱을 다시 열어도 그대로 살아 있어야 한다.
+    # 실주문을 자동으로 내는 설정이므로 복원 내역은 audit 로그에 남긴다.
+    def _save_order_settings(self):
+        self._settings.setValue(
+            "order/auto_cancel_armed",
+            json.dumps(sorted(self._account_auto_cancel_armed)))
+        # 단계(stage)를 함께 저장해야 재시작 뒤 이미 나간 단계가 다시 나가지
+        # 않는다. 날짜는 _check_balance_sell의 당일 만료 판정에 그대로 쓴다.
+        self._settings.setValue("order/balance_sell", json.dumps({
+            code: {
+                "setting": setting,
+                "stage": int(self._balance_sell_stage.get(code, 0)),
+                "date": self._balance_sell_date.get(code, ""),
+            }
+            for code, setting in self._balance_sell_settings.items()
+        }, ensure_ascii=False))
+        self._settings.setValue("order/exit_hotkeys", json.dumps({
+            prefix: specs
+            for prefix, specs in self._exit_hotkey_specs.items() if specs
+        }, ensure_ascii=False))
+        self._settings.sync()
+
+    def _load_order_settings(self):
+        """저장된 종목별 주문설정을 메모리로 되돌린다. 화면 반영은 편입 시점."""
+        def read(key, default):
+            raw = str(self._settings.value(key, "") or "").strip()
+            if not raw:
+                return default  # 아직 저장한 적 없음 — 손상과 구분한다
+            try:
+                return json.loads(raw) or default
+            except (ValueError, TypeError):
+                log.warning("order setting reload failed: %s raw=%.200s", key, raw)
+                return default
+
+        self._account_auto_cancel_armed = set(read("order/auto_cancel_armed", []))
+        today = datetime.now().strftime("%Y%m%d")
+        expired = []
+        for code, saved in read("order/balance_sell", {}).items():
+            # 3단매도는 원래 당일만 유효하다. 날짜가 지난 설정은 되살리지 않는다.
+            if str(saved.get("date") or "") != today:
+                expired.append(code)
+                continue
+            self._balance_sell_settings[code] = dict(saved.get("setting") or {})
+            self._balance_sell_stage[code] = int(saved.get("stage") or 0)
+            self._balance_sell_date[code] = today
+        self._exit_hotkey_specs = {
+            str(prefix): {str(code): spec for code, spec in (specs or {}).items()}
+            for prefix, specs in read("order/exit_hotkeys", {}).items()
+        }
+        if (self._account_auto_cancel_armed or self._balance_sell_settings
+                or self._exit_hotkey_specs):
+            audit_log.info(
+                "order settings restored auto_cancel=%s balance_sell=%s "
+                "hotkeys=%s expired_balance_sell=%s",
+                sorted(self._account_auto_cancel_armed),
+                {code: self._balance_sell_stage.get(code, 0)
+                 for code in self._balance_sell_settings},
+                {prefix: sorted(specs)
+                 for prefix, specs in self._exit_hotkey_specs.items()},
+                expired)
+
+    def _restore_screen_order_settings(self, screen: ConditionScreen):
+        """창이 만들어질 때 그 창 몫의 청산키를 다시 등록한다."""
+        for code, spec in self._exit_hotkey_specs.get(screen.prefix, {}).items():
+            screen.model.exit_hotkeys[code] = (
+                int(spec.get("key") or 0) | int(spec.get("modifiers") or 0),
+                str(spec.get("label") or ""))
+            screen.refresh_exit_hotkey_cell(code)
+            self._set_global_exit_hotkey(screen, code, spec, persist=False)
+
+    def _restore_stock_order_settings(self, screen: ConditionScreen, code: str):
+        """편입된 종목에 저장돼 있던 3단매도·자동취소를 화면에 되살린다."""
+        if code in self._account_auto_cancel_armed:
+            screen.model.set_account_auto_cancel_armed(code, True)
+        setting = self._balance_sell_settings.get(code)
+        if not setting:
+            return
+        screen.model.balance_sell_settings[code] = dict(setting)
+        screen.model.balance_sell_stage[code] = self._balance_sell_stage.get(code, 0)
 
     def _set_account_auto_cancel(self, code: str, armed: bool):
         code = str(code or "").strip().split("_")[0].removeprefix("A")
@@ -2243,6 +2701,7 @@ class App:
                 if token[0] != code}
         for view in self.views:
             view.screen.model.set_account_auto_cancel_armed(code, armed)
+        self._save_order_settings()
         log.warning(
             "account auto-cancel %s code=%s",
             "armed" if armed else "disarmed", code)
@@ -2269,6 +2728,7 @@ class App:
             row = view.screen.model.codes.index(code)
             cell = view.screen.model.index(row, BALANCE_SELL_COL)
             view.screen.model.dataChanged.emit(cell, cell)
+        self._save_order_settings()
         audit_log.info(
             "balance sell setting code=%s setting=%s", code, setting)
 
@@ -2347,20 +2807,36 @@ class App:
         self._balance_sell_stage[code] = target
         for view in self.views:
             view.screen.set_balance_sell_stage(code, target)
+        self._save_order_settings()
         _beep(f"balance{target}")
 
     async def _execute_balance_stage(
             self, code: str, target: int, ratio: float,
             price: int, bid_qty: int, market_sell: bool):
+        # 일부라도 파는 단계에서는 남은 매수를 먼저 끊는다. 미체결을 그대로 두면
+        # 방금 판 물량을 다시 사게 된다. 취소는 장부만 보고 즉시 전송하므로
+        # 미체결이 없으면 매도까지 단 한 번의 대기도 생기지 않는다.
+        reason = f"잔량 {target}단계"
+        self.orders.stop_local_submissions(code)
+        pending = self._pending_open_buys(code)
+        deferred = self._cancel_open_buys_now(code, pending, reason)
+        if pending:
+            # 취소 요청이 주문 큐에 먼저 들어가도록 한 틱만 양보한다.
+            await asyncio.sleep(0)
         try:
             sold = await self._sell_account_position(
-                code, ratio, price, f"잔량 {target}단계", market_sell)
+                code, ratio, price, reason, market_sell)
         except Exception:  # noqa: BLE001
             log.exception(
                 "balance sell failed; stage remains pending "
                 "code=%s stage=%s",
                 code, target)
             return
+        finally:
+            # 매도를 보낸 뒤 남은 취소를 이어 보내고, 장부가 못 본 미체결은
+            # 그다음에 조회로 확인한다.
+            self._cancel_open_buys_now(code, deferred, reason, cap=None)
+            asyncio.ensure_future(self._sweep_open_buys(code, reason))
         if sold <= 0:
             # 보유가 아직 잔고에 반영되지 않은 경우 다음 호가에서 재조회한다.
             return
@@ -2372,25 +2848,57 @@ class App:
     async def _sell_account_position(
             self, code: str, ratio: float, price: int, reason: str,
             market_sell: bool = False) -> int:
-        """실제 계좌 매매가능수량을 조회해 지정 비율만큼 매도한다."""
-        position = await self.rest.holding_position(code)
-        held = max(0, int(position.get("held_qty") or 0))
-        sellable = max(0, int(position.get("sellable_qty") or 0))
+        """매도가능수량만큼 지정 비율로 매도한다.
+
+        수량은 웹소켓으로 유지하는 잔고 장부에서 즉시 읽는다. 장부가 없거나
+        수량이 실제와 달라 거부되면 그때만 계좌를 조회해 한 번 재시도한다.
+        """
+        ratio = min(1.0, max(0.0, float(ratio)))
+        booked = self._position_book.get(code)
+        if booked is not None:
+            held, sellable, source = booked["held"], booked["sellable"], "book"
+        else:
+            position = await self.rest.holding_position(code)
+            held = max(0, int(position.get("held_qty") or 0))
+            sellable = max(0, int(position.get("sellable_qty") or 0))
+            source = "query"
         if sellable <= 0:
             log.warning(
-                "%s account sell ignored code=%s held=%s sellable=0",
-                reason, code, held)
+                "%s account sell ignored code=%s held=%s sellable=0 src=%s",
+                reason, code, held, source)
             return 0
-        ratio = min(1.0, max(0.0, float(ratio)))
         qty = sellable if ratio >= 1.0 else max(1, int(sellable * ratio))
-        result = await self.rest.sell_order(
-            code, qty, int(price), market=market_sell)
+        try:
+            result = await self._send_sell_order(
+                code, qty, price, market_sell, reason)
+        except OrderSendUnknown:
+            # 접수 여부를 끝내 확인하지 못했다. 다시 보내면 중복 매도가 된다.
+            raise
+        except Exception as error:  # noqa: BLE001
+            if source != "book":
+                raise
+            # 장부 수량이 실제와 어긋나 거부된 경우다. 장부를 버리고 계좌를
+            # 다시 읽어 한 번만 재시도한다. 이후 매도는 조회 경로로 돈다.
+            self._position_book.pop(code, None)
+            log.warning(
+                "%s book sell rejected; requery code=%s qty=%s error=%s",
+                reason, code, qty, error)
+            position = await self.rest.holding_position(code)
+            held = max(0, int(position.get("held_qty") or 0))
+            sellable = max(0, int(position.get("sellable_qty") or 0))
+            if sellable <= 0:
+                return 0
+            qty = sellable if ratio >= 1.0 else max(1, int(sellable * ratio))
+            source = "requery"
+            result = await self._send_sell_order(
+                code, qty, price, market_sell, reason)
+            asyncio.ensure_future(self._prime_position_book())
         log.warning(
             "%s account sell sent code=%s held=%s sellable=%s qty=%s "
-            "order_type=%s price=%s order_no=%s",
+            "order_type=%s price=%s order_no=%s src=%s",
             reason, code, held, sellable, qty,
             "시장가" if market_sell else "지정가",
-            "" if market_sell else price, result["order_no"])
+            "" if market_sell else price, result["order_no"], source)
         return qty
 
     def _emergency_exit(self, code: str, price: int, order_enabled: bool):
@@ -2439,17 +2947,31 @@ class App:
 
     async def _emergency_exit_async(
             self, code: str, price: int, order_enabled: bool):
-        try:
-            position = await self.rest.holding_position(code)
-            open_buys = await self.rest.open_buy_orders(code)
-        except Exception as error:  # noqa: BLE001
-            log.exception("emergency account query failed code=%s", code)
-            for view in self.views:
-                if code in view.screen.model.rows:
-                    view.screen.set_order_state(
-                        code, "잔고오류",
-                        f"상태 청산 보류 · 계좌잔고 조회 오류 · {error}", False)
-            return
+        # 장부가 서 있으면 계좌조회를 기다리지 않는다. 조회 큐는 1초에 1건이라
+        # 청산 순간에 두 건을 부르면 그만큼 매도가 늦는다.
+        booked = self._position_book.get(code)
+        booked_buys = self._pending_open_buys(code)
+        if booked is not None:
+            position = {
+                "held_qty": booked["held"], "sellable_qty": booked["sellable"]}
+            open_buys = [
+                {"code": code, "order_no": order_no,
+                 "remaining_qty": qty, "exchange": exchange}
+                for order_no, qty, exchange in booked_buys
+            ]
+        else:
+            try:
+                position = await self.rest.holding_position(code)
+                open_buys = await self.rest.open_buy_orders(code)
+            except Exception as error:  # noqa: BLE001
+                log.exception("emergency account query failed code=%s", code)
+                for view in self.views:
+                    if code in view.screen.model.rows:
+                        view.screen.set_order_state(
+                            code, "잔고오류",
+                            f"상태 청산 보류 · 계좌잔고 조회 오류 · {error}",
+                            False)
+                return
         batch = self.orders.batches.get(code)
         tracked_filled = max(0, int(batch.total_filled)) if batch else 0
         local_pending_qty = sum((
@@ -2513,19 +3035,48 @@ class App:
                 code, held_qty)
             return
         sold_qty = 0
-        cancelled_count = 0
-        cancelled_qty = 0
+        # 미체결 목록은 위에서 이미 조회했다. 다시 조회하지 않고 그 주문번호로
+        # 바로 취소를 띄운 뒤, 매도는 취소 응답을 기다리지 않고 내보낸다.
+        cancel_targets = [
+            (str(order["order_no"]),
+             max(0, int(order.get("remaining_qty") or 0)),
+             str(order.get("exchange") or "KRX"))
+            for order in open_buys
+        ]
+        cancelled_count = len(cancel_targets)
+        cancelled_qty = sum(qty for _, qty, _ex in cancel_targets)
+        deferred = self._cancel_open_buys_now(code, cancel_targets, "긴급정리")
+        if cancel_targets:
+            await asyncio.sleep(0)  # 취소를 주문 큐에 먼저 넣는다
         try:
             if sellable_qty > 0:
-                result = await self.rest.sell_order(
-                    code, sellable_qty, int(price))
+                try:
+                    result = await self._send_sell_order(
+                        code, sellable_qty, price, False, "긴급정리")
+                except OrderSendUnknown:
+                    raise  # 접수 미확인 -> 중복 매도 금지
+                except Exception as error:  # noqa: BLE001
+                    if booked is None:
+                        raise
+                    # 장부 수량이 어긋나 거부된 경우에만 계좌를 다시 읽는다.
+                    self._position_book.pop(code, None)
+                    log.warning(
+                        "emergency book sell rejected; requery code=%s "
+                        "qty=%s error=%s", code, sellable_qty, error)
+                    position = await self.rest.holding_position(code)
+                    sellable_qty = max(0, int(position.get("sellable_qty") or 0))
+                    held_qty = max(0, int(position.get("held_qty") or 0))
+                    if sellable_qty <= 0:
+                        raise
+                    result = await self._send_sell_order(
+                        code, sellable_qty, price, False, "긴급정리")
+                    asyncio.ensure_future(self._prime_position_book())
                 sold_qty = sellable_qty
                 log.warning(
                     "emergency account sell sent code=%s held=%s "
-                    "sellable=%s price=%s order_no=%s",
-                    code, held_qty, sellable_qty, price, result["order_no"])
-            cancelled_count, cancelled_qty = (
-                await self.rest.cancel_open_buy_orders(code))
+                    "sellable=%s price=%s order_no=%s src=%s",
+                    code, held_qty, sellable_qty, price, result["order_no"],
+                    "book" if booked is not None else "query")
         except Exception as error:  # noqa: BLE001
             log.exception(
                 "emergency cancel/sell failed code=%s price=%s "
@@ -2536,6 +3087,11 @@ class App:
                     view.screen.set_order_state(
                         code, "오류", f"상태 긴급정리 오류 · {error}", False)
             return
+        finally:
+            # 매도를 보낸 뒤 남은 취소를 이어 보내고, 장부가 못 본 미체결은
+            # 그다음에 조회로 확인한다.
+            self._cancel_open_buys_now(code, deferred, "긴급정리", cap=None)
+            asyncio.ensure_future(self._sweep_open_buys(code, "긴급정리"))
         for view in self.views:
             if code in view.screen.model.rows:
                 view.screen.set_order_state(
@@ -2859,6 +3415,7 @@ class App:
         screen.analysis_stock_requested.connect(
             lambda code, target=screen:
             self._open_condition_analysis_stock(target, code))
+        self._restore_screen_order_settings(screen)
 
     def _on_window_closed(self, win):
         if _SHUTDOWN[0]:  # 앱 종료 동반 닫힘: 창 개수 보존 (재시작 때 복원용)

@@ -6,6 +6,7 @@ REST 호출은 초당 1건 rate limit (config.REST_RATE_LIMIT).
 """
 import asyncio
 import logging
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
@@ -16,6 +17,34 @@ import config
 log = logging.getLogger("api")
 
 KST = timezone(timedelta(hours=9))
+
+# 주문 TR 제한은 1초에 5건이다. 건마다 0.2초씩 벌리면 취소 직후 매도가 그만큼
+# 밀리므로, 최근 1초에 5건이 찼을 때만 기다리는 슬라이딩 창으로 센다.
+# 키움이 유량을 순간 간격으로 재는지 창 평균으로 재는지는 공개하지 않는다.
+# 간격 방식일 경우를 대비해 유량 거부는 짧게 쉬고 재전송한다.
+# ponytail: 버스트가 거부되면 ORDER_BURST를 1로 낮추면 예전 간격 방식이 된다.
+ORDER_BURST = 5
+ORDER_WINDOW = 1.05  # 서버 창 경계 오차를 감안한 5% 여유
+ORDER_RETRY = 2
+ORDER_RETRY_WAIT = 0.25
+# 상한가가 무너지는 순간에 10초를 기다리는 것은 실패와 같다. 짧게 끊고
+# 접수 여부는 웹소켓 주문체결 이벤트로 확인한다.
+ORDER_TIMEOUT = 2.0
+RATE_LIMIT_HINTS = ("유량", "초당", "요청 제한", "호출 제한", "too many")
+
+
+class OrderSendUnknown(Exception):
+    """주문을 보냈지만 접수됐는지 확인하지 못한 상태.
+
+    그냥 재전송하면 중복 주문이 된다. 호출부는 웹소켓 접수 이벤트로 확인한
+    뒤에만 다시 보내야 한다.
+    """
+
+
+def _is_rate_limited(message: str) -> bool:
+    """주문 거부 사유가 유량 제한인지 본다. 잔고·가격 거부는 재전송하지 않는다."""
+    lowered = str(message or "").lower()
+    return any(hint in lowered for hint in RATE_LIMIT_HINTS)
 
 
 def _maintenance_datetime(value: str) -> datetime:
@@ -141,8 +170,9 @@ class RestClient:
         self.tokens = TokenManager(self._client)
         self._sem = asyncio.Semaphore(1)  # 동시 1건
         self._last_call = 0.0
-        self._order_sem = asyncio.Semaphore(1)
-        self._last_order_call = 0.0
+        # 주문 전송은 병렬로 두고, 이 락은 5건/초 창 계산만 순서대로 보호한다.
+        self._order_gate = asyncio.Lock()
+        self._order_sent: deque[float] = deque(maxlen=ORDER_BURST)
         # 시세 접미사: "" KRX, "_AL" 통합. watch_info 백필이 WS 통합시세를 KRX 종가로
         # 덮어쓰지 않게 ws.real_suffix와 함께 전환 (ka10095 _AL 실측: NXT 야간가 반영)
         self.suffix = ""
@@ -177,25 +207,55 @@ class RestClient:
         return (await self._request_raw(api_id, body, path)).json()
 
     async def _order_request(self, api_id: str, body: dict) -> dict:
-        """주문 전용 5건/초 제한. 일반 조회 1초 제한과 큐를 분리한다."""
+        """주문 전용 5건/초 제한. 일반 조회 1초 제한과 큐를 분리한다.
+
+        연속 ORDER_BURST건까지는 간격 없이 즉시 보낸다. 전송 자체는 병렬이다.
+        락을 응답까지 잡으면 앞선 취소의 왕복시간만큼 뒤따르는 매도가 밀리는데,
+        상한가가 무너지는 순간에는 그 한 번의 왕복도 허용할 수 없다.
+
+        키움은 유량 판정 방식을 공개하지 않는다. 간격 방식이면 버스트가
+        거부될 수 있으므로, 유량 거부는 짧게 쉬고 곧바로 재전송한다.
+        """
         import time
-        async with self._order_sem:
-            wait = 0.21 - (time.monotonic() - self._last_order_call)
-            if wait > 0:
-                await asyncio.sleep(wait)
+        for attempt in range(ORDER_RETRY + 1):
+            async with self._order_gate:  # 창 계산만 보호 -> 송신 순서는 유지
+                if len(self._order_sent) == ORDER_BURST:
+                    wait = ORDER_WINDOW - (
+                        time.monotonic() - self._order_sent[0])
+                    if wait > 0:
+                        await asyncio.sleep(wait)
+                self._order_sent.append(time.monotonic())
             token = await self.tokens.token()
             headers = {
                 "authorization": f"Bearer {token}", "api-id": api_id,
                 "Content-Type": "application/json;charset=UTF-8",
             }
-            r = await self._client.post(
-                f"{config.HOST}/api/dostk/ordr", json=body, headers=headers)
-            self._last_order_call = time.monotonic()
-        r.raise_for_status()
-        data = r.json()
-        if str(data.get("return_code", "0")) not in ("0", ""):
-            raise RuntimeError(data.get("return_msg") or f"{api_id} 주문 실패")
-        return data
+            try:
+                r = await self._client.post(
+                    f"{config.HOST}/api/dostk/ordr", json=body,
+                    headers=headers, timeout=ORDER_TIMEOUT)
+            except httpx.TransportError as error:  # 타임아웃·연결오류 포함
+                raise OrderSendUnknown(f"{api_id} 응답 없음: {error}") from error
+            if r.status_code >= 500:
+                # 서버가 받고 처리했는지 알 수 없다. 임의 재전송은 금지한다.
+                raise OrderSendUnknown(f"{api_id} 서버 오류 {r.status_code}")
+            if r.status_code == 429 and attempt < ORDER_RETRY:
+                log.warning("order rate limited (429) api=%s retry=%s",
+                            api_id, attempt + 1)
+                await asyncio.sleep(ORDER_RETRY_WAIT)
+                continue
+            r.raise_for_status()
+            data = r.json()
+            if str(data.get("return_code", "0")) in ("0", ""):
+                return data
+            message = str(data.get("return_msg") or "")
+            if attempt < ORDER_RETRY and _is_rate_limited(message):
+                log.warning("order rate limited api=%s retry=%s msg=%s",
+                            api_id, attempt + 1, message)
+                await asyncio.sleep(ORDER_RETRY_WAIT)
+                continue
+            raise RuntimeError(message or f"{api_id} 주문 실패")
+        raise RuntimeError(f"{api_id} 주문 유량 재시도 실패")
 
     async def buy_order(self, code: str, qty: int, price: int) -> dict:
         """KRX 보통 지정가 매수. 주문 화면은 상한가를 price로 전달한다."""
@@ -819,11 +879,14 @@ class RestClient:
             if row["code"] == code
         ), {"code": code, "name": "", "held_qty": 0, "sellable_qty": 0})
 
-    async def open_buy_orders(self, code: str) -> list[dict]:
-        """ka10075로 해당 종목의 계좌 전체 미체결 매수주문을 조회한다."""
+    async def open_buy_orders(self, code: str = "") -> list[dict]:
+        """ka10075로 계좌 미체결 매수주문을 조회한다.
+
+        code를 비우면 계좌 전 종목을 한 번에 받는다(앱 시작·재접속 시 장부 초기화).
+        """
         code = str(code).strip().split("_")[0].removeprefix("A")
         body = {
-            "all_stk_tp": "1",  # 종목
+            "all_stk_tp": "1" if code else "0",  # 종목 / 전체
             "trde_tp": "2",     # 매수
             "stk_cd": code,
             "stex_tp": "0",     # 통합
@@ -839,7 +902,8 @@ class RestClient:
                 order_no = str(item.get("ord_no") or "").strip()
                 row_code = str(item.get("stk_cd") or code)
                 row_code = row_code.split("_")[0].removeprefix("A")
-                if order_no and remaining > 0 and row_code == code:
+                if order_no and remaining > 0 and (
+                        not code or row_code == code):
                     ordered = max(0, _to_int(item.get("ord_qty")))
                     exchange = str(
                         item.get("stex_tp_txt") or "").strip().upper()
@@ -851,7 +915,7 @@ class RestClient:
                             "0": "SOR", "1": "KRX", "2": "NXT",
                         }.get(str(item.get("stex_tp") or ""), "KRX")
                     out.append({
-                        "code": code,
+                        "code": row_code,
                         "order_no": order_no,
                         "order_qty": ordered,
                         "remaining_qty": remaining,

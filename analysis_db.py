@@ -2376,9 +2376,9 @@ def theme_summary_rows(query: str = "", db_path: Path = DB_PATH) -> list[dict]:
 def active_theme_labels(db_path: Path = DB_PATH) -> dict[str, tuple[str, ...]]:
     """현재 유효한 종목별 테마명을 출처 우선순위대로 반환한다.
 
-    조건검색 실시간 정렬은 네이버 테마를 기본 분류로 쓰되, 네이버에 없는
-    종목은 키움 등 수집된 보조 출처의 테마로 묶는다. 한 종목의 복수 테마는
-    모두 보존하며 화면에서 현재 가장 강한 묶음을 대표 테마로 선택한다.
+    조건검색 실시간 정렬은 수동 등록과 네이버 테마를 함께 기본 분류로 쓰고,
+    둘 다 없는 종목만 키움 등 보조 출처로 묶는다. 한 종목의 복수 테마는 모두
+    보존하며 화면에서 현재 가장 강한 묶음을 대표 테마로 선택한다.
     """
     if not db_path.exists():
         return {}
@@ -2408,14 +2408,14 @@ def active_theme_labels(db_path: Path = DB_PATH) -> dict[str, tuple[str, ...]]:
                      WHERE stock_type='PREFERRED'""",
             ).fetchall()
         }
-    # 화면 테마정렬은 한 종목에 대해 가장 신뢰도 높은 출처 하나만 사용한다.
-    # MANUAL은 운용자가 명시적으로 검증·등록한 테마이므로 자동 수집 원천보다 우선한다.
-    # 예를 들어 네이버 세부 테마가 있는 포톤·알트에 WICS의 넓은 업종인
-    # '핸드셋'까지 함께 붙이면, 서로 다른 재료의 종목이 같은 테마로
-    # 정렬될 수 있다. 네이버 테마가 없을 때에만 키움/WICS 등을 보완한다.
+    # MANUAL과 네이버는 둘 다 세부 테마라 합쳐도 서로를 오염시키지 않는다.
+    # 합쳐야 한 종목의 여러 재료가 후보로 남아, 화면의 테마 강도 계산이 그날
+    # 실제로 강한 테마를 고를 수 있다. MANUAL 하나만 남기면 대주전자재료가
+    # '2차전지'에 묶여 우주태양광 재료가 뜬 날에도 그대로 갇힌다.
+    # 반면 WICS의 '핸드셋'·'화학' 같은 넓은 업종은 서로 다른 재료의 종목을
+    # 한 묶음으로 만드므로, 세부 테마가 아예 없을 때만 보완으로 쓴다.
+    CURATED_SOURCES = ("MANUAL", "NAVER")
     source_rank = {
-        "MANUAL": 0,
-        "NAVER": 1,
         "KIWOOM": 2,
         "WICS": 3,
         "KRX": 4,
@@ -2432,11 +2432,17 @@ def active_theme_labels(db_path: Path = DB_PATH) -> dict[str, tuple[str, ...]]:
                 themes.append(theme)
     result: dict[str, tuple[str, ...]] = {}
     for code, sources in by_code_source.items():
-        preferred = min(
-            sources,
-            key=lambda source: (source_rank.get(source, 9), source),
-        )
-        themes = list(sources[preferred])
+        themes = list(dict.fromkeys(
+            theme
+            for source in CURATED_SOURCES
+            for theme in sources.get(source, ())
+        ))
+        if not themes:
+            preferred = min(
+                sources,
+                key=lambda source: (source_rank.get(source, 9), source),
+            )
+            themes = list(sources[preferred])
         # 우선주는 본주와의 관계와 별개로 단기 수급에서 함께 움직이는
         # 독립 테마다. 세부 업종(식품·IT서비스 등)만으로 분리하지 않고
         # 현재 조건검색의 우선주 흐름을 하나의 그룹으로 정렬한다.

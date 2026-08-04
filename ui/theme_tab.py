@@ -9,11 +9,11 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, QUrl, QUrlQuery
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
-    QHBoxLayout, QLabel, QLineEdit, QPushButton, QTableWidget,
+    QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QTableWidget,
     QTableWidgetItem, QVBoxLayout,
 )
 
-from analysis_db import theme_summary_rows
+from analysis_db import set_realtime_watch, theme_summary_rows
 from gui import NumericTableWidgetItem
 
 
@@ -104,7 +104,9 @@ class ThemeTabMixin:
                         item.setToolTip(
                             "클릭하면 네이버 금융 테마 상세 페이지를 엽니다.")
                 if column == 5:
-                    item.setToolTip(members)
+                    item.setToolTip(
+                        "클릭하면 이 테마 종목을 관심종목에 모두 추가합니다.\n"
+                        f"{members}")
                 table.setItem(row_index, column, item)
         table.setSortingEnabled(True)
         table.resizeColumnsToContents()
@@ -116,6 +118,9 @@ class ThemeTabMixin:
             f"현재 테마 {len(rows):,}개 · 종목 연결 {total_members:,}건")
 
     def _theme_table_clicked(self, row: int, column: int):
+        if column == 5:
+            self._add_theme_members_to_watchlist(row)
+            return
         if column != 2:
             return
         item = self._theme_table.item(row, column)
@@ -133,3 +138,40 @@ class ThemeTabMixin:
             self.statusBar().showMessage(
                 f"네이버 테마 열기: {item.text()} (no={source_code})", 5000)
             QDesktopServices.openUrl(url)
+
+    def _add_theme_members_to_watchlist(self, row: int):
+        """테마 구성 종목을 관심종목(실시간 감시)에 한 번에 추가한다."""
+        item = self._theme_table.item(row, 5)
+        theme_item = self._theme_table.item(row, 2)
+        if item is None:
+            return
+        codes = []
+        for member in str(item.text() or "").split(","):
+            code = member.strip().split(" ", 1)[0].strip()
+            if code and code not in codes:
+                codes.append(code)
+        if not codes:
+            return
+        theme_name = theme_item.text() if theme_item is not None else "테마"
+        answer = QMessageBox.question(
+            self, "관심종목 추가",
+            f"'{theme_name}' 종목 {len(codes)}개를 관심종목에 추가할까요?",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        added = 0
+        failed = []
+        for code in codes:
+            try:
+                set_realtime_watch(code, True, "THEME_TAB")
+                added += 1
+            except ValueError as error:
+                failed.append(f"{code}: {error}")
+        self._refresh_realtime_watch_table()
+        self._refresh_realtime_news_table()
+        self._refresh_limit_up_table()
+        self.watchlist_changed.emit()
+        message = f"'{theme_name}' 관심종목 {added}개 추가"
+        if failed:
+            message += f" · 실패 {len(failed)}개"
+        self.statusBar().showMessage(message, 5000)

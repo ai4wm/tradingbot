@@ -22,7 +22,8 @@ from PySide6.QtWidgets import (
 
 import config
 from analysis_db import (
-    DB_PATH, log_content_request, news_request_count_today, news_rows,
+    DB_PATH, active_theme_labels, log_content_request,
+    news_request_count_today, news_rows,
     realtime_watch_codes, realtime_watch_rows,
     reconcile_news_search_results,
     resolve_analysis_stock, save_news_items, set_realtime_watch,
@@ -118,7 +119,8 @@ class StockNewsTabMixin:
         layout.addWidget(self._news_status)
 
         watch_columns = (
-            "번호", "종목명", "감시", "종목코드", "최근 뉴스", "마지막 조회",
+            "번호", "종목명", "테마", "감시", "종목코드", "최근 뉴스",
+            "마지막 조회",
         )
         self._news_watch_table = QTableWidget(0, len(watch_columns))
         self._news_watch_table.setHorizontalHeaderLabels(watch_columns)
@@ -132,12 +134,12 @@ class StockNewsTabMixin:
         watch_header.setSectionsMovable(False)
         watch_header.setStretchLastSection(False)
         saved_watch_header = self._settings.value(
-            "analysis_news_watch_header_v4")
+            "analysis_news_watch_header_v5")
         self._news_watch_header_restored = bool(
             saved_watch_header is not None
             and watch_header.restoreState(saved_watch_header))
         if not self._news_watch_header_restored:
-            for column, width in enumerate((42, 115, 38, 72, 145, 145)):
+            for column, width in enumerate((42, 115, 150, 38, 72, 145, 145)):
                 self._news_watch_table.setColumnWidth(column, width)
         # 기본은 등록 순서(번호 오름차순)이며, 이후 모든 열 제목으로 정렬 가능하다.
         self._news_watch_table.sortItems(0, Qt.SortOrder.AscendingOrder)
@@ -396,7 +398,7 @@ class StockNewsTabMixin:
         if not hasattr(self, "_news_watch_table"):
             return
         self._settings.setValue(
-            "analysis_news_watch_header_v4",
+            "analysis_news_watch_header_v5",
             self._news_watch_table.horizontalHeader().saveState())
         self._settings.sync()
 
@@ -420,14 +422,21 @@ class StockNewsTabMixin:
         if not hasattr(self, "_news_watch_table"):
             return
         rows = realtime_watch_rows()
+        try:
+            theme_labels = active_theme_labels()
+        except Exception as error:  # noqa: BLE001
+            log.warning("watch theme labels failed: %s", error)
+            theme_labels = {}
         table = self._news_watch_table
         selected_code = self._selected_watch_code
         table.setSortingEnabled(False)
         table.setRowCount(len(rows))
         selected_row = -1
         for row_index, row in enumerate(rows):
+            themes = theme_labels.get(row["stock_code"], ())
             values = (
-                row_index + 1, row["stock_name"], "★", row["stock_code"],
+                row_index + 1, row["stock_name"], ", ".join(themes),
+                "★", row["stock_code"],
                 self._display_timestamp(row["latest_news_at"]),
                 self._display_timestamp(row["last_news_checked_at"]),
             )
@@ -442,7 +451,9 @@ class StockNewsTabMixin:
                     Qt.ItemDataRole.UserRole + 3, row["stock_name"])
                 if column == 0:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                elif column == 2:
+                elif column == 2 and themes:
+                    item.setToolTip("\n".join(themes))
+                elif column == 3:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                     item.setForeground(QColor("#f4b400"))
                 elif column == 1 and row["market"] == "KOSDAQ":
@@ -461,7 +472,7 @@ class StockNewsTabMixin:
                     break
         if not self._news_watch_header_initialized:
             if not self._news_watch_header_restored:
-                for column, width in enumerate((42, 115, 38, 72, 145, 145)):
+                for column, width in enumerate((42, 115, 150, 38, 72, 145, 145)):
                     table.setColumnWidth(column, width)
             self._news_watch_header_initialized = True
         if rows and selected_row < 0:
@@ -620,7 +631,7 @@ class StockNewsTabMixin:
             return
         code = str(
             item.data(Qt.ItemDataRole.UserRole + 2) or "")
-        if column == 2:
+        if column == 3:  # ★ 감시 해제
             set_realtime_watch(code, False)
             if self._selected_watch_code == code:
                 self._selected_watch_code = ""
