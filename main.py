@@ -525,6 +525,10 @@ class View:
         self._beep_t = 0.0  # 편입소리 스로틀 (개장 이벤트 폭주 때 소리 도배 방지)
         screen.sound_check.setChecked(self._settings.value(self.prefix + "sound", "false") == "true")
         screen.sound_check.toggled.connect(self._on_sound)
+        screen.jumsang_check.setChecked(
+            self._settings.value(self.prefix + "jumsang", "false") == "true")
+        screen.jumsang_check.toggled.connect(self._on_jumsang)
+        screen.jumsang_entered.connect(self._on_jumsang_entered)
 
     # --- 조건 목록/선택 ---------------------------------------------------
     def on_condition_list(self, items):
@@ -723,6 +727,14 @@ class View:
         if self.screen.sound_check.isChecked() and time.monotonic() - self._beep_t >= 1.0:
             self._beep_t = time.monotonic()
             _beep("in")
+
+    def _on_jumsang(self, on: bool):
+        self._settings.setValue(self.prefix + "jumsang", "true" if on else "false")
+        self._settings.sync()
+
+    def _on_jumsang_entered(self, code: str):
+        _beep("jumsang")
+        log.info("jumsang%s: %s", self.prefix or "", code)
 
     def _on_auto_refresh(self, on: bool):
         self._settings.setValue(self._mkey("auto_refresh"), "true" if on else "false")
@@ -2745,26 +2757,40 @@ class App:
         krx_state, _, reason = _market_session_states(datetime.now())
         if reason or krx_state != "정규장":
             return
-        stage = self._balance_sell_stage.get(code, 0)
-        target = max((
-            number for number, key in enumerate(
-                ("first", "second", "third"), 1)
-            if int(setting.get(key, 0)) > 0
-            and bid_qty <= int(setting[key])
-        ), default=0)
-        if target <= stage:
+        # 번호는 이름일 뿐이고 실행 순서는 기준 잔량이 큰 쪽 -> 작은 쪽이다.
+        # 여러 기준을 한 번에 밑돌면 기준이 가장 작은 단계 하나만 실행하고
+        # 같이 밑돈 단계는 주문 없이 소진한다(진행도 = 지나온 깊이).
+        order = sorted(
+            ((int(setting.get(key, 0)), number)
+             for number, key in enumerate(("first", "second", "third"), 1)
+             if int(setting.get(key, 0)) > 0),
+            key=lambda item: (-item[0], item[1]))
+        progress = self._balance_sell_stage.get(code, 0)
+        depth = sum(1 for threshold, _ in order if bid_qty <= threshold)
+        if depth <= progress:
             return
+        threshold, number = order[depth - 1]
         ratio = float(setting.get(
-            ("first_ratio", "second_ratio", "third_ratio")[target - 1],
-            (0.0, 0.5, 1.0)[target - 1]))
+            ("first_ratio", "second_ratio", "third_ratio")[number - 1],
+            (0.0, 0.5, 1.0)[number - 1]))
         if ratio <= 0:
             audit_log.info(
-                "balance sell stage skipped code=%s stage=%s "
+                "balance sell stage skipped code=%s slot=%s depth=%s "
                 "bid_qty=%s threshold=%s ratio=%s",
-                code, target, bid_qty,
-                setting.get(("first", "second", "third")[target - 1]),
-                ratio)
-            self._complete_balance_stage(code, target)
+                code, number, depth, bid_qty, threshold, ratio)
+            self._complete_balance_stage(code, depth, sound="balance1")
+            return
+        # 앞 단계에서 다 팔아 보유가 없고 들어올 매수도 없으면 낼 주문이 없다.
+        # 틱마다 재시도하지 않도록 조용히 소진한다. 장부에 항목이 있을 때만
+        # 믿는다 — 항목이 없으면 체결 반영 지연일 수 있어 기존대로 재시도한다.
+        booked = self._position_book.get(code)
+        if (progress > 0 and booked is not None and booked["held"] <= 0
+                and not self._pending_open_buys(code)):
+            audit_log.info(
+                "balance sell stage consumed; nothing held code=%s "
+                "slot=%s depth=%s bid_qty=%s threshold=%s",
+                code, number, depth, bid_qty, threshold)
+            self._complete_balance_stage(code, depth, sound=None)
             return
         market_sell = bool(setting.get("market_sell", False))
         row = next((
@@ -2772,7 +2798,7 @@ class App:
             for view in self.views if code in view.screen.model.rows), {})
         if market_sell:
             price = 0
-        elif target == 3:
+        elif number == 3:
             # 매수 4호가 잔량/존재 여부와 무관하게 3틱 아래 가격으로
             # 지정가를 즉시 낸다. 실제 4호가가 비면 가격을 직접 계산한다.
             price = _balance_stage3_limit_price(row)
@@ -2781,42 +2807,48 @@ class App:
         if not market_sell and price <= 0:
             log.warning(
                 "balance sell reference price unavailable "
-                "code=%s stage=%s bid_qty=%s",
-                code, target, bid_qty)
+                "code=%s slot=%s depth=%s bid_qty=%s",
+                code, number, depth, bid_qty)
             return
         running = self._balance_sell_tasks.get(code)
         if running and not running.done():
             return
         audit_log.info(
-            "balance sell stage triggered code=%s stage=%s "
+            "balance sell stage triggered code=%s slot=%s depth=%s "
             "bid_qty=%s threshold=%s ratio=%s order_type=%s price=%s",
-            code, target, bid_qty,
-            setting.get(("first", "second", "third")[target - 1]),
+            code, number, depth, bid_qty, threshold,
             ratio, "market" if market_sell else "limit", price)
         task = asyncio.ensure_future(
             self._execute_balance_stage(
-                code, target, ratio, price, bid_qty, market_sell))
+                code, depth, number, ratio, price, bid_qty, market_sell))
         self._balance_sell_tasks[code] = task
         task.add_done_callback(
             lambda _task, stock_code=code:
             self._balance_sell_tasks.pop(stock_code, None))
 
-    def _complete_balance_stage(self, code: str, target: int):
-        if target <= self._balance_sell_stage.get(code, 0):
+    def _complete_balance_stage(
+            self, code: str, depth: int, sound: str | None = "balance_sold"):
+        """depth = 기준 잔량이 큰 쪽부터 센 진행도. 번호가 아니라 깊이로 센다.
+
+        소리는 단계 번호가 아니라 무슨 일이 있었는지로 가른다.
+        매도 체결=매도음, 0%(소리만)=경고음, 팔 것이 없어 소진=무음.
+        """
+        if depth <= self._balance_sell_stage.get(code, 0):
             return
-        self._balance_sell_stage[code] = target
+        self._balance_sell_stage[code] = depth
         for view in self.views:
-            view.screen.set_balance_sell_stage(code, target)
+            view.screen.set_balance_sell_stage(code, depth)
         self._save_order_settings()
-        _beep(f"balance{target}")
+        if sound:
+            _beep(sound)
 
     async def _execute_balance_stage(
-            self, code: str, target: int, ratio: float,
+            self, code: str, depth: int, number: int, ratio: float,
             price: int, bid_qty: int, market_sell: bool):
         # 일부라도 파는 단계에서는 남은 매수를 먼저 끊는다. 미체결을 그대로 두면
         # 방금 판 물량을 다시 사게 된다. 취소는 장부만 보고 즉시 전송하므로
         # 미체결이 없으면 매도까지 단 한 번의 대기도 생기지 않는다.
-        reason = f"잔량 {target}단계"
+        reason = f"잔량 {number}번"
         self.orders.stop_local_submissions(code)
         pending = self._pending_open_buys(code)
         deferred = self._cancel_open_buys_now(code, pending, reason)
@@ -2829,8 +2861,8 @@ class App:
         except Exception:  # noqa: BLE001
             log.exception(
                 "balance sell failed; stage remains pending "
-                "code=%s stage=%s",
-                code, target)
+                "code=%s slot=%s depth=%s",
+                code, number, depth)
             return
         finally:
             # 매도를 보낸 뒤 남은 취소를 이어 보내고, 장부가 못 본 미체결은
@@ -2840,10 +2872,10 @@ class App:
         if sold <= 0:
             # 보유가 아직 잔고에 반영되지 않은 경우 다음 호가에서 재조회한다.
             return
-        self._complete_balance_stage(code, target)
+        self._complete_balance_stage(code, depth)
         log.warning(
-            "balance sell completed code=%s stage=%s bid_qty=%s sold=%s",
-            code, target, bid_qty, sold)
+            "balance sell completed code=%s slot=%s depth=%s bid_qty=%s sold=%s",
+            code, number, depth, bid_qty, sold)
 
     async def _sell_account_position(
             self, code: str, ratio: float, price: int, reason: str,
@@ -3769,7 +3801,7 @@ class DetachedClockWindow(QWidget):
         self._owner._update_analysis_clock()
         self.setToolTip(
             f"배경 불투명도 {alpha * 100 // 255}% (휠로 조절)\n"
-            "끌어서 이동 · 우하단 모서리로 크기 조절\n"
+            "끌어서 이동 · 우하단 모서리로 크기 조절(가로·세로 따로)\n"
             "더블클릭하면 분석창으로 되돌립니다.")
 
     def mouseDoubleClickEvent(self, _event):

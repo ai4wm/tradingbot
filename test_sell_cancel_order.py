@@ -107,7 +107,7 @@ ONE_PENDING = [{"code": "005930", "order_no": "0009",
 
 async def check_balance_no_pending():
     app = _app([])
-    await app._execute_balance_stage("005930", 2, 0.5, 70000, 10, False)
+    await app._execute_balance_stage("005930", 2, 2, 0.5, 70000, 10, False)
     calls = app.rest.calls
     # 매도 전에는 잔고조회 하나뿐이어야 한다. 취소도 스윕도 앞서면 안 된다.
     assert calls[:2] == ["position", "sell"], calls
@@ -116,7 +116,7 @@ async def check_balance_no_pending():
 
 async def check_balance_pending():
     app = _app(ONE_PENDING)
-    await app._execute_balance_stage("005930", 2, 0.5, 70000, 10, False)
+    await app._execute_balance_stage("005930", 2, 2, 0.5, 70000, 10, False)
     calls = app.rest.calls
     assert calls[0] == "cancel_start:0009", calls
     # 매도는 취소 응답을 기다리지 않으므로 이 시점에 취소는 아직 진행 중이다.
@@ -131,7 +131,7 @@ async def check_balance_nine_splits():
     import api
 
     app = _app(_splits(9))
-    await app._execute_balance_stage("005930", 3, 1.0, 70000, 5, False)
+    await app._execute_balance_stage("005930", 3, 3, 1.0, 70000, 5, False)
     calls = app.rest.calls
     sent = [c for c in calls if c.startswith("cancel_start") or c == "sell"]
     # 매도 앞의 취소는 창 하나를 다 쓰지 않아야 한다(ORDER_BURST-1건 이하).

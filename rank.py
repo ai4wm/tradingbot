@@ -52,9 +52,8 @@ TONES = {  # (주파수Hz, 길이ms) 나열 -> 멜로디. 시스템 테마 무�
     "top":  [(1047, 130), (1319, 130), (1568, 420)],
     "jump": [(1100, 1000)],  # 급상승: 띠—— 긴 단일음
     "in":   [(784, 140), (1047, 140), (1319, 280)],  # 조건 편입: 뚜-뚜-띠~↑ (3음 차임, 길고 또렷)
-    "balance1": [(880, 180), (880, 180)],  # 잔량 1단계: 주의
-    "balance2": [(880, 180), (880, 180)],
-    "balance3": [(880, 180), (880, 180)],
+    "balance1": [(880, 180), (880, 180)],  # 잔량 단계 도달: 경고음만 (0% 소리만)
+    "balance_sold": [(880, 180), (1175, 300)],  # 실제 매도 체결
     "ls_news": [(784, 120), (988, 220)],  # 이전 일반 뉴스 호출 호환용
     "ls_news_with_code": [(988, 120), (1319, 220)],
     "ls_news_without_code": [(784, 120), (988, 220)],
@@ -62,6 +61,7 @@ TONES = {  # (주파수Hz, 길이ms) 나열 -> 멜로디. 시스템 테마 무�
     "telegram_news": [(1245, 120), (1568, 200)],
     "telegram_news_with_code": [(1245, 120), (1568, 200)],
     "telegram_news_without_code": [(880, 120), (1108, 200)],
+    "jumsang": [(1568, 120), (1568, 120), (2093, 320)],  # 점상 편입
 }
 
 
@@ -99,8 +99,7 @@ def _tone_wav(tones, sample_rate: int = 44100) -> bytes:
 _SOUND_EFFECTS = {}
 KIWOOM_ALERT_FILES = {
     "balance1": Path(r"C:\KiwoomHero4\sound\sound7.wav"),
-    "balance2": Path(r"C:\KiwoomHero4\sound\주문접수완료1.wav"),
-    "balance3": Path(r"C:\KiwoomHero4\sound\주문접수완료1.wav"),
+    "balance_sold": Path(r"C:\KiwoomHero4\sound\주문접수완료1.wav"),
     "ls_news": Path(r"C:\KiwoomHero4\sound\sound11.wav"),
     "ls_news_with_code": Path(r"C:\KiwoomHero4\sound\sound8.wav"),
     "ls_news_without_code": Path(r"C:\KiwoomHero4\sound\sound11.wav"),
@@ -108,6 +107,7 @@ KIWOOM_ALERT_FILES = {
     "telegram_news": Path(r"C:\KiwoomHero4\sound\sound10.wav"),
     "telegram_news_with_code": Path(r"C:\KiwoomHero4\sound\sound10.wav"),
     "telegram_news_without_code": Path(r"C:\KiwoomHero4\sound\sound9.wav"),
+    "jumsang": Path(r"C:\KiwoomHero4\sound\sound0.wav"),
 }
 
 

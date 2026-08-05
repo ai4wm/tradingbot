@@ -59,6 +59,9 @@ BALANCE_SELL_COL = FIELDS.index("balance_sell")
 AUTO_CANCEL_ARM_COL = FIELDS.index("auto_cancel_arm")
 EXIT_HOTKEY_COL = FIELDS.index("exit_hotkey")
 BALANCE_SELL_MARKET_LAST_KEY = "balance_sell_market_last"
+BALANCE_SELL_STAGE_KEYS = ("first", "second", "third")
+BALANCE_SELL_STAGE_LAST_KEYS = tuple(
+    f"balance_sell_stage_last/{key}" for key in BALANCE_SELL_STAGE_KEYS)
 RANK_COLS = (FIELDS.index("qrank"), FIELDS.index("qrank_chg"))
 RANK_CHANGE_COL = FIELDS.index("qrank_chg")
 RANK_DEFAULT_WIDTHS = {RANK_COLS[0]: 42, RANK_COLS[1]: 48}
@@ -145,17 +148,6 @@ def _theme_family(theme: str) -> str:
             or "피지컬 ai" in value or "온디바이스 ai" in value):
         return "AI·인공지능"
     return ""
-
-
-def _theme_group_precedence(group: tuple[str, str]) -> int:
-    """같은 종목의 넓은 테마와 세부 테마가 겹칠 때 세부 테마를 우선한다."""
-    if group[0] != "theme":
-        return 1
-    if group[1] == "2차전지(장비)":
-        return 0
-    if group[1] == "2차전지":
-        return 2
-    return 1
 
 
 class NumericTableWidgetItem(QTableWidgetItem):
@@ -285,7 +277,7 @@ class ClipTextDelegate(PreserveTextColorDelegate):
             _draw_selection_lines(painter, option.rect, option.palette)
 
 
-class OrderDelegate(QStyledItemDelegate):
+class OrderDelegate(PreserveTextColorDelegate):
     """주문 상태 왼쪽 + 종목별 잔량취소 오른쪽."""
 
     CANCEL_WIDTH = 34
@@ -615,10 +607,8 @@ class TieredProxy(QSortFilterProxyModel):
             candidates = family_candidates or theme_candidates or relation_candidates
             group = min(
                 candidates,
-                key=lambda item: (
-                    _theme_group_precedence(item),
-                    strengths.get(item, (2, 999999, 0, 0, 0, item[1])),
-                ),
+                key=lambda item: strengths.get(
+                    item, (2, 999999, 0, 0, 0, item[1])),
             ) if candidates else ("none", "미분류")
             self._theme_group_keys[code] = group
             theme_strength = strengths.get(
@@ -799,6 +789,60 @@ class TieredProxy(QSortFilterProxyModel):
 class ThemeGroupedTableView(QTableView):
     """거래상태 가로 구분선과 핵심 거래 열 세로 안내선을 표시한다."""
 
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._blink_codes: dict[str, int] = {}  # code -> 남은 토글 수
+        self._blink_on = False
+        self._blink_timer = QTimer(self)
+        self._blink_timer.timeout.connect(self._tick_blink)
+
+    def blink_rows(self, codes, times: int = 8, interval_ms: int = 220):
+        """해당 종목 행 테두리를 times/2회 깜박인다. 이미 깜박이는 행은 연장."""
+        if not codes:
+            return
+        for code in codes:
+            self._blink_codes[code] = times
+        self._blink_on = True
+        if not self._blink_timer.isActive():
+            self._blink_timer.start(interval_ms)
+        self.viewport().update()
+
+    def _tick_blink(self):
+        self._blink_on = not self._blink_on
+        for code, left in tuple(self._blink_codes.items()):
+            if left <= 1:
+                del self._blink_codes[code]
+            else:
+                self._blink_codes[code] = left - 1
+        if not self._blink_codes:
+            self._blink_timer.stop()
+            self._blink_on = False
+        self.viewport().update()
+
+    def waiting_group(self) -> tuple[int, set[str]]:
+        """첫 구분선 위(아직 첫 거래 전) 그룹의 마지막 행과, 그중 매도잔량이
+        0인(점상) 종목코드. 선 안에서도 tier 1 -> 0으로 올라오는 순간이
+        점상알림의 대상이라 두 tier를 구분해 돌려준다."""
+        proxy = self.model()
+        if not (isinstance(proxy, TieredProxy) and proxy.limit_mode
+                and not _in_opening_auction()):
+            return -1, set()
+        source = proxy.sourceModel()
+        if source is None or not hasattr(source, "codes"):
+            return -1, set()
+        last_row, jumsang = -1, set()
+        for row in range(proxy.rowCount()):
+            source_index = proxy.mapToSource(proxy.index(row, 0))
+            if not source_index.isValid():
+                break
+            tier = _limit_tier(source.rows[source.codes[source_index.row()]], False)
+            if tier not in (0, 1):
+                break
+            last_row = row
+            if tier == 0:
+                jumsang.add(source.codes[source_index.row()])
+        return last_row, jumsang
+
     def paintEvent(self, event):
         super().paintEvent(event)
         proxy = self.model()
@@ -807,23 +851,8 @@ class ThemeGroupedTableView(QTableView):
 
         # 상한가 정렬 순서는 그대로 두고, 09시 이후에도 예상상한 상태로
         # 아직 첫 거래가 시작되지 않은 종목군의 끝만 가로선으로 구분한다.
-        if (
-            isinstance(proxy, TieredProxy)
-            and proxy.limit_mode
-            and not _in_opening_auction()
-            and proxy.rowCount() > 1
-        ):
-            source = proxy.sourceModel()
-            last_waiting_row = -1
-            if source is not None and hasattr(source, "codes"):
-                for row in range(proxy.rowCount()):
-                    source_index = proxy.mapToSource(proxy.index(row, 0))
-                    if not source_index.isValid():
-                        break
-                    code = source.codes[source_index.row()]
-                    if _limit_tier(source.rows[code], False) not in (0, 1):
-                        break
-                    last_waiting_row = row
+        if proxy is not None and proxy.rowCount() > 1:
+            last_waiting_row = self.waiting_group()[0]
             if 0 <= last_waiting_row < proxy.rowCount() - 1:
                 y = (
                     self.rowViewportPosition(last_waiting_row)
@@ -855,6 +884,20 @@ class ThemeGroupedTableView(QTableView):
                     painter.setPen(QPen(color, width))
                     painter.drawLine(left, 0, left, line_bottom)
                     painter.drawLine(right, 0, right, line_bottom)
+
+        # 점상알림으로 올라온 행: 소리와 같이 테두리를 몇 번 깜박인다.
+        source = proxy.sourceModel() if proxy is not None else None
+        if (self._blink_codes and self._blink_on
+                and source is not None and hasattr(source, "codes")):
+            painter.setPen(QPen(QColor("#00E5FF"), 2))
+            for row in range(proxy.rowCount()):
+                source_index = proxy.mapToSource(proxy.index(row, 0))
+                if (not source_index.isValid()
+                        or source.codes[source_index.row()] not in self._blink_codes):
+                    continue
+                y, h = self.rowViewportPosition(row), self.rowHeight(row)
+                if y + h >= 0 and y < self.viewport().height():
+                    painter.drawRect(0, y, self.viewport().width() - 1, h - 1)
         painter.end()
 
 
@@ -1605,12 +1648,10 @@ class StockModel(QAbstractTableModel):
             stage = self.balance_sell_stage.get(code, 0)
             if role == Qt.DisplayRole:
                 if setting:
-                    keys = ["first", "second"]
-                    if int(setting.get("third", 0)) > 0:
-                        keys.append("third")
                     return " / ".join(
                         _shares_in_ten_thousands(setting[key])
-                        for key in keys)
+                        for key in BALANCE_SELL_STAGE_KEYS
+                        if int(setting.get(key, 0)) > 0)
                 bid = max(0, int(stored.get("bid_qty") or 0))
                 if bid:
                     first, _, _ = _balance_sell_suggestion(bid)
@@ -1645,13 +1686,13 @@ class StockModel(QAbstractTableModel):
                         f"적용 중인 보조 설정\n"
                         f"주문방식: "
                         f"{'시장가' if setting.get('market_sell', False) else '지정가'}\n"
-                        f"1차 {setting['first']:,}주 이하"
+                        f"1번 {setting['first']:,}주 이하"
                         f"{' (꺼짐)' if not setting['first'] else ''}: "
                         f"{int(float(setting.get('first_ratio', 0)) * 100)}% 매도\n"
-                        f"2차 {setting['second']:,}주 이하"
+                        f"2번 {setting['second']:,}주 이하"
                         f"{' (꺼짐)' if not setting['second'] else ''}: "
                         f"{int(float(setting.get('second_ratio', .5)) * 100)}%까지 매도\n"
-                        f"3차 {setting['third']:,}주 이하"
+                        f"3번 {setting['third']:,}주 이하"
                         f"{' (꺼짐)' if not setting['third'] else ''}: "
                         f"{int(float(setting.get('third_ratio', 1)) * 100)}%까지 매도\n"
                         "클릭하면 수정")
@@ -2063,7 +2104,6 @@ class BalanceSellDialog(QDialog):
             self._settings = QSettings("layout.ini", QSettings.IniFormat)
         self._market_sell_key = BALANCE_SELL_MARKET_LAST_KEY
         self._manual_edit = self.config is not None
-        self._third_before_second_full = None
         name = screen.model.rows.get(code, {}).get("name") or code
         self.setWindowTitle(f"3단 잔량매도 설정 — {name}")
         self.setModal(True)
@@ -2085,6 +2125,15 @@ class BalanceSellDialog(QDialog):
                 "Ctrl+화살표/휠: 100만")
             edit.valueChanged.connect(self._mark_manual)
             edit.lineEdit().returnPressed.connect(self._apply)
+        # 단계별 사용 체크. 해제한 단계는 기준 0으로 적용돼 감시·주문에서 빠진다.
+        self.first_check = QCheckBox("1")
+        self.second_check = QCheckBox("2")
+        self.third_check = QCheckBox("3")
+        for stage_check in self.stage_checks():
+            stage_check.setToolTip(
+                "해제하면 이 단계는 경고음도 주문도 실행하지 않습니다."
+                " 마지막 체크 상태를 기억합니다.")
+            stage_check.toggled.connect(self._on_stage_toggled)
         self.first_sell_combo = QComboBox()
         self.second_sell_combo = QComboBox()
         self.third_sell_combo = QComboBox()
@@ -2096,8 +2145,6 @@ class BalanceSellDialog(QDialog):
                     ("100% 전량매도", 1.0)):
                 combo.addItem(label, ratio)
             combo.currentIndexChanged.connect(self._mark_manual)
-        self.second_sell_combo.currentIndexChanged.connect(
-            self._on_second_sell_changed)
         self.market_sell_check = QCheckBox("시장가 매도")
         self.market_sell_check.setToolTip(
             "마지막 체크/해제 상태를 즉시 저장해 다음 설정창과 앱 재실행 때 "
@@ -2160,15 +2207,15 @@ class BalanceSellDialog(QDialog):
         grid.addWidget(QLabel("현재 적용값"), 0, 0)
         grid.addWidget(self.applied_label, 0, 1, 1, 2)
         grid.addWidget(self.market_sell_check, 0, 3)
-        grid.addWidget(QLabel("1차"), 1, 0)
+        grid.addWidget(self.first_check, 1, 0)
         grid.addWidget(self.first_edit, 1, 1)
         grid.addWidget(QLabel("이하 → 경고음 +"), 1, 2)
         grid.addWidget(self.first_sell_combo, 1, 3)
-        grid.addWidget(QLabel("2차"), 2, 0)
+        grid.addWidget(self.second_check, 2, 0)
         grid.addWidget(self.second_edit, 2, 1)
         grid.addWidget(QLabel("이하 → 경고음 +"), 2, 2)
         grid.addWidget(self.second_sell_combo, 2, 3)
-        grid.addWidget(QLabel("3차"), 3, 0)
+        grid.addWidget(self.third_check, 3, 0)
         grid.addWidget(self.third_edit, 3, 1)
         grid.addWidget(QLabel("이하 → 완료음 +"), 3, 2)
         grid.addWidget(self.third_sell_combo, 3, 3)
@@ -2185,6 +2232,20 @@ class BalanceSellDialog(QDialog):
         layout.addWidget(self.error_label)
         layout.addLayout(buttons)
 
+        # 적용된 설정이 있으면 그 설정의 기준값(0=해제)이 곧 체크 상태다.
+        # 없으면 마지막으로 쓰던 체크 상태를 되살린다(기본 전부 사용).
+        for stage_check, key, last_key in zip(
+                self.stage_checks(), BALANCE_SELL_STAGE_KEYS,
+                BALANCE_SELL_STAGE_LAST_KEYS):
+            if self.config:
+                enabled = int(self.config.get(key, 0)) > 0
+            else:
+                saved = self._settings.value(last_key)
+                enabled = True if saved is None else _stored_bool(saved)
+            stage_check.blockSignals(True)
+            stage_check.setChecked(enabled)
+            stage_check.blockSignals(False)
+
         if self.config:
             self.first_edit.setValue(self.config["first"])
             self.second_edit.setValue(self.config["second"])
@@ -2199,20 +2260,16 @@ class BalanceSellDialog(QDialog):
                     self.third_sell_combo), ratios):
                 combo_index = combo.findData(ratio)
                 combo.setCurrentIndex(combo_index if combo_index >= 0 else 0)
-            self._on_second_sell_changed()
             self.applied_label.setText(
                 ("시장가 · " if self.config.get("market_sell", False)
                  else "지정가 · ")
-                + f"{_compact_shares(self.config['first'])}↓ "
-                f"{self.first_sell_combo.currentText()} / "
-                f"{_compact_shares(self.config['second'])}↓ "
-                f"{self.second_sell_combo.currentText()} / "
-                + (
-                    "3차 제외"
-                    if float(self.second_sell_combo.currentData() or 0) >= 1
-                    else f"{_compact_shares(self.config['third'])}↓ "
-                         f"{self.third_sell_combo.currentText()}"
-                ))
+                + " / ".join(
+                    f"{_compact_shares(self.config[key])}↓ {combo.currentText()}"
+                    if int(self.config.get(key, 0)) > 0 else f"{label}번 제외"
+                    for key, label, combo in zip(
+                        BALANCE_SELL_STAGE_KEYS, ("1", "2", "3"),
+                        (self.first_sell_combo, self.second_sell_combo,
+                         self.third_sell_combo))))
         else:
             self.first_sell_combo.setCurrentIndex(0)
             self.third_sell_combo.setCurrentIndex(2)
@@ -2220,6 +2277,7 @@ class BalanceSellDialog(QDialog):
             self.applied_label.setText("없음 — 실제 주문은 실행되지 않습니다")
             self._refresh_suggestion()
             self._manual_edit = False
+        self._sync_stage_enabled()
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._refresh_live)
@@ -2228,6 +2286,32 @@ class BalanceSellDialog(QDialog):
         self.apply_btn.setFocus()
         # 창이 실제 표시된 뒤에도 Enter 기본 버튼에 포커스를 유지한다.
         QTimer.singleShot(0, self.apply_btn.setFocus)
+
+    def stage_checks(self):
+        return (self.first_check, self.second_check, self.third_check)
+
+    def _stage_rows(self):
+        return zip(
+            self.stage_checks(),
+            (self.first_edit, self.second_edit, self.third_edit),
+            (self.first_sell_combo, self.second_sell_combo,
+             self.third_sell_combo))
+
+    def _sync_stage_enabled(self):
+        """해제한 단계의 입력만 잠근다. 번호 간 종속은 없다."""
+        for stage_check, edit, combo in self._stage_rows():
+            enabled = stage_check.isChecked()
+            edit.setEnabled(enabled)
+            combo.setEnabled(enabled)
+
+    def _on_stage_toggled(self, checked: bool):
+        for stage_check, last_key in zip(
+                self.stage_checks(), BALANCE_SELL_STAGE_LAST_KEYS):
+            self._settings.setValue(
+                last_key, "true" if stage_check.isChecked() else "false")
+        self._settings.sync()
+        self._sync_stage_enabled()
+        self._mark_manual()
 
     def _mark_manual(self):
         self._manual_edit = True
@@ -2240,33 +2324,6 @@ class BalanceSellDialog(QDialog):
         self._settings.sync()
         self._mark_manual()
 
-    def _on_second_sell_changed(self, *_):
-        full = float(self.second_sell_combo.currentData() or 0) >= 1.0
-        if full:
-            if self.third_edit.value() > 0:
-                self._third_before_second_full = (
-                    self.third_edit.value(),
-                    self.third_sell_combo.currentIndex(),
-                )
-            self.third_edit.blockSignals(True)
-            self.third_sell_combo.blockSignals(True)
-            self.third_edit.setValue(0)
-            self.third_sell_combo.setCurrentIndex(0)
-            self.third_edit.blockSignals(False)
-            self.third_sell_combo.blockSignals(False)
-            self.third_edit.setEnabled(False)
-            self.third_sell_combo.setEnabled(False)
-            self.error_label.setText(
-                "2차 전량매도 선택: 3차 단계는 자동 제외됩니다.")
-        else:
-            self.third_edit.setEnabled(True)
-            self.third_sell_combo.setEnabled(True)
-            if self.third_edit.value() == 0 and self._third_before_second_full:
-                value, combo_index = self._third_before_second_full
-                self.third_edit.setValue(value)
-                self.third_sell_combo.setCurrentIndex(combo_index)
-            self.error_label.clear()
-
     def _current_bid(self) -> int:
         return max(
             0, int(self.screen.model.rows.get(self.code, {}).get("bid_qty") or 0))
@@ -2276,8 +2333,6 @@ class BalanceSellDialog(QDialog):
         if current <= 0:
             return
         first, second, third = _balance_sell_suggestion(current)
-        if float(self.second_sell_combo.currentData() or 0) >= 1.0:
-            third = 0
         for edit in (self.first_edit, self.second_edit, self.third_edit):
             edit.blockSignals(True)
         self.first_edit.setValue(first)
@@ -2303,11 +2358,15 @@ class BalanceSellDialog(QDialog):
         current = self._current_bid()
         upper = int(row.get("upper") or 0)
         bid_price = int(row.get("bid_price") or 0)
-        first = self.first_edit.value()
-        second = self.second_edit.value()
-        third = self.third_edit.value()
-        if float(self.second_sell_combo.currentData() or 0) >= 1.0:
-            third = 0
+        # 체크 해제한 단계는 기준 0으로 저장한다. 감시·주문 판정이 이미
+        # 기준 0을 "그 단계 없음"으로 처리하므로 실행 쪽은 그대로 둔다.
+        first = self.first_edit.value() if self.first_check.isChecked() else 0
+        second = self.second_edit.value() if self.second_check.isChecked() else 0
+        third = self.third_edit.value() if self.third_check.isChecked() else 0
+        if not (first or second or third):
+            self.error_label.setText(
+                "사용할 단계를 하나 이상 체크하세요. 감시를 끄려면 '감시 해제'.")
+            return
         if not upper or bid_price != upper:
             self.error_label.setText(
                 "현재 최우선 매수호가가 상한가가 아니므로 적용할 수 없습니다.")
@@ -2487,6 +2546,7 @@ class ConditionScreen(QWidget):
     market_overview_requested = Signal()
     realtime_news_requested = Signal()
     account_summary_requested = Signal()
+    jumsang_entered = Signal(str)  # 매도잔량 0으로 상한가정렬 tier 0에 올라온 종목
 
     def __init__(self, prefix: str = "", parent=None):
         super().__init__(parent)
@@ -2537,11 +2597,16 @@ class ConditionScreen(QWidget):
         self.theme_sort.setToolTip(
             "테마별로 묶어 정렬 · 상한가 진입이 빠른 테마 우선, "
             "그 외는 테마 내 최고 등락률 순 · 테마 안에서는 상한가 진입시각과 등락률 순")
+        self._jumsang_group: set[str] | None = None
+        self.jumsang_check = QCheckBox("점상알림")
+        self.jumsang_check.setToolTip(
+            "09:01~09:03 상한가정렬 첫 구분선 위 그룹(아직 첫 거래 전)에"
+            " 새로 올라온 종목을 소리로 알림 · 상한↑ 켜져 있어야 동작")
         self._checkbox_style = VisibleCheckStyle()
         self._checkbox_style.setParent(self)
         for checkbox in (
                 self.auto_refresh, self.auto_remove, self.sound_check,
-                self.limit_sort, self.theme_sort):
+                self.limit_sort, self.theme_sort, self.jumsang_check):
             checkbox.setStyle(self._checkbox_style)
         self.unified_check = QPushButton("K")  # KRX<->통합 조건검색·시세 전환, 전 창 공통
         self.unified_check.setCheckable(True)
@@ -2682,6 +2747,7 @@ class ConditionScreen(QWidget):
         account_bar.addWidget(QLabel("대출인출가능금액"))
         account_bar.addWidget(self.loan_withdrawable_value)
         account_bar.addStretch(1)
+        account_bar.addWidget(self.jumsang_check)
 
         # 주문 실행줄 — 종목을 고른 뒤 이 줄에서 분할/취소/주문방식을 즉시 결정한다.
         self.order_target_value = QLabel("종목을 선택하세요")
@@ -3698,6 +3764,10 @@ class ConditionScreen(QWidget):
         """스로틀 시간이 끝나면 현재 열과 방향으로 정렬을 확실히 다시 적용한다."""
         self.proxy.invalidate()
         self._apply_sort()
+        # 점상알림은 여기서 판정한다. paintEvent에 두면 창이 가려지거나
+        # 최소화됐을 때 리페인트가 안 와서 정작 필요한 순간에 안 울린다.
+        self._jumsang_alert(
+            self.table.waiting_group()[1] if self.limit_sort.isChecked() else None)
 
     def _apply_sort(self):
         self._sync_dynamic_sort_mode()
@@ -3892,6 +3962,20 @@ class ConditionScreen(QWidget):
                 popup.set_value(int(fields.get("bid_qty") or 0))
         if code == self._order_target_code:
             self._refresh_order_target_display()
+
+    def _jumsang_alert(self, waiting: set[str] | None):
+        """구분선 위 그룹에 새로 들어온 종목만 알린다.
+        직전 집합을 모르는 첫 호출은 기준선이라 소리 없음.
+        None(상한↑ 꺼짐)은 기준선을 지워 다시 켤 때 도배되지 않게 한다."""
+        if waiting is None:
+            self._jumsang_group = None
+            return
+        before, self._jumsang_group = self._jumsang_group, waiting
+        fresh = waiting - before if before is not None else set()
+        if (fresh and self.jumsang_check.isChecked()
+                and "0901" <= time.strftime("%H%M") < "0903"):
+            self.table.blink_rows(fresh)
+            self.jumsang_entered.emit(", ".join(sorted(fresh)))
 
 
 def _demo(screen: ConditionScreen):
