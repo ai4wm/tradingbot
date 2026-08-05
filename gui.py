@@ -2809,6 +2809,19 @@ class ConditionScreen(QWidget):
             button.setEnabled(False)
             button.setToolTip(
                 "주문허용 체크 후 클릭하면 KRX 상한가 지정가 주문을 전송합니다")
+        # 실제 주문을 보내는 두 버튼만 테두리 색으로 구분해 한눈에 찾게 한다.
+        for button, line, fill, over, dim in (
+                (self.fixed_qty_order_btn,
+                 "#EF6C00", "#FFF3E0", "#FFE0B2", "#F0C9A5"),
+                (self.remaining_order_btn,
+                 "#C62828", "#FFEBEE", "#FFCDD2", "#EAB3B3")):
+            button.setStyleSheet(
+                f"QPushButton{{border:2px solid {line};border-radius:4px;"
+                f"background:{fill};color:#212121;font-weight:bold;"
+                "padding:0px 8px}"
+                f"QPushButton:hover{{background:{over}}}"
+                f"QPushButton:disabled{{border-color:{dim};background:#FAFAFA;"
+                "color:#9E9E9E}")
         self.order_enable_check = QCheckBox("주문허용")
         self.order_enable_check.setStyle(self._checkbox_style)
         self.order_enable_check.setToolTip("체크한 동안 주문 버튼이 실제 주문을 전송합니다")

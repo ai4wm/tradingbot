@@ -3685,6 +3685,10 @@ class DetachedClockWindow(QWidget):
         self.setMouseTracking(True)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        # 끌기·크기조절 도중 매번 쓰지 않도록 모아서 저장한다.
+        self._geo_timer = QTimer(self)
+        self._geo_timer.setSingleShot(True)
+        self._geo_timer.timeout.connect(self._save_geo)
 
     def adopt(self, label):
         """시계 라벨을 넘겨받고 크기 제한을 풀어 창 크기를 복원한다."""
@@ -3811,6 +3815,7 @@ class DetachedClockWindow(QWidget):
     def resizeEvent(self, e):
         super().resizeEvent(e)
         self._apply_scale()
+        self._geo_timer.start(400)
 
     def _apply_scale(self):
         """창 크기에 맞춰 시계 글자 크기를 다시 그린다."""
@@ -3851,15 +3856,20 @@ class DetachedClockWindow(QWidget):
             owner._update_analysis_clock()
 
     def _save_geo(self):
+        # 숨겨질 때 Qt가 보내는 엉뚱한 좌표·크기를 저장하면 복원이 깨진다.
+        if not self.isVisible():
+            return
         self._owner._settings.setValue("clock_window_pos", self.pos())
         self._owner._settings.setValue("clock_window_size", self.size())
         self._owner._settings.sync()
 
     def moveEvent(self, e):
         super().moveEvent(e)
-        self._owner._settings.setValue("clock_window_pos", self.pos())
+        self._geo_timer.start(400)
 
     def closeEvent(self, e):
+        self._geo_timer.stop()
+        self._save_geo()  # 아직 보이는 지금 저장해야 좌표가 온전하다
         if self._owner._shutting_down:
             # 앱 종료 중 Qt가 닫는 것은 합치기가 아니다. 분리 상태를 남겨
             # 다음 실행에서 시계 창을 그대로 복원한다.
@@ -4167,34 +4177,23 @@ class AnalysisWindow(
         seconds = now.hour * 3600 + now.minute * 60 + now.second
         if not holiday_reason and 9 * 3600 <= seconds < 9 * 3600 + 10 * 60:
             phase_text = "개장 급변 구간 · 추격 주의"
-            phase_background, phase_color = "#9A6500", "#FFF4C2"
         elif (
             not holiday_reason
             and 9 * 3600 + 10 * 60 <= seconds < 9 * 3600 + 30 * 60
         ):
             phase_text = "핵심 매매시간 · 체결 활발"
-            phase_background, phase_color = "#087F5B", "#E6FFF7"
             border = "#35D6A2"
         elif (
             not holiday_reason
             and 9 * 3600 + 30 * 60 <= seconds < 15 * 3600 + 30 * 60
         ):
             phase_text = "09:30 경과 · 체결속도 저하 · 신규매매 경고"
-            phase_background, phase_color = "#A32632", "#FFF0F2"
             border, background = "#FF5868", "#351D22"
         else:
             phase_text = "매매 집중시간 아님"
-            phase_background, phase_color = "#424A55", "#E2E7ED"
 
         self._clock_date_text = f"{now:%Y-%m-%d} {weekday}{day_state}"
         self._clock_phase_text = phase_text
-        phase_px = getattr(self, "_clock_phase_px", 0) or self._clock_px(12)
-        phase_badge = (
-            f"<div style='margin-top:2px; background-color:{phase_background};"
-            f" color:{phase_color};"
-            f" font-size:{phase_px}px; font-weight:900;'>"
-            f"{phase_text}</div>"
-        )
         alpha = int(getattr(self, "_clock_alpha", 255))
         if alpha < 255:
             fill = QColor(background)
@@ -4221,7 +4220,6 @@ class AnalysisWindow(
             f"{now:%H:%M:%S}</div>"
             f"<div>{badge('KRX', krx_state)}&nbsp;"
             f"{badge('NXT', nxt_state)}</div>"
-            f"{phase_badge}"
         )
 
     def _mark_shutting_down(self):

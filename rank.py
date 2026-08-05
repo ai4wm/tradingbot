@@ -122,10 +122,20 @@ def _play_wav_quiet(path: Path, volume: float) -> bool:
         effect = _WAV_EFFECTS.get(key)
         if effect is None:
             effect = QSoundEffect(QApplication.instance())
-            effect.setSource(QUrl.fromLocalFile(key))
             effect.setLoopCount(1)
+            # 읽는 중에 play()하면 소리가 그냥 사라져서 준비되면 한 번 낸다.
+            effect.statusChanged.connect(
+                lambda e=effect: e.status() == QSoundEffect.Status.Ready
+                and e.property("pending") and (
+                    e.setProperty("pending", False), e.play()))
+            effect.setSource(QUrl.fromLocalFile(key))
             _WAV_EFFECTS[key] = effect
         effect.setVolume(volume)
+        if effect.status() != QSoundEffect.Status.Ready:
+            if effect.status() == QSoundEffect.Status.Error:
+                return False
+            effect.setProperty("pending", True)
+            return True
         if effect.isPlaying():
             effect.stop()
         effect.play()
