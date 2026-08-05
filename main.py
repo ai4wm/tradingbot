@@ -3637,7 +3637,7 @@ class DetachedClockWindow(QWidget):
         self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
         self.setWindowTitle("시계")
         self.setToolTip(
-            "끌어서 이동 · 우하단 모서리로 크기 조절(정비율)\n"
+            "끌어서 이동 · 우하단 모서리로 크기 조절(가로·세로 따로)\n"
             "더블클릭하면 분석창으로 되돌립니다.")
         self._owner = owner
         self._drag_offset = None
@@ -3681,9 +3681,11 @@ class DetachedClockWindow(QWidget):
         # 높이가 다시 커지는 되먹임으로 창이 무한히 커진다.
         self._base_width = max(80, self._content_width(label))
         size = self._owner._settings.value("clock_window_size")
-        width = (size.width() if isinstance(size, QSize) and size.isValid()
-                 else self._base_width)
-        self.resize(min(1600, max(80, width)), self._base_width)
+        if isinstance(size, QSize) and size.isValid():
+            self.resize(min(1600, max(80, size.width())),
+                        min(1200, max(30, size.height())))
+        else:
+            self.resize(self._base_width, self._base_width)
         self._apply_scale()
 
     def showEvent(self, event):
@@ -3744,11 +3746,10 @@ class DetachedClockWindow(QWidget):
             else Qt.CursorShape.SizeAllCursor)
         if self._resize_from is not None:
             origin, size = self._resize_from
-            width = min(1600, max(80, size.width()
-                                  + (event.globalPosition().toPoint()
-                                     - origin).x()))
-            # 너비만 받고 높이는 내용이 정한다(정비율).
-            self.resize(width, self.height())
+            delta = event.globalPosition().toPoint() - origin
+            # 가로·세로를 따로 받는다. 글자 배율은 둘 중 작은 쪽에 맞춘다.
+            self.resize(min(1600, max(80, size.width() + delta.x())),
+                        min(1200, max(30, size.height() + delta.y())))
         elif self._drag_offset is not None:
             self.move(event.globalPosition().toPoint() - self._drag_offset)
 
@@ -3807,11 +3808,15 @@ class DetachedClockWindow(QWidget):
         owner._clock_phase_px = base_px
         owner._update_analysis_clock()
         label = self._label()
-        if label is not None:
-            # 높이는 내용이 정한다. 사용자가 조절하는 값은 너비뿐이다.
-            wanted = min(1200, max(30, label.heightForWidth(self.width())))
-            if abs(wanted - self.height()) > 1:
-                self.resize(self.width(), wanted)
+        if label is None:
+            return
+        # 너비로 잡은 배율이 창 높이를 넘치면 높이에 맞춰 한 번 더 줄인다.
+        # 창 크기는 건드리지 않는다. 가로·세로 비율은 사용자가 정한다.
+        wanted = max(1, label.heightForWidth(self.width()))
+        if wanted > self.height():
+            owner._clock_scale = max(
+                0.4, owner._clock_scale * self.height() / wanted)
+            owner._update_analysis_clock()
 
     def _save_geo(self):
         self._owner._settings.setValue("clock_window_pos", self.pos())

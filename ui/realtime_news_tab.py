@@ -125,6 +125,14 @@ LS_NEWS_SOURCE_SEARCH_HOST_NAMES = {
 }
 
 
+LATEST_NEWS_BANNER_COLORS = {
+    # 공급처: (평상시 배경, 평상시 테두리, 신규 배경, 신규 테두리)
+    "LS": ("#1B3A4A", "#4E8FB0", "#1F5E80", "#7FDBFF"),
+    "NAVER": ("#17402C", "#3E9160", "#1E7A47", "#62E58F"),
+    "TELEGRAM": ("#33265A", "#7A63C8", "#4E37A8", "#C0A8FF"),
+}
+
+
 class LatestLSNewsLabel(QLabel):
     """분석창 상단에 최신 실시간 뉴스 제목 한 줄을 표시한다."""
 
@@ -837,12 +845,12 @@ class RealtimeNewsTabMixin:
     def _set_latest_ls_news_highlight(self, highlighted: bool):
         if not hasattr(self, "_latest_ls_news_label"):
             return
-        if highlighted:
-            background = "#315C72"
-            border = "#79D2FF"
-        else:
-            background = "#20303A"
-            border = "#52788B"
+        provider = str(
+            (getattr(self, "_latest_ls_news_context", None) or {})
+            .get("provider") or "LS")
+        colors = LATEST_NEWS_BANNER_COLORS.get(
+            provider, LATEST_NEWS_BANNER_COLORS["LS"])
+        background, border = colors[2:] if highlighted else colors[:2]
         self._latest_ls_news_label.setStyleSheet(
             "QLabel {"
             " color: #FFFFFF;"

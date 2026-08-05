@@ -2331,6 +2331,145 @@ class BalanceSellDialog(QDialog):
         self.accept()
 
 
+class BidQtyPopup(QWidget):
+    """매수잔량 한 종목만 크게 띄우는 타이틀바 없는 항상 위 창.
+
+    끌어서 이동, 우하단으로 크기 조절, 더블클릭으로 닫기. 위치·크기는
+    종목코드별로 layout.ini에 남는다. 조건 이탈 종목은 화면이 자동으로 닫는다.
+    """
+
+    GRIP = 14
+
+    def __init__(self, screen: "ConditionScreen", code: str, name: str):
+        super().__init__(
+            screen,
+            Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint,
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        # 배경을 비워 라벨의 둥근 모서리가 창 모양이 되게 한다.
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setMouseTracking(True)
+        self.setMinimumSize(90, 44)
+        self.setMaximumSize(1200, 800)
+        self._screen = screen
+        self.code = code
+        self._name = name
+        self._key = screen.prefix + "bidqty_popup_" + code
+        self._text = ""
+        self._drag_offset = None
+        self._resize_from = None
+        # 레이아웃 없이 라벨을 직접 채운다. 레이아웃을 쓰면 글자가 커질수록
+        # 창 최소 크기가 따라 커져 다시 줄일 수 없다.
+        self._label = QLabel(self)
+        self._label.setAlignment(Qt.AlignCenter)
+        self._label.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        try:
+            self._alpha = int(screen._settings.value(self._key + "_alpha", 235))
+        except (TypeError, ValueError):
+            self._alpha = 235
+        self._alpha = min(255, max(60, self._alpha))
+        geometry = screen._settings.value(self._key)
+        if geometry is None or not self.restoreGeometry(geometry):
+            self.resize(240, 96)
+        self._refresh()
+
+    def set_value(self, qty: int):
+        text = f"{qty:,}"
+        if text != self._text:
+            self._text = text
+            self._refresh()
+
+    def _refresh(self):
+        big = max(12, int(self.height() * 0.5))
+        small = max(8, int(big * 0.34))
+        self._label.setStyleSheet(
+            f"QLabel {{ background-color: rgba(23, 28, 34, {self._alpha});"
+            f" border: 2px solid rgba(224, 93, 93, {self._alpha});"
+            " border-radius: 10px; }")
+        self._label.setText(
+            f"<div style='font-size:{small}px; color:#C9A968'>{self._name}</div>"
+            f"<div style='font-size:{big}px; font-weight:900; color:#FFC24D'>"
+            f"{self._text}</div>")
+        self.setToolTip(
+            f"{self._name} 매수잔량\n"
+            f"배경 불투명도 {self._alpha * 100 // 255}% (휠로 조절)\n"
+            "끌어서 이동 · 우하단 모서리로 크기 조절\n"
+            "더블클릭하면 닫습니다.")
+
+    def wheelEvent(self, event):
+        """휠로 배경 불투명도를 조절하고 바로 저장한다."""
+        step = 15 if event.angleDelta().y() > 0 else -15
+        self._alpha = min(255, max(60, self._alpha + step))
+        self._screen._settings.setValue(self._key + "_alpha", self._alpha)
+        self._screen._settings.sync()
+        self._refresh()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._ensure_on_screen()
+
+    def _ensure_on_screen(self):
+        """타이틀바가 없어 화면 밖으로 나가면 잡을 수 없다. 안으로 되돌린다."""
+        areas = [screen.availableGeometry()
+                 for screen in QApplication.screens()]
+        if not areas or any(area.intersects(self.frameGeometry())
+                            for area in areas):
+            return
+        area = areas[0]
+        self.move(area.left() + 40, area.top() + 40)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._label.setGeometry(self.rect())
+        self._refresh()
+
+    def _in_grip(self, pos) -> bool:
+        return (pos.x() >= self.width() - self.GRIP
+                and pos.y() >= self.height() - self.GRIP)
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        if self._in_grip(event.position().toPoint()):
+            self._resize_from = (event.globalPosition().toPoint(), self.size())
+        else:
+            self._drag_offset = (event.globalPosition().toPoint()
+                                 - self.frameGeometry().topLeft())
+
+    def mouseMoveEvent(self, event):
+        point = event.position().toPoint()
+        self.setCursor(
+            Qt.CursorShape.SizeFDiagCursor if self._in_grip(point)
+            else Qt.CursorShape.SizeAllCursor)
+        if self._resize_from is not None:
+            origin, size = self._resize_from
+            delta = event.globalPosition().toPoint() - origin
+            self.resize(max(90, size.width() + delta.x()),
+                        max(44, size.height() + delta.y()))
+        elif self._drag_offset is not None:
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+
+    def mouseReleaseEvent(self, _event):
+        if self._resize_from is not None or self._drag_offset is not None:
+            self._save_geo()
+        self._resize_from = None
+        self._drag_offset = None
+
+    def mouseDoubleClickEvent(self, _event):
+        self.close()  # 타이틀바가 없으니 더블클릭이 닫기다
+
+    def _save_geo(self):
+        self._screen._settings.setValue(self._key, self.saveGeometry())
+        self._screen._settings.sync()
+
+    def closeEvent(self, event):
+        self._save_geo()
+        self._screen._bid_popups.pop(self.code, None)
+        super().closeEvent(event)
+
+
 class ConditionScreen(QWidget):
     """조건검색실시간 화면 하나. 나중에 QMdiArea에 이 위젯을 여러 개 띄우면 다중창."""
 
@@ -2354,6 +2493,7 @@ class ConditionScreen(QWidget):
         self.prefix = prefix  # 다중창: 창별 설정 키 접두사 ("", "w2_", ...)
         self._settings = QSettings("layout.ini", QSettings.IniFormat)
         self.model = StockModel()
+        self._bid_popups: dict[str, BidQtyPopup] = {}
 
         # 툴바: 조건목록 새로고침 / 조건식 선택 / 등록 토글 / 이탈삭제 / 종목수
         self.reload_btn = QPushButton()  # 조건 목록(CNSRLST) 새로 받기: 영웅문서 조건 추가/수정 시
@@ -2673,6 +2813,7 @@ class ConditionScreen(QWidget):
         self.model.dataChanged.connect(self._on_data_changed)
         self.model.rowsInserted.connect(self._on_data_changed)
         self.model.rowsRemoved.connect(self._on_data_changed)
+        self.model.rowsRemoved.connect(self._close_orphan_bid_popups)
         self._balance_blink_timer = QTimer(self)
         self._balance_blink_timer.timeout.connect(
             self._refresh_balance_alert_blink)
@@ -3508,9 +3649,33 @@ class ConditionScreen(QWidget):
                 (f"{code}: 새 청산키를 누르세요"
                  + (f" (현재 {current[1]})" if current else "")
                  + "\nDelete/Backspace: 해제 · Esc: 취소"))
+        elif index.column() == BID_QTY_COL:
+            self._open_bid_popup(code)
         elif index.column() == NAME_COL:
             QApplication.clipboard().setText(code)
             QToolTip.showText(QCursor.pos(), f"{code} 복사됨")
+
+    def _open_bid_popup(self, code: str):
+        """매수잔량 셀 클릭 -> 종목별 확대 창. 이미 떠 있으면 앞으로 올린다.
+
+        갱신은 타이머가 아니라 0D 호가 푸시(on_tick)가 직접 한다.
+        """
+        popup = self._bid_popups.get(code)
+        if popup is not None:
+            popup.raise_()
+            return
+        stored = self.model.rows.get(code, {})
+        popup = BidQtyPopup(
+            self, code, str(stored.get("name") or code))
+        popup.set_value(int(stored.get("bid_qty") or 0))
+        self._bid_popups[code] = popup
+        popup.show()
+
+    def _close_orphan_bid_popups(self, *_):
+        """조건 이탈로 행이 사라진 종목은 확대 창도 닫는다."""
+        for code, popup in list(self._bid_popups.items()):
+            if code not in self.model.rows:
+                popup.close()
 
     def _on_context_menu(self, pos):
         """종목명 우클릭 -> 네이버 종목토론실 브라우저로 열기."""
@@ -3720,6 +3885,11 @@ class ConditionScreen(QWidget):
     def on_tick(self, code: str, fields: dict):
         """실시간 시세 (0B 체결 / 0D 호가)"""
         self.model.update_stock(code, fields)
+        # 0D는 매도쪽만 바뀌어도 오므로 매수잔량이 실린 틱만 확대 창에 넘긴다.
+        if self._bid_popups and "bid_qty" in fields:
+            popup = self._bid_popups.get(code)
+            if popup is not None:
+                popup.set_value(int(fields.get("bid_qty") or 0))
         if code == self._order_target_code:
             self._refresh_order_target_display()
 

@@ -70,7 +70,7 @@ class StockNewsTabMixin:
                 row.get("naver_url") or row.get("original_url") or ""
             ).strip(),
         }
-        headline = f"[네이버] {stock_name} · {title}" if stock_name else title
+        headline = f"{stock_name} · {title}" if stock_name else title
         self._latest_ls_news_label.set_headline(headline)
         self._set_latest_ls_news_highlight(True)
         self._latest_ls_news_highlight_timer.start(3500)

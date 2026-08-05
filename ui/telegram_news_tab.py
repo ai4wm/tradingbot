@@ -556,7 +556,7 @@ class TelegramNewsTabMixin:
             "body": str(row.get("body") or ""),
             "channel": channel,
         }
-        self._latest_ls_news_label.set_headline(f"[TG] {channel} · {title}")
+        self._latest_ls_news_label.set_headline(f"{channel} · {title}")
         self._set_latest_ls_news_highlight(True)
         self._latest_ls_news_highlight_timer.start(3500)
 
