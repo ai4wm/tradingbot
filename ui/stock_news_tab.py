@@ -335,8 +335,11 @@ class StockNewsTabMixin:
             web_page = AnalysisWebPage(
                 self._news_web_profile, self._news_webview)
             # 비활성 창의 Chromium 표면이 다시 합성되는 순간 기본 검정색이
-            # 드러나지 않도록 앱의 웹뷰 바탕색을 명시한다.
-            web_page.setBackgroundColor(QColor("#202124"))
+            # 드러나지 않도록 웹뷰 바탕색을 명시한다. 앱 테마를 따라 어둡게
+            # 두면 배경을 직접 칠하지 않는 영역이 검게 남아, 흰 바탕을 전제로
+            # 한 회색 글자가 안 보인다(더벨 기사 오른쪽 issue 칼럼). 뉴스
+            # 사이트는 밝은 바탕이 기본이므로 흰색으로 맞춘다.
+            web_page.setBackgroundColor(QColor("#FFFFFF"))
             self._news_webview.setPage(web_page)
             self._news_webview.setVisible(False)
             self._news_web_host_layout.addWidget(self._news_webview)
@@ -921,10 +924,19 @@ class StockNewsTabMixin:
                     }}
                     for (const source of documents) {{
                         for (const row of source.querySelectorAll('table tr')) {{
-                            const text = (row.innerText || '').replace(/\\s+/g, ' ');
+                            // 이미 칠한 행은 다시 만지지 않는다. 스윕이 여러 번
+                            // 돌 때 스타일 재계산이 그만큼 반복되기 때문이다.
+                            if (row.dataset.codexToday) {{
+                                todayCount += 1;
+                                continue;
+                            }}
+                            // innerText는 행마다 강제 레이아웃을 부른다.
+                            // 날짜 문자열만 찾으므로 textContent로 충분하다.
+                            const text = (row.textContent || '').replace(/\\s+/g, ' ');
                             const isToday = todayLabels.some(label => text.includes(label));
                             if (!isToday) continue;
                             todayCount += 1;
+                            row.dataset.codexToday = '1';
                             row.style.setProperty('background-color', '#FFF3B0', 'important');
                             row.style.setProperty('box-shadow', 'inset 4px 0 #F57C00', 'important');
                             row.style.setProperty('font-weight', '700', 'important');
@@ -954,12 +966,18 @@ class StockNewsTabMixin:
                     }}
                     }};
                     applyTodayHighlight();
-                    // 상위 문서는 먼저 끝나고 목록 iframe이 뒤늦게 채워질 수 있다.
-                    for (const frame of document.querySelectorAll('iframe')) {{
-                        frame.addEventListener('load', applyTodayHighlight);
+                    // 이 스크립트는 한 페이지에서 두 번 실행된다. 후속 스윕
+                    // 예약과 iframe 리스너는 첫 실행에서만 건다. 그러지 않으면
+                    // 리스너가 중복 등록되어 같은 훑기가 배로 돈다.
+                    if (!window.__analysisTodayHighlightBound) {{
+                        window.__analysisTodayHighlightBound = true;
+                        // 상위 문서는 먼저 끝나고 목록 iframe이 뒤늦게 채워진다.
+                        for (const frame of document.querySelectorAll('iframe')) {{
+                            frame.addEventListener('load', applyTodayHighlight);
+                        }}
+                        window.setTimeout(applyTodayHighlight, 500);
+                        window.setTimeout(applyTodayHighlight, 1500);
                     }}
-                    window.setTimeout(applyTodayHighlight, 500);
-                    window.setTimeout(applyTodayHighlight, 1500);
                 """
             script = f"""
                 (() => {{
@@ -1008,8 +1026,14 @@ class StockNewsTabMixin:
                         return bestScore >= 3 ? bestTarget : null;
                     }};
 
+                    // 300ms마다 다시 찾으면 링크마다 new URL을 만드는 탐색이
+                    // 반복된다. 한 번 찾은 메뉴는 문서에 붙어 있는 동안 쓴다.
+                    let cachedMenu = null;
                     const alignItemMenu = () => {{
-                        const target = findItemMenu();
+                        if (cachedMenu && !cachedMenu.isConnected) {{
+                            cachedMenu = null;
+                        }}
+                        const target = cachedMenu || (cachedMenu = findItemMenu());
                         if (!target) return false;
                         const top = Math.max(
                             0,
@@ -1035,7 +1059,10 @@ class StockNewsTabMixin:
                                 window.__analysisBoardMenuAlignTimer
                             );
                         }}
-                        let remainingAlignments = 24;
+                        // 같은 2.4초를 덮되 훑는 횟수를 1/3로 줄인다. 100ms는
+                        // 사용자가 스크롤을 시작한 프레임과 겹쳐 손으로 잡아
+                        // 끄는 느낌을 준다.
+                        let remainingAlignments = 8;
                         let userMovedPage = false;
                         const cancelAlignment = () => {{
                             userMovedPage = true;
@@ -1046,13 +1073,29 @@ class StockNewsTabMixin:
                                 window.__analysisBoardMenuAlignTimer = null;
                             }}
                         }};
-                        for (const eventName of [
+                        const moveEvents = [
                             'wheel', 'touchstart', 'pointerdown', 'keydown'
-                        ]) {{
-                            window.addEventListener(
-                                eventName, cancelAlignment,
-                                {{ once: true, capture: true }}
-                            );
+                        ];
+                        // 목록·본문이 iframe에 들어가면 그 안에서 굴린 휠은
+                        // 부모 window에 오지 않는다. 취소가 안 걸려 2.4초 내내
+                        // 스크롤이 튕기므로 하위 문서에도 같이 건다.
+                        const cancelTargets = [window];
+                        for (const frame of document.querySelectorAll('iframe')) {{
+                            try {{
+                                if (frame.contentWindow) {{
+                                    cancelTargets.push(frame.contentWindow);
+                                }}
+                            }} catch (_error) {{}}
+                        }}
+                        for (const target of cancelTargets) {{
+                            for (const eventName of moveEvents) {{
+                                try {{
+                                    target.addEventListener(
+                                        eventName, cancelAlignment,
+                                        {{ once: true, capture: true }}
+                                    );
+                                }} catch (_error) {{}}
+                            }}
                         }}
                         window.__analysisBoardMenuAlignTimer =
                             window.setInterval(() => {{
@@ -1062,7 +1105,7 @@ class StockNewsTabMixin:
                                     return;
                                 }}
                                 alignItemMenu();
-                            }}, 100);
+                            }}, 300);
                     }}
                     {today_highlight}
                     return aligned;
