@@ -534,15 +534,15 @@ class TieredProxy(QSortFilterProxyModel):
         model = self.sourceModel()
         if model is None or not hasattr(model, "rows"):
             return
-        if not self.theme_mode:
-            if getattr(model, "theme_leaders", set()):
-                model.theme_leaders = set()
-                if model.codes:
-                    model.dataChanged.emit(
-                        model.index(0, NAME_COL),
-                        model.index(len(model.codes) - 1, THEME_COL),
-                    )
-            return
+        # 테마정렬을 안 켜도 강도는 계산한다. 테마 컬럼의 이름 순서를 그날
+        # 강한 쪽부터 적기 위해서다. 대장 표시와 색 세로바는 켰을 때만 쓴다.
+        if not self.theme_mode and getattr(model, "theme_leaders", set()):
+            model.theme_leaders = set()
+            if model.codes:
+                model.dataChanged.emit(
+                    model.index(0, NAME_COL),
+                    model.index(len(model.codes) - 1, THEME_COL),
+                )
         groups: dict[tuple[str, str], list[str]] = {}
         for code in model.codes:
             for theme in self.theme_labels.get(code.removesuffix("_AL"), ()):
@@ -625,6 +625,9 @@ class TieredProxy(QSortFilterProxyModel):
             if group[0] != "none":
                 grouped_codes.setdefault(group, []).append(code)
 
+        if not self.theme_mode:
+            return  # 강도만 쓰고 색·대장은 켰을 때만 만든다
+
         # 해시 색상은 서로 다른 인접 그룹이 같은 색이 될 수 있다. 실제 화면 순서대로
         # 팔레트를 배정해 위·아래 테마의 세로바가 반드시 다르게 보이게 한다.
         ordered_groups = sorted(
@@ -666,6 +669,25 @@ class TieredProxy(QSortFilterProxyModel):
                 )
 
 
+    def refresh_theme_keys(self):
+        """테마정렬이 꺼진 화면에서 테마 컬럼의 강도 순서만 갱신한다.
+
+        켜져 있으면 재정렬 타이머가 이미 계산하므로 건너뛴다. 강도는 초 단위로
+        따라가면 충분해서 정렬 스로틀(200ms)과 따로 느리게 돈다.
+        """
+        if self.theme_mode:
+            return
+        model = self.sourceModel()
+        if model is None or not getattr(model, "codes", None):
+            return
+        before = dict(self._theme_group_keys)
+        self._refresh_theme_sort_keys()
+        if before != self._theme_group_keys:
+            model.dataChanged.emit(
+                model.index(0, THEME_COL),
+                model.index(len(model.codes) - 1, THEME_COL),
+            )
+
     def sort(self, column, order=Qt.AscendingOrder):
         self._opening_auction = _in_opening_auction()
         if column not in NON_LIMIT_IGNORED_SORT_COLS:
@@ -685,6 +707,20 @@ class TieredProxy(QSortFilterProxyModel):
         return super().headerData(section, orientation, role)
 
     def data(self, index, role=Qt.DisplayRole):
+        if (role == Qt.DisplayRole and index.isValid()
+                and FIELDS[index.column()] == "theme" and not self.theme_mode):
+            # 정렬을 안 켜도 그날 강한 테마를 앞에 적는다. 순서만 바꾸고
+            # 색·대장 표시는 건드리지 않는다.
+            model = self.sourceModel()
+            source_index = self.mapToSource(index)
+            if model is not None and source_index.isValid() and hasattr(
+                    model, "codes"):
+                code = model.codes[source_index.row()]
+                labels = model.theme_labels.get(code.removesuffix("_AL"), ())
+                group = self._theme_group_keys.get(code)
+                if labels and group is not None and group[1] in labels:
+                    return "·".join(
+                        [group[1], *(t for t in labels if t != group[1])])
         if index.isValid() and FIELDS[index.column()] == "theme" and self.theme_mode:
             model = self.sourceModel()
             source_index = self.mapToSource(index)
@@ -3010,6 +3046,10 @@ class ConditionScreen(QWidget):
         self._theme_reload_timer = QTimer(self)
         self._theme_reload_timer.timeout.connect(self._load_theme_classification)
         self._theme_reload_timer.start(300000)  # 5분
+        # 테마 강도는 초 단위면 충분하다. 정렬 스로틀과 따로 느리게 돈다.
+        self._theme_key_timer = QTimer(self)
+        self._theme_key_timer.timeout.connect(self.proxy.refresh_theme_keys)
+        self._theme_key_timer.start(1000)
         self.rank_period.activated.connect(self._save_rank_period)
         self.set_rank_period("rank")  # 기본: 조회순위 기준시간 (급증 선택 시 main이 교체)
         if self._settings.value(self.prefix + "limit_sort", "false") == "true":  # 상한가정렬 복원
