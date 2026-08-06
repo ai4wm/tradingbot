@@ -14,7 +14,7 @@ from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from theme_keywords import match_news_themes
+from theme_keywords import STRONG_EVENT_THEMES, match_news_themes
 
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "market_analysis.db"
@@ -4041,6 +4041,83 @@ def codes_with_individual_news(trade_date: str = "",
             if 1 <= len(found) <= NEWS_THEME_MAX_CODES:
                 codes.update(str(code) for code in found)
     return codes
+
+
+# 시간외 단일가 상한 기사. 인포스탁이 17:55쯤 보낸다. 제목이 종목명으로
+# 시작해 따옴표 친 '상한가'로 끝난다. [시간외Y] 머리표는 붙을 때도 있고
+# 빠질 때도 있어(8/5 유니켐) 머리표 대신 끝맺음으로 가른다.
+_AFTER_HOURS_LIMIT_RE = re.compile(r"['‘’\"]상한가['‘’\"]\s*$")
+
+
+def pre_market_materials(trade_date: str = "",
+                         db_path: Path = DB_PATH) -> list[dict]:
+    """장 시작 전에 볼 재료 목록. 전 거래일 15:30부터 당일 개장까지를 훑는다.
+
+    아침 점상은 대부분 전날 장 마감 뒤 공시·기사에서 시작한다. 그때 시간외
+    단일가가 상한이면 다음 날 시초부터 갭이 뜬다. 두 신호를 한 표로 모은다.
+    """
+    if not db_path.exists():
+        return []
+    day = trade_date or datetime.now().strftime("%Y%m%d")
+    with closing(connect(db_path)) as connection:
+        previous = connection.execute(
+            """SELECT MAX(news_date) FROM ls_realtime_news
+                WHERE news_date<?""", (day,)).fetchone()[0]
+        if not previous:
+            return []
+        names = {
+            row["stock_code"]: row["stock_name"]
+            for row in connection.execute(
+                "SELECT stock_code, stock_name FROM stocks").fetchall()
+        }
+        rows = connection.execute(
+            """SELECT news_date, news_time, title, stock_code,
+                      related_stock_codes
+                 FROM ls_realtime_news
+                WHERE (news_date=? AND news_time>='153000')
+                   OR (news_date=? AND news_time<'090000')
+                ORDER BY news_date, news_time""",
+            (previous, day)).fetchall()
+    found: dict[str, dict] = {}
+    after_hours: set[str] = set()
+    for row in rows:
+        title = str(row["title"] or "")
+        codes = [
+            code for code in dict.fromkeys(
+                split_ls_news_stock_codes(row["stock_code"])
+                + split_ls_news_stock_codes(row["related_stock_codes"]))
+            if code in names
+        ]
+        if not (1 <= len(codes) <= NEWS_THEME_MAX_CODES):
+            continue
+        if _AFTER_HOURS_LIMIT_RE.search(title):
+            after_hours.update(codes)
+            continue
+        themes = match_news_themes(title)
+        if not themes:
+            continue
+        for code in codes:
+            entry = found.setdefault(code, {
+                "stock_code": code,
+                "stock_name": names.get(code, ""),
+                "news_date": row["news_date"],
+                "news_time": row["news_time"],
+                "themes": (),
+                "title": title,
+                "after_hours_limit": False,
+            })
+            entry["themes"] = tuple(dict.fromkeys(entry["themes"] + themes))
+    for code in found:
+        found[code]["after_hours_limit"] = code in after_hours
+    # 시간외 상한을 맨 위로, 그 안에서는 인수합병·제3자배정 같은 사건 재료를
+    # 먼저 본다. 시간외 상한에 사건 재료까지 겹친 종목이 아침 점상 1순위다.
+    return sorted(
+        found.values(),
+        key=lambda item: (
+            not item["after_hours_limit"],
+            not any(theme in STRONG_EVENT_THEMES
+                    for theme in item["themes"]),
+            item["news_date"], item["news_time"]))
 
 
 def save_theme_snapshot(theme_rows: list[dict], snapshot_date: str,

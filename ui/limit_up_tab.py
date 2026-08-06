@@ -11,13 +11,13 @@ import logging
 from PySide6.QtCore import QDate, QPoint, Qt, QUrl
 from PySide6.QtGui import QColor, QDesktopServices
 from PySide6.QtWidgets import (
-    QApplication, QDateEdit, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
-    QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QApplication, QDateEdit, QDialog, QHBoxLayout, QLabel, QLineEdit,
+    QMessageBox, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
 )
 
 from analysis_db import (
-    delete_limit_up_record, limit_up_rows, realtime_watch_codes,
-    set_realtime_watch,
+    delete_limit_up_record, limit_up_rows, pre_market_materials,
+    realtime_watch_codes, set_realtime_watch,
 )
 from gui import NumericTableWidgetItem
 
@@ -47,6 +47,11 @@ class LimitUpTabMixin:
         self._dart_btn.clicked.connect(self._start_dart_collection)
         limit_refresh_btn = QPushButton("연상 재수집")
         limit_refresh_btn.clicked.connect(self.limit_count_collect_requested.emit)
+        pre_market_btn = QPushButton("장전 재료")
+        pre_market_btn.setToolTip(
+            "전 거래일 15:30부터 오늘 개장까지 나온 재료 기사와 "
+            "시간외 상한가 종목을 모아 보여 줍니다.")
+        pre_market_btn.clicked.connect(self._show_pre_market_materials)
         controls.addWidget(QLabel("기간"))
         controls.addWidget(self._limit_from)
         controls.addWidget(QLabel("~"))
@@ -55,6 +60,7 @@ class LimitUpTabMixin:
         controls.addWidget(disclosure_btn)
         controls.addWidget(self._dart_btn)
         controls.addWidget(limit_refresh_btn)
+        controls.addWidget(pre_market_btn)
         controls.addStretch(1)
         layout.addLayout(controls)
 
@@ -142,6 +148,90 @@ class LimitUpTabMixin:
         self._limit_table.customContextMenuRequested.connect(
             self._limit_table_right_clicked)
         layout.addWidget(self._limit_table)
+
+    def _show_pre_market_materials(self):
+        """전 거래일 마감 뒤부터 오늘 개장까지의 재료를 창으로 띄운다."""
+        try:
+            rows = pre_market_materials()
+        except Exception as error:  # noqa: BLE001
+            log.warning("pre-market materials failed: %s", error)
+            QMessageBox.warning(self, "장전 재료", str(error))
+            return
+        dialog = getattr(self, "_pre_market_dialog", None)
+        if dialog is None:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("장전 재료")
+            dialog.resize(1000, 600)
+            layout = QVBoxLayout(dialog)
+            dialog._summary = QLabel()
+            layout.addWidget(dialog._summary)
+            columns = ("번호", "시간외상한", "종목코드", "종목명", "시각",
+                       "테마", "재료 기사")
+            dialog._table = QTableWidget(0, len(columns))
+            dialog._table.setHorizontalHeaderLabels(columns)
+            dialog._table.setSortingEnabled(True)
+            dialog._table.setAlternatingRowColors(True)
+            dialog._table.setEditTriggers(
+                QTableWidget.EditTrigger.NoEditTriggers)
+            dialog._table.verticalHeader().setVisible(False)
+            dialog._table.cellClicked.connect(
+                self._pre_market_cell_clicked)
+            layout.addWidget(dialog._table)
+            self._pre_market_dialog = dialog
+
+        table = dialog._table
+        table.setSortingEnabled(False)
+        table.setRowCount(len(rows))
+        for index, row in enumerate(rows):
+            time_text = str(row["news_time"] or "")
+            values = (
+                index + 1,
+                "★" if row["after_hours_limit"] else "",
+                row["stock_code"], row["stock_name"],
+                f"{row['news_date'][4:6]}/{row['news_date'][6:8]}"
+                f" {time_text[:2]}:{time_text[2:4]}",
+                "·".join(row["themes"]), row["title"],
+            )
+            for column, value in enumerate(values):
+                if column == 0:
+                    item = NumericTableWidgetItem(str(value), index + 1)
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                else:
+                    item = QTableWidgetItem(str(value))
+                if column == 1:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if row["after_hours_limit"]:
+                    item.setForeground(QColor("#ff5252"))
+                item.setData(
+                    Qt.ItemDataRole.UserRole + 2, row["stock_code"])
+                table.setItem(index, column, item)
+        table.setSortingEnabled(True)
+        # 표를 채운 순서(시간외 상한 먼저, 그다음 재료 시각순)를 그대로 보인다.
+        table.sortItems(0, Qt.SortOrder.AscendingOrder)
+        table.resizeColumnsToContents()
+        after_hours = sum(1 for row in rows if row["after_hours_limit"])
+        dialog._summary.setText(
+            f"재료 {len(rows)}종목 · 시간외 상한 {after_hours}종목"
+            " (종목코드 클릭 복사, 종목명 클릭 기업정보)")
+        dialog.show()
+        dialog.raise_()
+
+    def _pre_market_cell_clicked(self, row: int, column: int):
+        """장전 재료 표에서 종목코드 복사와 기업정보 열기를 처리한다."""
+        table = self._pre_market_dialog._table
+        item = table.item(row, column)
+        stock_code = str(
+            item.data(Qt.ItemDataRole.UserRole + 2) or "") if item else ""
+        if not stock_code:
+            return
+        if column == 2:
+            QApplication.clipboard().setText(stock_code)
+            self.statusBar().showMessage(
+                f"종목코드 {stock_code}를 복사했습니다.", 3000)
+        elif column == 3:
+            QDesktopServices.openUrl(QUrl(
+                "https://finance.naver.com/item/coinfo.naver"
+                f"?code={stock_code}"))
 
     def _limit_sort_changed(self, column: int, _order):
         """진입시간 정렬 중에는 아직 수집되지 않은 행을 제외한다."""

@@ -26,6 +26,8 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QToolTip, QVBoxLayout, QWidget,
 )
 
+from theme_keywords import STRONG_EVENT_THEMES
+
 log = logging.getLogger("gui")
 audit_log = logging.getLogger("trade.audit")
 
@@ -126,6 +128,9 @@ NO_NEWS_MARK_LIGHT = QColor("#D32F2F")
 NO_NEWS_MARK_DARK = QColor("#FF6B6B")
 
 
+PRIORITY_THEMES = STRONG_EVENT_THEMES
+
+
 def _theme_cell_text(labels, news_themes, has_news: bool = True,
                      separator: str = "·") -> str:
     """테마 이름을 잇되 뉴스로 붙은 것에만 표식을 단다.
@@ -133,6 +138,7 @@ def _theme_cell_text(labels, news_themes, has_news: bool = True,
     색은 테마 묶음 구분에 이미 쓰고 있어 표식으로 나타낸다.
     """
     marks = set(news_themes or ())
+    labels = sorted(labels, key=lambda name: name not in PRIORITY_THEMES)
     text = separator.join(
         (NEWS_THEME_MARK + name) if name in marks else name
         for name in labels
@@ -4099,6 +4105,9 @@ class ConditionScreen(QWidget):
 
     def on_tick(self, code: str, fields: dict):
         """실시간 시세 (0B 체결 / 0D 호가)"""
+        previous_upper = (
+            int(self.model.rows.get(code, {}).get("upper") or 0)
+            if code == self._order_target_code else 0)
         self.model.update_stock(code, fields)
         # 0D는 매도쪽만 바뀌어도 오므로 매수잔량이 실린 틱만 확대 창에 넘긴다.
         if self._bid_popups and "bid_qty" in fields:
@@ -4107,6 +4116,13 @@ class ConditionScreen(QWidget):
                 popup.set_value(int(fields.get("bid_qty") or 0))
         if code == self._order_target_code:
             self._refresh_order_target_display()
+            upper = int(self.model.rows.get(code, {}).get("upper") or 0)
+            if upper and upper != previous_upper:
+                # 상한가가 바뀌면 그 값으로 받아 둔 주문가능수량은 무효다.
+                # 상장 당일 종목은 시초가가 정해질 때 상한가가 바뀌므로,
+                # 다시 조회하지 않으면 주문 버튼이 잠긴 채로 남는다.
+                self._orderable_detail = None
+                self.order_target_selected.emit(code, upper)
 
     def _jumsang_alert(self, waiting: set[str] | None):
         """구분선 위 그룹에 새로 들어온 종목만 알린다.

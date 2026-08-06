@@ -507,6 +507,11 @@ class View:
         self._auto_timer = QTimer(screen)
         self._auto_timer.timeout.connect(self.on_refresh)
         self._auto_refresh_cutoff_timer = None
+        # 상장 당일 종목의 상한가는 시초가가 정해져야 확정된다. 장 전 값은
+        # 공모가 기준이라 09:00을 넘기면 한 번 다시 읽어야 한다.
+        self._new_listing_timer = QTimer(screen)
+        self._new_listing_timer.setSingleShot(True)
+        self._new_listing_timer.timeout.connect(self._on_new_listing_refresh)
 
         screen.condition_combo.activated.connect(self._on_condition_selected)
         screen.rank_period.activated.connect(self.on_refresh)  # 기준시간 변경 -> 즉시 재폴
@@ -523,6 +528,7 @@ class View:
             self._auto_refresh_cutoff_timer.timeout.connect(
                 self._on_main_auto_refresh_cutoff)
             self._schedule_main_auto_refresh_cutoff(clear_stale=True)
+        self._schedule_new_listing_refresh()
         self._beep_t = 0.0  # 편입소리 스로틀 (개장 이벤트 폭주 때 소리 도배 방지)
         screen.sound_check.setChecked(self._settings.value(self.prefix + "sound", "false") == "true")
         screen.sound_check.toggled.connect(self._on_sound)
@@ -775,6 +781,30 @@ class View:
         if was_checked:
             log.info("main auto-requery OFF at 09:02:20")
         self._schedule_main_auto_refresh_cutoff()
+
+    # 상장 당일 종목 상한가 갱신 시각. 시초가 결정 직후 첫 체결까지 여유를 둔다.
+    NEW_LISTING_REFRESH = (9, 0, 30)
+
+    def _schedule_new_listing_refresh(self):
+        """상장 당일 종목의 상한가를 매일 09:00:30에 한 번 다시 읽도록 예약한다."""
+        hour, minute, second = self.NEW_LISTING_REFRESH
+        now = datetime.now(KST)
+        target = now.replace(
+            hour=hour, minute=minute, second=second, microsecond=0)
+        if now >= target:
+            target += timedelta(days=1)
+        self._new_listing_timer.start(
+            max(1, int((target - now).total_seconds() * 1000)))
+
+    def _on_new_listing_refresh(self):
+        """상장 당일 종목이 화면에 있으면 시세를 다시 받아 상한가를 고친다."""
+        new_today = getattr(self.app._market, "new_today", set())
+        present = [code for code in self.screen.model.codes
+                   if code.removesuffix("_AL") in new_today]
+        if present:
+            log.info("new listing upper refresh: %s", ",".join(present))
+            self._schedule_refresh()
+        self._schedule_new_listing_refresh()
 
     # --- 편입/이탈 ---------------------------------------------------------
     def on_snapshot(self, codes: list[str]):

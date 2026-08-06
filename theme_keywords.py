@@ -31,17 +31,33 @@ NEWS_THEME_KEYWORDS: dict[str, tuple[str, ...]] = {
     "양자컴퓨팅": ("양자컴퓨팅", "양자내성", "큐비트"),
     "자율주행": ("자율주행", "라이다", "레벨4", "로보택시"),
     "조선": ("조선", "LNG선", "선박 수주", "MRO"),
+    # 일반 유상증자는 물량 부담이라 악재지만 제3자배정은 다르다. 새 주인이나
+    # 전략 투자자가 값을 정해 들어오는 것이라 경영권·사업 변화 재료로 읽힌다.
+    "제3자배정": ("제3자배정", "제3자 배정", "제3자ㆍ배정", "3자배정"),
     "무상증자": ("무상증자",),
     "자사주소각": ("자사주 소각", "자기주식 소각"),
     # 산업이 아니라 사건 테마다. 파는 쪽·사는 쪽을 제목만으로는 가를 수 없어
     # 한 묶음으로 둔다. 회사가 팔리는 재료가 주가 반응이 크다.
+    # 표현이 끝없이 갈라지므로("인수 소식에", "100% 인수", "회사합병 결정")
+    # 활용형을 나열하지 않고 어근만 잡고, 아래 잡음 목록으로 잘라 낸다.
     "인수합병": (
-        "인수한다", "지분 100%", "인수 결정", "피인수", "인수 추진",
-        "인수 검토", "인수설", "매각 추진", "매각설", "매각 검토",
-        "경영권 양수", "경영권 매각", "경영권 인수", "최대주주 변경",
-        "품는다", "M&A",
+        "인수", "합병", "경영권", "최대주주 변경", "매각 추진", "매각설",
+        "매각 검토", "주식양수도", "지분 취득", "주식 취득", "주식취득",
+        "타법인주식", "품는다", "M&A",
     ),
 }
+
+# 산업 테마보다 앞에 적고 목록에서도 위로 올린다. 회사가 팔리거나 새 주인이
+# 값을 정해 들어오는 사건은 업종 순환매보다 주가 반응이 크다.
+STRONG_EVENT_THEMES = ("인수합병", "제3자배정")
+
+# '인수'·'합병'이 들어가지만 회사를 사고파는 재료가 아닌 말. 먼저 지운다.
+NEWS_THEME_NOISE = (
+    "신주인수권", "기업인수목적", "무인수", "채무인수", "총액인수",
+    "잔액인수", "인수단", "인수인계", "인수위", "합병증", "보험 인수",
+    # 자사주는 인수합병이 아니라 '자사주소각' 쪽 재료다.
+    "자기주식취득", "자기주식 취득", "자기주식 신탁",
+)
 
 
 def match_news_themes(text: str) -> tuple[str, ...]:
@@ -49,6 +65,8 @@ def match_news_themes(text: str) -> tuple[str, ...]:
     lowered = " ".join((text or "").split()).lower()
     if not lowered:
         return ()
+    for noise in NEWS_THEME_NOISE:
+        lowered = lowered.replace(noise.lower(), " ")
     return tuple(
         theme for theme, words in NEWS_THEME_KEYWORDS.items()
         if any(word.lower() in lowered for word in words)
@@ -63,6 +81,26 @@ def demo():
         "상상인증권, 매각 추진 소식 이후 장중 '상한가 직행'")
     assert "인수합병" in match_news_themes(
         "본느, 최대주주 변경 기대에 '4연상'")
+    assert "인수합병" in match_news_themes(
+        "유니켐, 美 로봇 전자피부 기업 인수…'휴머노이드 촉각' 시장 베팅")
+    assert "인수합병" in match_news_themes(
+        "(주)유니켐 회사합병 결정(자율공시)(종속회사의 주요경영사항)")
+    assert "인수합병" not in match_news_themes(
+        "(주)우성머티리얼스 전환가액ㆍ신주인수권행사가액의 조정(안내공시)")
+    assert "인수합병" not in match_news_themes(
+        "신한제16호기업인수목적 주식회사 주주총회소집결의")
+    assert "인수합병" not in match_news_themes(
+        "AI 작전 명령에 무인수상정 출항…한화시스템 “통합 지휘역량 입증”")
+    assert "인수합병" in match_news_themes(
+        "유니켐, Loomia Technologies,Inc. 주식 취득 결정")
+    assert "인수합병" not in match_news_themes(
+        "넥스트바이오메디컬, 대장 ESD 후 합병증 감소 효과 국제학술지 게재")
+    assert "인수합병" not in match_news_themes(
+        "(주)한샘 주요사항보고서(자기주식취득결정)")
+    assert "제3자배정" in match_news_themes(
+        "본느, 22.03억원 규모 제3자배정 유상증자 결정")
+    assert "제3자배정" not in match_news_themes(
+        "(주)어떤회사 유상증자결정(주주배정후 실권주 일반공모)")
     assert match_news_themes("") == ()
     assert match_news_themes("오늘 날씨가 좋다") == ()
     print("ok", match_news_themes("HBM 공급 계약과 전고체 배터리 수주"))
