@@ -3970,6 +3970,79 @@ def backfill_news_themes(days: int = NEWS_THEME_MAX_AGE_DAYS,
     return linked
 
 
+def news_theme_labels(db_path: Path = DB_PATH) -> dict[str, tuple[str, ...]]:
+    """뉴스로 붙은 테마만 종목별로 반환한다. 화면에서 재료 표식에 쓴다."""
+    if not db_path.exists():
+        return {}
+    result: dict[str, tuple[str, ...]] = {}
+    with closing(connect(db_path)) as connection:
+        for row in connection.execute(
+                """SELECT st.stock_code, t.theme_name
+                     FROM stock_themes st
+                     JOIN themes t ON t.theme_id=st.theme_id
+                    WHERE st.source='NEWS' AND st.valid_to IS NULL
+                      AND st.valid_from>=?""",
+                (NEWS_THEME_CUTOFF(),)).fetchall():
+            code = str(row["stock_code"] or "").removesuffix("_AL")
+            name = str(row["theme_name"] or "").strip()
+            if code and name and name not in result.get(code, ()):
+                result[code] = (*result.get(code, ()), name)
+    return result
+
+
+_PRICE_TICKER_RE = re.compile(
+    r"상한가 진입|상한가 출발|하한가|급등세 기록|급락세 기록|상승세|하락세"
+    r"|상승폭 확대|하락폭 확대|신고가 경신|신저가|연속 상승|연속 하락"
+    r"|거래량 급증|^<[유코넥]>|투자경고|투자주의|투자유의"
+    r"|장중수급포착|순매수행진|순매도행진")
+
+NEWS_MARK_DAYS = 3  # 재료 기사를 찾는 기간. 재료는 며칠 이어진다
+
+
+def codes_with_individual_news(trade_date: str = "",
+                               days: int = NEWS_MARK_DAYS,
+                               db_path: Path = DB_PATH) -> set[str]:
+    """최근 며칠 안에 재료 기사가 있는 종목코드.
+
+    시황 나열, 시세속보, 수급 포착 기사는 세지 않는다. 왜 오르는지 알려주지
+    않기 때문이다. 그것까지 세면 오른 종목은 모두 뉴스가 있는 것이 된다.
+    당일만 보면 어제 터진 재료로 이어 오르는 종목이 빠지므로 기간으로 본다.
+    """
+    if not db_path.exists():
+        return set()
+    day = trade_date or datetime.now().strftime("%Y%m%d")
+    since = (datetime.strptime(day, "%Y%m%d")
+             - timedelta(days=max(0, days - 1))).strftime("%Y%m%d")
+    codes: set[str] = set()
+    with closing(connect(db_path)) as connection:
+        for row in connection.execute(
+                """SELECT stock_code, related_stock_codes, title
+                     FROM ls_realtime_news
+                    WHERE news_date BETWEEN ? AND ?""",
+                (since, day)).fetchall():
+            if _PRICE_TICKER_RE.search(str(row["title"] or "")):
+                continue
+            found = list(dict.fromkeys(
+                split_ls_news_stock_codes(row["stock_code"])
+                + split_ls_news_stock_codes(row["related_stock_codes"])))
+            if 1 <= len(found) <= NEWS_THEME_MAX_CODES:
+                codes.update(found)
+        for row in connection.execute(
+                """SELECT stock_codes, title FROM telegram_news
+                    WHERE REPLACE(SUBSTR(published_at,1,10),'-','')
+                          BETWEEN ? AND ?""",
+                (since, day)).fetchall():
+            if _PRICE_TICKER_RE.search(str(row["title"] or "")):
+                continue
+            try:
+                found = list(dict.fromkeys(json.loads(row["stock_codes"])))
+            except (TypeError, ValueError):
+                continue
+            if 1 <= len(found) <= NEWS_THEME_MAX_CODES:
+                codes.update(str(code) for code in found)
+    return codes
+
+
 def save_theme_snapshot(theme_rows: list[dict], snapshot_date: str,
                         source: str = "KIWOOM",
                         confidence: float = 0.8,

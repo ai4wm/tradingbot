@@ -16,8 +16,8 @@ from PySide6.QtCore import (
     QSortFilterProxyModel, Qt, QTimer, QUrl, Signal,
 )
 from PySide6.QtGui import (
-    QColor, QCursor, QDesktopServices, QFont, QIcon, QKeySequence, QPainter,
-    QPen, QPixmap, QPolygon,
+    QColor, QCursor, QDesktopServices, QFont, QFontMetrics, QIcon,
+    QKeySequence, QPainter, QPen, QPixmap, QPolygon,
 )
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QHBoxLayout, QHeaderView, QLabel,
@@ -117,6 +117,27 @@ THEME_GROUP_COLORS = (
     QColor("#00C2A8"), QColor("#F4B400"), QColor("#9B7BFF"),
     QColor("#FF6E8A"), QColor("#4FC3F7"), QColor("#8BC34A"),
 )
+
+
+NEWS_THEME_MARK = "•"  # 최근 뉴스로 붙은 테마 앞에 붙인다
+NO_NEWS_MARK = "?"  # 오늘 재료 기사가 없는 종목: 왜 오르는지 모른다는 뜻
+# 노랑은 라이트 배경에서 대비가 안 나온다. 배경 밝기에 따라 빨강을 바꾼다.
+NO_NEWS_MARK_LIGHT = QColor("#D32F2F")
+NO_NEWS_MARK_DARK = QColor("#FF6B6B")
+
+
+def _theme_cell_text(labels, news_themes, has_news: bool = True,
+                     separator: str = "·") -> str:
+    """테마 이름을 잇되 뉴스로 붙은 것에만 표식을 단다.
+
+    색은 테마 묶음 구분에 이미 쓰고 있어 표식으로 나타낸다.
+    """
+    marks = set(news_themes or ())
+    text = separator.join(
+        (NEWS_THEME_MARK + name) if name in marks else name
+        for name in labels
+    )
+    return text if has_news else NO_NEWS_MARK + text
 
 
 def _theme_group_color(group: tuple[str, str]) -> QColor | None:
@@ -269,6 +290,19 @@ class ClipTextDelegate(PreserveTextColorDelegate):
         painter.save()
         painter.setClipRect(option.rect)
         painter.setFont(opt.font)
+        if text.startswith(NO_NEWS_MARK):
+            # 재료 없음 표식만 빨강으로 따로 그린다. 뒤의 테마 이름은 묶음
+            # 색을 그대로 써야 해서 두 번에 나눠 그린다.
+            dark = opt.palette.base().color().lightness() < 128
+            painter.setPen(
+                NO_NEWS_MARK_DARK if dark else NO_NEWS_MARK_LIGHT)
+            painter.drawText(
+                text_rect, opt.displayAlignment | Qt.TextSingleLine,
+                NO_NEWS_MARK)
+            text_rect = text_rect.adjusted(
+                QFontMetrics(opt.font).horizontalAdvance(NO_NEWS_MARK),
+                0, 0, 0)
+            text = text[len(NO_NEWS_MARK):]
         painter.setPen(opt.palette.text().color())
         painter.drawText(
             text_rect, opt.displayAlignment | Qt.TextSingleLine, text)
@@ -716,11 +750,13 @@ class TieredProxy(QSortFilterProxyModel):
             if model is not None and source_index.isValid() and hasattr(
                     model, "codes"):
                 code = model.codes[source_index.row()]
-                labels = model.theme_labels.get(code.removesuffix("_AL"), ())
+                plain = code.removesuffix("_AL")
+                labels = model.theme_labels.get(plain, ())
                 group = self._theme_group_keys.get(code)
                 if labels and group is not None and group[1] in labels:
-                    return "·".join(
-                        [group[1], *(t for t in labels if t != group[1])])
+                    return _theme_cell_text(
+                        [group[1], *(t for t in labels if t != group[1])],
+                        model.news_themes.get(plain), plain in model.news_codes)
         if index.isValid() and FIELDS[index.column()] == "theme" and self.theme_mode:
             model = self.sourceModel()
             source_index = self.mapToSource(index)
@@ -736,7 +772,10 @@ class TieredProxy(QSortFilterProxyModel):
                         in model.theme_labels.get(code.removesuffix("_AL"), ())
                         if theme != name
                     ]
-                    return "·".join([name, *labels])
+                    plain = code.removesuffix("_AL")
+                    return _theme_cell_text(
+                        [name, *labels], model.news_themes.get(plain),
+                        plain in model.news_codes)
                 if role == Qt.UserRole:
                     return name
                 if role == Qt.ForegroundRole:
@@ -748,8 +787,9 @@ class TieredProxy(QSortFilterProxyModel):
                     font.setBold(True)
                     return font
                 if role == Qt.ToolTipRole:
-                    labels = model.theme_labels.get(code.removesuffix("_AL"), ())
-                    return "테마: " + " · ".join(labels) if labels else "테마 미분류"
+                    return model.data(
+                        model.index(source_index.row(), THEME_COL),
+                        Qt.ToolTipRole)
                 if role == Qt.TextAlignmentRole:
                     return Qt.AlignLeft | Qt.AlignVCenter
         if role == THEME_COLOR_ROLE:
@@ -963,6 +1003,9 @@ class StockModel(QAbstractTableModel):
         self.limit_cnt: dict[str, tuple[int, int]] = {}  # (어제까지 연속상한 일수, 어제 종가) (main 주입, 연상 컬럼)
         self.watched: set[str] = set()     # 실시간 뉴스 감시 종목 (main 주입)
         self.theme_labels: dict[str, tuple[str, ...]] = {}
+        # 뉴스로 붙은 테마와 오늘 재료 기사가 있는 종목. 표식에만 쓴다.
+        self.news_themes: dict[str, tuple[str, ...]] = {}
+        self.news_codes: set[str] = set()
         self.relation_labels: dict[str, tuple[str, ...]] = {}
         self.relation_evidence: dict[str, tuple[str, ...]] = {}
         self.theme_leaders: set[str] = set()
@@ -1614,6 +1657,21 @@ class StockModel(QAbstractTableModel):
                 self.index(len(self.codes) - 1, THEME_COL),
             )
 
+    def set_news_marks(self, news_themes: dict[str, tuple[str, ...]],
+                       news_codes: set[str]):
+        """뉴스로 붙은 테마와 오늘 재료 기사가 있는 종목을 설정한다."""
+        self.news_themes = {
+            str(code).removesuffix("_AL"): tuple(names)
+            for code, names in news_themes.items() if names
+        }
+        self.news_codes = {
+            str(code).removesuffix("_AL") for code in news_codes}
+        if self.codes:
+            self.dataChanged.emit(
+                self.index(0, THEME_COL),
+                self.index(len(self.codes) - 1, THEME_COL),
+            )
+
     def set_relation_groups(self, groups: dict[str, tuple[str, ...]]):
         """종목명 도구설명에 표시할 최대주주·계열 등 관계 묶음을 설정한다."""
         labels: dict[str, list[str]] = {}
@@ -1669,7 +1727,12 @@ class StockModel(QAbstractTableModel):
             primary = themes[0] if themes else ""
             if role == Qt.DisplayRole:
                 # 가진 테마를 모두 적는다. 대표만 적으면 오늘 재료가 안 보인다.
-                return "·".join(themes) if themes else "미분류"
+                plain = code.removesuffix("_AL")
+                if not themes:
+                    return "미분류" if plain in self.news_codes else "?미분류"
+                return _theme_cell_text(
+                    themes, self.news_themes.get(plain),
+                    plain in self.news_codes)
             if role == Qt.UserRole:
                 return primary
             if role == Qt.ForegroundRole:
@@ -1683,7 +1746,17 @@ class StockModel(QAbstractTableModel):
             if role == Qt.TextAlignmentRole:
                 return Qt.AlignLeft | Qt.AlignVCenter
             if role == Qt.ToolTipRole:
-                return "테마: " + " · ".join(themes) if themes else "테마 미분류"
+                if not themes:
+                    return "테마 미분류"
+                plain = code.removesuffix("_AL")
+                lines = ["테마: " + " · ".join(themes)]
+                news = self.news_themes.get(plain)
+                if news:
+                    lines.append(f"{NEWS_THEME_MARK} 최근 뉴스 재료: "
+                                 + " · ".join(news))
+                if plain not in self.news_codes:
+                    lines.append("오늘 재료 기사 없음 (시세속보 제외)")
+                return "\n".join(lines)
             return None
         if field == "balance_sell":
             setting = self.balance_sell_settings.get(code)
@@ -3947,16 +4020,22 @@ class ConditionScreen(QWidget):
             # GUI 모듈을 DB 초기화와 분리하기 위해 실제 화면 생성 시 불러온다.
             from analysis_db import (
                 active_relation_groups, active_theme_labels,
-                dart_relation_evidence_labels,
+                codes_with_individual_news, dart_relation_evidence_labels,
+                news_theme_labels,
             )
             labels = active_theme_labels()
             relation_groups = active_relation_groups()
             relation_evidence = dart_relation_evidence_labels()
+            news_themes = news_theme_labels()
+            news_codes = codes_with_individual_news()
         except Exception as error:  # noqa: BLE001
             log.warning("theme labels unavailable: %s", error)
             labels = {}
             relation_groups = {}
             relation_evidence = {}
+            news_themes = {}
+            news_codes = set()
+        self.model.set_news_marks(news_themes, news_codes)
         self.model.set_theme_labels(labels)
         self.model.set_relation_groups(relation_groups)
         self.model.set_relation_evidence(relation_evidence)
