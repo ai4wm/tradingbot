@@ -4980,9 +4980,19 @@ class AnalysisWindow(
                 classifier = ClassificationClient()
                 try:
                     missing = limit_up_codes_without_sources(("KIWOOM",))
+                    self._collection_progress.setRange(0, max(1, len(missing)))
                     self._collection_status.setText(
                         f"WICS 보완 조회 · 대상 {len(missing):,}종목")
-                    wics = await classifier.wics_for_stocks(missing)
+
+                    def wics_progress(done, total):
+                        # 종목당 한 건씩 웹에서 받아 수 분이 걸린다.
+                        # 진행이 안 보이면 멈춘 것으로 오해한다.
+                        self._collection_progress.setValue(done)
+                        self._collection_status.setText(
+                            f"WICS 보완 조회 · {done:,}/{total:,}종목")
+
+                    wics = await classifier.wics_for_stocks(
+                        missing, progress=wics_progress)
                     _, wics_links = save_source_classifications(
                         wics, snapshot_date, "WICS", 0.9)
                     saved += wics_links

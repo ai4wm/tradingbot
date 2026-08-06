@@ -62,20 +62,31 @@ class ClassificationClient:
         await self._client.aclose()
 
     async def wics_for_stocks(
-        self, stock_codes: list[str], concurrency: int = 5
+        self, stock_codes: list[str], concurrency: int = 5, progress=None
     ) -> dict[str, str]:
-        """네이버 기업정보에 공개된 WICS 분류를 종목별로 조회한다."""
+        """네이버 기업정보에 공개된 WICS 분류를 종목별로 조회한다.
+
+        종목 수가 많아 수 분이 걸린다. progress(done, total)로 진행을 알린다.
+        """
         semaphore = asyncio.Semaphore(concurrency)
+        total = len(stock_codes)
+        done = 0
 
         async def one(code: str):
+            nonlocal done
             async with semaphore:
                 url = (
                     "https://navercomp.wisereport.co.kr/v2/company/"
                     f"c1010001.aspx?cmp_cd={code}&cn="
                 )
-                response = await self._client.get(url)
-                response.raise_for_status()
-                match = _WICS_RE.search(response.text)
+                try:
+                    response = await self._client.get(url)
+                    response.raise_for_status()
+                    match = _WICS_RE.search(response.text)
+                finally:
+                    done += 1
+                    if progress is not None:
+                        progress(done, total)
                 if not match:
                     return code, ""
                 return code, html.unescape(match.group(1)).strip()
