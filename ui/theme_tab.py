@@ -13,7 +13,9 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QVBoxLayout,
 )
 
-from analysis_db import set_realtime_watch, theme_summary_rows
+from analysis_db import (
+    backfill_news_themes, set_realtime_watch, theme_summary_rows,
+)
 from gui import NumericTableWidgetItem
 
 
@@ -33,11 +35,18 @@ class ThemeTabMixin:
         self._naver_theme_btn = QPushButton("네이버 테마 수집")
         self._naver_theme_btn.clicked.connect(
             self._start_naver_theme_collection)
+        self._news_theme_btn = QPushButton("뉴스 테마 소급")
+        self._news_theme_btn.setToolTip(
+            "새 뉴스는 저장될 때 자동으로 테마에 붙습니다.\n"
+            "이 버튼은 theme_keywords.py 사전을 고친 뒤\n"
+            "이미 저장된 최근 뉴스를 다시 훑을 때만 씁니다.")
+        self._news_theme_btn.clicked.connect(self._start_news_theme_backfill)
         controls.addWidget(QLabel("검색"))
         controls.addWidget(self._theme_search, 1)
         controls.addWidget(refresh)
         controls.addWidget(self._theme_btn)
         controls.addWidget(self._naver_theme_btn)
+        controls.addWidget(self._news_theme_btn)
         layout.addLayout(controls)
 
         self._theme_summary = QLabel("테마 0개")
@@ -64,11 +73,11 @@ class ThemeTabMixin:
         table.setSortingEnabled(False)
         table.setRowCount(len(rows))
         source_names = {
-            "NAVER": "네이버", "KIWOOM": "키움", "WICS": "WICS",
+            "NEWS": "뉴스", "NAVER": "네이버", "KIWOOM": "키움", "WICS": "WICS",
             "KRX": "KRX", "DART": "DART",
         }
         source_priority = {
-            "NAVER": 1, "KIWOOM": 2, "WICS": 3, "KRX": 4, "DART": 5,
+            "NEWS": 0, "NAVER": 1, "KIWOOM": 2, "WICS": 3, "KRX": 4, "DART": 5,
         }
         total_members = 0
         for row_index, row in enumerate(rows):

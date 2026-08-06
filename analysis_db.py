@@ -2356,6 +2356,7 @@ def theme_summary_rows(query: str = "", db_path: Path = DB_PATH) -> list[dict]:
                  LEFT JOIN stocks s ON s.stock_code=st.stock_code
                 LEFT JOIN limit_up_events e ON e.stock_code=st.stock_code
                 WHERE st.valid_to IS NULL
+                  AND (st.source<>'NEWS' OR st.valid_from>=?)
                   AND (?='' OR t.theme_name LIKE ? OR EXISTS (
                       SELECT 1
                         FROM stock_themes sx
@@ -2366,11 +2367,13 @@ def theme_summary_rows(query: str = "", db_path: Path = DB_PATH) -> list[dict]:
                          AND (sx.stock_code LIKE ? OR ss.stock_name LIKE ?)))
                 GROUP BY st.source, t.theme_id, t.theme_name
                 ORDER BY CASE st.source
+                           WHEN 'NEWS' THEN 0
                            WHEN 'NAVER' THEN 1 WHEN 'KIWOOM' THEN 2
                            WHEN 'WICS' THEN 3 WHEN 'KRX' THEN 4
                            WHEN 'DART' THEN 5 ELSE 9 END,
                          limit_up_count DESC, member_count DESC, t.theme_name""",
-            (query, f"%{query}%", f"%{query}%", f"%{query}%"),
+            (NEWS_THEME_CUTOFF(), query,
+             f"%{query}%", f"%{query}%", f"%{query}%"),
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -3888,21 +3891,21 @@ def apply_news_themes(stock_codes, text: str, trade_date: str = "",
     기존 출처(KIWOOM 등)는 건드리지 않고 source='NEWS' 행만 더한다.
     상장 종목표에 없는 코드는 무시한다.
     """
+    day = trade_date or datetime.now().strftime("%Y%m%d")
+    with closing(connect(db_path)) as connection, connection:
+        return _link_news_themes(connection, stock_codes, text, day)
+
+
+def _link_news_themes(connection, stock_codes, text: str,
+                      day: str) -> tuple[str, ...]:
+    """열린 트랜잭션에서 뉴스 한 건의 종목-테마 NEWS 연결을 더한다."""
     codes = list(dict.fromkeys(
-        str(code).removesuffix("_AL") for code in (stock_codes or ())))
+        str(code).removesuffix("_AL") for code in (stock_codes or ()) if code))
     if not codes or len(codes) > NEWS_THEME_MAX_CODES:
         return ()
     themes = match_news_themes(text)
     if not themes:
         return ()
-    day = trade_date or datetime.now().strftime("%Y%m%d")
-    with closing(connect(db_path)) as connection, connection:
-        return _link_news_themes(connection, codes, themes, day)
-
-
-def _link_news_themes(connection, codes: list[str], themes: tuple[str, ...],
-                      day: str) -> tuple[str, ...]:
-    """열린 트랜잭션에서 종목-테마 NEWS 연결을 더한다."""
     now = datetime.now().astimezone().isoformat(timespec="seconds")
     known = {
         row[0] for row in connection.execute(
@@ -3948,16 +3951,12 @@ def backfill_news_themes(days: int = NEWS_THEME_MAX_AGE_DAYS,
                 """SELECT news_date, stock_code, related_stock_codes, title
                      FROM ls_realtime_news WHERE news_date>=?""",
                 (since,)).fetchall():
-            codes = list(dict.fromkeys(
-                split_ls_news_stock_codes(row["stock_code"])
-                + split_ls_news_stock_codes(row["related_stock_codes"])))
-            themes = match_news_themes(row["title"]) if (
-                codes and len(codes) <= NEWS_THEME_MAX_CODES) else ()
-            if themes and _link_news_themes(
-                    connection, codes, themes, str(row["news_date"])):
-                linked += len(themes) * len(codes)
+            codes = (split_ls_news_stock_codes(row["stock_code"])
+                     + split_ls_news_stock_codes(row["related_stock_codes"]))
+            linked += len(_link_news_themes(
+                connection, codes, row["title"], str(row["news_date"])))
         for row in connection.execute(
-                """SELECT published_at, stock_codes, title, body
+                """SELECT published_at, stock_codes, title
                      FROM telegram_news
                     WHERE REPLACE(SUBSTR(published_at,1,10),'-','')>=?""",
                 (since,)).fetchall():
@@ -3965,13 +3964,9 @@ def backfill_news_themes(days: int = NEWS_THEME_MAX_AGE_DAYS,
                 codes = [str(code) for code in json.loads(row["stock_codes"])]
             except (TypeError, ValueError):
                 codes = []
-            codes = list(dict.fromkeys(codes))
-            themes = match_news_themes(
-                f"{row['title']} {row['body']}") if (
-                    codes and len(codes) <= NEWS_THEME_MAX_CODES) else ()
-            day = str(row["published_at"])[:10].replace("-", "")
-            if themes and _link_news_themes(connection, codes, themes, day):
-                linked += len(themes) * len(codes)
+            linked += len(_link_news_themes(
+                connection, codes, row["title"],
+                str(row["published_at"])[:10].replace("-", "")))
     return linked
 
 
@@ -4721,6 +4716,15 @@ def merge_ls_news_server_rows(
             if server_id <= cursor:
                 raise ValueError("서버 뉴스 ID가 오름차순이 아닙니다.")
             result = _upsert_ls_realtime_news(connection, row, now)
+            if result["inserted"]:
+                # 앱을 꺼 둔 동안의 뉴스도 테마에 붙여야 소급 버튼이 필요 없다.
+                _link_news_themes(
+                    connection,
+                    split_ls_news_stock_codes(
+                        row.get("codes") or row.get("code") or ""),
+                    str(row.get("title") or ""),
+                    str(row.get("date") or row.get("news_date") or "").strip()
+                    or datetime.now().strftime("%Y%m%d"))
             inserted += int(bool(result["inserted"]))
             processed += 1
             cursor = server_id
@@ -5139,10 +5143,10 @@ def save_telegram_news(row: dict, db_path: Path = DB_PATH, *,
         )
         inserted = cursor.rowcount > 0
     if inserted:
+        # 본문은 링크·잡담까지 섞여 옆길로 샌다. 제목만 본다.
         apply_news_themes(
             row.get("stock_codes") or (),
-            f"{row.get('title') or ''} {row.get('body') or ''}",
-            db_path=db_path)
+            str(row.get("title") or ""), db_path=db_path)
     return inserted
 
 
@@ -5267,6 +5271,10 @@ def save_news_items(stock_code: str, stock_name: str, rows: list[dict],
                 )
                 result["new"] += 1
                 result["new_ids"].append(news_id)
+                # 네이버 뉴스는 테마 편입에 쓰지 않는다. 종목명으로 검색해
+                # 가져오므로 본문에 이름만 스친 남의 회사 기사까지 들어온다.
+                # "HD현대 조선그룹…" 기사가 본문의 증권사 이름 때문에 그
+                # 증권사 종목에 조선·원자력을 붙이는 식이다.
             else:
                 news_id = int(existing["news_id"])
                 incoming_hash = str(item.get("current_hash") or "")
@@ -5364,11 +5372,6 @@ def save_news_items(stock_code: str, stock_name: str, rows: list[dict],
                WHERE stock_code=?""",
             (now, stock_code),
         )
-    if result["new"]:
-        apply_news_themes(
-            (stock_code,),
-            " ".join(str(item.get("title") or "") for item in rows),
-            db_path=db_path)
     return result
 
 

@@ -693,7 +693,14 @@ class TieredProxy(QSortFilterProxyModel):
                 group = self._theme_group_keys.get(code, ("none", "미분류"))
                 name = group[1] if group[0] != "none" else "미분류"
                 if role == Qt.DisplayRole:
-                    return name
+                    # 묶음 이름을 앞에 두고 나머지 테마를 뒤에 잇는다.
+                    # 같은 묶음끼리 앞부분이 같아 정렬 결과를 읽기 쉽다.
+                    labels = [
+                        theme for theme
+                        in model.theme_labels.get(code.removesuffix("_AL"), ())
+                        if theme != name
+                    ]
+                    return "·".join([name, *labels])
                 if role == Qt.UserRole:
                     return name
                 if role == Qt.ForegroundRole:
@@ -1625,9 +1632,8 @@ class StockModel(QAbstractTableModel):
             themes = self.theme_labels.get(code.removesuffix("_AL"), ())
             primary = themes[0] if themes else ""
             if role == Qt.DisplayRole:
-                if not primary:
-                    return "미분류"
-                return primary
+                # 가진 테마를 모두 적는다. 대표만 적으면 오늘 재료가 안 보인다.
+                return "·".join(themes) if themes else "미분류"
             if role == Qt.UserRole:
                 return primary
             if role == Qt.ForegroundRole:
@@ -2596,7 +2602,9 @@ class ConditionScreen(QWidget):
         self.theme_sort = QCheckBox("테마정렬")
         self.theme_sort.setToolTip(
             "테마별로 묶어 정렬 · 상한가 진입이 빠른 테마 우선, "
-            "그 외는 테마 내 최고 등락률 순 · 테마 안에서는 상한가 진입시각과 등락률 순")
+            "그 외는 테마 내 최고 등락률 순 · 테마 안에서는 상한가 진입시각과 등락률 순\n"
+            "강도는 시장 전체가 아니라 이 창에 검색된 종목만으로 계산합니다.\n"
+            "조건이 좁으면 테마당 종목이 적어 강도 비교가 무뎌집니다.")
         self._jumsang_group: set[str] | None = None
         self.jumsang_check = QCheckBox("점상알림")
         self.jumsang_check.setToolTip(
@@ -2997,6 +3005,11 @@ class ConditionScreen(QWidget):
         # 이전에는 테마정렬을 켤 때만 DB 연결표를 읽어, 체크가 꺼진 채
         # 시작하면 삼성전자·SK하이닉스처럼 분류가 있는 종목도 미분류였다.
         self._load_theme_classification()
+        # 뉴스 테마는 장중에 계속 붙으므로 주기적으로 다시 읽는다.
+        # DB 조회 한 번이라 부담이 없고, 값이 같으면 화면도 그대로다.
+        self._theme_reload_timer = QTimer(self)
+        self._theme_reload_timer.timeout.connect(self._load_theme_classification)
+        self._theme_reload_timer.start(300000)  # 5분
         self.rank_period.activated.connect(self._save_rank_period)
         self.set_rank_period("rank")  # 기본: 조회순위 기준시간 (급증 선택 시 main이 교체)
         if self._settings.value(self.prefix + "limit_sort", "false") == "true":  # 상한가정렬 복원

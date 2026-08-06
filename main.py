@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 )
 
 from analysis_db import (
+    backfill_news_themes,
     database_stats, save_stock_history, start_collection,
     update_collection, save_dart_corp_codes, save_dart_parent_relations,
     sync_stock_catalog, save_krx_market_day, krx_collected_dates,
@@ -5034,6 +5035,28 @@ class AnalysisWindow(
             self._collection_task = None
             self._refresh_limit_up_table()
             self._refresh_theme_table()
+
+    def _start_news_theme_backfill(self):
+        """저장된 최근 뉴스를 다시 훑어 테마 연결을 채운다.
+
+        새 뉴스는 저장할 때 자동으로 붙으므로, 키워드 사전을 고친 뒤에만 쓴다.
+        DB만 읽고 쓰는 작업이라 수집 작업과 달리 그 자리에서 끝낸다.
+        """
+        button = self._news_theme_btn
+        button.setEnabled(False)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            linked = backfill_news_themes()
+        except Exception as error:  # noqa: BLE001
+            log.exception("news theme backfill failed")
+            QMessageBox.warning(
+                self, "뉴스 테마", f"소급에 실패했습니다.\n{error}")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+            button.setEnabled(True)
+        self._collection_status.setText(f"뉴스 테마 소급 · {linked:,}건 연결")
+        self._refresh_theme_table()
 
     def _start_naver_theme_collection(self):
         if self._collection_task and not self._collection_task.done():
