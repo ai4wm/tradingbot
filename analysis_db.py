@@ -14,6 +14,8 @@ from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from theme_keywords import match_news_themes
+
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "market_analysis.db"
 SCHEMA_VERSION = 22
@@ -2389,17 +2391,20 @@ def active_theme_labels(db_path: Path = DB_PATH) -> dict[str, tuple[str, ...]]:
                  JOIN themes t ON t.theme_id=st.theme_id
                 WHERE st.valid_to IS NULL
                   AND TRIM(t.theme_name)<>''
+                  AND (st.source<>'NEWS' OR st.valid_from>=?)
                 ORDER BY st.stock_code,
                     CASE st.source
                         WHEN 'MANUAL' THEN 0
-                        WHEN 'NAVER' THEN 1
-                        WHEN 'KIWOOM' THEN 2
-                        WHEN 'WICS' THEN 3
-                        WHEN 'KRX' THEN 4
-                        WHEN 'DART' THEN 5
+                        WHEN 'NEWS' THEN 1
+                        WHEN 'NAVER' THEN 2
+                        WHEN 'KIWOOM' THEN 3
+                        WHEN 'WICS' THEN 4
+                        WHEN 'KRX' THEN 5
+                        WHEN 'DART' THEN 6
                         ELSE 9
                     END,
                     t.theme_name""",
+            (NEWS_THEME_CUTOFF(),),
         ).fetchall()
         preferred_codes = {
             str(row["stock_code"] or "").removesuffix("_AL")
@@ -2414,12 +2419,12 @@ def active_theme_labels(db_path: Path = DB_PATH) -> dict[str, tuple[str, ...]]:
     # '2차전지'에 묶여 우주태양광 재료가 뜬 날에도 그대로 갇힌다.
     # 반면 WICS의 '핸드셋'·'화학' 같은 넓은 업종은 서로 다른 재료의 종목을
     # 한 묶음으로 만드므로, 세부 테마가 아예 없을 때만 보완으로 쓴다.
-    CURATED_SOURCES = ("MANUAL", "NAVER")
+    CURATED_SOURCES = ("MANUAL", "NEWS", "NAVER")
     source_rank = {
-        "KIWOOM": 2,
-        "WICS": 3,
-        "KRX": 4,
-        "DART": 5,
+        "KIWOOM": 3,
+        "WICS": 4,
+        "KRX": 5,
+        "DART": 6,
     }
     by_code_source: dict[str, dict[str, list[str]]] = {}
     for row in rows:
@@ -3864,6 +3869,112 @@ def theme_source_member_counts(
         }
 
 
+NEWS_THEME_MAX_AGE_DAYS = 7  # 약 5거래일. 재료가 식으면 원래 분류로 돌아간다
+# 종목코드가 여럿 달린 뉴스는 개별 재료가 아니라 시황·수급 나열이다.
+# "로봇 관련주 줄급등" 같은 기사를 편입시키면 테마가 전 종목으로 번진다.
+NEWS_THEME_MAX_CODES = 2
+
+
+def NEWS_THEME_CUTOFF() -> str:
+    """이 날짜보다 오래된 뉴스 편입은 조회에서 제외한다."""
+    return (datetime.now() - timedelta(days=NEWS_THEME_MAX_AGE_DAYS)
+            ).strftime("%Y%m%d")
+
+
+def apply_news_themes(stock_codes, text: str, trade_date: str = "",
+                      db_path: Path = DB_PATH) -> tuple[str, ...]:
+    """뉴스 한 건의 키워드로 종목을 테마에 붙인다. 붙인 테마명을 돌려준다.
+
+    기존 출처(KIWOOM 등)는 건드리지 않고 source='NEWS' 행만 더한다.
+    상장 종목표에 없는 코드는 무시한다.
+    """
+    codes = list(dict.fromkeys(
+        str(code).removesuffix("_AL") for code in (stock_codes or ())))
+    if not codes or len(codes) > NEWS_THEME_MAX_CODES:
+        return ()
+    themes = match_news_themes(text)
+    if not themes:
+        return ()
+    day = trade_date or datetime.now().strftime("%Y%m%d")
+    with closing(connect(db_path)) as connection, connection:
+        return _link_news_themes(connection, codes, themes, day)
+
+
+def _link_news_themes(connection, codes: list[str], themes: tuple[str, ...],
+                      day: str) -> tuple[str, ...]:
+    """열린 트랜잭션에서 종목-테마 NEWS 연결을 더한다."""
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    known = {
+        row[0] for row in connection.execute(
+            "SELECT stock_code FROM stocks WHERE stock_code IN ({})".format(
+                ",".join("?" * len(codes))), codes).fetchall()
+    }
+    if not known:
+        return ()
+    for theme in themes:
+        connection.execute(
+            """INSERT INTO themes(theme_name, description, updated_at)
+               VALUES (?, '', ?)
+               ON CONFLICT(theme_name) DO UPDATE SET
+                   updated_at=excluded.updated_at""",
+            (theme, now),
+        )
+        theme_id = connection.execute(
+            "SELECT theme_id FROM themes WHERE theme_name=?",
+            (theme,)).fetchone()[0]
+        connection.executemany(
+            """INSERT INTO stock_themes(
+                   stock_code, theme_id, valid_from, valid_to,
+                   source, confidence)
+               VALUES (?, ?, ?, NULL, 'NEWS', 0.5)
+               ON CONFLICT(stock_code, theme_id, valid_from)
+               DO UPDATE SET valid_to=NULL""",
+            ((code, theme_id, day) for code in known),
+        )
+    return themes
+
+
+def backfill_news_themes(days: int = NEWS_THEME_MAX_AGE_DAYS,
+                         db_path: Path = DB_PATH) -> int:
+    """이미 저장된 최근 뉴스를 훑어 테마 연결을 채운다. 연결한 건수를 돌려준다.
+
+    새 뉴스는 저장할 때 바로 붙지만, 기능을 넣기 전에 쌓인 뉴스와
+    사전을 고친 뒤의 소급 반영에는 이 함수가 필요하다.
+    """
+    since = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
+    linked = 0
+    with closing(connect(db_path)) as connection, connection:
+        for row in connection.execute(
+                """SELECT news_date, stock_code, related_stock_codes, title
+                     FROM ls_realtime_news WHERE news_date>=?""",
+                (since,)).fetchall():
+            codes = list(dict.fromkeys(
+                split_ls_news_stock_codes(row["stock_code"])
+                + split_ls_news_stock_codes(row["related_stock_codes"])))
+            themes = match_news_themes(row["title"]) if (
+                codes and len(codes) <= NEWS_THEME_MAX_CODES) else ()
+            if themes and _link_news_themes(
+                    connection, codes, themes, str(row["news_date"])):
+                linked += len(themes) * len(codes)
+        for row in connection.execute(
+                """SELECT published_at, stock_codes, title, body
+                     FROM telegram_news
+                    WHERE REPLACE(SUBSTR(published_at,1,10),'-','')>=?""",
+                (since,)).fetchall():
+            try:
+                codes = [str(code) for code in json.loads(row["stock_codes"])]
+            except (TypeError, ValueError):
+                codes = []
+            codes = list(dict.fromkeys(codes))
+            themes = match_news_themes(
+                f"{row['title']} {row['body']}") if (
+                    codes and len(codes) <= NEWS_THEME_MAX_CODES) else ()
+            day = str(row["published_at"])[:10].replace("-", "")
+            if themes and _link_news_themes(connection, codes, themes, day):
+                linked += len(themes) * len(codes)
+    return linked
+
+
 def save_theme_snapshot(theme_rows: list[dict], snapshot_date: str,
                         source: str = "KIWOOM",
                         confidence: float = 0.8,
@@ -4548,7 +4659,12 @@ def save_ls_realtime_news(row: dict, db_path: Path = DB_PATH, *,
         initialize(db_path)
     now = datetime.now().astimezone().isoformat(timespec="seconds")
     with closing(connect(db_path)) as connection, connection:
-        return _upsert_ls_realtime_news(connection, row, now)
+        result = _upsert_ls_realtime_news(connection, row, now)
+    if result.get("inserted"):
+        apply_news_themes(
+            split_ls_news_stock_codes(row.get("codes") or row.get("code") or ""),
+            str(row.get("title") or ""), db_path=db_path)
+    return result
 
 
 LS_NEWS_SERVER_CURSOR_KEY = "ls_news_last_server_id"
@@ -5021,7 +5137,13 @@ def save_telegram_news(row: dict, db_path: Path = DB_PATH, *,
                 now,
             ),
         )
-        return cursor.rowcount > 0
+        inserted = cursor.rowcount > 0
+    if inserted:
+        apply_news_themes(
+            row.get("stock_codes") or (),
+            f"{row.get('title') or ''} {row.get('body') or ''}",
+            db_path=db_path)
+    return inserted
 
 
 def telegram_news_rows(limit: int = 300, *, stock_only: bool = False,
@@ -5242,6 +5364,11 @@ def save_news_items(stock_code: str, stock_name: str, rows: list[dict],
                WHERE stock_code=?""",
             (now, stock_code),
         )
+    if result["new"]:
+        apply_news_themes(
+            (stock_code,),
+            " ".join(str(item.get("title") or "") for item in rows),
+            db_path=db_path)
     return result
 
 
