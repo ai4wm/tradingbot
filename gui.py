@@ -3071,6 +3071,15 @@ class ConditionScreen(QWidget):
         self.trim_order_btn.clicked.connect(self._request_trim)
         # 미체결 100주 초과분 합계. main이 장부에서 계산해 내려준다.
         self._trim_qty = 0
+        # 컬럼 배치만 두 벌로 나눈다. 나머지 화면 설정은 두 상태가 함께 쓴다.
+        self.expected_layout_check = QCheckBox("예상")
+        self.expected_layout_check.setStyle(self._checkbox_style)
+        self.expected_layout_check.setToolTip(
+            "컬럼 순서·너비·정렬을 이 상태 전용으로 따로 기억합니다"
+            " · 재조회·소리·정렬 체크 등 나머지 설정은 공유합니다")
+        self.expected_layout_check.setChecked(
+            self._settings.value(self.prefix + "expected_layout", "false")
+            == "true")
         self.order_enable_check = QCheckBox("주문허용")
         self.order_enable_check.setStyle(self._checkbox_style)
         self.order_enable_check.setToolTip("체크한 동안 주문 버튼이 실제 주문을 전송합니다")
@@ -3083,6 +3092,8 @@ class ConditionScreen(QWidget):
         # 상세상태 문자열은 내부 보관만 하고, 화면 표시는 종목별 주문 컬럼이 담당한다.
         self.order_status_value = QLabel()
         self.order_enable_check.toggled.connect(self._refresh_order_actions)
+        # setChecked를 끝낸 뒤에 잇는다. 먼저 이으면 초기 복원이 저장을 부른다.
+        self.expected_layout_check.toggled.connect(self._on_expected_layout)
         self.fixed_qty_order_btn.clicked.connect(
             lambda: self._request_order("fixed"))
         self.remaining_order_btn.clicked.connect(
@@ -3106,6 +3117,7 @@ class ConditionScreen(QWidget):
         order_bar.addWidget(self.fixed_qty_order_btn)
         order_bar.addWidget(self.remaining_order_btn)
         order_bar.addStretch(1)
+        order_bar.addWidget(self.expected_layout_check)
 
         order_preview_bar = QHBoxLayout()
         order_preview_bar.setContentsMargins(0, 0, 0, 0)
@@ -3229,34 +3241,7 @@ class ConditionScreen(QWidget):
         self.model.rowsRemoved.connect(self._update_count)
 
         # 컬럼 너비/순서 기억: 저장된 상태 복원 후, 변경 시 debounce 저장
-        state = self._settings.value(self.prefix + "header")
-        # 컬럼 수가 바뀐 옛 저장분은 restoreState가 False -> 기본 레이아웃/정렬 유지
-        if state is not None and self.table.horizontalHeader().restoreState(state):
-            # restoreState가 옛 정렬값(가운데)까지 되살림 -> 왼쪽 재적용
-            self.table.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-            sec = self.table.horizontalHeader().sortIndicatorSection()
-            if sec >= 0:  # 마지막 정렬 컬럼/방향 복원
-                self._sort_col = sec
-                self._sort_order = self.table.horizontalHeader().sortIndicatorOrder()
-        # saveState는 컬럼 수가 달라지면 통째로 복원에 실패한다. 이름별 너비를 다시
-        # 덮어써 새 컬럼이 추가돼도 기존 컬럼 크기는 그대로 유지한다.
-        removed_bad_width = False
-        for col, field in enumerate(FIELDS):
-            key = self.prefix + "colwidth_" + field
-            width = self._settings.value(key)
-            if width is None:
-                continue
-            try:
-                width = int(width)
-            except (TypeError, ValueError):
-                width = 0
-            if width > 0:
-                self.table.setColumnWidth(col, width)
-            else:  # 구버전이 숨김 컬럼 폭 0을 저장한 값은 즉시 폐기
-                self._settings.remove(key)
-                removed_bad_width = True
-        if removed_bad_width:
-            self._settings.sync()
+        self._restore_layout()
         if self.table.columnWidth(BALANCE_SELL_COL) > 170:
             self.table.setColumnWidth(BALANCE_SELL_COL, 125)
         # 저장된 구버전 헤더 순서와 무관하게
@@ -3827,15 +3812,68 @@ class ConditionScreen(QWidget):
                 QEvent.Type.ApplicationPaletteChange):
             self._update_count()
 
-    def _save_layout(self):
+    def _layout_key(self, name: str, expected: bool | None = None) -> str:
+        """컬럼 배치 저장 키. '예상' 체크에 따라 두 벌을 따로 남긴다.
+
+        나머지 화면 설정(재조회·소리·정렬 체크 등)은 프로필과 무관하게 하나만
+        쓴다. 표 배치만 갈아 끼워야 전환했을 때 놀랄 일이 없다.
+        """
+        if expected is None:
+            expected = self.expected_layout_check.isChecked()
+        return self.prefix + ("exp_" if expected else "") + name
+
+    def _restore_layout(self, expected: bool | None = None):
+        """저장된 컬럼 순서·너비·정렬을 화면에 되돌린다."""
         header = self.table.horizontalHeader()
-        self._settings.setValue(self.prefix + "header", header.saveState())
+        state = self._settings.value(self._layout_key("header", expected))
+        # 컬럼 수가 바뀐 옛 저장분은 restoreState가 False -> 기본 레이아웃/정렬 유지
+        if state is not None and header.restoreState(state):
+            # restoreState가 옛 정렬값(가운데)까지 되살림 -> 왼쪽 재적용
+            header.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            sec = header.sortIndicatorSection()
+            if sec >= 0:  # 마지막 정렬 컬럼/방향 복원
+                self._sort_col = sec
+                self._sort_order = header.sortIndicatorOrder()
+        # saveState는 컬럼 수가 달라지면 통째로 복원에 실패한다. 이름별 너비를 다시
+        # 덮어써 새 컬럼이 추가돼도 기존 컬럼 크기는 그대로 유지한다.
+        removed_bad_width = False
+        for col, field in enumerate(FIELDS):
+            key = self._layout_key("colwidth_" + field, expected)
+            width = self._settings.value(key)
+            if width is None:
+                continue
+            try:
+                width = int(width)
+            except (TypeError, ValueError):
+                width = 0
+            if width > 0:
+                self.table.setColumnWidth(col, width)
+            else:  # 구버전이 숨김 컬럼 폭 0을 저장한 값은 즉시 폐기
+                self._settings.remove(key)
+                removed_bad_width = True
+        if removed_bad_width:
+            self._settings.sync()
+
+    def _on_expected_layout(self, checked: bool):
+        """예상 체크를 바꾸면 지금 배치를 이전 프로필에 남기고 새 배치를 연다."""
+        self._save_layout(expected=not checked)
+        self._settings.setValue(
+            self.prefix + "expected_layout", "true" if checked else "false")
+        self._settings.sync()  # _save_layout의 sync보다 뒤라 따로 내려야 한다
+        self._restore_layout(checked)
+        self._apply_sort()
+
+    def _save_layout(self, expected: bool | None = None):
+        header = self.table.horizontalHeader()
+        self._settings.setValue(
+            self._layout_key("header", expected), header.saveState())
         for col, field in enumerate(FIELDS):
             # 숨김 컬럼은 sectionSize=0이다. 이를 저장하면 순위 화면에서 다시
             # 표시해도 폭 0으로 남으므로 마지막 정상 너비를 보존한다.
             if not header.isSectionHidden(col) and header.sectionSize(col) > 0:
                 self._settings.setValue(
-                    self.prefix + "colwidth_" + field, header.sectionSize(col))
+                    self._layout_key("colwidth_" + field, expected),
+                    header.sectionSize(col))
         self._settings.sync()  # 강제 종료돼도 디스크에 남게
 
     @staticmethod
