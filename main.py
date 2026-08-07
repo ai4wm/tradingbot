@@ -2716,63 +2716,64 @@ class App:
     # 3단매도·자동취소·청산키는 앱을 다시 열어도 그대로 살아 있어야 한다.
     # 실주문을 자동으로 내는 설정이므로 복원 내역은 audit 로그에 남긴다.
     def _save_order_settings(self):
-        self._settings.setValue(
-            "order/auto_cancel_armed",
-            json.dumps(sorted(self._account_auto_cancel_armed)))
-        # 단계(stage)를 함께 저장해야 재시작 뒤 이미 나간 단계가 다시 나가지
-        # 않는다. 날짜는 _check_balance_sell의 당일 만료 판정에 그대로 쓴다.
-        self._settings.setValue("order/balance_sell", json.dumps({
-            code: {
-                "setting": setting,
-                "stage": int(self._balance_sell_stage.get(code, 0)),
-                "date": self._balance_sell_date.get(code, ""),
-            }
-            for code, setting in self._balance_sell_settings.items()
-        }, ensure_ascii=False))
-        self._settings.setValue("order/exit_hotkeys", json.dumps({
-            prefix: specs
-            for prefix, specs in self._exit_hotkey_specs.items() if specs
-        }, ensure_ascii=False))
+        """청산키만 날짜와 함께 남긴다. 3단매도와 자동취소는 저장하지 않는다.
+
+        3단매도·자동취소는 켜져 있으면 조건이 맞는 순간 스스로 주문을 낸다.
+        앱을 켜자마자 되살아나면 사용자가 모르는 사이에 매도나 취소가 나간다.
+        매번 손으로 켜는 비용이 그 위험보다 싸다. 옛 저장분도 지운다.
+
+        청산키는 사용자가 눌러야 나가지만, 앱이 뒤에 있어도 먹는 전역키라
+        어제 배정이 남으면 오늘 화면에 없는 종목이 청산된다. 그날만 유효하게
+        둔다.
+        """
+        self._settings.remove("order/auto_cancel_armed")
+        self._settings.remove("order/balance_sell")
+        specs = {
+            prefix: values
+            for prefix, values in self._exit_hotkey_specs.items() if values
+        }
+        self._settings.setValue("order/exit_hotkeys", json.dumps(
+            {"date": datetime.now().strftime("%Y%m%d"), "specs": specs}
+            if specs else {}, ensure_ascii=False))
         self._settings.sync()
 
     def _load_order_settings(self):
-        """저장된 종목별 주문설정을 메모리로 되돌린다. 화면 반영은 편입 시점."""
-        def read(key, default):
-            raw = str(self._settings.value(key, "") or "").strip()
-            if not raw:
-                return default  # 아직 저장한 적 없음 — 손상과 구분한다
-            try:
-                return json.loads(raw) or default
-            except (ValueError, TypeError):
-                log.warning("order setting reload failed: %s raw=%.200s", key, raw)
-                return default
+        """그날 배정한 청산키만 되돌린다. 화면 반영은 편입 시점.
 
-        self._account_auto_cancel_armed = set(read("order/auto_cancel_armed", []))
+        3단매도와 자동취소는 일부러 안 되살린다. 스스로 주문을 내는 설정이라
+        앱을 켜자마자 조건이 맞으면 그대로 나간다. 남아 있던 옛 저장분도
+        지워, 예전 버전이 남긴 값이 되살아나지 않게 한다.
+        """
+        raw = str(self._settings.value("order/exit_hotkeys", "") or "").strip()
+        try:
+            saved = json.loads(raw) if raw else {}
+        except (ValueError, TypeError):
+            log.warning("exit hotkey reload failed: raw=%.200s", raw)
+            saved = {}
         today = datetime.now().strftime("%Y%m%d")
-        expired = []
-        for code, saved in read("order/balance_sell", {}).items():
-            # 3단매도는 원래 당일만 유효하다. 날짜가 지난 설정은 되살리지 않는다.
-            if str(saved.get("date") or "") != today:
-                expired.append(code)
-                continue
-            self._balance_sell_settings[code] = dict(saved.get("setting") or {})
-            self._balance_sell_stage[code] = int(saved.get("stage") or 0)
-            self._balance_sell_date[code] = today
+        # 날짜 없는 옛 형식은 언제 배정한 것인지 알 수 없으므로 버린다.
+        expired = bool(saved) and str(saved.get("date") or "") != today
+        specs = {} if expired else (saved.get("specs") or {})
         self._exit_hotkey_specs = {
-            str(prefix): {str(code): spec for code, spec in (specs or {}).items()}
-            for prefix, specs in read("order/exit_hotkeys", {}).items()
+            str(prefix): {str(code): spec for code, spec in (values or {}).items()}
+            for prefix, values in specs.items()
         }
-        if (self._account_auto_cancel_armed or self._balance_sell_settings
-                or self._exit_hotkey_specs):
+        dropped = [
+            key for key in ("order/auto_cancel_armed", "order/balance_sell")
+            if str(self._settings.value(key, "") or "").strip() not in ("", "{}", "[]")
+        ]
+        for key in ("order/auto_cancel_armed", "order/balance_sell"):
+            self._settings.remove(key)
+        if expired:
+            self._settings.remove("order/exit_hotkeys")
+        if dropped or expired:
+            self._settings.sync()
+        if self._exit_hotkey_specs or dropped or expired:
             audit_log.info(
-                "order settings restored auto_cancel=%s balance_sell=%s "
-                "hotkeys=%s expired_balance_sell=%s",
-                sorted(self._account_auto_cancel_armed),
-                {code: self._balance_sell_stage.get(code, 0)
-                 for code in self._balance_sell_settings},
-                {prefix: sorted(specs)
-                 for prefix, specs in self._exit_hotkey_specs.items()},
-                expired)
+                "order settings restored hotkeys=%s dropped=%s expired_hotkeys=%s",
+                {prefix: sorted(values)
+                 for prefix, values in self._exit_hotkey_specs.items()},
+                dropped, expired)
 
     def _restore_screen_order_settings(self, screen: ConditionScreen):
         """창이 만들어질 때 그 창 몫의 청산키를 다시 등록한다."""
