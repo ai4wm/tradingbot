@@ -62,7 +62,7 @@ from dart_api import DartClient
 from krx_api import KrxClient
 from global_market_api import GlobalMarketClient
 from gui import (
-    BALANCE_SELL_COL, ConditionScreen, NumericTableWidgetItem,
+    BALANCE_SELL_COL, ORDER_TRIM_KEEP, ConditionScreen, NumericTableWidgetItem,
 )
 from ls_news_server_sync import LSNewsServerSync
 from ui.limit_up_tab import LimitUpTabMixin
@@ -1094,6 +1094,7 @@ class App:
             lambda code, mode, count, auto, total, price, target=screen:
             self._submit_order(target, code, mode, count, auto, total, price))
         screen.cancel_requested.connect(self._cancel_order)
+        screen.trim_requested.connect(self._trim_open_buys)
         screen.order_enable_check.toggled.connect(
             lambda enabled, source=screen:
             self._sync_order_enabled(enabled, source))
@@ -2549,11 +2550,16 @@ class App:
 
         buy = summary(self._open_buy_orders)
         sell = summary(self._open_sell_orders)
+        # 나머지취소가 실제로 끊어 낼 수 있는 수량. 100주 이하인 건은 없다.
+        trim = sum(
+            qty - ORDER_TRIM_KEEP
+            for qty, _ in (self._open_buy_orders.get(code) or {}).values()
+            if qty > ORDER_TRIM_KEEP)
         booked = self._position_book.get(code) or {}
         position = (max(0, int(booked.get("held") or 0)),
                     max(0, int(booked.get("sellable") or 0)))
         for view in self.views:
-            view.screen.set_pending_orders(code, buy, sell, position)
+            view.screen.set_pending_orders(code, buy, sell, position, trim)
 
     def _pending_open_buys(self, code: str) -> list[tuple[str, int, str]]:
         """장부의 미체결 매수를 (주문번호, 잔량, 거래소)로 돌려준다. 조회 없음."""
@@ -2601,6 +2607,46 @@ class App:
             log.exception(
                 "%s open-buy cancel failed code=%s order=%s qty=%s",
                 reason, code, order_no, qty)
+
+    def _trim_open_buys(self, code: str):
+        """미체결 매수 각 건에서 100주만 남기고 나머지를 부분취소한다.
+
+        230주 9분할이면 130주씩 9건을 취소해 100주 9건만 남긴다.
+        """
+        code = str(code or "").strip().split("_")[0].removeprefix("A")
+        targets = [
+            (order_no, remaining - ORDER_TRIM_KEEP, exchange)
+            for order_no, (remaining, exchange)
+            in (self._open_buy_orders.get(code) or {}).items()
+            if remaining > ORDER_TRIM_KEEP
+        ]
+        if not targets:
+            return
+        audit_log.info(
+            "trim open buys requested code=%s orders=%s keep=%s cancel=%s",
+            code, len(targets), ORDER_TRIM_KEEP,
+            sum(qty for _, qty, _ex in targets))
+        for order_no, qty, exchange in targets:
+            asyncio.ensure_future(
+                self._trim_one_open_buy(code, order_no, qty, exchange))
+
+    async def _trim_one_open_buy(self, code: str, order_no: str, qty: int,
+                                 exchange: str):
+        """부분취소 한 건. 전량취소 장부(`_cancel_sent_orders`)는 쓰지 않는다.
+
+        부분취소는 잔량이 남아 취소확인(잔량 0)이 오지 않는다. 전송 표시를
+        남기면 지워 줄 이벤트가 없어, 이후 비상정지·3단매도의 전량취소가
+        그 주문을 이미 보낸 것으로 보고 건너뛴다.
+        """
+        try:
+            await self.rest.cancel_order(code, order_no, qty, exchange)
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "trim cancel failed code=%s order=%s qty=%s",
+                code, order_no, qty)
+            return
+        audit_log.info(
+            "trim cancel sent code=%s order=%s qty=%s", code, order_no, qty)
 
     async def _sweep_open_buys(self, code: str, reason: str):
         """매도 전송 뒤 계좌 미체결을 한 번 더 확인해 장부 누락을 메운다.
@@ -3474,6 +3520,7 @@ class App:
             lambda code, mode, count, auto, total, price, target=screen:
             self._submit_order(target, code, mode, count, auto, total, price))
         screen.cancel_requested.connect(self._cancel_order)
+        screen.trim_requested.connect(self._trim_open_buys)
         screen.order_enable_check.toggled.connect(
             lambda enabled, source=screen:
             self._sync_order_enabled(enabled, source))

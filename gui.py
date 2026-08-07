@@ -21,8 +21,8 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QHBoxLayout, QHeaderView, QLabel,
-    QDialog, QGridLayout, QLineEdit, QMainWindow, QProxyStyle, QPushButton, QSpinBox,
-    QStyle, QStyledItemDelegate, QStyleOptionViewItem, QTableView,
+    QDialog, QGridLayout, QLineEdit, QMainWindow, QProxyStyle, QPushButton, QSizePolicy,
+    QSpinBox, QStyle, QStyledItemDelegate, QStyleOptionViewItem, QTableView,
     QTableWidgetItem, QToolTip, QVBoxLayout, QWidget,
 )
 
@@ -120,6 +120,9 @@ THEME_GROUP_COLORS = (
     QColor("#FF6E8A"), QColor("#4FC3F7"), QColor("#8BC34A"),
 )
 
+
+ORDER_TRIM_KEEP = 100  # 나머지취소가 미체결 매수 각 건에 남기는 수량
+TRIM_BUTTON_TEXT = "나머지취소"
 
 NEWS_THEME_MARK = "•"  # 최근 뉴스로 붙은 테마 앞에 붙인다
 NO_NEWS_MARK = "?"  # 오늘 재료 기사가 없는 종목: 왜 오르는지 모른다는 뜻
@@ -483,11 +486,6 @@ class NameDelegate(QStyledItemDelegate):
             _draw_selection_lines(painter, option.rect, option.palette)
 
 
-def _in_opening_auction() -> bool:
-    """개장 동시호가 여부. 프로젝트의 시각 기준은 로컬 KST다."""
-    return "0830" <= time.strftime("%H%M") < "0900"
-
-
 def _minute_value_display_bucket(value) -> int:
     """대금/분 화면 표시와 정렬이 함께 사용할 0.1억원 단위 값."""
     raw = max(0, int(value or 0))
@@ -532,6 +530,8 @@ class TieredProxy(QSortFilterProxyModel):
         super().__init__()
         self.limit_mode = False
         self.theme_mode = False
+        # 세로 헤더를 눌러 맨 위에 붙인 종목. 어떤 정렬에서도 위에 남는다.
+        self.pinned: set[str] = set()
         self.theme_labels: dict[str, tuple[str, ...]] = {}
         self.relation_groups: dict[str, tuple[str, ...]] = {}
         self._theme_sort_keys: dict[str, tuple] = {}
@@ -741,9 +741,23 @@ class TieredProxy(QSortFilterProxyModel):
         self._refresh_theme_sort_keys()
         super().invalidate()
 
+    def row_code(self, row: int) -> str:
+        """프록시 행 -> 종목코드. 정렬 뒤 화면 순서를 소스로 되짚는다."""
+        model = self.sourceModel()
+        source_index = self.mapToSource(self.index(row, 0))
+        if model is None or not source_index.isValid():
+            return ""
+        if not hasattr(model, "codes") or source_index.row() >= len(model.codes):
+            return ""
+        return model.codes[source_index.row()]
+
     def headerData(self, section, orientation, role=Qt.DisplayRole):
         # 세로 헤더 = 순위: 프록시 행번호(정렬 순서)로 1..N. 소스 매핑 안 함(편입순서 X).
         if orientation == Qt.Vertical and role == Qt.DisplayRole:
+            # 고정 종목은 번호 대신 표식을 넣는다. 어차피 맨 위 몇 줄이라
+            # 순위를 잃지 않고, 컬럼을 새로 만들지 않아도 된다.
+            if self.pinned and self.row_code(section) in self.pinned:
+                return "📌"
             return section + 1
         return super().headerData(section, orientation, role)
 
@@ -815,6 +829,15 @@ class TieredProxy(QSortFilterProxyModel):
         return super().data(index, role)
 
     def lessThan(self, left, right):
+        if self.pinned:
+            model = self.sourceModel()
+            left_pinned = model.codes[left.row()] in self.pinned
+            right_pinned = model.codes[right.row()] in self.pinned
+            if left_pinned != right_pinned:
+                # 어떤 정렬·방향에서도 위에 남긴다. Qt는 내림차순일 때
+                # lessThan 결과를 뒤집으므로 반대로 돌려준다.
+                return (right_pinned if self.sortOrder() == Qt.DescendingOrder
+                        else left_pinned)
         if self.theme_mode:
             model = self.sourceModel()
             left_code = model.codes[left.row()]
@@ -914,8 +937,7 @@ class ThemeGroupedTableView(QTableView):
         0인(점상) 종목코드. 선 안에서도 tier 1 -> 0으로 올라오는 순간이
         점상알림의 대상이라 두 tier를 구분해 돌려준다."""
         proxy = self.model()
-        if not (isinstance(proxy, TieredProxy) and proxy.limit_mode
-                and not _in_opening_auction()):
+        if not (isinstance(proxy, TieredProxy) and proxy.limit_mode):
             return -1, set()
         source = proxy.sourceModel()
         if source is None or not hasattr(source, "codes"):
@@ -925,12 +947,17 @@ class ThemeGroupedTableView(QTableView):
             source_index = proxy.mapToSource(proxy.index(row, 0))
             if not source_index.isValid():
                 break
-            tier = _limit_tier(source.rows[source.codes[source_index.row()]])
+            code = source.codes[source_index.row()]
+            tier = _limit_tier(source.rows[code])
+            if tier == 0:
+                jumsang.add(code)
+            if code in proxy.pinned:
+                # 고정 종목은 순위와 무관하게 맨 위에 붙는다. 여기서 끊으면
+                # 일반 종목 하나만 고정해도 구분선이 통째로 사라진다.
+                continue
             if tier not in (0, 1):
                 break
             last_row = row
-            if tier == 0:
-                jumsang.add(source.codes[source_index.row()])
         return last_row, jumsang
 
     def paintEvent(self, event):
@@ -2658,6 +2685,7 @@ class ConditionScreen(QWidget):
     order_target_changed = Signal(str)
     order_requested = Signal(str, str, int, bool, int, int)
     cancel_requested = Signal(str)
+    trim_requested = Signal(str)  # 미체결 매수에서 100주만 남기고 부분취소
     emergency_exit_requested = Signal(str, int, bool)
     order_status_acknowledged = Signal(str)
     exit_hotkey_changed = Signal(str, object)
@@ -2946,6 +2974,29 @@ class ConditionScreen(QWidget):
                 f"QPushButton:hover{{background:{over}}}"
                 f"QPushButton:disabled{{border-color:{dim};background:#FAFAFA;"
                 "color:#9E9E9E}")
+        # 미체결 매수 각 건에서 100주만 남기고 나머지를 취소한다. 매수 버튼과
+        # 색을 달리해 손이 미끄러져도 매수가 나가지 않게 한다.
+        self.trim_order_btn = QPushButton(TRIM_BUTTON_TEXT)
+        self.trim_order_btn.setFixedHeight(24)
+        # 폭은 Qt가 스타일시트 여백까지 넣어 계산한 값을 그대로 쓴다. 폰트를
+        # 직접 재면 앱 전역 글꼴·볼드가 반영되지 않아 글자가 잘린다.
+        # Fixed 정책이라 줄이 꽉 차도 이 버튼만은 안 줄어든다.
+        self.trim_order_btn.setSizePolicy(
+            QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.trim_order_btn.setEnabled(False)
+        self.trim_order_btn.setToolTip(
+            f"미체결 매수 주문마다 {ORDER_TRIM_KEEP}주만 남기고 나머지를"
+            " 부분취소합니다 · 주문허용 체크 후 사용")
+        self.trim_order_btn.setStyleSheet(
+            "QPushButton{border:2px solid #424242;border-radius:4px;"
+            "background:#EEEEEE;color:#212121;font-weight:bold;"
+            "padding:0px 11px}"
+            "QPushButton:hover{background:#DCDCDC}"
+            "QPushButton:disabled{border-color:#BDBDBD;background:#FAFAFA;"
+            "color:#9E9E9E}")
+        self.trim_order_btn.clicked.connect(self._request_trim)
+        # 미체결 100주 초과분 합계. main이 장부에서 계산해 내려준다.
+        self._trim_qty = 0
         self.order_enable_check = QCheckBox("주문허용")
         self.order_enable_check.setStyle(self._checkbox_style)
         self.order_enable_check.setToolTip("체크한 동안 주문 버튼이 실제 주문을 전송합니다")
@@ -2984,8 +3035,25 @@ class ConditionScreen(QWidget):
 
         order_preview_bar = QHBoxLayout()
         order_preview_bar.setContentsMargins(0, 0, 0, 0)
+        # 미체결과 버튼은 내용 크기 그대로 오른쪽 끝에 붙고, 남는 폭은 왼쪽
+        # 예상주문이 다 가져간다. 비율로 나누면 내용 길이와 무관하게 잘려서
+        # 짧은 미체결 쪽에 빈칸이 남고 긴 예상주문이 먼저 끊긴다.
+        # 좁아질 때 줄어드는 순서는 예상주문 -> 미체결 -> 버튼(안 줄어듦)이다.
+        # 예상주문이 먼저 제 폭을 다 가져가고(Maximum = 내용폭 이상으로는
+        # 안 커짐), 미체결이 남는 폭을 쓴다(Ignored + stretch). 창이 좁아지면
+        # 미체결이 먼저 없어지고 그다음 예상주문이 줄어든다.
+        # minimumWidth(1)이 필요하다. 0은 '설정 안 함'으로 취급돼 글자 전체
+        # 폭인 minimumSizeHint가 그대로 먹히고, 그러면 예상주문이 안 줄어들어
+        # 취소 버튼이 화면 밖으로 밀려난다.
+        self.order_preview_value.setSizePolicy(
+            QSizePolicy.Maximum, QSizePolicy.Preferred)
+        self.order_preview_value.setMinimumWidth(1)
+        self.pending_order_value.setSizePolicy(
+            QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.pending_order_value.setMinimumWidth(0)
         order_preview_bar.addWidget(self.order_preview_value)
-        order_preview_bar.addWidget(self.pending_order_value)
+        order_preview_bar.addWidget(self.pending_order_value, 1)
+        order_preview_bar.addWidget(self.trim_order_btn)
 
         # 그리드
         self.proxy = TieredProxy()
@@ -3027,6 +3095,16 @@ class ConditionScreen(QWidget):
         self._minute_value_timer.start(1000)
         self.table.verticalHeader().setVisible(True)  # 순위(정렬 순서대로 1..N 자동)
         self.table.verticalHeader().setDefaultSectionSize(22)
+        # 순위 칸은 표시 전용이라 비어 있다. 여기에 고정 토글을 붙이면 이미
+        # 클릭이 걸린 종목명·연상·매수잔량 셀과 부딪히지 않는다.
+        self.table.verticalHeader().setToolTip(
+            "클릭하면 그 종목을 맨 위에 고정합니다. 다시 누르면 해제")
+        self.table.verticalHeader().sectionClicked.connect(self._toggle_pin)
+        self.proxy.pinned = {
+            code for code in str(
+                self._settings.value(self.prefix + "pinned", "") or ""
+            ).split(",") if code
+        }
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         # StretchLastSection 금지: 마지막 컬럼 경계선이 사라지고 폭 조절이 잠김
         # 헤더 글자 왼쪽 정렬: 가운데면 칸 좁힐 때 앞자리부터 잘림 (시가총액->총액)
@@ -3185,12 +3263,16 @@ class ConditionScreen(QWidget):
         return min(self._account_available, manual_limit)
 
     def set_pending_orders(self, code: str, buy: tuple[int, int],
-                           sell: tuple[int, int], position: tuple[int, int]):
+                           sell: tuple[int, int], position: tuple[int, int],
+                           trim: int = 0):
         """선택 종목의 체결(보유)·미체결 요약을 예상주문 줄 오른쪽에 표시한다.
 
-        buy/sell은 (건수, 수량), position은 (보유, 매도가능)이다."""
+        buy/sell은 (건수, 수량), position은 (보유, 매도가능)이다.
+        trim은 미체결 매수에서 100주씩 남기고 취소할 수 있는 수량 합계다."""
         if code != self._order_target_code:
             return
+        self._trim_qty = max(0, int(trim))
+        self._refresh_order_actions()
         held, sellable = position
         parts = []
         if held:
@@ -3212,6 +3294,7 @@ class ConditionScreen(QWidget):
         code = self._order_target_code
         if not code or code not in self.model.rows:
             self.order_target_value.setText("종목을 선택하세요")
+            self._trim_qty = 0
             self.pending_order_value.setText("체결·미체결 -")
             self.orderable_qty_value.setText("-")
             self.orderable_qty_value.setToolTip("주문 대상종목을 선택하세요")
@@ -3332,6 +3415,17 @@ class ConditionScreen(QWidget):
         self.remaining_order_btn.setText(
             f"분할매수 ({remaining_count}회)" if remaining_count
             else "분할매수")
+        # 취소는 주문 진행 상태와 무관하게 낼 수 있어야 한다. 주문허용과
+        # 실제로 취소할 수량이 있는지만 본다.
+        self.trim_order_btn.setEnabled(
+            self.order_enable_check.isChecked() and self._trim_qty > 0)
+        # 수량은 바로 왼쪽 미체결 표시에 이미 있다. 버튼에 또 적으면 폭이
+        # 흔들리고 좁은 줄을 더 먹는다. 도구설명으로만 알린다.
+        self.trim_order_btn.setToolTip(
+            f"미체결 매수에서 {ORDER_TRIM_KEEP}주씩 남기고 "
+            f"{self._trim_qty:,}주를 취소합니다" if self._trim_qty
+            else f"미체결 매수 주문마다 {ORDER_TRIM_KEEP}주만 남기고 나머지를"
+                 " 부분취소합니다 · 주문허용 체크 후 사용")
         self._refresh_order_preview(
             available_qty, selected_count, fixed_count, remaining_count)
 
@@ -3380,11 +3474,14 @@ class ConditionScreen(QWidget):
         else:
             split_text = "주문가능수량 없음"
 
+        # 100주가 안 되면 100주씩은 0회라 금액이 0원으로 나왔다. 그래도
+        # 분할매수는 가능수량 전부를 주문하므로 그 금액을 대신 보여 준다.
+        amount_qty = fixed_total or available_qty
         self.order_preview_value.setText(
-            f"<b>상한가 지정가</b>&nbsp;&nbsp; 100주씩 {fixed_text}"
+            f"<b>상한가</b>&nbsp;&nbsp; 100주씩 {fixed_text}"
             f"&nbsp;&nbsp;│&nbsp;&nbsp; 분할매수 {split_text}"
             f"&nbsp;&nbsp;·&nbsp;&nbsp;"
-            f"<b>{fixed_total * upper:,}원</b>")
+            f"<b>{amount_qty * upper:,}원</b>")
         self.order_preview_value.setToolTip(
             "■ 실제 전송되는 주문 · □ 설정했지만 수량 부족으로 전송되지 않는 주문")
 
@@ -3429,6 +3526,19 @@ class ConditionScreen(QWidget):
         self._refresh_order_actions()
         self.order_requested.emit(
             code, mode, count, auto_cancel, total_qty, price)
+
+    def _request_trim(self):
+        """미체결 매수에서 100주씩만 남기고 나머지 취소를 요청한다."""
+        code = self._order_target_code
+        if not self.order_enable_check.isChecked() or not code:
+            return
+        if self._trim_qty <= 0:
+            return
+        # 취소가 장부에 반영되기 전 연타를 막는다. 새 잔량이 내려오면
+        # set_pending_orders가 다시 켠다.
+        self._trim_qty = 0
+        self._refresh_order_actions()
+        self.trim_requested.emit(code)
 
     def _on_split_changed(self, _count: int):
         code = self._order_target_code
@@ -3906,6 +4016,23 @@ class ConditionScreen(QWidget):
             or self.theme_sort.isChecked()
         )
         self.proxy.setDynamicSortFilter(not throttled)
+
+    def _toggle_pin(self, row: int):
+        """순위 칸을 누르면 그 종목을 맨 위에 고정하거나 해제한다."""
+        code = self.proxy.row_code(row)
+        if not code:
+            return
+        if code in self.proxy.pinned:
+            self.proxy.pinned.discard(code)
+        else:
+            self.proxy.pinned.add(code)
+        self._settings.setValue(
+            self.prefix + "pinned", ",".join(sorted(self.proxy.pinned)))
+        self._settings.sync()
+        self._resort_proxy()
+        if self.proxy.rowCount():  # 번호 <-> 표식 교체를 즉시 반영
+            self.proxy.headerDataChanged.emit(
+                Qt.Vertical, 0, self.proxy.rowCount() - 1)
 
     def _resort_proxy(self):
         """스로틀 시간이 끝나면 현재 열과 방향으로 정렬을 확실히 다시 적용한다."""
