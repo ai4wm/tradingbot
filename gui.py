@@ -2547,6 +2547,7 @@ class BidQtyPopup(QWidget):
     """
 
     GRIP = 14
+    SPAWN_GAP = 2  # 새 종목 창을 직전 창 옆에 붙일 때 남기는 틈
 
     def __init__(self, screen: "ConditionScreen", code: str, name: str):
         super().__init__(
@@ -2564,6 +2565,8 @@ class BidQtyPopup(QWidget):
         self.code = code
         self._name = name
         self._key = screen.prefix + "bidqty_popup_" + code
+        # 종목 기록이 없을 때 쓰는 기준 크기·자리. 창별로 따로 남긴다.
+        self._last_key = screen.prefix + "bidqty_popup_last"
         self._text = ""
         self._drag_offset = None
         self._resize_from = None
@@ -2578,10 +2581,37 @@ class BidQtyPopup(QWidget):
         except (TypeError, ValueError):
             self._alpha = 235
         self._alpha = min(255, max(60, self._alpha))
-        geometry = screen._settings.value(self._key)
-        if geometry is None or not self.restoreGeometry(geometry):
-            self.resize(240, 96)
+        if not self._place_beside_last():
+            geometry = screen._settings.value(self._key)
+            if geometry is None or not self.restoreGeometry(geometry):
+                geometry = screen._settings.value(self._last_key)
+                if geometry is None or not self.restoreGeometry(geometry):
+                    self.resize(240, 96)
         self._refresh()
+
+    def _place_beside_last(self) -> bool:
+        """떠 있는 창이 있으면 같은 크기로 그 오른쪽에 붙인다.
+
+        옆에 붙이는 것이 종목별 저장 위치보다 우선이다. 예전에 한 번이라도
+        띄운 종목은 자기 기록으로 돌아가 버려, 여러 종목을 늘어놓는 중에
+        한 종목만 엉뚱한 자리에 뜬다. 창이 하나도 없을 때만 기록을 쓴다.
+        """
+        opened = list(self._screen._bid_popups.values())
+        last = opened[-1] if opened else None
+        if last is None or last is self:
+            return False
+        self.resize(last.size())
+        right = last.x() + last.width() + self.SPAWN_GAP
+        area = self.screen().availableGeometry() if self.screen() else None
+        if area is not None and right + self.width() > area.right():
+            # 오른쪽이 모자라면 첫 창의 왼쪽 변에 맞춰 다음 줄을 시작한다.
+            # 마지막 창 아래에 붙이면 줄이 오른쪽으로 계단처럼 밀린다.
+            first = opened[0]
+            bottom = max(popup.y() + popup.height() for popup in opened)
+            self.move(first.x(), bottom + self.SPAWN_GAP)
+        else:
+            self.move(right, last.y())
+        return True
 
     def set_value(self, qty: int):
         text = f"{qty:,}"
@@ -2669,7 +2699,10 @@ class BidQtyPopup(QWidget):
         self.close()  # 타이틀바가 없으니 더블클릭이 닫기다
 
     def _save_geo(self):
-        self._screen._settings.setValue(self._key, self.saveGeometry())
+        geometry = self.saveGeometry()
+        self._screen._settings.setValue(self._key, geometry)
+        # 다음에 처음 띄우는 종목이 기준으로 삼는다.
+        self._screen._settings.setValue(self._last_key, geometry)
         self._screen._settings.sync()
 
     def closeEvent(self, event):
@@ -3455,13 +3488,13 @@ class ConditionScreen(QWidget):
         fixed_slots = self._order_slots(fixed_count, selected_count)
         if fixed_count:
             fixed_text = (
-                f"{fixed_slots}&nbsp; 설정 {selected_count}회 → "
+                f"{fixed_slots}&nbsp;설정 {selected_count}회 → "
                 f"<b>실제 {fixed_count}회</b> · 100주씩 · 총 {fixed_total:,}주")
             if excluded:
                 fixed_text += f" · <b>미주문 {excluded:,}주</b>"
         else:
             fixed_text = (
-                f"{self._order_slots(0, selected_count)}&nbsp; "
+                f"{self._order_slots(0, selected_count)}&nbsp;"
                 "<b>최소 100주 필요</b>")
 
         if remaining_count:
@@ -3469,7 +3502,7 @@ class ConditionScreen(QWidget):
             per_order = (
                 f"{base + 1:,}/{base:,}주씩" if extra else f"{base:,}주씩")
             split_text = (
-                f"{self._order_slots(remaining_count, selected_count)}&nbsp; "
+                f"{self._order_slots(remaining_count, selected_count)}&nbsp;"
                 f"<b>{remaining_count}회</b> · {per_order}")
         else:
             split_text = "주문가능수량 없음"
@@ -3478,9 +3511,9 @@ class ConditionScreen(QWidget):
         # 분할매수는 가능수량 전부를 주문하므로 그 금액을 대신 보여 준다.
         amount_qty = fixed_total or available_qty
         self.order_preview_value.setText(
-            f"<b>상한가</b>&nbsp;&nbsp; 100주씩 {fixed_text}"
-            f"&nbsp;&nbsp;│&nbsp;&nbsp; 분할매수 {split_text}"
-            f"&nbsp;&nbsp;·&nbsp;&nbsp;"
+            f"<b>상한가</b>&nbsp;100주씩 {fixed_text}"
+            f"&nbsp;│&nbsp;분할매수 {split_text}"
+            f"&nbsp;·&nbsp;"
             f"<b>{amount_qty * upper:,}원</b>")
         self.order_preview_value.setToolTip(
             "■ 실제 전송되는 주문 · □ 설정했지만 수량 부족으로 전송되지 않는 주문")
