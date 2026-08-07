@@ -139,9 +139,15 @@ def _theme_cell_text(labels, news_themes, has_news: bool = True,
     """테마 이름을 잇되 뉴스로 붙은 것에만 표식을 단다.
 
     색은 테마 묶음 구분에 이미 쓰고 있어 표식으로 나타낸다.
+
+    순서는 사건 재료(인수합병·제3자배정) → 그 밖의 뉴스 재료 → 분류 테마다.
+    호출부가 강도로 뽑은 테마를 앞에 넘겨도 여기서 다시 세운다. 칸이 좁아
+    앞 한두 개만 읽히는데, 오늘 왜 오르는지가 거기 있어야 한다.
     """
     marks = set(news_themes or ())
-    labels = sorted(labels, key=lambda name: name not in PRIORITY_THEMES)
+    labels = sorted(
+        labels,
+        key=lambda name: (name not in PRIORITY_THEMES, name not in marks))
     text = separator.join(
         (NEWS_THEME_MARK + name) if name in marks else name
         for name in labels
@@ -1098,6 +1104,9 @@ class StockModel(QAbstractTableModel):
         self.order_target_code = ""       # 주문 컬럼에서 선택한 현재 대상종목
         self.order_status: dict[str, str] = {}
         self.order_cancellable: set[str] = set()
+        # 주문허용이 꺼져 있으면 취소 영역을 그리지 않는다. 실제 주문을
+        # 보내는 자리라 매수 버튼과 같은 관문을 지나야 한다.
+        self.order_enabled = False
         # 종목이 행에서 빠졌다 다시 들어와도 같은 실행 세션에서는
         # 사용자가 적용한 3단 기준을 보존한다.
         self.balance_sell_settings: dict[str, dict] = {}
@@ -1219,6 +1228,32 @@ class StockModel(QAbstractTableModel):
             self.order_cancellable.discard(code)
         row = self.codes.index(code)
         cell = self.index(row, ORDER_COL)
+        self.dataChanged.emit(cell, cell)
+
+    def set_order_enabled(self, on: bool):
+        """주문허용 상태를 반영해 취소 영역을 한꺼번에 켜고 끈다."""
+        if self.order_enabled == on:
+            return
+        self.order_enabled = on
+        if self.codes:
+            self.dataChanged.emit(
+                self.index(0, ORDER_COL),
+                self.index(len(self.codes) - 1, ORDER_COL))
+
+    def set_cancellable(self, code: str, on: bool):
+        """미체결 매수가 있으면 주문 셀에 취소 영역을 그린다.
+
+        앱이 낸 주문 배치와 별개로 계좌 장부만 보고 정한다. 영웅문에서 낸
+        주문이나 앱을 다시 띄운 뒤에도 취소가 눌리게 하려면 이 경로가 있어야
+        한다. 배치 상태는 앱이 껐다 켜면 사라지지만 미체결은 계좌에 남는다.
+        """
+        if code not in self.rows or (code in self.order_cancellable) == on:
+            return
+        if on:
+            self.order_cancellable.add(code)
+        else:
+            self.order_cancellable.discard(code)
+        cell = self.index(self.codes.index(code), ORDER_COL)
         self.dataChanged.emit(cell, cell)
 
     def set_account_auto_cancel_armed(self, code: str, armed: bool):
@@ -1961,10 +1996,10 @@ class StockModel(QAbstractTableModel):
             if role == Qt.ToolTipRole:
                 return (
                     "상태 클릭=대상 선택, 오른쪽 취소=이 종목 잔량 즉시취소"
-                    if code in self.order_cancellable
+                    if self.order_enabled and code in self.order_cancellable
                     else "클릭하여 주문 대상종목으로 지정")
             if role == ORDER_CANCEL_ROLE:
-                return code in self.order_cancellable
+                return self.order_enabled and code in self.order_cancellable
             return None
         if field == "streak":  # 연상 = 어제까지 일수 + (지금 상한이면 1), 매번 계산 (저장 안 함)
             cnt, yclose = self.limit_cnt.get(self.codes[index.row()], (0, 0))
@@ -3338,6 +3373,12 @@ class ConditionScreen(QWidget):
 
         buy/sell은 (건수, 수량), position은 (보유, 매도가능)이다.
         trim은 미체결 매수에서 100주씩 남기고 취소할 수 있는 수량 합계다."""
+        # 취소 영역은 선택 종목이 아니어도 그려야 하므로 먼저 반영한다.
+        self.model.set_cancellable(code, buy[0] > 0)
+        if not buy[0] and self.model.order_status.get(code) == "취소전송":
+            # 계좌 취소는 '취소전송'에서 멈춘다. 거래소 확인은 웹소켓이 장부를
+            # 비우는 것으로만 오므로, 미체결이 0이 되는 순간을 완료로 읽는다.
+            self.model.set_order_status(code, "취소완료")
         if code != self._order_target_code:
             return
         self._trim_qty = max(0, int(trim))
@@ -3466,6 +3507,8 @@ class ConditionScreen(QWidget):
         return min(api_qty, remaining // upper)
 
     def _refresh_order_actions(self, *_):
+        # 주문허용 토글이 이 함수에 이미 연결돼 있다. 취소 영역도 같이 따라간다.
+        self.model.set_order_enabled(self.order_enable_check.isChecked())
         available_qty = self._current_orderable_qty()
         selected_count = self.split_group.checkedId()
         fixed_count = min(selected_count, available_qty // 100)
@@ -4051,7 +4094,7 @@ class ConditionScreen(QWidget):
                 cursor_x >= cell_rect.right() - OrderDelegate.CANCEL_WIDTH + 1)
             # 취소 버튼이 실제로 그려진 주문만 취소한다. 수동취소가 기본 선택인
             # 상태에서 단순히 셀 오른쪽을 눌러도 빈 계좌 취소조회가 나가면 안 된다.
-            if cancel_area and code in self.model.order_cancellable:
+            if cancel_area and index.data(ORDER_CANCEL_ROLE):
                 self.model.set_order_status(
                     code, self.model.order_status.get(code, ""), False)
                 self.cancel_requested.emit(code)
