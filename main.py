@@ -970,6 +970,9 @@ class App:
         # 접속 시 한 번 조회해 세우고 이후 웹소켓 체결로만 갱신한다.
         self._open_sell_orders: dict[str, dict[str, tuple[int, str]]] = {}
         self._position_book: dict[str, dict[str, int]] = {}
+        # 장부를 계좌에서 한 번이라도 세웠는지. 세운 적이 있어야 '장부에 없음'을
+        # '보유 0'으로 읽을 수 있다. 세우기 전에는 그냥 모르는 상태다.
+        self._position_book_primed = False
         self._position_fill_ids: set[tuple[str, str]] = set()
         # 종목별 매도 접수 기록 (주문번호, 수량). 응답이 유실된 매도를 다시
         # 보내기 전에, 거래소가 실제로 접수했는지 여기서 확인한다.
@@ -2383,6 +2386,14 @@ class App:
         self._track_order_book(self._open_buy_orders, code, order_no, event)
         filled = self._new_fill_qty(order_no, event)
         position = self._position_book.get(code)
+        if filled and position is None and self._position_book_primed:
+            # 장부를 세운 뒤 처음 보는 종목 = 영웅문 등 앱 밖에서 새로 산 것.
+            # 계좌를 읽었을 때 없었으니 보유 0에서 시작하는 것이 맞다.
+            # 장부를 못 세운 상태에서는 만들지 않는다. 실제 보유보다 적은
+            # 수량이 박히면 매도가 그 값을 믿어(main.py `_sell_account`)
+            # 덜 팔린다. 항목이 없으면 매도는 계좌 조회로 돌아간다.
+            position = self._position_book.setdefault(
+                code, {"held": 0, "sellable": 0})
         if filled and position is not None:
             # 당일 매수 체결분은 그대로 매도할 수 있다.
             position["held"] += filled
@@ -2495,6 +2506,7 @@ class App:
             for row in rows
         }
         self._position_fill_ids.clear()
+        self._position_book_primed = True
         log.warning("position book primed codes=%s", len(self._position_book))
 
     async def _prime_open_buy_book(self):

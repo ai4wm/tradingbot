@@ -494,22 +494,26 @@ def _minute_value_display_bucket(value) -> int:
     return (raw + MINUTE_VALUE_DISPLAY_STEP // 2) // MINUTE_VALUE_DISPLAY_STEP
 
 
-def _limit_tier(d: dict, opening_auction: bool = False) -> int:
+def _limit_tier(d: dict) -> int:
     """상한가정렬 우선순위.
 
-    개장 동시호가의 누적거래량은 0이 아닌 값이 남아 있을 수 있으므로, 이때는
-    거래량과 무관하게 예상상한을 매도잔량 0/있음으로 먼저 완전히 분리한다.
-    장중 실제 상한가도 매도잔량 0/있음 순으로 연속 배치한 뒤 예상상한과
-    일반 종목을 표시한다.
+    맨 위(0·1)는 아직 정규장 가격이 안 잡힌 예상상한 대기 종목이고, 그 다음
+    (2·3)이 장이 열린 뒤의 실제 상한가다. 두 묶음을 구분선으로 가른다.
+
+    '아직 가격이 안 잡혔다'는 시각이나 누적거래량이 아니라 등락률 0으로 본다.
+    시각으로 자르면 예상등락률이 큰 종목의 랜덤엔드 연장(09:00 + 2분 + 0~20초)
+    동안 대기 종목이 묶음에서 빠진다. 누적거래량은 장전 시간외종가(08:30~08:40)
+    체결로 이미 0이 아니다. 그 체결은 전일 종가로 이뤄지므로 등락률만 0으로
+    남고, 시초가가 잡히는 순간 등락률이 튀어 두 묶음이 저절로 갈린다.
     """
     actual_limit = d["upper"] > 0 and d["price"] == d["upper"]
     expected_limit = d["exp_price"] > 0 and (
         d["exp_price"] >= d["upper"] if d["upper"] > 0 else d["exp_rate"] >= LIMIT
     )
-    if opening_auction and expected_limit:
-        return 0 if d["ask_qty"] == 0 else 1
-    if d["vol"] == 0 and expected_limit:
-        return 0 if d["ask_qty"] == 0 else 1
+    if expected_limit and not d["rate"]:
+        # 매수잔량까지 있어야 점상 대기다. 양쪽 다 비어 있으면 호가가 아직
+        # 안 들어온 것이라 같은 자리에 두면 안 된다.
+        return 0 if d["ask_qty"] == 0 and d["bid_qty"] > 0 else 1
     if actual_limit:
         return 2 if d["ask_qty"] == 0 else 3
     if expected_limit:
@@ -519,7 +523,7 @@ def _limit_tier(d: dict, opening_auction: bool = False) -> int:
 
 class TieredProxy(QSortFilterProxyModel):
     """상한가정렬 모드(limit_mode):
-    개장 동시호가 예상상한, 실제 상한, 장중 예상상한을 각각
+    장 시작 전 예상상한 대기, 실제 상한, 장중 예상상한을 각각
     매도잔량 0 -> 매도잔량 있음 순으로 분리해 위에 고정한다.
     그룹 안은 현재 정렬컬럼과 정렬방향을 따른다.
     모드 off면 전 컬럼 일반 정렬."""
@@ -534,7 +538,6 @@ class TieredProxy(QSortFilterProxyModel):
         # 현재 테마정렬에서 실제로 선택된 묶음.
         self._theme_group_keys: dict[str, tuple[str, str]] = {}
         self._theme_group_colors: dict[tuple[str, str], QColor] = {}
-        self._opening_auction = _in_opening_auction()
         # 상한가진입시간 정렬 중 비상한 그룹이 유지할 마지막 일반 정렬 기준.
         self._non_limit_sort_col = FIELDS.index("rate")
         self._non_limit_sort_order = Qt.DescendingOrder
@@ -729,14 +732,12 @@ class TieredProxy(QSortFilterProxyModel):
             )
 
     def sort(self, column, order=Qt.AscendingOrder):
-        self._opening_auction = _in_opening_auction()
         if column not in NON_LIMIT_IGNORED_SORT_COLS:
             self._non_limit_sort_col = column
             self._non_limit_sort_order = order
         super().sort(column, order)
 
     def invalidate(self):
-        self._opening_auction = _in_opening_auction()
         self._refresh_theme_sort_keys()
         super().invalidate()
 
@@ -839,8 +840,8 @@ class TieredProxy(QSortFilterProxyModel):
             m = self.sourceModel()
             a = m.rows[m.codes[left.row()]]
             b = m.rows[m.codes[right.row()]]
-            ta = _limit_tier(a, self._opening_auction)
-            tb = _limit_tier(b, self._opening_auction)
+            ta = _limit_tier(a)
+            tb = _limit_tier(b)
             desc = self.sortOrder() == Qt.DescendingOrder
             if ta != tb:  # 우선순위 그룹 순서는 현재 정렬방향과 무관하게 고정
                 return ta > tb if desc else ta < tb
@@ -924,7 +925,7 @@ class ThemeGroupedTableView(QTableView):
             source_index = proxy.mapToSource(proxy.index(row, 0))
             if not source_index.isValid():
                 break
-            tier = _limit_tier(source.rows[source.codes[source_index.row()]], False)
+            tier = _limit_tier(source.rows[source.codes[source_index.row()]])
             if tier not in (0, 1):
                 break
             last_row = row
@@ -3146,6 +3147,9 @@ class ConditionScreen(QWidget):
         self._save_timer.setSingleShot(True)
         self._save_timer.timeout.connect(self._save_layout)
         hdr = self.table.horizontalHeader()
+        # 컬럼 순서는 사용자가 직접 끌어 정한다. FIELDS 배열을 고치면 저장된
+        # 폭이 논리 인덱스 기준이라 엉뚱한 컬럼에 붙는다.
+        hdr.setSectionsMovable(True)
         hdr.sectionResized.connect(lambda *a: self._save_timer.start(400))
         hdr.sectionMoved.connect(lambda *a: self._save_timer.start(400))
 
@@ -3194,14 +3198,12 @@ class ConditionScreen(QWidget):
             parts.append(
                 f"체결 <b>{held:,}주</b>"
                 + (f" (묶임 {locked:,})" if locked else ""))
+        # 색을 빼고 상자의 기본 글자색(#222)으로 통일한다. 주황·파랑은 밝은
+        # 상자 위에서 대비가 안 나와 건수·수량이 안 읽혔다.
         if buy[0]:
-            parts.append(
-                f"<span style='color:#D66A00'>미체결매수 {buy[0]}건 "
-                f"{buy[1]:,}주</span>")
+            parts.append(f"<b>미체결매수 {buy[0]}건 {buy[1]:,}주</b>")
         if sell[0]:
-            parts.append(
-                f"<span style='color:#1E88E5'>미체결매도 {sell[0]}건 "
-                f"{sell[1]:,}주</span>")
+            parts.append(f"<b>미체결매도 {sell[0]}건 {sell[1]:,}주</b>")
         self.pending_order_value.setText(
             "&nbsp;&nbsp;·&nbsp;&nbsp;".join(parts) if parts
             else "체결·미체결 없음")
@@ -3362,11 +3364,11 @@ class ConditionScreen(QWidget):
                 f"{fixed_slots}&nbsp; 설정 {selected_count}회 → "
                 f"<b>실제 {fixed_count}회</b> · 100주씩 · 총 {fixed_total:,}주")
             if excluded:
-                fixed_text += f" · <span style='color:#D66A00'>미주문 {excluded:,}주</span>"
+                fixed_text += f" · <b>미주문 {excluded:,}주</b>"
         else:
             fixed_text = (
                 f"{self._order_slots(0, selected_count)}&nbsp; "
-                "<span style='color:#C62828'>최소 100주 필요</span>")
+                "<b>최소 100주 필요</b>")
 
         if remaining_count:
             base, extra = divmod(available_qty, remaining_count)

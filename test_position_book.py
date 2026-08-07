@@ -1,0 +1,72 @@
+# -*- coding: utf-8 -*-
+"""영웅문 등 앱 밖 매수 체결이 보유수량 장부에 잡히는지 검사.
+
+체결 이벤트는 웹소켓으로 바로 오지만, 장부에 없는 종목이면 통째로 버려져
+앱 재시작 전까지 보유수량이 안 보였다. 계좌를 다시 읽지 않고 체결만으로
+세우되, 장부를 세운 적 없을 때는 만들지 않아야 한다(덜 팔림 방지).
+"""
+import logging
+import os
+import types
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import main
+
+logging.disable(logging.CRITICAL)  # 운영 bot.log에 쓰지 않는다
+
+
+class Stub:
+    """`App`에서 장부 갱신에 필요한 부분만 세운 대역."""
+
+    def __init__(self, primed: bool, book: dict | None = None):
+        self._open_buy_orders = {}
+        self._position_book = book if book is not None else {}
+        self._position_book_primed = primed
+        self._position_fill_ids = set()
+        self._cancel_sent_orders = set()
+        self.pushed = []
+        for name in ("_track_open_buy", "_track_order_book", "_new_fill_qty"):
+            setattr(self, name,
+                    types.MethodType(getattr(main.App, name), self))
+
+    def _push_pending_orders(self, code):
+        self.pushed.append(code)
+
+
+def fill(code="011330", order_no="1", qty=197, fill_id="A1") -> dict:
+    return {"code": code, "side": "buy", "status": "체결", "order_qty": qty,
+            "remaining_qty": 0, "fill_qty": qty, "fill_id": fill_id}
+
+
+def demo():
+    # 장부를 세운 뒤 처음 보는 종목 -> 0에서 시작해 체결량만큼 잡힌다.
+    app = Stub(primed=True)
+    app._track_open_buy("011330", "1", fill())
+    assert app._position_book["011330"] == {"held": 197, "sellable": 197}, (
+        app._position_book)
+
+    # 같은 체결번호가 두 번 와도 한 번만 센다.
+    app._track_open_buy("011330", "1", fill())
+    assert app._position_book["011330"]["held"] == 197
+
+    # 추가 체결은 누적된다.
+    app._track_open_buy("011330", "1", fill(qty=100, fill_id="A2"))
+    assert app._position_book["011330"] == {"held": 297, "sellable": 297}
+
+    # 장부를 못 세운 상태에서는 만들지 않는다. 항목이 없어야 매도가 계좌
+    # 조회 경로로 돌아가 실제 보유보다 덜 파는 일이 없다.
+    cold = Stub(primed=False)
+    cold._track_open_buy("011330", "1", fill())
+    assert "011330" not in cold._position_book, cold._position_book
+
+    # 이미 들고 있던 종목은 전과 같이 그대로 더한다.
+    held = Stub(primed=True, book={"005930": {"held": 10, "sellable": 4}})
+    held._track_open_buy("005930", "1", fill(code="005930", qty=5))
+    assert held._position_book["005930"] == {"held": 15, "sellable": 9}
+
+    print("ok")
+
+
+if __name__ == "__main__":
+    demo()
