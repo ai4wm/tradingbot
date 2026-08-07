@@ -492,17 +492,33 @@ def _minute_value_display_bucket(value) -> int:
     return (raw + MINUTE_VALUE_DISPLAY_STEP // 2) // MINUTE_VALUE_DISPLAY_STEP
 
 
+# 상한가정렬 묶음 번호. 작을수록 위다. 구분선은 점상 대기(0) 바로 아래다.
+TIER_WAIT_CLEAN = 0    # 예상상한 대기 · 매도잔량 0 · 매수잔량 있음 (점상)
+TIER_WAIT = 1          # 예상상한 대기 · 매도잔량 있음
+TIER_EXPECTED = 2      # 예상값이 살아 있는 종목(동시호가·VI·단일가)
+TIER_LIMIT_CLEAN = 3   # 실제 상한가 · 매도잔량 0
+TIER_LIMIT = 4         # 실제 상한가 · 매도잔량 있음
+TIER_PLAIN = 5         # 그 밖의 일반 종목
+
+
 def _limit_tier(d: dict) -> int:
     """상한가정렬 우선순위.
 
-    맨 위(0·1)는 아직 정규장 가격이 안 잡힌 예상상한 대기 종목이고, 그 다음
-    (2·3)이 장이 열린 뒤의 실제 상한가다. 두 묶음을 구분선으로 가른다.
+    맨 위(0)는 점상 대기, 즉 예상등락률이 상한가인데 매도잔량이 없고 매수만
+    쌓인 종목이다. 구분선은 여기까지다. 점상알림 대상과 선 안이 정확히 같은
+    집합이어야 알림이 새지 않는다. 매도잔량이 있으면 예상등락률이 상한가여도
+    선 아래(1)로 내리고, 그 아래(2)에 예상값이 뜬 나머지 종목을 예상등락률
+    내림차순으로 모은다. 실제 상한가(3·4)는 그다음이다.
 
     '아직 가격이 안 잡혔다'는 시각이나 누적거래량이 아니라 등락률 0으로 본다.
     시각으로 자르면 예상등락률이 큰 종목의 랜덤엔드 연장(09:00 + 2분 + 0~20초)
     동안 대기 종목이 묶음에서 빠진다. 누적거래량은 장전 시간외종가(08:30~08:40)
     체결로 이미 0이 아니다. 그 체결은 전일 종가로 이뤄지므로 등락률만 0으로
     남고, 시초가가 잡히는 순간 등락률이 튀어 두 묶음이 저절로 갈린다.
+
+    예상값은 단일가 국면에만 살아 있다(모델이 0H·단일가·VI에서만 켜고 체결이
+    재개되면 끈다). 그래서 `exp_price > 0` 하나로 동시호가·VI 종목이 갈린다.
+    상한가에 얼마나 붙었는지는 묶음 안 순서(예상등락률 내림차순)가 나타낸다.
     """
     actual_limit = d["upper"] > 0 and d["price"] == d["upper"]
     expected_limit = d["exp_price"] > 0 and (
@@ -511,12 +527,13 @@ def _limit_tier(d: dict) -> int:
     if expected_limit and not d["rate"]:
         # 매수잔량까지 있어야 점상 대기다. 양쪽 다 비어 있으면 호가가 아직
         # 안 들어온 것이라 같은 자리에 두면 안 된다.
-        return 0 if d["ask_qty"] == 0 and d["bid_qty"] > 0 else 1
+        return (TIER_WAIT_CLEAN
+                if d["ask_qty"] == 0 and d["bid_qty"] > 0 else TIER_WAIT)
+    if d["exp_price"] > 0:
+        return TIER_EXPECTED
     if actual_limit:
-        return 2 if d["ask_qty"] == 0 else 3
-    if expected_limit:
-        return 4 if d["ask_qty"] == 0 else 5
-    return 6
+        return TIER_LIMIT_CLEAN if d["ask_qty"] == 0 else TIER_LIMIT
+    return TIER_PLAIN
 
 
 class TieredProxy(QSortFilterProxyModel):
@@ -868,12 +885,17 @@ class TieredProxy(QSortFilterProxyModel):
             desc = self.sortOrder() == Qt.DescendingOrder
             if ta != tb:  # 우선순위 그룹 순서는 현재 정렬방향과 무관하게 고정
                 return ta > tb if desc else ta < tb
-            if ta in (2, 3) and left.column() == TIME_COL:
+            if ta == TIER_EXPECTED and a["exp_rate"] != b["exp_rate"]:
+                # 예상값 묶음은 헤더 정렬컬럼·방향과 무관하게 예상등락률
+                # 내림차순으로 고정한다. 상한가에 붙은 순서가 그대로 위다.
+                return (a["exp_rate"] < b["exp_rate"] if desc
+                        else a["exp_rate"] > b["exp_rate"])
+            if ta in (TIER_LIMIT_CLEAN, TIER_LIMIT) and left.column() == TIME_COL:
                 # 실제 상한가 그룹에서는 진입시간 미수신 종목을 항상 뒤로 보낸다.
                 a_has_time, b_has_time = bool(a["time"]), bool(b["time"])
                 if a_has_time != b_has_time:
                     return not a_has_time if desc else a_has_time
-            if ta == 6 and left.column() in NON_LIMIT_IGNORED_SORT_COLS:
+            if ta == TIER_PLAIN and left.column() in NON_LIMIT_IGNORED_SORT_COLS:
                 # 진입시간/매수잔량은 비상한 그룹에 적용하지 않고 직전 정렬을 유지한다.
                 fallback_left = m.index(left.row(), self._non_limit_sort_col)
                 fallback_right = m.index(right.row(), self._non_limit_sort_col)
@@ -933,9 +955,11 @@ class ThemeGroupedTableView(QTableView):
         self.viewport().update()
 
     def waiting_group(self) -> tuple[int, set[str]]:
-        """첫 구분선 위(아직 첫 거래 전) 그룹의 마지막 행과, 그중 매도잔량이
-        0인(점상) 종목코드. 선 안에서도 tier 1 -> 0으로 올라오는 순간이
-        점상알림의 대상이라 두 tier를 구분해 돌려준다."""
+        """구분선 위 그룹의 마지막 행과 그 종목코드.
+
+        선 위는 점상 대기(예상상한 · 매도잔량 0 · 매수잔량 있음)만이다.
+        매도잔량이 있으면 예상등락률이 상한가여도 선 아래로 내린다.
+        """
         proxy = self.model()
         if not (isinstance(proxy, TieredProxy) and proxy.limit_mode):
             return -1, set()
@@ -949,13 +973,13 @@ class ThemeGroupedTableView(QTableView):
                 break
             code = source.codes[source_index.row()]
             tier = _limit_tier(source.rows[code])
-            if tier == 0:
+            if tier == TIER_WAIT_CLEAN:
                 jumsang.add(code)
             if code in proxy.pinned:
                 # 고정 종목은 순위와 무관하게 맨 위에 붙는다. 여기서 끊으면
                 # 일반 종목 하나만 고정해도 구분선이 통째로 사라진다.
                 continue
-            if tier not in (0, 1):
+            if tier != TIER_WAIT_CLEAN:
                 break
             last_row = row
         return last_row, jumsang
@@ -3125,6 +3149,12 @@ class ConditionScreen(QWidget):
         self._minute_value_timer = QTimer(self)
         self._minute_value_timer.timeout.connect(
             self.model.refresh_minute_values)
+        # ponytail: 매수잔량이 실제로 어떤 간격·크기로 들어오는지 한 번 재려고
+        # 붙인 계측이다. 간격을 알아야 속도·가속도 계산 주기를 정할 수 있다.
+        # 값을 확인하면 이 타이머 연결과 아래 세 조각을 지운다.
+        self._minute_value_timer.timeout.connect(self._refresh_bidqty_probe)
+        self._bidqty_probe: list[tuple] = []
+        self._bidqty_probe_on = False
         self._minute_value_timer.start(1000)
         self.table.verticalHeader().setVisible(True)  # 순위(정렬 순서대로 1..N 자동)
         self.table.verticalHeader().setDefaultSectionSize(22)
@@ -4265,12 +4295,37 @@ class ConditionScreen(QWidget):
                 self._refresh_order_target_display()
             self.model.remove_stock(code)
 
+    def _refresh_bidqty_probe(self):
+        """ponytail: 계측 구간(09:00~09:03)을 켜고 끄고, 끝나면 파일로 내린다."""
+        on = (self.limit_sort.isChecked()
+              and "0900" <= time.strftime("%H%M") < "0903")
+        if on == self._bidqty_probe_on:
+            return
+        self._bidqty_probe_on = on
+        if not on and self._bidqty_probe:
+            rows, self._bidqty_probe = self._bidqty_probe, []
+            try:
+                with open("bidqty_probe.csv", "a", encoding="utf-8") as file:
+                    file.write("epoch,code,bid_qty,ask_qty\n")
+                    for stamp, stock, bid, ask in rows:
+                        file.write(f"{stamp:.3f},{stock},{bid},{ask}\n")
+            except OSError as error:
+                log.warning("bidqty probe write failed: %s", error)
+                return
+            log.warning("bidqty probe rows=%s -> bidqty_probe.csv", len(rows))
+
     def on_tick(self, code: str, fields: dict):
         """실시간 시세 (0B 체결 / 0D 호가)"""
         previous_upper = (
             int(self.model.rows.get(code, {}).get("upper") or 0)
             if code == self._order_target_code else 0)
         self.model.update_stock(code, fields)
+        # ponytail: 계측. 켜져 있는 3분 동안 점상 대기 종목만 메모리에 모은다.
+        if self._bidqty_probe_on and "bid_qty" in fields:
+            stored = self.model.rows.get(code)
+            if stored is not None and _limit_tier(stored) == TIER_WAIT_CLEAN:
+                self._bidqty_probe.append(
+                    (time.time(), code, stored["bid_qty"], stored["ask_qty"]))
         # 0D는 매도쪽만 바뀌어도 오므로 매수잔량이 실린 틱만 확대 창에 넘긴다.
         if self._bid_popups and "bid_qty" in fields:
             popup = self._bid_popups.get(code)

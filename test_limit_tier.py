@@ -33,15 +33,21 @@ def demo():
 
     # 시초가가 잡히면 등락률이 튀고 장 시작 묶음으로 넘어간다.
     opened = row(price=1204, rate=29.9, vol=800_000)
-    assert _limit_tier(opened) == 2, "실제 상한가·매도잔량0"
-    assert _limit_tier(row(**{**opened, "ask_qty": 500})) == 3, "실제 상한가·매도잔량"
+    assert _limit_tier(opened) == 3, "실제 상한가·매도잔량0"
+    assert _limit_tier(row(**{**opened, "ask_qty": 500})) == 4, "실제 상한가·매도잔량"
 
-    # 장중 VI 예상상한은 이미 오른 상태라 대기 묶음이 아니다.
+    # 예상값이 살아 있으면 매도잔량과 무관하게 구분선 바로 아래 묶음이다.
+    # 상한가에 얼마나 붙었는지는 묶음 안 순서(예상등락률 내림차순)가 나타낸다.
     vi = row(price=1100, rate=18.5, vol=500_000, exp_price=1204, exp_rate=29.9)
-    assert _limit_tier(vi) == 4, "장중 예상상한·매도잔량0"
-    assert _limit_tier(row(**{**vi, "ask_qty": 300})) == 5, "장중 예상상한·매도잔량"
+    assert _limit_tier(vi) == 2, "장중 예상상한"
+    assert _limit_tier(row(**{**vi, "ask_qty": 300})) == 2, "매도잔량 있어도 같은 묶음"
+    near = row(price=1100, rate=15.0, vol=500_000, exp_price=1150, exp_rate=20.0)
+    assert _limit_tier(near) == 2, "상한가 미만 예상값도 같은 묶음"
 
-    assert _limit_tier(row(price=900, rate=5.0, vol=100)) == 6, "일반 종목"
+    # 예상값 묶음은 실제 상한가보다 위다.
+    assert _limit_tier(near) < _limit_tier(opened)
+
+    assert _limit_tier(row(price=900, rate=5.0, vol=100)) == 5, "일반 종목"
     print("ok")
 
 

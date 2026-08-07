@@ -19,3 +19,4 @@ data/walkforward_*_report.json
 data/walkforward_*_report.md
 data/*.session
 data/*.session-journal
+bidqty_probe.csv
