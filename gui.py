@@ -493,12 +493,14 @@ def _minute_value_display_bucket(value) -> int:
 
 
 # 상한가정렬 묶음 번호. 작을수록 위다. 구분선은 점상 대기(0) 바로 아래다.
+# 0·1·2는 모두 아직 정규장 가격이 안 잡힌(등락률 0) 종목이다.
 TIER_WAIT_CLEAN = 0    # 예상상한 대기 · 매도잔량 0 · 매수잔량 있음 (점상)
 TIER_WAIT = 1          # 예상상한 대기 · 매도잔량 있음
-TIER_EXPECTED = 2      # 예상값이 살아 있는 종목(동시호가·VI·단일가)
+TIER_PREOPEN = 2       # 장 시작 전 나머지 · 예상등락률 내림차순
 TIER_LIMIT_CLEAN = 3   # 실제 상한가 · 매도잔량 0
 TIER_LIMIT = 4         # 실제 상한가 · 매도잔량 있음
-TIER_PLAIN = 5         # 그 밖의 일반 종목
+TIER_NO_ASK = 5        # 거래 중인데 매도호가가 빈 종목 (상한가 직전)
+TIER_PLAIN = 6         # 그 밖의 일반 종목
 
 
 def _limit_tier(d: dict) -> int:
@@ -507,8 +509,11 @@ def _limit_tier(d: dict) -> int:
     맨 위(0)는 점상 대기, 즉 예상등락률이 상한가인데 매도잔량이 없고 매수만
     쌓인 종목이다. 구분선은 여기까지다. 점상알림 대상과 선 안이 정확히 같은
     집합이어야 알림이 새지 않는다. 매도잔량이 있으면 예상등락률이 상한가여도
-    선 아래(1)로 내리고, 그 아래(2)에 예상값이 뜬 나머지 종목을 예상등락률
-    내림차순으로 모은다. 실제 상한가(3·4)는 그다음이다.
+    선 아래(1)로 내리고, 나머지 장 시작 전 종목(2)이 예상등락률 내림차순으로
+    뒤따른다. 여기까지가 아직 정규장 가격이 안 잡힌 대기열이다.
+
+    그 아래가 실제 상한가(3·4)이고, 거래 중인데 매도호가 자체가 빈 종목(5)이
+    뒤따른다. 매도가 비었다는 건 상한가 직전이라는 뜻이다.
 
     '아직 가격이 안 잡혔다'는 시각이나 누적거래량이 아니라 등락률 0으로 본다.
     시각으로 자르면 예상등락률이 큰 종목의 랜덤엔드 연장(09:00 + 2분 + 0~20초)
@@ -516,9 +521,10 @@ def _limit_tier(d: dict) -> int:
     체결로 이미 0이 아니다. 그 체결은 전일 종가로 이뤄지므로 등락률만 0으로
     남고, 시초가가 잡히는 순간 등락률이 튀어 두 묶음이 저절로 갈린다.
 
-    예상값은 단일가 국면에만 살아 있다(모델이 0H·단일가·VI에서만 켜고 체결이
-    재개되면 끈다). 그래서 `exp_price > 0` 하나로 동시호가·VI 종목이 갈린다.
-    상한가에 얼마나 붙었는지는 묶음 안 순서(예상등락률 내림차순)가 나타낸다.
+    이미 거래된 종목은 예상값이 있어도 대기열에 넣지 않는다. VI든 단기과열이든
+    실제 등락률이 뜬 이상 장 시작 전이 아니다. 대신 등락률로 정렬할 때 예상값이
+    살아 있으면 그 값으로 비교해(`StockModel.data`) 곧 체결될 가격이 순서에
+    반영되게 한다.
     """
     actual_limit = d["upper"] > 0 and d["price"] == d["upper"]
     expected_limit = d["exp_price"] > 0 and (
@@ -529,10 +535,15 @@ def _limit_tier(d: dict) -> int:
         # 안 들어온 것이라 같은 자리에 두면 안 된다.
         return (TIER_WAIT_CLEAN
                 if d["ask_qty"] == 0 and d["bid_qty"] > 0 else TIER_WAIT)
-    if d["exp_price"] > 0:
-        return TIER_EXPECTED
+    if not d["rate"] and d["exp_price"] > 0:
+        # 예상값까지 있어야 장 시작 전이다. 등락률 0만 보면 시초가가 전일종가와
+        # 같은 종목이 하루 종일 대기열에 남는다. 예상값은 체결이 재개되면
+        # 모델이 끄므로, 세 대기 묶음이 09:03 이후 함께 사라진다.
+        return TIER_PREOPEN
     if actual_limit:
         return TIER_LIMIT_CLEAN if d["ask_qty"] == 0 else TIER_LIMIT
+    if d["ask_qty"] == 0:
+        return TIER_NO_ASK
     return TIER_PLAIN
 
 
@@ -885,8 +896,8 @@ class TieredProxy(QSortFilterProxyModel):
             desc = self.sortOrder() == Qt.DescendingOrder
             if ta != tb:  # 우선순위 그룹 순서는 현재 정렬방향과 무관하게 고정
                 return ta > tb if desc else ta < tb
-            if ta == TIER_EXPECTED and a["exp_rate"] != b["exp_rate"]:
-                # 예상값 묶음은 헤더 정렬컬럼·방향과 무관하게 예상등락률
+            if ta == TIER_PREOPEN and a["exp_rate"] != b["exp_rate"]:
+                # 장 시작 전 대기열은 헤더 정렬컬럼·방향과 무관하게 예상등락률
                 # 내림차순으로 고정한다. 상한가에 붙은 순서가 그대로 위다.
                 return (a["exp_rate"] < b["exp_rate"] if desc
                         else a["exp_rate"] > b["exp_rate"])
@@ -1015,6 +1026,7 @@ class ThemeGroupedTableView(QTableView):
             )
             if line_bottom >= 0:
                 for column, color, width in (
+                    (ORDER_COL, QColor("#FFB300"), 1),
                     (VOLUME_COL, QColor("#FFB300"), 2),
                     (BID_QTY_COL, QColor("#FFB300"), 1),
                 ):
@@ -2130,6 +2142,11 @@ class StockModel(QAbstractTableModel):
                 return f"{value:,}" if value else ""
             return value
         if role == Qt.UserRole:  # 정렬용 원본값
+            if field == "rate" and stored["exp_price"] > 0:
+                # 동시호가·VI로 예상값이 살아 있으면 곧 체결될 가격이 그것이다.
+                # 표시는 실제 등락률 그대로 두고 정렬만 예상등락률로 비교해,
+                # +18%인데 예상 +29%인 종목이 +29% 자리에 서게 한다.
+                return stored["exp_rate"]
             return value
         if role == Qt.TextAlignmentRole:
             if field in ("name", "time"):
