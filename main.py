@@ -861,24 +861,32 @@ class View:
         self.app.ensure_prev_vol(self.screen.model)  # 역산 0인 종목 ka10081 백필
         self._fill_entry_times()
 
-    def _fill_entry_times(self):
-        m = self.screen.model
-        todo = []
-        for code in list(m.codes):
-            d = m.rows[code]
-            at_limit = d["upper"] > 0 and d["price"] == d["upper"]
-            if at_limit:
-                if code in self._entry_cache:
-                    self.screen.on_tick(code, {"time": self._entry_cache[code]})
-                elif code not in self._entry_pending:
-                    self._entry_pending.add(code)
-                    todo.append((d["vol"], code, d["upper"]))
-            elif code in self._entry_cache:
+    def fill_entry_time(self, code: str):
+        """한 종목의 상한가 진입시각을 필요할 때만 채운다. 조회는 종목당 1회다.
+
+        시세 틱마다 불린다. 상한가가 아니거나 이미 받아 둔 종목은 즉시 빠진다.
+        """
+        d = self.screen.model.rows.get(code)
+        if d is None:
+            return
+        if not (d["upper"] > 0 and d["price"] == d["upper"]):
+            if code in self._entry_cache:  # 상한가가 풀리면 시각을 지운다
                 del self._entry_cache[code]
                 self.screen.on_tick(code, {"time": ""})
-        if todo:  # 거래량 적은 순(점상 먼저) 순차 조회
-            todo.sort()
-            asyncio.ensure_future(self._drain_entries(todo))
+            return
+        if code in self._entry_cache:
+            if not d["time"]:
+                self.screen.on_tick(code, {"time": self._entry_cache[code]})
+            return
+        if code in self._entry_pending:
+            return
+        self._entry_pending.add(code)
+        asyncio.ensure_future(
+            self._drain_entries([(d["vol"], code, d["upper"])]))
+
+    def _fill_entry_times(self):
+        for code in list(self.screen.model.codes):
+            self.fill_entry_time(code)
 
     async def _drain_entries(self, todo):
         for _, code, upper in todo:
@@ -2266,6 +2274,11 @@ class App:
             # REST/내부 갱신(source=None)은 기존처럼 전달하고, 웹소켓은 시장 출처가 맞는 창에만 전달.
             if code in v.screen.model.rows and (source is None or source == expected):
                 v.screen.on_tick(code, fields)
+                if "price" in fields:
+                    # 이미 화면에 있던 종목이 상한가에 닿는 순간을 잡는다.
+                    # 진입시각 조회는 편입 때만 돌아서, 편입 뒤에 상한가로 간
+                    # 종목은 다음 편입이 있을 때까지 시각이 비어 있었다.
+                    v.fill_entry_time(code)
         if "bid_qty" in fields:
             self._check_balance_sell(code, int(fields.get("bid_qty") or 0))
 
@@ -4019,6 +4032,9 @@ class AnalysisWindow(
         self._ls_news_url_tasks: dict[str, asyncio.Task] = {}
         self._news_web_auto_timer = QTimer(self)
         self._news_web_auto_timer.timeout.connect(self._auto_reload_news_web)
+        # 창이 활성 상태가 아니어도 도움말이 뜨게 한다. Qt 기본은 활성
+        # 창에서만 띄운다. 최상위 창에 걸어야 하위 위젯까지 적용된다.
+        self.setAttribute(Qt.WidgetAttribute.WA_AlwaysShowToolTips, True)
         self.setWindowTitle("분석")
         self._key = "analysis_geometry"
         self._settings = QSettings("layout.ini", QSettings.IniFormat)
@@ -5664,6 +5680,9 @@ class ConditionWindow(QMainWindow):
 
     def __init__(self, prefix: str, on_close=None):
         super().__init__()
+        # 창이 활성 상태가 아니어도 도움말이 뜨게 한다. Qt 기본은 활성
+        # 창에서만 띄운다. 최상위 창에 걸어야 하위 위젯까지 적용된다.
+        self.setAttribute(Qt.WidgetAttribute.WA_AlwaysShowToolTips, True)
         self._key = prefix + "geometry"
         self._on_close = on_close
         self._settings = QSettings("layout.ini", QSettings.IniFormat)
@@ -5711,6 +5730,9 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        # 창이 활성 상태가 아니어도 도움말이 뜨게 한다. Qt 기본은 활성
+        # 창에서만 띄운다. 최상위 창에 걸어야 하위 위젯까지 적용된다.
+        self.setAttribute(Qt.WidgetAttribute.WA_AlwaysShowToolTips, True)
         self._app_controller = None
         self._key = "geometry"  # 화면 전환 시 set_view_mode가 화면별 키로 교체
         self._settings = QSettings("layout.ini", QSettings.IniFormat)

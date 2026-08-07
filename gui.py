@@ -21,9 +21,9 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QHBoxLayout, QHeaderView, QLabel,
-    QDialog, QGridLayout, QLineEdit, QMainWindow, QProxyStyle, QPushButton, QSizePolicy,
-    QSpinBox, QStyle, QStyledItemDelegate, QStyleOptionViewItem, QTableView,
-    QTableWidgetItem, QToolTip, QVBoxLayout, QWidget,
+    QDialog, QGridLayout, QLineEdit, QMainWindow, QMenu, QProxyStyle, QPushButton,
+    QSizePolicy, QSpinBox, QStyle, QStyledItemDelegate, QStyleOptionViewItem,
+    QTableView, QTableWidgetItem, QToolTip, QVBoxLayout, QWidget,
 )
 
 from theme_keywords import STRONG_EVENT_THEMES
@@ -3293,6 +3293,10 @@ class ConditionScreen(QWidget):
         # 컬럼 순서는 사용자가 직접 끌어 정한다. FIELDS 배열을 고치면 저장된
         # 폭이 논리 인덱스 기준이라 엉뚱한 컬럼에 붙는다.
         hdr.setSectionsMovable(True)
+        # 컬럼 줄에서 찾는 게 자연스럽다. 표 본문 우클릭도 같은 메뉴를 연다.
+        hdr.setContextMenuPolicy(Qt.CustomContextMenu)
+        hdr.customContextMenuRequested.connect(
+            lambda pos: self._show_column_menu(hdr.mapToGlobal(pos)))
         hdr.sectionResized.connect(lambda *a: self._save_timer.start(400))
         hdr.sectionMoved.connect(lambda *a: self._save_timer.start(400))
 
@@ -3861,12 +3865,37 @@ class ConditionScreen(QWidget):
             self.prefix + "expected_layout", "true" if checked else "false")
         self._settings.sync()  # _save_layout의 sync보다 뒤라 따로 내려야 한다
         self._restore_layout(checked)
+        self._restore_window_width(checked)
         self._apply_sort()
+
+    def _restore_window_width(self, expected: bool | None = None):
+        """이 프로필에 저장된 창 가로폭으로 되돌린다. 높이·위치는 그대로 둔다."""
+        window = self.window()
+        if window is None or window.isMaximized():
+            return
+        try:
+            width = int(self._settings.value(
+                self._layout_key("window_width", expected)) or 0)
+        except (TypeError, ValueError):
+            return
+        if width > 0 and width != window.width():
+            window.resize(width, window.height())
+
+    def resizeEvent(self, event):
+        """창 가로폭도 배치 프로필에 함께 남긴다. 헤더 저장 타이머를 같이 쓴다."""
+        super().resizeEvent(event)
+        self._save_timer.start(400)
 
     def _save_layout(self, expected: bool | None = None):
         header = self.table.horizontalHeader()
         self._settings.setValue(
             self._layout_key("header", expected), header.saveState())
+        window = self.window()
+        # 최대화 중에는 화면 폭이 잡히므로 저장하지 않는다. 복원할 때 그 값으로
+        # 창을 줄이면 사용자가 최대화해 둔 상태가 깨진다.
+        if window is not None and not window.isMaximized():
+            self._settings.setValue(
+                self._layout_key("window_width", expected), window.width())
         for col, field in enumerate(FIELDS):
             # 숨김 컬럼은 sectionSize=0이다. 이를 저장하면 순위 화면에서 다시
             # 표시해도 폭 0으로 남으므로 마지막 정상 너비를 보존한다.
@@ -4119,12 +4148,48 @@ class ConditionScreen(QWidget):
                 popup.close()
 
     def _on_context_menu(self, pos):
-        """종목명 우클릭 -> 네이버 종목토론실 브라우저로 열기."""
+        """종목명은 네이버 종목토론실, 그 밖의 자리는 컬럼 표시 메뉴."""
         index = self.table.indexAt(pos)
-        if not index.isValid() or index.column() != FIELDS.index("name"):
+        if index.isValid() and index.column() == NAME_COL:
+            code = self.model.codes[self.proxy.mapToSource(index).row()]
+            QDesktopServices.openUrl(QUrl(
+                f"https://finance.naver.com/item/board.naver?code={code}"))
             return
-        code = self.model.codes[self.proxy.mapToSource(index).row()]
-        QDesktopServices.openUrl(QUrl(f"https://finance.naver.com/item/board.naver?code={code}"))
+        self._show_column_menu(self.table.viewport().mapToGlobal(pos))
+
+    def _show_column_menu(self, at):
+        """보이는 열을 체크로 고른다. 숨긴 열도 목록에 남아 되살릴 수 있다.
+
+        헤더가 아니라 표에서 여는 이유는 열을 다 숨겨도 메뉴에 닿기 위해서다.
+        순위·변동은 화면 모드(일반/순위/보유)가 소유하므로 목록에서 뺀다.
+        """
+        columns = [col for col in range(len(FIELDS)) if col not in RANK_COLS]
+        shown = [col for col in columns if not self.table.isColumnHidden(col)]
+        menu = QMenu(self)
+        for col in columns:
+            action = menu.addAction(COLUMNS[col])
+            action.setCheckable(True)
+            visible = col in shown
+            action.setChecked(visible)
+            # 마지막 한 열까지 숨기면 이 메뉴를 띄울 자리가 사라진다.
+            action.setEnabled(not visible or len(shown) > 1)
+            action.triggered.connect(
+                lambda checked, target=col:
+                self._set_column_visible(target, checked))
+        menu.exec(at)
+
+    def _set_column_visible(self, col: int, visible: bool):
+        """열을 감추거나 되살리고 현재 배치 프로필에 남긴다."""
+        self.table.setColumnHidden(col, not visible)
+        if visible and self.table.columnWidth(col) <= 0:
+            # 숨김 상태의 폭은 0이다. 마지막 정상 너비를 되살린다.
+            try:
+                width = int(self._settings.value(
+                    self._layout_key("colwidth_" + FIELDS[col])) or 0)
+            except (TypeError, ValueError):
+                width = 0
+            self.table.setColumnWidth(col, width if width > 0 else 80)
+        self._save_layout()
 
     def _sync_dynamic_sort_mode(self):
         """고빈도·복합 정렬은 타이머가 맡고 일반 컬럼만 Qt 자동정렬을 쓴다."""
