@@ -548,7 +548,9 @@ def _limit_tier(d: dict) -> int:
         return TIER_PREOPEN
     if actual_limit:
         return TIER_LIMIT_CLEAN if d["ask_qty"] == 0 else TIER_LIMIT
-    if d["ask_qty"] == 0:
+    if d["ask_qty"] == 0 and d["price"] > 0:
+        # 현재가까지 있어야 '거래 중인데 매도가 빈' 종목이다. 방금 편입돼
+        # 시세가 아직 안 들어온 행은 값이 전부 0이라 이 자리에 오면 안 된다.
         return TIER_NO_ASK
     return TIER_PLAIN
 

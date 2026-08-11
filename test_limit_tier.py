@@ -66,6 +66,9 @@ def demo():
 
     assert _limit_tier(row(price=900, rate=5.0, vol=100, ask_qty=10)) == 6, "일반"
 
+    # 방금 편입돼 시세 백필 전인 행. 값이 전부 0이라도 상한가 직전이 아니다.
+    assert _limit_tier(row(upper=0, base=0)) == 6, "편입 직후 빈 행은 맨 아래 묶음"
+
     # 등락률 정렬 키: 예상값이 살아 있으면 그 값으로 비교한다. 표시는 그대로다.
     model = gui.StockModel()
     model.add_stock("VI", {**vi, "exp_hot": 1})
