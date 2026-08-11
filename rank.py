@@ -111,47 +111,10 @@ KIWOOM_ALERT_FILES = {
 }
 
 
-NEWS_ALERT_VOLUME = 0.35  # 뉴스 알림만 작게 (0.0~1.0). 다른 알림은 원래 크기
-_WAV_EFFECTS = {}
-
-
-def _play_wav_quiet(path: Path, volume: float) -> bool:
-    """winsound는 음량 조절이 없어 낮춰 재생할 때만 Qt로 WAV를 낸다."""
-    try:
-        key = str(path)
-        effect = _WAV_EFFECTS.get(key)
-        if effect is None:
-            effect = QSoundEffect(QApplication.instance())
-            effect.setLoopCount(1)
-            # 읽는 중에 play()하면 소리가 그냥 사라져서 준비되면 한 번 낸다.
-            effect.statusChanged.connect(
-                lambda e=effect: e.status() == QSoundEffect.Status.Ready
-                and e.property("pending") and (
-                    e.setProperty("pending", False), e.play()))
-            effect.setSource(QUrl.fromLocalFile(key))
-            _WAV_EFFECTS[key] = effect
-        effect.setVolume(volume)
-        if effect.status() != QSoundEffect.Status.Ready:
-            if effect.status() == QSoundEffect.Status.Error:
-                return False
-            effect.setProperty("pending", True)
-            return True
-        if effect.isPlaying():
-            effect.stop()
-        effect.play()
-        return True
-    except Exception as error:  # noqa: BLE001
-        log.warning("Quiet WAV playback failed: %s error=%s", path, error)
-        return False
-
-
 def _beep(kind: str):
     """서명된 PowerShell의 Console.Beep으로 수정 전 Windows 원음을 재생한다."""
     kiwoom_sound = KIWOOM_ALERT_FILES.get(kind)
     if kiwoom_sound and kiwoom_sound.is_file():
-        if "news" in kind and _play_wav_quiet(
-                kiwoom_sound, NEWS_ALERT_VOLUME):
-            return
         try:
             winsound.PlaySound(
                 str(kiwoom_sound),
