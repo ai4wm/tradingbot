@@ -741,7 +741,10 @@ class View:
 
     def _on_jumsang_entered(self, code: str):
         _beep("jumsang")
-        log.info("jumsang%s: %s", self.prefix or "", code)
+        # ponytail: 소리가 안 들린다는 보고를 가르려고 WARNING으로 올렸다. info는
+        # 루트 레벨이 WARNING이라 bot.log에 안 남는다. 몇 번·몇 초 간격으로
+        # 울리는지 보이면 SND_ASYNC가 끊기는 것인지 갈린다. 확인 뒤 info로 되돌린다.
+        log.warning("jumsang%s: %s", self.prefix or "", code)
 
     def _on_auto_refresh(self, on: bool):
         self._settings.setValue(self._mkey("auto_refresh"), "true" if on else "false")
