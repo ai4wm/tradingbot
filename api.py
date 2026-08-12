@@ -47,6 +47,15 @@ def _is_rate_limited(message: str) -> bool:
     return any(hint in lowered for hint in RATE_LIMIT_HINTS)
 
 
+def is_nothing_to_cancel(error) -> bool:
+    """취소할 잔량이 이미 없다는 응답인지 본다(506550).
+
+    영웅문에서 먼저 취소했거나 그사이 전량 체결되면 나온다. 취소의 목적은
+    잔량을 없애는 것이므로 이미 달성된 상태다. 오류로 볼 일이 아니다.
+    """
+    return "506550" in str(error)
+
+
 def _maintenance_datetime(value: str) -> datetime:
     return datetime.strptime(value, "%Y-%m-%d %H:%M").replace(tzinfo=KST)
 

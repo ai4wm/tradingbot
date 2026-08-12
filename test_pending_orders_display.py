@@ -13,8 +13,8 @@ class _Screen:
     def __init__(self):
         self.shown = []
 
-    def set_pending_orders(self, code, buy, sell, position):
-        self.shown.append((code, buy, sell, position))
+    def set_pending_orders(self, code, buy, sell, position, trim=0):
+        self.shown.append((code, buy, sell, position, trim))
 
 
 class _View:
@@ -39,7 +39,8 @@ def demo():
     app = QApplication.instance() or QApplication([])
     screen = _Screen()
     _App(screen)._push_pending_orders("005930")
-    assert screen.shown[-1] == ("005930", (2, 500), (1, 100), (800, 700)), (
+    # 나머지취소 수량은 100주 넘는 건에서만 나온다: (300-100)+(200-100)=300
+    assert screen.shown[-1] == ("005930", (2, 500), (1, 100), (800, 700), 300), (
         screen.shown[-1])
 
     # 종목코드 접미사(_AL/_NX)와 A접두사가 붙어 와도 같은 장부를 봐야 한다.
@@ -50,7 +51,7 @@ def demo():
     # 미체결이 없는 종목은 0건으로 알려야 한다(표시가 옛 값에 남지 않게).
     screen.shown.clear()
     _App(screen)._push_pending_orders("000660")
-    assert screen.shown[-1] == ("000660", (0, 0), (0, 0), (0, 0)), screen.shown[-1]
+    assert screen.shown[-1] == ("000660", (0, 0), (0, 0), (0, 0), 0), screen.shown[-1]
 
     # 화면 쪽 문구 — 대상이 아닌 종목의 갱신은 무시해야 한다.
     from gui import ConditionScreen

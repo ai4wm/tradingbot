@@ -65,6 +65,9 @@ class FakeSettings:
     def value(self, key, default=""):
         return self.saved.get(key, default)
 
+    def remove(self, key):
+        self.saved.pop(key, None)
+
     def sync(self):
         pass
 
@@ -82,7 +85,15 @@ def _app(pending):
     app.orders = types.SimpleNamespace(
         stop_local_submissions=lambda code: None, batches={})
     app._balance_sell_stage = {}
+    app._balance_sell_tasks = {}
+    app._balance_sell_recheck = set()
     app._emergency_status_dismissed = set()
+    app._emergency_locked = set()
+    app._account_auto_cancel_filled = {}
+    app._account_auto_cancel_fill_ids = set()
+    app._account_auto_cancel_tasks = {}
+    app._account_summary_debounce = types.SimpleNamespace(start=lambda ms: None)
+    app.orders.on_order_event = lambda event: None
     app._cancel_sent_orders = set()
     app._position_book = {}
     app._open_sell_orders = {}
@@ -441,11 +452,148 @@ async def check_order_send_is_parallel():
           "(취소 응답 0.3초를 기다리지 않음)")
 
 
+def check_nothing_to_cancel():
+    """영웅문에서 먼저 취소한 건은 오류가 아니라 이미 목적 달성이다.
+
+    이 판별이 무너지면 정상 경합이 ERROR 스택으로 쌓여 진짜 취소 실패가
+    로그에서 묻힌다.
+    """
+    from api import is_nothing_to_cancel
+    assert is_nothing_to_cancel(
+        RuntimeError("[2000](506550:취소가능수량이 없습니다.)"))
+    assert not is_nothing_to_cancel(
+        RuntimeError("[2000](506560:주문가능금액이 부족합니다.)"))
+    assert not is_nothing_to_cancel(RuntimeError("kt10003 응답 없음"))
+    print("취소 경합     : 506550만 정상 처리, 다른 거부는 오류 유지")
+
+
+async def check_balance_stages():
+    """전량 매도 뒤 늦게 들어온 매수 체결도 곧바로 매도되는지 확인한다.
+
+    상이 무너지는 순간 호가 틱이 체결보다 먼저 오면, 매도 직전에 보낸 취소가
+    닿기 전에 체결된 물량이 남는다. 이 갈래가 무너지면 그 물량은 소진된
+    단계에 막혀 아무도 팔지 않는다.
+    """
+    code = "005930"
+    app = _app([])
+    # 2026-08-12 실사용 설정: 1단계는 소리만, 2단계에서 시장가 전량.
+    app._balance_sell_settings[code] = {
+        "first": 3_000_000, "second": 600_000, "third": 0,
+        "first_ratio": 0.0, "second_ratio": 1.0, "third_ratio": 1.0,
+        "market_sell": True}
+    app._balance_sell_date[code] = _main.datetime.now().strftime("%Y%m%d")
+    app._position_book[code] = {"held": 1408, "sellable": 1408}
+    app._open_buy_orders[code] = {"0009": (200, "KRX")}
+
+    session, beep = _main._market_session_states, _main._beep
+    _main._market_session_states = lambda now: ("정규장", "정규장", "")
+    _main._beep = lambda *_args, **_kwargs: None
+    try:
+        app._check_balance_sell(code, 3_000_000)   # 1단계: 비율 0 -> 주문 없음
+        assert app._balance_sell_stage[code] == 1, app._balance_sell_stage
+        assert "sell" not in app.rest.calls, app.rest.calls
+
+        app._check_balance_sell(code, 500_000)     # 2단계: 시장가 전량
+        await app._balance_sell_tasks[code]
+        await asyncio.sleep(0.1)                   # 취소·스윕까지 마무리
+        assert app.rest.calls.count("sell") == 1, app.rest.calls
+        assert app._balance_sell_stage[code] == 2, app._balance_sell_stage
+
+        # 매도 접수 -> 매도가능 0. 그 뒤 취소가 늦어 체결된 매수 200주가 들어온다.
+        app._on_account_order_event({
+            "code": code, "side": "sell", "status": "접수", "order_no": "1001",
+            "original_order_no": "0000000", "order_qty": 1408, "fill_qty": 0,
+            "remaining_qty": 1408, "fill_id": "", "exchange": "KRX"})
+        app._on_account_order_event({
+            "code": code, "side": "buy", "status": "체결", "order_no": "0009",
+            "original_order_no": "0000000", "order_qty": 200, "fill_qty": 200,
+            "remaining_qty": 0, "fill_id": "7777", "exchange": "KRX"})
+        await app._balance_sell_tasks[code]
+        await asyncio.sleep(0.1)
+        # 체결분 200주가 곧바로 매도된다. 진행도는 그대로 2다.
+        assert app.rest.calls.count("sell") == 2, app.rest.calls
+        assert app._balance_sell_stage[code] == 2, app._balance_sell_stage
+
+        # 그 매도까지 접수되면 더 팔 것이 없다. 호가가 더 무너져도 주문은 없다.
+        app._on_account_order_event({
+            "code": code, "side": "sell", "status": "접수", "order_no": "1002",
+            "original_order_no": "0000000", "order_qty": 200, "fill_qty": 0,
+            "remaining_qty": 200, "fill_id": "", "exchange": "KRX"})
+        app._check_balance_sell(code, 400_000)
+        await asyncio.sleep(0.1)
+        assert code not in app._balance_sell_tasks, app._balance_sell_tasks
+        assert app.rest.calls.count("sell") == 2, app.rest.calls
+    finally:
+        _main._market_session_states, _main._beep = session, beep
+    print(f"늦은 체결     : 전량 매도 뒤 체결 200주도 매도됨 "
+          f"(sell {app.rest.calls.count('sell')}회, 진행도 "
+          f"{app._balance_sell_stage[code]} 유지)")
+
+
+async def check_balance_refill_while_selling():
+    """매도가 아직 도는 중에 늦은 체결이 오면, 끝난 뒤 이어서 팔아야 한다.
+
+    늦은 체결은 다시 올 이벤트가 없다. 실행 중 가드에서 그냥 버리면 그 물량은
+    아무도 팔지 않는다. 상이 무너지는 순간 실제로 이 순서가 먼저 나온다.
+    """
+    code = "005930"
+    app = _app([])
+    app._balance_sell_settings[code] = {
+        "first": 3_000_000, "second": 600_000, "third": 0,
+        "first_ratio": 0.0, "second_ratio": 1.0, "third_ratio": 1.0,
+        "market_sell": True}
+    app._balance_sell_date[code] = _main.datetime.now().strftime("%Y%m%d")
+    app._position_book[code] = {"held": 1408, "sellable": 1408}
+
+    # 매도 응답을 늦춰 '아직 도는 중'을 만든다.
+    async def slow_sell(stock_code, qty, price, market=False):
+        app.rest.calls.append(f"sell:{qty}")
+        await asyncio.sleep(0.05)
+        return {"order_no": "1001"}
+
+    app.rest.sell_order = slow_sell
+    session, beep = _main._market_session_states, _main._beep
+    _main._market_session_states = lambda now: ("정규장", "정규장", "")
+    _main._beep = lambda *_args, **_kwargs: None
+    try:
+        app._check_balance_sell(code, 3_000_000)   # 1단계 소진
+        app._check_balance_sell(code, 500_000)     # 2단계 매도 시작
+        selling = app._balance_sell_tasks[code]
+        await asyncio.sleep(0)                     # 매도 전송까지만 진행
+
+        # 매도 접수와 늦은 체결이 매도 응답보다 먼저 웹소켓으로 들어온다.
+        app._on_account_order_event({
+            "code": code, "side": "sell", "status": "접수", "order_no": "1001",
+            "original_order_no": "0000000", "order_qty": 1408, "fill_qty": 0,
+            "remaining_qty": 1408, "fill_id": "", "exchange": "KRX"})
+        app._on_account_order_event({
+            "code": code, "side": "buy", "status": "체결", "order_no": "0009",
+            "original_order_no": "0000000", "order_qty": 200, "fill_qty": 200,
+            "remaining_qty": 0, "fill_id": "7777", "exchange": "KRX"})
+        # 매도가 아직 도는 중이라 바로 못 판다. 끝난 뒤 볼 대상으로 남긴다.
+        assert code in app._balance_sell_recheck, app._balance_sell_recheck
+        assert app._position_book[code]["sellable"] == 200, app._position_book
+
+        await selling
+        await asyncio.sleep(0.1)                   # 이어지는 재매도까지
+        if app._balance_sell_tasks.get(code):
+            await app._balance_sell_tasks[code]
+            await asyncio.sleep(0.1)
+        sells = [c for c in app.rest.calls if c.startswith("sell:")]
+        assert sells == ["sell:1408", "sell:200"], app.rest.calls
+        assert not app._balance_sell_recheck, app._balance_sell_recheck
+        assert app._balance_sell_stage[code] == 2, app._balance_sell_stage
+    finally:
+        _main._market_session_states, _main._beep = session, beep
+    print(f"실행 중 체결  : 매도 중 들어온 200주도 이어서 매도됨 ({sells})")
+
+
 async def _immediate_token():
     return "token"
 
 
 async def main_check():
+    check_nothing_to_cancel()
     check_open_buy_book()
     check_position_book()
     await check_sell_uses_book()
@@ -456,6 +604,8 @@ async def main_check():
     await check_balance_no_pending()
     await check_balance_pending()
     await check_balance_nine_splits()
+    await check_balance_stages()
+    await check_balance_refill_while_selling()
     await check_emergency_no_pending()
     await check_emergency_pending()
     await check_emergency_with_book()

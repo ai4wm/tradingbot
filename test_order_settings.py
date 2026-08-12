@@ -96,6 +96,24 @@ def demo():
     assert stored["date"] == today, stored
     assert stored["specs"] == hotkeys, stored
 
+    # 5) 저장한 적 없는 첫 실행은 손상이 아니므로 조용히 빈 상태여야 한다.
+    seed()
+    app = Stub()
+    app._load_order_settings()
+    assert app._exit_hotkey_specs == {}, app._exit_hotkey_specs
+    assert app._account_auto_cancel_armed == set(), app._account_auto_cancel_armed
+    assert app._balance_sell_settings == {}, app._balance_sell_settings
+
+    # 6) 저장값이 깨져도 앱은 죽지 않고 빈 상태로 시작한다. 실제로 파싱하는
+    #    키는 exit_hotkeys 하나뿐이라 그 키를 깨야 예외 경로를 탄다.
+    broken = QSettings(INI, QSettings.IniFormat)
+    broken.clear()
+    broken.setValue("order/exit_hotkeys", "{not json")
+    broken.sync()
+    app = Stub()
+    app._load_order_settings()
+    assert app._exit_hotkey_specs == {}, app._exit_hotkey_specs
+
     QSettings(INI, QSettings.IniFormat).clear()
     if os.path.exists(INI):
         os.remove(INI)

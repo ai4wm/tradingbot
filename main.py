@@ -56,6 +56,7 @@ from analysis_db import (
 from api import (
     KST, ORDER_BURST, OrderSendUnknown, RestClient,
     active_kiwoom_maintenance, format_kiwoom_maintenance,
+    is_nothing_to_cancel,
 )
 from classification_api import ClassificationClient
 from dart_api import DartClient
@@ -409,6 +410,21 @@ def _previous_krx_quote_price(price: int) -> int:
     else:
         tick = 1_000
     return max(1, price - tick)
+
+
+def _balance_stage_order(setting: dict) -> list[tuple[int, int]]:
+    """3단매도 단계를 기준 잔량이 큰 쪽부터 (기준, 단계번호)로 돌려준다."""
+    return sorted(
+        ((int(setting.get(key, 0)), number)
+         for number, key in enumerate(("first", "second", "third"), 1)
+         if int(setting.get(key, 0)) > 0),
+        key=lambda item: (-item[0], item[1]))
+
+
+def _balance_stage_ratio(setting: dict, number: int) -> float:
+    return float(setting.get(
+        ("first_ratio", "second_ratio", "third_ratio")[number - 1],
+        (0.0, 0.5, 1.0)[number - 1]))
 
 
 def _balance_stage3_limit_price(row: dict) -> int:
@@ -951,6 +967,9 @@ class App:
         self._balance_sell_stage: dict[str, int] = {}
         self._balance_sell_date: dict[str, str] = {}
         self._balance_sell_tasks: dict[str, asyncio.Task] = {}
+        # 매도가 도는 중에 들어온 늦은 체결. 그 체결은 다시 올 이벤트가 없으므로
+        # 지금 매도가 끝난 뒤에 한 번 더 본다(청산키의 _emergency_recheck와 같다).
+        self._balance_sell_recheck: set[str] = set()
         self._emergency_locked: set[str] = set()
         self._emergency_tasks: dict[str, asyncio.Task] = {}
         self._emergency_prices: dict[str, int] = {}
@@ -2326,6 +2345,10 @@ class App:
         if event.get("side") != "buy":
             return
         self._track_open_buy(code, order_no, event)
+        if int(event.get("fill_qty") or 0) > 0:
+            # 장부를 갱신한 뒤에 부른다. 먼저 부르면 방금 체결된 물량이
+            # 매도가능수량에 아직 없어 그대로 남는다.
+            self._resell_late_buy_fill(code)
         if code not in self._account_auto_cancel_armed:
             return
         fill_qty = max(0, int(event.get("fill_qty") or 0))
@@ -2616,10 +2639,15 @@ class App:
             reason: str):
         try:
             await self.rest.cancel_order(code, order_no, 0, exchange)
-        except Exception:  # noqa: BLE001
+        except Exception as error:  # noqa: BLE001
             # 이미 체결·취소된 주문일 수 있다. 다음 기회에 다시 시도하도록
             # 전송 표시를 지운다.
             self._cancel_sent_orders.discard(order_no)
+            if is_nothing_to_cancel(error):
+                log.info(
+                    "%s open-buy cancel already gone code=%s order=%s qty=%s",
+                    reason, code, order_no, qty)
+                return
             log.exception(
                 "%s open-buy cancel failed code=%s order=%s qty=%s",
                 reason, code, order_no, qty)
@@ -2656,7 +2684,12 @@ class App:
         """
         try:
             await self.rest.cancel_order(code, order_no, qty, exchange)
-        except Exception:  # noqa: BLE001
+        except Exception as error:  # noqa: BLE001
+            if is_nothing_to_cancel(error):
+                log.info(
+                    "trim cancel already gone code=%s order=%s qty=%s",
+                    code, order_no, qty)
+                return
             log.exception(
                 "trim cancel failed code=%s order=%s qty=%s",
                 code, order_no, qty)
@@ -2706,8 +2739,14 @@ class App:
                 "account auto-cancel code=%s event_order=%s "
                 "orders=%s qty=%s",
                 code, order_no, count, qty)
-        except Exception:  # noqa: BLE001
+        except Exception as error:  # noqa: BLE001
             self._cancel_sent_orders.discard(order_no)
+            if is_nothing_to_cancel(error):
+                # 영웅문에서 먼저 취소했거나 그사이 전량 체결된 경우다.
+                log.info(
+                    "account auto-cancel already gone code=%s event_order=%s",
+                    code, order_no)
+                return
             log.exception(
                 "account auto-cancel failed code=%s event_order=%s",
                 code, order_no)
@@ -2850,7 +2889,37 @@ class App:
         audit_log.info(
             "balance sell setting code=%s setting=%s", code, setting)
 
-    def _check_balance_sell(self, code: str, bid_qty: int):
+    def _resell_late_buy_fill(self, code: str):
+        """전량 매도 단계를 지난 뒤 늦게 체결된 매수를 같은 조건으로 판다.
+
+        상이 무너지는 순간 호가 틱이 체결보다 먼저 오면, 매도 직전에 보낸
+        취소가 닿기 전에 체결된 물량이 소진된 단계에 막혀 그대로 남는다.
+        청산키는 체결마다 재청산을 걸지만(_queue_emergency_reconcile) 잔량매도
+        에는 그 갈래가 없었다. 진행도는 그대로 두고 이 물량만 처리한다.
+        """
+        setting = self._balance_sell_settings.get(code)
+        if not setting:
+            return
+        running = self._balance_sell_tasks.get(code)
+        if running and not running.done():
+            # 지금 도는 매도가 어느 단계를 소진할지 아직 모른다. 끝난 뒤에
+            # 진행도를 보고 판단한다. 이 체결은 다시 올 이벤트가 없다.
+            self._balance_sell_recheck.add(code)
+            return
+        progress = self._balance_sell_stage.get(code, 0)
+        if progress <= 0:
+            return
+        order = _balance_stage_order(setting)
+        if progress > len(order):
+            return
+        threshold, number = order[progress - 1]
+        # 일부만 파는 단계는 남은 물량이 있는 것이 정상이라 건드리지 않는다.
+        if _balance_stage_ratio(setting, number) < 1.0:
+            return
+        self._check_balance_sell(code, threshold, refill=True)
+
+    def _check_balance_sell(self, code: str, bid_qty: int,
+                            refill: bool = False):
         setting = self._balance_sell_settings.get(code)
         if not setting:
             return
@@ -2866,19 +2935,15 @@ class App:
         # 번호는 이름일 뿐이고 실행 순서는 기준 잔량이 큰 쪽 -> 작은 쪽이다.
         # 여러 기준을 한 번에 밑돌면 기준이 가장 작은 단계 하나만 실행하고
         # 같이 밑돈 단계는 주문 없이 소진한다(진행도 = 지나온 깊이).
-        order = sorted(
-            ((int(setting.get(key, 0)), number)
-             for number, key in enumerate(("first", "second", "third"), 1)
-             if int(setting.get(key, 0)) > 0),
-            key=lambda item: (-item[0], item[1]))
+        order = _balance_stage_order(setting)
         progress = self._balance_sell_stage.get(code, 0)
         depth = sum(1 for threshold, _ in order if bid_qty <= threshold)
-        if depth <= progress:
+        # refill은 늦게 들어온 체결을 처리하려고 소진된 단계를 다시 부른 것이라
+        # 같은 깊이를 허용한다. 호가 틱은 진행도를 넘길 때만 발동한다.
+        if depth < progress or (depth == progress and not refill):
             return
         threshold, number = order[depth - 1]
-        ratio = float(setting.get(
-            ("first_ratio", "second_ratio", "third_ratio")[number - 1],
-            (0.0, 0.5, 1.0)[number - 1]))
+        ratio = _balance_stage_ratio(setting, number)
         if ratio <= 0:
             audit_log.info(
                 "balance sell stage skipped code=%s slot=%s depth=%s "
@@ -2921,16 +2986,23 @@ class App:
             return
         audit_log.info(
             "balance sell stage triggered code=%s slot=%s depth=%s "
-            "bid_qty=%s threshold=%s ratio=%s order_type=%s price=%s",
+            "bid_qty=%s threshold=%s ratio=%s order_type=%s price=%s refill=%s",
             code, number, depth, bid_qty, threshold,
-            ratio, "market" if market_sell else "limit", price)
+            ratio, "market" if market_sell else "limit", price, refill)
         task = asyncio.ensure_future(
             self._execute_balance_stage(
                 code, depth, number, ratio, price, bid_qty, market_sell))
         self._balance_sell_tasks[code] = task
         task.add_done_callback(
             lambda _task, stock_code=code:
-            self._balance_sell_tasks.pop(stock_code, None))
+            self._finish_balance_sell(stock_code))
+
+    def _finish_balance_sell(self, code: str):
+        """매도가 끝났다. 도는 동안 들어온 늦은 체결이 있으면 이어서 판다."""
+        self._balance_sell_tasks.pop(code, None)
+        if code in self._balance_sell_recheck:
+            self._balance_sell_recheck.discard(code)
+            self._resell_late_buy_fill(code)
 
     def _complete_balance_stage(
             self, code: str, depth: int, sound: str | None = "balance_sold"):
