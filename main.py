@@ -2951,17 +2951,25 @@ class App:
                 code, number, depth, bid_qty, threshold, ratio)
             self._complete_balance_stage(code, depth, sound="balance1")
             return
-        # 앞 단계에서 다 팔아 보유가 없고 들어올 매수도 없으면 낼 주문이 없다.
-        # 틱마다 재시도하지 않도록 조용히 소진한다. 장부에 항목이 있을 때만
-        # 믿는다 — 항목이 없으면 체결 반영 지연일 수 있어 기존대로 재시도한다.
+        # 보유가 없고 들어올 매수도 없으면 낼 주문이 없다. 틱마다 재시도하지
+        # 않도록 조용히 소진한다. 장부를 세운 뒤에는 항목이 없는 것도 미보유로
+        # 믿는다(체결이 오면 `_track_open_buy`가 만든다). 장부를 세우기 전에는
+        # 실제로 들고 있어도 항목이 없으므로 재시도한다.
+        # 소진해도 진행도가 서므로 나중에 산 물량은 `_resell_late_buy_fill`이
+        # 되살린다. 진행도가 0으로 남으면 그 되살리기조차 걸리지 않는다.
         booked = self._position_book.get(code)
-        if (progress > 0 and booked is not None and booked["held"] <= 0
+        if ((booked is not None or self._position_book_primed)
+                and (booked or {}).get("held", 0) <= 0
                 and not self._pending_open_buys(code)):
             audit_log.info(
                 "balance sell stage consumed; nothing held code=%s "
-                "slot=%s depth=%s bid_qty=%s threshold=%s",
-                code, number, depth, bid_qty, threshold)
-            self._complete_balance_stage(code, depth, sound=None)
+                "slot=%s depth=%s bid_qty=%s threshold=%s progress=%s",
+                code, number, depth, bid_qty, threshold, progress)
+            # 앞 단계를 지나온 뒤면 그 단계에서 다 판 것이라 알릴 것이 없다.
+            # 진행도 0 = 애초에 안 들고 있던 종목이라 소리로 알린다.
+            self._complete_balance_stage(
+                code, depth,
+                sound="balance_unheld" if progress <= 0 else None)
             return
         market_sell = bool(setting.get("market_sell", False))
         row = next((

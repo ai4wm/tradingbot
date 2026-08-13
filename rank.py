@@ -53,6 +53,7 @@ TONES = {  # (주파수Hz, 길이ms) 나열 -> 멜로디. 시스템 테마 무�
     "jump": [(1100, 1000)],  # 급상승: 띠—— 긴 단일음
     "in":   [(784, 140), (1047, 140), (1319, 280)],  # 조건 편입: 뚜-뚜-띠~↑ (3음 차임, 길고 또렷)
     "balance1": [(880, 180), (880, 180)],  # 잔량 단계 도달: 경고음만 (0% 소리만)
+    "balance_unheld": [(660, 160), (523, 260)],  # 미보유라 못 판 소진: 내림음
     "balance_sold": [(880, 180), (1175, 300)],  # 실제 매도 체결
     "ls_news": [(784, 120), (988, 220)],  # 이전 일반 뉴스 호출 호환용
     "ls_news_with_code": [(988, 120), (1319, 220)],
@@ -99,6 +100,7 @@ def _tone_wav(tones, sample_rate: int = 44100) -> bytes:
 _SOUND_EFFECTS = {}
 KIWOOM_ALERT_FILES = {
     "balance1": Path(r"C:\KiwoomHero4\sound\sound7.wav"),
+    "balance_unheld": Path(r"C:\KiwoomHero4\sound\sound5.wav"),
     "balance_sold": Path(r"C:\KiwoomHero4\sound\주문접수완료1.wav"),
     "ls_news": Path(r"C:\KiwoomHero4\sound\sound11.wav"),
     "ls_news_with_code": Path(r"C:\KiwoomHero4\sound\sound8.wav"),
