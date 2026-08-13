@@ -63,7 +63,7 @@ def demo():
     view = gui.ThemeGroupedTableView()
     view.setModel(proxy)
     proxy.sort(gui.RATE_COL, Qt.DescendingOrder)
-    last_row, jumsang = view.waiting_group()
+    last_row, jumsang, _limit_row = view.waiting_group()
     assert "000001" in jumsang, f"점상 알림 대상 유지: {jumsang}"
     assert last_row == order(proxy).index("000001"), (
         f"선이 점상 대기 행까지 내려와야 한다: last_row={last_row} "

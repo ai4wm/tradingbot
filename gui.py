@@ -32,8 +32,11 @@ log = logging.getLogger("gui")
 audit_log = logging.getLogger("trade.audit")
 
 # 순위/변동: ★조회순위(ka00198) 모드 전용 -> 다른 화면에선 숨김 (set_view_mode)
-COLUMNS = ["순위",  "변동",      "등락률", "연상", "종목명", "테마",   "현재가", "예상체결가", "주문",  "L일봉H", "예상등락률", "전일거래량", "거래량", "매도잔량", "매수잔량", "예상체결량", "대금/분",       "시총(억)", "상한가진입시간", "3단매도(만)", "자동취소",       "청산키"]
-FIELDS  = ["qrank", "qrank_chg", "rate",   "streak", "name", "theme", "price", "exp_price", "order", "bar",    "exp_rate",   "prev_vol", "vol",   "ask_qty",  "bid_qty",  "exp_qty",  "minute_value", "mcap",   "time",             "balance_sell", "auto_cancel_arm", "exit_hotkey"]
+# 새 컬럼은 반드시 맨 뒤에 붙인다. 저장된 폭·순서가 논리 인덱스 기준이라
+# 중간에 끼우면 사용자 layout.ini의 폭이 엉뚱한 컬럼에 붙는다. 원하는 자리는
+# 사용자가 헤더를 끌어 옮긴다(setSectionsMovable).
+COLUMNS = ["순위",  "변동",      "등락률", "연상", "종목명", "테마",   "현재가", "예상체결가", "주문",  "L일봉H", "예상등락률", "전일거래량", "거래량", "매도잔량", "매수잔량", "예상체결량", "대금/분",       "시총(억)", "상한가진입시간", "3단매도(만)", "자동취소",       "청산키",     "거래대금"]
+FIELDS  = ["qrank", "qrank_chg", "rate",   "streak", "name", "theme", "price", "exp_price", "order", "bar",    "exp_rate",   "prev_vol", "vol",   "ask_qty",  "bid_qty",  "exp_qty",  "minute_value", "mcap",   "time",             "balance_sell", "auto_cancel_arm", "exit_hotkey", "acc_value"]
 # 컬럼은 아니지만 L일봉H 그리기에 필요한 저장 필드 (시/저/고/전일종가/상한/하한)
 # streak(연상)/mcap(시가총액)은 저장 안 함: 매번 계산
 BOOK_FIELDS = {f"{side}_{kind}{level if level > 1 else ''}"
@@ -52,6 +55,7 @@ TIME_COL = FIELDS.index("time")
 VOLUME_COL = FIELDS.index("vol")
 BID_QTY_COL = FIELDS.index("bid_qty")
 MINUTE_VALUE_COL = FIELDS.index("minute_value")
+ACC_VALUE_COL = FIELDS.index("acc_value")
 MINUTE_VALUE_DISPLAY_STEP = 10_000_000  # 화면의 0.1억원과 정렬 구간을 일치시킨다.
 NON_LIMIT_IGNORED_SORT_COLS = {TIME_COL, BID_QTY_COL}
 STREAK_COL = FIELDS.index("streak")
@@ -64,6 +68,13 @@ BALANCE_SELL_MARKET_LAST_KEY = "balance_sell_market_last"
 BALANCE_SELL_STAGE_KEYS = ("first", "second", "third")
 BALANCE_SELL_STAGE_LAST_KEYS = tuple(
     f"balance_sell_stage_last/{key}" for key in BALANCE_SELL_STAGE_KEYS)
+
+
+def _balance_stages_done(setting: dict, stage: int) -> bool:
+    """켜 둔 단계를 모두 지났는가. 지났으면 더 나갈 매도가 없다."""
+    active = sum(1 for key in BALANCE_SELL_STAGE_KEYS
+                 if int(setting.get(key, 0)) > 0)
+    return bool(active) and stage >= active
 RANK_COLS = (FIELDS.index("qrank"), FIELDS.index("qrank_chg"))
 RANK_CHANGE_COL = FIELDS.index("qrank_chg")
 RANK_DEFAULT_WIDTHS = {RANK_COLS[0]: 42, RANK_COLS[1]: 48}
@@ -973,35 +984,46 @@ class ThemeGroupedTableView(QTableView):
             self._blink_on = False
         self.viewport().update()
 
-    def waiting_group(self) -> tuple[int, set[str]]:
-        """구분선 위 그룹의 마지막 행과 그 종목코드.
+    def waiting_group(self) -> tuple[int, set[str], int]:
+        """구분선 위 그룹의 마지막 행과 그 종목코드, 그리고 상한가 묶음의 끝.
 
         선 위는 점상 대기(예상상한 · 매도잔량 0 · 매수잔량 있음)만이다.
         매도잔량이 있으면 예상등락률이 상한가여도 선 아래로 내린다.
+
+        장이 열린 뒤에는 실제 상한가이면서 매도잔량이 0인 묶음(3)의 끝에도
+        같은 선을 긋는다. 두 선의 뜻은 '매도잔량 0 묶음이 여기까지'로 같다.
+        점상알림 대상(jumsang)은 첫 묶음에서만 모은다 — 알림이 새면 안 된다.
         """
         proxy = self.model()
         if not (isinstance(proxy, TieredProxy) and proxy.limit_mode):
-            return -1, set()
+            return -1, set(), -1
         source = proxy.sourceModel()
         if source is None or not hasattr(source, "codes"):
-            return -1, set()
-        last_row, jumsang = -1, set()
+            return -1, set(), -1
+        last_row, jumsang, limit_row = -1, set(), -1
+        waiting = True  # 아직 첫 묶음(점상 대기)을 지나는 중
         for row in range(proxy.rowCount()):
             source_index = proxy.mapToSource(proxy.index(row, 0))
             if not source_index.isValid():
                 break
             code = source.codes[source_index.row()]
             tier = _limit_tier(source.rows[code])
-            if tier == TIER_WAIT_CLEAN:
+            if waiting and tier == TIER_WAIT_CLEAN:
                 jumsang.add(code)
             if code in proxy.pinned:
                 # 고정 종목은 순위와 무관하게 맨 위에 붙는다. 여기서 끊으면
                 # 일반 종목 하나만 고정해도 구분선이 통째로 사라진다.
                 continue
-            if tier != TIER_WAIT_CLEAN:
-                break
-            last_row = row
-        return last_row, jumsang
+            if waiting:
+                if tier == TIER_WAIT_CLEAN:
+                    last_row = row
+                    continue
+                waiting = False
+            if tier == TIER_LIMIT_CLEAN:
+                limit_row = row
+            elif tier > TIER_LIMIT_CLEAN:
+                break  # 상한가 묶음을 지났으므로 더 볼 것이 없다
+        return last_row, jumsang, limit_row
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -1012,14 +1034,16 @@ class ThemeGroupedTableView(QTableView):
         # 상한가 정렬 순서는 그대로 두고, 09시 이후에도 예상상한 상태로
         # 아직 첫 거래가 시작되지 않은 종목군의 끝만 가로선으로 구분한다.
         if proxy is not None and proxy.rowCount() > 1:
-            last_waiting_row = self.waiting_group()[0]
-            if 0 <= last_waiting_row < proxy.rowCount() - 1:
+            last_waiting_row, _, last_limit_row = self.waiting_group()
+            painter.setPen(QPen(QColor("#FFD54F"), 2))
+            for group_row in (last_waiting_row, last_limit_row):
+                if not 0 <= group_row < proxy.rowCount() - 1:
+                    continue
                 y = (
-                    self.rowViewportPosition(last_waiting_row)
-                    + self.rowHeight(last_waiting_row) - 1
+                    self.rowViewportPosition(group_row)
+                    + self.rowHeight(group_row) - 1
                 )
                 if 0 <= y < self.viewport().height():
-                    painter.setPen(QPen(QColor("#FFD54F"), 2))
                     painter.drawLine(0, y, self.viewport().width(), y)
 
         # 셀 배경과 숫자색은 그대로 두고, 가장 중요한 두 열의 위치만
@@ -1890,13 +1914,21 @@ class StockModel(QAbstractTableModel):
                         QColor("#FFF176") if alert == 1
                         else QColor("#FF9800") if alert == 2
                         else QColor("#D50000"))
+                # 켜 둔 단계를 모두 지나면 더 나갈 매도가 없다. 소리는 그
+                # 순간에만 들리므로 자리를 비운 뒤에도 알 수 있게 색으로 남긴다.
+                # 옅은 회색은 옅은 초록과 명도가 붙어 한눈에 안 갈리므로
+                # 어두운 남회색으로 둔다(경보색인 주황·빨강과도 안 겹친다).
+                if _balance_stages_done(setting, stage):
+                    return QColor("#37474F")
                 return QColor("#CDECCF")
             if role == Qt.ForegroundRole and setting:
-                if (
-                    self.balance_alert_stage.get(code, 0) >= 3
-                    and self.balance_blink_on
-                ):
-                    return WHITE
+                alert = self.balance_alert_stage.get(code, 0)
+                if alert and self.balance_blink_on:
+                    # 점멸 중에는 배경이 경보색이다. 소진 여부와 무관하게
+                    # 그 배경에 맞춘다(3차 빨강만 흰 글씨).
+                    return WHITE if alert >= 3 else QColor("#111111")
+                if _balance_stages_done(setting, stage):
+                    return WHITE  # 어두운 소진 배경 위
                 return QColor("#111111")
             if role == Qt.FontRole and setting:
                 font = QFont()
@@ -2119,6 +2151,17 @@ class StockModel(QAbstractTableModel):
                 return Qt.AlignRight | Qt.AlignVCenter
             if role == Qt.ToolTipRole:
                 return f"최근 60초 실제 체결대금\n{value:,}원"
+            return None
+        if field == "acc_value":  # 장 시작부터의 누적거래대금
+            value = max(0, int(stored.get(field) or 0))
+            if role == Qt.DisplayRole:
+                return f"{value / 100_000_000:,.0f}억" if value else ""
+            if role == Qt.UserRole:
+                return value
+            if role == Qt.TextAlignmentRole:
+                return Qt.AlignRight | Qt.AlignVCenter
+            if role == Qt.ToolTipRole:
+                return f"당일 누적거래대금\n{value:,}원"
             return None
         value = stored[field]
 
@@ -3247,6 +3290,7 @@ class ConditionScreen(QWidget):
         self.table.setColumnWidth(EXIT_HOTKEY_COL, 56)
         self.table.setColumnWidth(BAR_COL, 70)
         self.table.setColumnWidth(MINUTE_VALUE_COL, 72)
+        self.table.setColumnWidth(ACC_VALUE_COL, 72)
         for col, width in RANK_DEFAULT_WIDTHS.items():
             self.table.setColumnWidth(col, width)
         self.table.setItemDelegate(PreserveTextColorDelegate(self.table))

@@ -74,6 +74,26 @@ def demo():
     real.set_pending_orders("005930", (0, 0), (0, 0), (500, 500))
     assert real.pending_order_value.text() == "체결 <b>500주</b>", (
         real.pending_order_value.text())
+
+    # 3단매도 셀 — 켜 둔 단계를 다 지나면 더 나갈 매도가 없다. 소리는 그때만
+    # 들리므로 자리를 비운 뒤에도 알 수 있게 배경색으로 남아야 한다.
+    # 옅은 회색은 평상시 옅은 초록과 명도가 붙어 안 갈렸다(test_balance_colors).
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QColor
+    from gui import BALANCE_SELL_COL
+    real.model.add_stock("005930", {})
+    real.model.balance_sell_settings["005930"] = {
+        "first": 3_000_000, "second": 700_000, "third": 0}  # 켠 단계 2개
+    cell = real.model.index(real.model.codes.index("005930"), BALANCE_SELL_COL)
+    for stage, expected in ((0, "#CDECCF"), (1, "#CDECCF"), (2, "#37474F")):
+        real.model.balance_sell_stage["005930"] = stage
+        assert real.model.data(cell, Qt.BackgroundRole) == QColor(expected), (
+            stage, real.model.data(cell, Qt.BackgroundRole))
+    # 점멸 중에는 경고색이 우선한다(단계 소진 여부와 무관).
+    real.model.balance_alert_stage["005930"] = 2
+    real.model.balance_blink_on = True
+    assert real.model.data(cell, Qt.BackgroundRole) == QColor("#FF9800"), (
+        real.model.data(cell, Qt.BackgroundRole))
     del app
     print("ok")
 

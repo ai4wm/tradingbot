@@ -85,7 +85,54 @@ def demo():
     # 표시상 +18.5 < +26 이지만 정렬은 뒤집힌다.
     assert model.data(index, Qt.UserRole) > model.data(plain, Qt.UserRole)
 
+    check_group_lines()
     print("ok")
+
+
+def check_group_lines():
+    """구분선 두 개: 점상 대기(0)의 끝과 실제 상한가·매도잔량0(3)의 끝."""
+    model = gui.StockModel()
+    proxy = gui.TieredProxy()
+    proxy.setSourceModel(model)
+    proxy.limit_mode = True
+    table = gui.ThemeGroupedTableView()
+    table.setModel(proxy)
+
+    # exp_hot=1이라야 모델이 예상체결가를 받는다(0D 에코 무시 게이트).
+    waiting = row(exp_price=1204, exp_rate=29.9, bid_qty=5_000_000, exp_hot=1)
+    opened = row(price=1204, rate=29.9, vol=800_000)
+    for code, data in (
+        ("W1", waiting),                                    # 0 점상 대기
+        ("W2", waiting),                                    # 0
+        ("A1", {**waiting, "ask_qty": 700}),                # 1 매도잔량 있음
+        ("L1", opened),                                     # 3 상한가·매도0
+        ("L2", opened),                                     # 3
+        ("L3", {**opened, "ask_qty": 500}),                 # 4 상한가·매도잔량
+        ("P1", row(price=900, rate=5.0, vol=100, ask_qty=10)),  # 6 일반
+    ):
+        model.add_stock(code, dict(data))
+    proxy.sort(gui.RATE_COL, Qt.DescendingOrder)
+
+    def code_at(proxy_row):
+        return model.codes[proxy.mapToSource(proxy.index(proxy_row, 0)).row()]
+
+    last_waiting, jumsang, last_limit = table.waiting_group()
+    assert jumsang == {"W1", "W2"}, jumsang
+    assert code_at(last_waiting) in {"W1", "W2"}, code_at(last_waiting)
+    assert code_at(last_waiting + 1) == "A1", "첫 선은 점상 대기 바로 아래"
+    assert code_at(last_limit) in {"L1", "L2"}, code_at(last_limit)
+    assert code_at(last_limit + 1) == "L3", "둘째 선은 매도잔량 있는 상한가 위"
+
+    # 매도잔량 0인 상한가가 없으면 둘째 선은 안 그린다.
+    empty = gui.StockModel()
+    empty_proxy = gui.TieredProxy()
+    empty_proxy.setSourceModel(empty)
+    empty_proxy.limit_mode = True
+    empty_table = gui.ThemeGroupedTableView()
+    empty_table.setModel(empty_proxy)
+    empty.add_stock("W1", dict(waiting))
+    empty.add_stock("L3", {**opened, "ask_qty": 500})
+    assert empty_table.waiting_group()[2] == -1, "매도잔량0 상한가 없음"
 
 
 if __name__ == "__main__":
