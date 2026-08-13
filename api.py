@@ -374,8 +374,12 @@ class RestClient:
                 "vol": vol,
                 # ka10095 응답의 거래대금은 백만원 단위인 경우가 있어
                 # 일봉 저장 계층과 동일하게 원 단위로 정규화한다.
-                "trading_value": abs(_to_int(r.get("trde_prica"))) * 1_000_000
-                    or abs(_to_int(r.get("cur_prc"))) * vol,
+                # acc_value는 같은 값의 화면용 이름. 체결(0B FID 14)이 와야만
+                # 채워지던 거래대금 칸을 편입 즉시 채운다(거래 없는 종목은 계속 빈다).
+                **dict.fromkeys(
+                    ("trading_value", "acc_value"),
+                    abs(_to_int(r.get("trde_prica"))) * 1_000_000
+                    or abs(_to_int(r.get("cur_prc"))) * vol),
                 "prev_vol": prev_vol,                      # 전일거래량 (역산)
                 "ask_qty": _to_int(r.get("pri_sel_req")),  # 최우선 매도잔량
                 "bid_qty": _to_int(r.get("pri_buy_req")),  # 최우선 매수잔량

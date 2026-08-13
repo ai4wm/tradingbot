@@ -25,7 +25,13 @@ FID = {
     "10": "price",     # 현재가 (부호 포함 -> abs)
     "12": "rate",      # 등락율
     "13": "vol",       # 누적거래량
+    "14": "acc_value",  # 누적거래대금 (백만원 단위로 옴 -> 원으로 환산)
     "15": "tick_qty",  # 개별 체결량 (+매수체결 / -매도체결, 부호 보존)
+    # L일봉H 몸통·심지. REST(watch_info)는 편입 때 한 번뿐이라 그 뒤 고가·저가가
+    # 안 자랐다. 매 체결 틱에 실려 오므로 늦은 REST가 덮어써도 다음 틱이 고친다.
+    "16": "open",      # 시가 (전일대비 부호가 붙어 옴 -> abs)
+    "17": "high",      # 당일 고가
+    "18": "low",       # 당일 저가
     "41": "ask_price",  # 매도호가1
     "42": "ask_price2", "43": "ask_price3", "44": "ask_price4", "45": "ask_price5",
     "51": "bid_price",  # 매수호가1
@@ -93,7 +99,12 @@ def parse_real_item(item: dict) -> tuple[str, dict]:
         if not field:
             continue
         n = _num(raw)
-        if field in ("price", "exp_price") or "price" in field:  # 가격류
+        if field == "acc_value":
+            # 키움은 백만원 단위로 보낸다. REST(`api.py` trading_value)와 DB가
+            # 모두 원 단위라 여기서 맞춰 둔다.
+            out[field] = int(n) * 1_000_000
+        elif (field in ("price", "exp_price", "open", "high", "low")
+                or "price" in field):  # 가격류
             out[field] = int(abs(n))
         elif (field in ("vol", "tick_qty", "exp_qty") or "qty" in field
               or field.endswith("_amount")):
@@ -175,6 +186,10 @@ class WSClient:
         self._real_stats: dict = {}        # 5초 단위 REAL 수신 빈도 (예상값 갱신속도 진단용)
         self._stats_t = 0.0
         self._last_reg_limit_log = 0.0
+        # ponytail: 1h가 등록 종목만 오는지 전 시장인지 실측. 미등록 발동이
+        # 잡히면 화면 밖 VI 포착이 공짜로 열린다. 확인되면 이 셋과 _vi_survey 삭제.
+        self._vi_survey: dict = {}
+        self._vi_survey_t = 0.0
 
     # --- 외부 API -------------------------------------------------------
     async def run(self, token_fn):
@@ -405,7 +420,7 @@ class WSClient:
             self._handle_condition(msg)
         elif trnm == "REAL":
             for item in msg.get("data", []):
-                if log.isEnabledFor(logging.INFO):
+                if log.isEnabledFor(logging.WARNING):
                     self._discover_fids(item)  # 처음 본 FID 로그 (FID 발굴용)
                     self._count_real(item)
                 if item.get("type") == "02":  # 조건검색 실시간 편입/이탈
@@ -462,8 +477,10 @@ class WSClient:
             if key in self._seen_fids:
                 continue
             self._seen_fids.add(key)
-            log.info("FID discover: type=%s fid=%s -> %s  sample=%r",
-                     typ, fid, table.get(fid, "UNMAPPED"), val)
+            # bot.log는 WARNING 이상만 남긴다(main.py `_ProductionFileLogFilter`).
+            # 발굴 중에만 올려 둔다. (type,fid)당 한 번뿐이라 양은 안 는다.
+            log.warning("FID discover: type=%s fid=%s -> %s  sample=%r",
+                        typ, fid, table.get(fid, "UNMAPPED"), val)
 
     def _on_real_condition(self, item: dict):
         """REAL type=02 (2026-07-07 실수신으로 확정): values에
@@ -482,10 +499,30 @@ class WSClient:
         # 정적/동적 구분(1225와 동일)일 가능성 -> 우리 종목 raw 전체를 남겨 다음 VI에서 확정
         v = item.get("values", {})
         code = (v.get("9001") or "").split("_")[0].lstrip("A")
-        if any(c == code for c, _ in self._reg_codes):
+        mine = any(c == code for c, _ in self._reg_codes)
+        if mine:
             log.info("VI raw %s: %s", code, v)
+        self._survey_vi(code, mine, v.get("9068"))
         if code and self.on_vi:
             self.on_vi(code, v.get("9068") == "1", int(abs(_num(v.get("1221")))))
+
+    def _survey_vi(self, code: str, mine: bool, flag):
+        """1h 수신 범위 실측. bot.log는 WARNING 이상만 남아 warning으로 남긴다."""
+        s = self._vi_survey
+        s["mine" if mine else "other"] = s.get("mine" if mine else "other", 0) + 1
+        s.setdefault("codes", set()).add(("" if mine else "*") + code + str(flag))
+        now = time.monotonic()
+        if not self._vi_survey_t:
+            self._vi_survey_t = now
+            log.warning("VI survey start: first=%s mine=%s flag=%s reg=%d",
+                        code, mine, flag, len(self._reg_codes))
+        elif now - self._vi_survey_t >= 60:
+            log.warning("VI survey/%.0fs: mine=%d other=%d reg=%d samples=%s",
+                        now - self._vi_survey_t, s.get("mine", 0),
+                        s.get("other", 0), len(self._reg_codes),
+                        sorted(s["codes"])[:15])
+            self._vi_survey = {}
+            self._vi_survey_t = now
 
     def _handle_condition(self, msg: dict):
         """CNSRREQ 응답 = 현재 편입 전체 스냅샷. 통째로 넘겨 diff는 main이 한다
@@ -534,6 +571,15 @@ def _demo():
     assert code == "005930", code
     assert f["price"] == 4620 and f["rate"] == 29.96 and f["vol"] == 19687, f
     assert f["tick_qty"] == -125, f
+    # 시가/고가/저가도 전일대비 부호가 붙어 온다. 가격류라 abs + 정수여야
+    # gui의 L일봉H(BAR_COL)와 저장 필드가 REST 백필과 같은 형태가 된다.
+    _, fb = parse_real_item({"item": "x", "type": "0B", "values": {
+        "16": "+92,900", "17": "+108000", "18": "-91500"}})
+    assert fb == {"open": 92900, "high": 108000, "low": 91500}, fb
+    assert all(isinstance(v, int) for v in fb.values()), fb
+    # 누적거래대금은 백만원 단위로 온다 -> 원으로 환산해 REST/DB와 맞춘다.
+    _, fv = parse_real_item({"item": "x", "type": "0B", "values": {"14": "211,903"}})
+    assert fv == {"acc_value": 211_903_000_000}, fv
     _, fe = parse_real_item({"item": "x", "type": "0D", "values": {"23": "+1215", "24": "8,151"}})
     assert fe == {"exp_price": 1215, "exp_qty": 8151}, fe
     _, book = parse_real_item({"item": "x", "type": "0D", "values": {
@@ -571,6 +617,13 @@ def _demo():
     c._on_vi({"type": "1h", "values": {"9001": "109610_AL", "9068": "1", "1221": "2165"}})
     c._on_vi({"type": "1h", "values": {"9001": "760006_AL", "9068": "2", "1221": "8260"}})
     assert vi == [("109610", True, 2165), ("760006", False, 8260)], vi
+    # 수신 범위 실측: 등록 종목(109610)과 미등록(760006)을 갈라 세야 한다.
+    c._reg_codes = {("109610", None): 1}
+    c._vi_survey, c._vi_survey_t = {}, 0.0
+    c._on_vi({"type": "1h", "values": {"9001": "109610_AL", "9068": "1"}})
+    c._on_vi({"type": "1h", "values": {"9001": "760006_AL", "9068": "1"}})
+    assert c._vi_survey["mine"] == 1 and c._vi_survey["other"] == 1, c._vi_survey
+    assert c._vi_survey["codes"] == {"1096101", "*7600061"}, c._vi_survey
     # CNSRREQ 스냅샷 -> (seq, 코드 리스트)
     snap = []
     c.on_condition_snapshot = lambda seq, codes: snap.append((seq, codes))
