@@ -2327,10 +2327,10 @@ def _balance_sell_suggestion(current: int) -> tuple[int, int, int]:
     """장초 대량취소를 감안한 잔량 규모별 3단 절대수량 제안."""
     current = max(0, int(current or 0))
     tiers = (
-        (10_000_000, (3_000_000, 1_500_000, 500_000)),
-        (5_000_000, (2_000_000, 1_000_000, 300_000)),
-        (2_000_000, (1_000_000, 500_000, 200_000)),
-        (1_000_000, (500_000, 300_000, 100_000)),
+        # 500만주 위로는 더 올리지 않는다. 200만/100만/50만이 상한이다.
+        (5_000_000, (2_000_000, 1_000_000, 500_000)),
+        (2_000_000, (1_000_000, 500_000, 300_000)),
+        (1_000_000, (500_000, 300_000, 200_000)),
         (500_000, (300_000, 150_000, 50_000)),
         (200_000, (100_000, 50_000, 20_000)),
     )
@@ -2339,21 +2339,33 @@ def _balance_sell_suggestion(current: int) -> tuple[int, int, int]:
             return values
     if current <= 0:
         return 0, 0, 0
-    first = _clean_balance_value(current * .50)
-    second = min(first - 1, _clean_balance_value(current * .25))
-    third = min(second - 1, _clean_balance_value(current * .10))
+    first = _clean_balance_value(current * .60)
+    second = min(first - 1, _clean_balance_value(current * .40))
+    third = min(second - 1, _clean_balance_value(current * .30))
     return max(3, first), max(2, second), max(1, third)
 
 
 class BalanceStepSpinBox(QSpinBox):
-    """보조키에 따라 잔량 증감 단위를 1만·10만·100만으로 전환한다."""
+    """잔량 증감 단위를 화살표 1만·휠 10만으로 두고 보조키로 바꾼다."""
+
+    _wheel = False
+
+    def wheelEvent(self, event):
+        # 휠은 기본 10만. 포커스·고해상도 휠 처리는 Qt 기본 구현에 맡긴다.
+        self._wheel = True
+        try:
+            super().wheelEvent(event)
+        finally:
+            self._wheel = False
 
     def stepBy(self, steps: int):
         modifiers = QApplication.keyboardModifiers()
+        base, shifted = (
+            (100_000, 10_000) if self._wheel else (10_000, 100_000))
         unit = (
             1_000_000 if modifiers & Qt.ControlModifier
-            else 100_000 if modifiers & Qt.ShiftModifier
-            else 10_000
+            else shifted if modifiers & Qt.ShiftModifier
+            else base
         )
         # QAbstractSpinBox가 Ctrl 입력 때 steps 자체를 10배로 넘기므로 크기는
         # 사용하지 않고 위/아래 방향만 취한다. 그렇지 않으면 100만×10이 된다.
@@ -2391,8 +2403,8 @@ class BalanceSellDialog(QDialog):
             edit.setAlignment(Qt.AlignRight)
             edit.setSuffix(" 주")
             edit.setToolTip(
-                "화살표/휠: 1만 · Shift+화살표/휠: 10만 · "
-                "Ctrl+화살표/휠: 100만")
+                "화살표: 1만(Shift 10만) · 휠: 10만(Shift 1만) · "
+                "Ctrl: 100만")
             edit.valueChanged.connect(self._mark_manual)
             edit.lineEdit().returnPressed.connect(self._apply)
         # 단계별 사용 체크. 해제한 단계는 기준 0으로 적용돼 감시·주문에서 빠진다.
@@ -2462,7 +2474,11 @@ class BalanceSellDialog(QDialog):
         self.apply_btn = QPushButton("설정 적용  Enter")
         cancel_btn = QPushButton("취소  Esc")
         off_btn = QPushButton("감시 해제")
-        rebase_btn = QPushButton("현재 잔량으로 다시 계산")
+        rebase_btn = QPushButton(
+            "현재 잔량으로 재설정" if self.config else "현재 잔량으로 다시 계산")
+        rebase_btn.setToolTip(
+            "현재 매수잔량으로 3단 기준을 다시 잡습니다."
+            + (" 이미 설정된 종목은 바로 적용됩니다." if self.config else ""))
         self.apply_btn.setDefault(True)
         self.apply_btn.setAutoDefault(True)
         for button in (cancel_btn, off_btn, rebase_btn):
@@ -2615,6 +2631,10 @@ class BalanceSellDialog(QDialog):
         """취소물량이 나온 뒤 현재 안정잔량을 새 출발점으로 다시 제안한다."""
         self._refresh_suggestion()
         self._manual_edit = True
+        if self.config:
+            # 이미 감시 중인 종목은 되묻지 않고 바로 새 기준으로 갈아 끼운다.
+            self._apply()
+            return
         self.error_label.setText(
             "현재 잔량으로 다시 계산했습니다. Enter를 눌러야 적용됩니다.")
         self.apply_btn.setFocus()
