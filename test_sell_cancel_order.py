@@ -98,6 +98,7 @@ def _app(pending):
     app._position_book = {}
     app._open_sell_orders = {}
     app._position_fill_ids = set()
+    app._position_filled = {}
     app._sell_accepts = {}
     app._open_buy_orders = {
         "005930": {o["order_no"]: (o["remaining_qty"], o["exchange"])

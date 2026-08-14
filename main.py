@@ -1004,6 +1004,8 @@ class App:
         # '보유 0'으로 읽을 수 있다. 세우기 전에는 그냥 모르는 상태다.
         self._position_book_primed = False
         self._position_fill_ids: set[tuple[str, str]] = set()
+        # 주문번호별로 장부에 이미 반영한 누적체결량.
+        self._position_filled: dict[str, int] = {}
         # 종목별 매도 접수 기록 (주문번호, 수량). 응답이 유실된 매도를 다시
         # 보내기 전에, 거래소가 실제로 접수했는지 여기서 확인한다.
         self._sell_accepts: dict[str, list[tuple[str, int]]] = {}
@@ -2508,17 +2510,36 @@ class App:
             await asyncio.sleep(0.02)
 
     def _new_fill_qty(self, order_no: str, event: dict) -> int:
-        """같은 체결번호가 두 번 와도 한 번만 세도록 거른다."""
+        """이 이벤트로 새로 늘어난 체결량만 돌려준다.
+
+        체결량(FID 911)이 그 체결분이 아니라 누적으로 실려 오는 경우가 있어
+        그대로 더하면 보유수량이 부풀려진다. 2026-08-14 049630은 한 주문에
+        34와 100이 잇달아 와서 134로 세는 바람에 장부가 434주가 되었고,
+        실제 400주라 매도가 거부됐다. 주문수량-잔량을 누적체결량의 권위값으로
+        쓰고 이미 센 만큼을 뺀다. 자동취소 경로와 같은 기준이다.
+        """
         filled = max(0, int(event.get("fill_qty") or 0))
         if not filled:
             return 0
-        fill_id = str(event.get("fill_id") or "").strip()
-        if fill_id:
-            token = (order_no, fill_id)
-            if token in self._position_fill_ids:
-                return 0
-            self._position_fill_ids.add(token)
-        return filled
+        counted = self._position_filled.get(order_no, 0)
+        order_qty = max(0, int(event.get("order_qty") or 0))
+        remaining = event.get("remaining_qty")
+        if order_qty and remaining is not None:
+            # 같은 이벤트가 두 번 와도 누적값이 같아 차분이 0이 된다.
+            # 체결량이 누적이 아니라 그 체결분으로 오는 경우에 대비해 둘 중
+            # 큰 값을 쓴다. 덜 세면 그만큼 덜 팔린다.
+            total = max(counted, filled, order_qty - max(0, int(remaining)))
+        else:
+            # 잔량이 없는 이벤트만 체결번호로 중복을 거른다.
+            fill_id = str(event.get("fill_id") or "").strip()
+            if fill_id:
+                token = (order_no, fill_id)
+                if token in self._position_fill_ids:
+                    return 0
+                self._position_fill_ids.add(token)
+            total = counted + filled
+        self._position_filled[order_no] = total
+        return total - counted
 
     def _on_ws_connected(self):
         """접속·재접속 직후 미체결·잔고 장부를 계좌 기준으로 다시 맞춘다."""
@@ -2546,6 +2567,9 @@ class App:
             for row in rows
         }
         self._position_fill_ids.clear()
+        # `_position_filled`는 지우지 않는다. 조회한 보유수량에는 이미 반영된
+        # 체결이라, 여기서 0으로 되돌리면 부분체결 중 재접속했을 때 다음 이벤트의
+        # 누적체결량이 통째로 다시 더해진다.
         self._position_book_primed = True
         log.warning("position book primed codes=%s", len(self._position_book))
 
