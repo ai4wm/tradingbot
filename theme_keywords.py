@@ -39,7 +39,25 @@ NEWS_THEME_KEYWORDS: dict[str, tuple[str, ...]] = {
     # 기자 표현이라 뺐다. 지배구조 분쟁 기사에도 붙는다.
     "내부자매수": ("장내매수", "장내 매수", "유상증자 참여"),
     "무상증자": ("무상증자",),
-    "자사주소각": ("자사주 소각", "자기주식 소각"),
+    # 소각과 취득을 한 테마로 둔다. 소각은 주식수가 줄고 취득은 회사가 사 주는
+    # 것이라 성격이 다르지만, 제목만으로는 갈라도 화면에서 쓸모가 같다.
+    # 그래서 이름은 어느 쪽에도 거짓이 아닌 '자사주'로 적는다.
+    "자사주": (
+        "자사주 소각", "자기주식 소각",
+        "자사주 취득", "자사주취득", "자기주식 취득", "자기주식취득",
+        "자사주 매입", "자사주매입", "자기주식 신탁", "자사주 신탁",
+    ),
+    # 실적은 매일 수백 건이라 '실적 개선' 같은 흔한 말은 넣지 않는다. 주가가
+    # 실제로 뛰는 강한 문구만 잡는다. 놓치는 기사가 있어도 화면이 실적으로
+    # 덮이는 쪽보다 낫다.
+    "실적": (
+        "흑자전환", "흑자 전환", "턴어라운드", "호실적",
+        "어닝서프라이즈", "어닝 서프라이즈",
+        "사상 최대 실적", "사상 최대 매출", "사상 최대 영업이익",
+        "사상 최대 순이익", "역대 최대 실적", "역대 최대 매출",
+        "분기 최대 실적", "최대 분기 실적",
+        "영업이익 급증", "영업익 급증", "실적 개선 폭 확대",
+    ),
     # 산업이 아니라 사건 테마다. 파는 쪽·사는 쪽을 제목만으로는 가를 수 없어
     # 한 묶음으로 둔다. 회사가 팔리는 재료가 주가 반응이 크다.
     # 표현이 끝없이 갈라지므로("인수 소식에", "100% 인수", "회사합병 결정")
@@ -59,7 +77,8 @@ STRONG_EVENT_THEMES = ("인수합병", "제3자배정")
 NEWS_THEME_NOISE = (
     "신주인수권", "기업인수목적", "무인수", "채무인수", "총액인수",
     "잔액인수", "인수단", "인수인계", "인수위", "합병증", "보험 인수",
-    # 자사주는 인수합병이 아니라 '자사주소각' 쪽 재료다.
+    # 자사주는 인수합병이 아니라 '자사주' 쪽 재료다. 지우는 것은 인수합병
+    # 판정에서만이라 자사주 테마는 이 말을 그대로 잡는다.
     "자기주식취득", "자기주식 취득", "자기주식 신탁",
 )
 
@@ -69,11 +88,15 @@ def match_news_themes(text: str) -> tuple[str, ...]:
     lowered = " ".join((text or "").split()).lower()
     if not lowered:
         return ()
+    # 잡음 목록은 '인수합병' 오탐만 막으려고 있다. 전체에서 지우면 '자기주식
+    # 취득'처럼 다른 테마가 잡아야 할 말까지 함께 사라진다.
+    cleaned = lowered
     for noise in NEWS_THEME_NOISE:
-        lowered = lowered.replace(noise.lower(), " ")
+        cleaned = cleaned.replace(noise.lower(), " ")
     return tuple(
         theme for theme, words in NEWS_THEME_KEYWORDS.items()
-        if any(word.lower() in lowered for word in words)
+        if any(word.lower() in (cleaned if theme == "인수합병" else lowered)
+               for word in words)
     )
 
 
@@ -113,6 +136,21 @@ def demo():
         "금감원, SK디앤디 유상증자에 정정 요구…'상장폐지 꼼수' vs '책임 경영'")
     assert "인수합병" in match_news_themes(
         "가비아, 독립 특별위원회 설치…맥쿼리 공개매수 공정성 검토 착수")
+    # 자사주 취득. 잡음 목록이 '자기주식취득'을 지우지만 그건 인수합병
+    # 판정에서만이고, 자사주는 원문 그대로 본다. 2026-08-14 SHD 미분류 건.
+    assert "자사주" in match_news_themes(
+        "[특징주] ‘20억원 자사주 취득 ’ 소식에…SHD, 上")
+    assert "자사주" in match_news_themes("(주)한샘 주요사항보고서(자기주식취득결정)")
+    assert "자사주" in match_news_themes("에스에이치디, 자사주 소각 결정")
+    assert "인수합병" not in match_news_themes(
+        "[특징주] ‘20억원 자사주 취득 ’ 소식에…SHD, 上")
+
+    # 실적. 흔한 말은 안 잡는다. 2026-08-14 재영솔루텍 미분류 건.
+    assert "실적" in match_news_themes("실적 개선 폭 확대…재영솔루텍 17%↑[특징주]")
+    assert "실적" in match_news_themes("한국알콜, 3분기 흑자전환 성공")
+    assert "실적" not in match_news_themes("삼성전자, 하반기 실적 개선 기대감")
+    assert "실적" not in match_news_themes("2분기 실적 발표 앞두고 관망세")
+
     assert match_news_themes("") == ()
     assert match_news_themes("오늘 날씨가 좋다") == ()
     print("ok", match_news_themes("HBM 공급 계약과 전고체 배터리 수주"))
