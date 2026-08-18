@@ -72,7 +72,7 @@ from ui.realtime_news_tab import (
 from ui.stock_news_tab import StockNewsTabMixin
 from ui.telegram_news_tab import TelegramNewsTabMixin
 from ui.theme_tab import ThemeTabMixin
-from order import OrderEngine, split_quantity
+from order import OrderEngine, fixed_quantities, split_quantity
 from rank import RankScreen, _beep
 from ws import WSClient
 
@@ -1552,7 +1552,7 @@ class App:
                       count: int, auto_cancel: bool, total_qty: int, price: int):
         try:
             quantities = (
-                [100] * count if mode == "fixed"
+                fixed_quantities(total_qty) if mode == "fixed"
                 else split_quantity(total_qty, count))
             name = screen.model.rows.get(code, {}).get("name") or code
             if auto_cancel:

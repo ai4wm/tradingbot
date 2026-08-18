@@ -18,6 +18,16 @@ def split_quantity(total_qty: int, count: int) -> list[int]:
     return [base + (1 if i < extra else 0) for i in range(count)]
 
 
+def fixed_quantities(total_qty: int) -> list[int]:
+    """100주씩 계획. 100주 단위로 채우고 100주 미만 자투리는 마지막 1건.
+
+    총수량만으로 계획이 정해진다(자투리는 정의상 100주 미만이라 하나뿐).
+    화면이 설정 횟수 안에서 자투리를 붙일지 정한 결과가 총수량에 담겨 온다.
+    """
+    rest = total_qty % 100
+    return [100] * (total_qty // 100) + ([rest] if rest else [])
+
+
 @dataclass
 class ChildOrder:
     requested_qty: int

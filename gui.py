@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QTableView, QTableWidgetItem, QToolTip, QVBoxLayout, QWidget,
 )
 
+from order import fixed_quantities
 from theme_keywords import STRONG_EVENT_THEMES
 
 log = logging.getLogger("gui")
@@ -3583,12 +3584,26 @@ class ConditionScreen(QWidget):
             0, self._usable_order_funds() - self._effective_reserved())
         return min(api_qty, remaining // upper)
 
+    @staticmethod
+    def _fixed_total(available_qty: int, count: int) -> int:
+        """100주씩 총수량. 설정 횟수가 남으면 자투리를 마지막 1건으로 붙인다.
+
+        설정 횟수를 다 채웠으면 자투리는 붙이지 않는다. 사용자가 정한
+        주문 건수를 넘기지 않는 것이 먼저다.
+        """
+        full = min(count, available_qty // 100)
+        if full < 1:
+            return 0
+        rest = available_qty - full * 100
+        return full * 100 + (rest if full < count else 0)
+
     def _refresh_order_actions(self, *_):
         # 주문허용 토글이 이 함수에 이미 연결돼 있다. 취소 영역도 같이 따라간다.
         self.model.set_order_enabled(self.order_enable_check.isChecked())
         available_qty = self._current_orderable_qty()
         selected_count = self.split_group.checkedId()
-        fixed_count = min(selected_count, available_qty // 100)
+        fixed_total = self._fixed_total(available_qty, selected_count)
+        fixed_count = len(fixed_quantities(fixed_total))
         remaining_count = (
             min(selected_count, max(1, available_qty // 100))
             if available_qty > 0 else 0)
@@ -3616,7 +3631,7 @@ class ConditionScreen(QWidget):
             else f"미체결 매수 주문마다 {ORDER_TRIM_KEEP}주만 남기고 나머지를"
                  " 부분취소합니다 · 주문허용 체크 후 사용")
         self._refresh_order_preview(
-            available_qty, selected_count, fixed_count, remaining_count)
+            available_qty, selected_count, fixed_total, remaining_count)
 
     @staticmethod
     def _order_slots(actual_count: int, selected_count: int) -> str:
@@ -3630,7 +3645,7 @@ class ConditionScreen(QWidget):
 
     def _refresh_order_preview(
             self, available_qty: int, selected_count: int,
-            fixed_count: int, remaining_count: int):
+            fixed_total: int, remaining_count: int):
         if not self._order_target_code or not self._orderable_detail:
             self.order_preview_value.setText("예상주문&nbsp;&nbsp;종목을 선택하거나 조회를 기다리세요")
             self.order_preview_value.setToolTip("")
@@ -3639,13 +3654,18 @@ class ConditionScreen(QWidget):
         upper = int(
             self.model.rows.get(
                 self._order_target_code, {}).get("upper") or 0)
-        fixed_total = fixed_count * 100
+        fixed_plan = fixed_quantities(fixed_total)
+        fixed_count = len(fixed_plan)
         excluded = max(0, available_qty - fixed_total)
         fixed_slots = self._order_slots(fixed_count, selected_count)
         if fixed_count:
+            odd_lot = fixed_plan[-1] if fixed_plan[-1] < 100 else 0
+            unit_text = (
+                f"100주씩+{odd_lot:,}주" if odd_lot else "100주씩")
             fixed_text = (
                 f"{fixed_slots}&nbsp;설정 {selected_count}회 → "
-                f"<b>실제 {fixed_count}회</b> · 100주씩 · 총 {fixed_total:,}주")
+                f"<b>실제 {fixed_count}회</b> · {unit_text}"
+                f" · 총 {fixed_total:,}주")
             if excluded:
                 fixed_text += f" · <b>미주문 {excluded:,}주</b>"
         else:
@@ -3681,8 +3701,8 @@ class ConditionScreen(QWidget):
         count = self.split_group.checkedId()
         available_qty = self._current_orderable_qty()
         if mode == "fixed":
-            count = min(count, available_qty // 100)
-            total_qty = 100 * count
+            total_qty = self._fixed_total(available_qty, count)
+            count = len(fixed_quantities(total_qty))
             if count < 1:
                 self.model.set_order_status(code, "수량부족")
                 self.order_status_value.setText(
