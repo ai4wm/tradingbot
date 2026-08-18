@@ -831,6 +831,7 @@ class View:
         new = set(codes)
         for code in cur - new:
             self.screen.on_excluded(code)
+            self._forget_entry_time(code)
             if self.seq in RANK_SEQS and code in self.screen.model.rows:
                 # 자동삭제 OFF면 행과 실시간 추적은 남긴다. 다만 직전 순위를
                 # 그대로 두면 현재 상위 20종목보다 실시간 등록 우선순위가
@@ -859,6 +860,7 @@ class View:
             self._maybe_beep()
         else:
             self.screen.on_excluded(code)
+            self._forget_entry_time(code)
             self.app.queue_real(code, add=False, suffix=self._real_suffix())
 
     # --- 시세 채우기/진입시각 ----------------------------------------------
@@ -903,6 +905,16 @@ class View:
         asyncio.ensure_future(
             self._drain_entries([(d["vol"], code, d["upper"])]))
 
+    def _forget_entry_time(self, code: str):
+        """조건에서 빠지면 받아 둔 진입시각을 버린다.
+
+        이탈하면 실시간 등록도 풀려 상한가가 무너지는 틱이 오지 않는다.
+        그대로 두면 다시 편입돼 상한가에 재진입해도 캐시가 살아 있어
+        무너지기 전 시각을 그대로 보여 준다. 진행 중인 조회도 취소한다.
+        """
+        self._entry_cache.pop(code, None)
+        self._entry_pending.discard(code)
+
     def _fill_entry_times(self):
         for code in list(self.screen.model.codes):
             self.fill_entry_time(code)
@@ -914,6 +926,8 @@ class View:
             except Exception as e:  # noqa: BLE001
                 log.warning("last_limit_entry %s: %s", code, e)
                 t = ""
+            if code not in self._entry_pending:
+                continue  # 조회 도중 이탈했다. 이 값은 이미 옛것이다.
             self._entry_pending.discard(code)
             self._entry_cache[code] = t
             self.screen.on_tick(code, {"time": t})
