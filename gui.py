@@ -3113,8 +3113,8 @@ class ConditionScreen(QWidget):
             button.setFixedSize(72, 24)
             self.cancel_group.addButton(button)
         # 행의 '자동취소'는 계좌 전체 주문 감시이고, 이 두 버튼은 새 앱 주문의
-        # 취소 방식이다. 기본은 안전하게 수동취소로 둔다.
-        self.manual_cancel_btn.setChecked(True)
+        # 취소 방식이다. 실제로 쓰는 쪽이 자동취소라 기본으로 둔다.
+        self.auto_cancel_btn.setChecked(True)
         self.auto_cancel_btn.setToolTip(
             "이 앱에서 새로 전송할 주문에 자동취소를 적용")
         self.manual_cancel_btn.setToolTip(
