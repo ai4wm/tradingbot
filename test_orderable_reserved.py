@@ -303,9 +303,72 @@ def demo_status_clears_after_cancel():
     print("ok (취소 뒤 주문버튼)")
 
 
+
+def demo_stale_qty_after_other_order():
+    """다른 종목을 산 뒤 캐시된 주문가능수량이 상한으로 남지 않는지 확인한다.
+
+    2026-08-18: 215790을 860,400원어치 산 뒤 098120에 345주(1,304만원)를
+    내서 3번째 주문이 증거금 부족으로 거부됐다. 금액 쪽은 계좌 조회가
+    따라잡았지만 종목별 kt00010 수량(345주)이 매수 전 값 그대로 남아
+    min()의 상한이 됐다.
+    """
+    app = QApplication.instance() or QApplication([])
+
+    screen = ConditionScreen()
+    screen.model.rows["B"] = {"name": "나종목", "upper": 37800}
+    screen.model.misu.add("B")
+    screen._order_target_code = "B"
+    screen.margin_order_check.setEnabled(True)
+    screen.margin_order_check.setChecked(True)
+
+    # 매수 전에 받아 둔 종목별 조회값(현금 3,921,496원 / 증거금 30% 기준).
+    screen.set_orderable_quantity("B", 37800, {
+        "code": "B", "price": 37800,
+        "cash_amount": 3_921_496, "cash_qty": 103,
+        "margin_amount": 13_071_653, "margin_qty": 345,
+        "applied_margin_rate": 30, "stock_margin_rate": "30%",
+        "reserved_base": 0,
+    })
+
+    # 다른 종목을 860,400원어치 사고, 그것이 반영된 계좌 조회가 도착한다.
+    screen.set_order_reserved(860_400)
+    screen.set_account_summary({
+        "estimated_assets": 3_921_496,
+        "cash_orderable": 3_061_093,
+        "orderable_by_margin": {20: 15_305_465},
+        "reserved_base": 860_400,
+    })
+
+    # 계좌가 이미 반영했으니 로컬 예약금은 빠지지 않는다(이중 차감 방지).
+    # 이때 옛 수량이 남아 있으면 그대로 주문에 실린다.
+    stale = screen._current_orderable_qty()
+
+    # 고친 뒤: 재조회가 끝날 때까지 주문가능수량을 비워 주문을 막는다.
+    screen.clear_orderable_quantity()
+    assert screen._current_orderable_qty() == 0, "옛 수량이 아직 살아 있음"
+    assert not screen.remaining_order_btn.isEnabled(), "재조회 전인데 분할매수 열림"
+    assert screen.order_target() == ("B", 37800), screen.order_target()
+
+    # 새 조회값(현금 3,061,093원 기준)이 오면 269주로 내려온다.
+    screen.set_orderable_quantity("B", 37800, {
+        "code": "B", "price": 37800,
+        "cash_amount": 3_061_093, "cash_qty": 80,
+        "margin_amount": 10_203_643, "margin_qty": 269,
+        "applied_margin_rate": 30, "stock_margin_rate": "30%",
+        "reserved_base": 860_400,
+    })
+    fresh = screen._current_orderable_qty()
+    assert fresh == 269, fresh
+    assert stale > fresh, (stale, fresh)
+
+    del app
+    print(f"ok (다른 종목 주문 뒤 수량 재조회) {stale}주 -> {fresh}주")
+
+
 if __name__ == "__main__":
     demo()
     demo_consecutive()
     demo_cancel_then_reorder()
     demo_cancel_then_other_stock()
     demo_status_clears_after_cancel()
+    demo_stale_qty_after_other_order()

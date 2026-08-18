@@ -933,6 +933,7 @@ class App:
         self.ws = WSClient()
         self.orders = OrderEngine(self.rest, self._on_order_update)
         self._orderable_cache: dict[tuple[str, int], dict] = {}
+        self._orderable_reserved = 0
         self._orderable_tasks: dict[ConditionScreen, asyncio.Task] = {}
         self._orderable_prefetch_task = None
         self._orderable_prefetch_failed: dict[tuple[str, int], float] = {}
@@ -1622,6 +1623,18 @@ class App:
             child.order_no and child.remaining_qty > 0 and not child.cancel_sent
             for child in batch.children)
         reserved = self.orders.committed_notional()
+        if reserved != self._orderable_reserved:
+            # 주문액이 바뀌면 종목별 주문가능수량은 전부 주문 전 값이다.
+            # 금액 쪽은 계좌 조회가 따라잡지만 수량은 캐시에 그대로 남아
+            # min()의 상한이 되고, 다음 종목이 증거금 부족으로 거부된다.
+            self._orderable_reserved = reserved
+            self._orderable_cache.clear()
+            for view in self.views:
+                target, upper = view.screen.order_target()
+                if not target or not upper:
+                    continue
+                view.screen.clear_orderable_quantity()
+                self._queue_orderable_quantity(view.screen, target, upper)
         for view in self.views:
             view.screen.set_order_reserved(reserved)
             if batch.code in view.screen.model.rows:

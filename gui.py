@@ -3545,6 +3545,17 @@ class ConditionScreen(QWidget):
         self.account_available_value.setText(self._money_text(selected_amount))
         self._refresh_order_funds_display()
 
+    def order_target(self) -> tuple[str, int]:
+        """현재 주문 대상종목과 그 상한가. 없으면 빈 값."""
+        code = self._order_target_code
+        return code, int(self.model.rows.get(code, {}).get("upper") or 0)
+
+    def clear_orderable_quantity(self):
+        """재조회가 끝날 때까지 옛 주문가능수량으로 주문하지 못하게 막는다."""
+        self._orderable_detail = None
+        self._refresh_order_target_display()
+        self._refresh_order_actions()
+
     def set_orderable_quantity_error(self, code: str, price: int, message: str):
         """현재 선택 종목의 주문가능수량 조회 실패를 즉시 표시한다."""
         if code != self._order_target_code:
