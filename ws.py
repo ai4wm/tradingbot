@@ -27,6 +27,10 @@ FID = {
     "13": "vol",       # 누적거래량
     "14": "acc_value",  # 누적거래대금 (백만원 단위로 옴 -> 원으로 환산)
     "15": "tick_qty",  # 개별 체결량 (+매수체결 / -매도체결, 부호 보존)
+    # 전일거래량대비(주). 누적거래량에서 빼면 전일거래량이 그대로 나온다.
+    # FID 30(비율)은 소수 2자리 반올림이라 역산에 오차가 있고, 동시호가엔
+    # 오늘 거래량이 0이라 역산 자체가 0이 된다. 뺄셈은 둘 다 겪지 않는다.
+    "26": "prev_vol_diff",
     # L일봉H 몸통·심지. REST(watch_info)는 편입 때 한 번뿐이라 그 뒤 고가·저가가
     # 안 자랐다. 매 체결 틱에 실려 오므로 늦은 REST가 덮어써도 다음 틱이 고친다.
     "16": "open",      # 시가 (전일대비 부호가 붙어 옴 -> abs)
@@ -111,6 +115,12 @@ def parse_real_item(item: dict) -> tuple[str, dict]:
             out[field] = int(n)
         else:
             out[field] = n
+    if "prev_vol_diff" in out:
+        # 체결 틱에는 누적거래량이 늘 함께 온다. 없으면 전일값을 만들 수 없으니
+        # 조회 백필에 맡기고 조각만 버린다.
+        diff = out.pop("prev_vol_diff")
+        if "vol" in out:
+            out["prev_vol"] = max(0, out["vol"] - int(diff))
     if table is FID_0H and out:
         out["exp_hot"] = 1  # 0H는 단일가/VI 국면에만 옴 -> gui가 판정 없이 표시
     elif table is FID_0W and out:
@@ -577,6 +587,18 @@ def _demo():
         "16": "+92,900", "17": "+108000", "18": "-91500"}})
     assert fb == {"open": 92900, "high": 108000, "low": 91500}, fb
     assert all(isinstance(v, int) for v in fb.values()), fb
+    # 전일거래량 = 누적거래량(13) - 전일거래량대비(26). 2026-08-21 실측 틱이다.
+    # 오늘 2,575주 / 전일대비 -35,044 -> 전일 37,619주. FID 30(-6.84%) 역산은
+    # 37,646으로 27주 어긋난다(비율이 소수 2자리라서).
+    _, fp0 = parse_real_item({"item": "x", "type": "0B", "values": {
+        "13": "2575", "26": "-35,044"}})
+    assert fp0 == {"vol": 2575, "prev_vol": 37619}, fp0
+    _, fp1 = parse_real_item({"item": "x", "type": "0B", "values": {
+        "13": "26601929", "26": "+15515771"}})
+    assert fp1["prev_vol"] == 11086158, fp1
+    # 누적거래량이 없는 틱에서는 만들 수 없다. 조각을 흘려보내고 조회에 맡긴다.
+    _, fp2 = parse_real_item({"item": "x", "type": "0B", "values": {"26": "-35044"}})
+    assert fp2 == {}, fp2
     # 누적거래대금은 백만원 단위로 온다 -> 원으로 환산해 REST/DB와 맞춘다.
     _, fv = parse_real_item({"item": "x", "type": "0B", "values": {"14": "211,903"}})
     assert fv == {"acc_value": 211_903_000_000}, fv
