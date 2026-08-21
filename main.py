@@ -1066,13 +1066,11 @@ class App:
             lambda: setattr(self, "_ip_task", asyncio.ensure_future(self._check_ip()))
             if not (self._ip_task and not self._ip_task.done()) else None)
         self._ip_timer.start(60000)
-        # 추정자산·주문가능금액은 시작 때 한 번만 읽으면 매매 뒤에도 옛 값이
-        # 그대로 남는다. 주기 갱신과 체결 직후 갱신을 함께 건다.
+        # 추정자산·주문가능금액은 주기 폴링을 두지 않는다. 갱신 시점은 셋이다:
+        # 시작 직후 1회, 체결·취소 뒤 debounce, 추정자산 버튼. 종목을 고를 때
+        # 나가는 kt00011이 계좌가능 금액을 함께 실어 오므로(gui.set_orderable_
+        # quantity) 주문 직전 값은 늘 새것이다.
         self._account_summary_task = None
-        self._account_summary_timer = QTimer()
-        self._account_summary_timer.timeout.connect(
-            self._refresh_account_summary)
-        self._account_summary_timer.start(60000)
         self._account_summary_debounce = QTimer()
         self._account_summary_debounce.setSingleShot(True)
         self._account_summary_debounce.timeout.connect(
@@ -1264,13 +1262,29 @@ class App:
             log.warning("account summary failed: %s", e)
             return
         summary["reserved_base"] = base
+        previous = (self._account_summary or {}).get("cash_orderable")
         self._account_summary = summary
         for view in self.views:
             view.screen.set_account_summary(summary)
+        if previous is not None and summary["cash_orderable"] != previous:
+            # 매도 체결·입출금·다른 단말 주문으로 현금이 바뀌면 종목별
+            # 주문가능수량은 전부 옛 금액으로 계산된 값이다. 금액만 갱신하고
+            # 수량 캐시를 두면 그 수량이 min()의 상한으로 남아 주문이 줄어든다.
+            self._reload_orderable_quantities()
         audit_log.info(
             "account summary estimated=%s cash_orderable=%s deposit=%s",
             summary["estimated_assets"], summary["cash_orderable"],
             summary["cash_deposit"])
+
+    def _reload_orderable_quantities(self):
+        """종목별 주문가능수량 캐시를 버리고 화면이 보는 종목만 다시 조회한다."""
+        self._orderable_cache.clear()
+        for view in self.views:
+            target, upper = view.screen.order_target()
+            if not target or not upper:
+                continue
+            view.screen.clear_orderable_quantity()
+            self._queue_orderable_quantity(view.screen, target, upper)
 
     def _refresh_market_overview(self):
         """DB 최신 국내지수·외국인 수급을 모든 조건검색창에 표시한다."""
@@ -1642,13 +1656,7 @@ class App:
             # 금액 쪽은 계좌 조회가 따라잡지만 수량은 캐시에 그대로 남아
             # min()의 상한이 되고, 다음 종목이 증거금 부족으로 거부된다.
             self._orderable_reserved = reserved
-            self._orderable_cache.clear()
-            for view in self.views:
-                target, upper = view.screen.order_target()
-                if not target or not upper:
-                    continue
-                view.screen.clear_orderable_quantity()
-                self._queue_orderable_quantity(view.screen, target, upper)
+            self._reload_orderable_quantities()
         for view in self.views:
             view.screen.set_order_reserved(reserved)
             if batch.code in view.screen.model.rows:
