@@ -3896,9 +3896,43 @@ def apply_news_themes(stock_codes, text: str, trade_date: str = "",
         return _link_news_themes(connection, stock_codes, text, day)
 
 
+def _preferred_siblings(connection, names: dict[str, str]) -> set[str]:
+    """보통주에 붙는 회사 사건은 그 우선주에도 붙는다.
+
+    분할 재상장·액면병합·자사주 같은 재료는 종목이 아니라 회사에서 일어난다.
+    그런데 뉴스는 보통주 코드만 싣는다(2026-08-25 한화머시너리앤서비스홀딩스는
+    0220W0만 오고 3우B인 0220WL은 빠졌다).
+
+    KRX 코드는 같은 발행사면 앞 5자리가 같다. 그것만으로는 남의 종목을 끌어올
+    수 있으므로 이름이 보통주 이름으로 시작하는 것만 남긴다.
+    """
+    prefixes = {code[:5]: code for code in names if len(code) >= 6}
+    if not prefixes:
+        return set()
+    rows = connection.execute(
+        "SELECT stock_code, stock_name FROM stocks WHERE SUBSTR(stock_code,1,5)"
+        " IN ({})".format(",".join("?" * len(prefixes))),
+        list(prefixes)).fetchall()
+    found = set()
+    for row in rows:
+        code = str(row[0])
+        parent = prefixes.get(code[:5], "")
+        if not parent or code == parent:
+            continue
+        base = names.get(parent, "")
+        name = str(row[1] or "")
+        if base and name != base and name.startswith(base):
+            found.add(code)
+    return found
+
+
 def _link_news_themes(connection, stock_codes, text: str,
-                      day: str) -> tuple[str, ...]:
-    """열린 트랜잭션에서 뉴스 한 건의 종목-테마 NEWS 연결을 더한다."""
+                      day: str, seen: set | None = None) -> tuple[str, ...]:
+    """열린 트랜잭션에서 뉴스 한 건의 종목-테마 NEWS 연결을 더한다.
+
+    `seen`을 주면 이 뉴스가 뒷받침하는 (종목, 테마명, 날짜)를 모아 담는다.
+    재분류가 "지금 사전으로 재현되지 않는 연결"을 가려내는 데 쓴다.
+    """
     codes = list(dict.fromkeys(
         str(code).removesuffix("_AL") for code in (stock_codes or ()) if code))
     if not codes or len(codes) > NEWS_THEME_MAX_CODES:
@@ -3907,13 +3941,21 @@ def _link_news_themes(connection, stock_codes, text: str,
     if not themes:
         return ()
     now = datetime.now().astimezone().isoformat(timespec="seconds")
-    known = {
-        row[0] for row in connection.execute(
-            "SELECT stock_code FROM stocks WHERE stock_code IN ({})".format(
-                ",".join("?" * len(codes))), codes).fetchall()
+    names: dict[str, str] = {
+        row[0]: str(row[1] or "") for row in connection.execute(
+            "SELECT stock_code, stock_name FROM stocks WHERE stock_code IN ({})"
+            .format(",".join("?" * len(codes))), codes).fetchall()
     }
+    known = set(names)
     if not known:
         return ()
+    known |= _preferred_siblings(connection, names)
+    if seen is not None:
+        # 실제로 붙이는 코드(우선주 포함)와 상장 종목표에 없는 코드까지 담는다.
+        # 넓게 잡을수록 재분류가 덜 지운다. 우선주를 빠뜨리면 방금 붙인 연결을
+        # 같은 실행의 삭제 단계가 도로 지운다.
+        seen.update((code, theme, day)
+                    for code in (*codes, *known) for theme in themes)
     for theme in themes:
         connection.execute(
             """INSERT INTO themes(theme_name, description, updated_at)
@@ -3943,9 +3985,14 @@ def backfill_news_themes(days: int = NEWS_THEME_MAX_AGE_DAYS,
 
     새 뉴스는 저장할 때 바로 붙지만, 기능을 넣기 전에 쌓인 뉴스와
     사전을 고친 뒤의 소급 반영에는 이 함수가 필요하다.
+
+    붙이기만 하면 사전에서 뺀 판정이 DB에 그대로 남는다. 그래서 같은 기간의
+    `source='NEWS'` 연결 중 지금 사전으로 재현되지 않는 것을 함께 지운다.
+    다른 출처(WICS·NAVER·KIWOOM)와 기간 밖 연결은 건드리지 않는다.
     """
     since = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
     linked = 0
+    seen: set[tuple[str, str, str]] = set()
     with closing(connect(db_path)) as connection, connection:
         for row in connection.execute(
                 """SELECT news_date, stock_code, related_stock_codes, title
@@ -3954,7 +4001,7 @@ def backfill_news_themes(days: int = NEWS_THEME_MAX_AGE_DAYS,
             codes = (split_ls_news_stock_codes(row["stock_code"])
                      + split_ls_news_stock_codes(row["related_stock_codes"]))
             linked += len(_link_news_themes(
-                connection, codes, row["title"], str(row["news_date"])))
+                connection, codes, row["title"], str(row["news_date"]), seen))
         for row in connection.execute(
                 """SELECT published_at, stock_codes, title
                      FROM telegram_news
@@ -3966,7 +4013,24 @@ def backfill_news_themes(days: int = NEWS_THEME_MAX_AGE_DAYS,
                 codes = []
             linked += len(_link_news_themes(
                 connection, codes, row["title"],
-                str(row["published_at"])[:10].replace("-", "")))
+                str(row["published_at"])[:10].replace("-", ""), seen))
+        stale = [
+            (row["stock_code"], row["theme_id"], row["valid_from"])
+            for row in connection.execute(
+                """SELECT st.stock_code, st.theme_id, st.valid_from,
+                          t.theme_name
+                     FROM stock_themes st
+                     JOIN themes t ON t.theme_id=st.theme_id
+                    WHERE st.source='NEWS' AND st.valid_to IS NULL
+                      AND st.valid_from>=?""", (since,)).fetchall()
+            if (row["stock_code"], row["theme_name"],
+                    str(row["valid_from"])) not in seen
+        ]
+        if stale:
+            connection.executemany(
+                """DELETE FROM stock_themes
+                    WHERE stock_code=? AND theme_id=? AND valid_from=?
+                      AND source='NEWS'""", stale)
     return linked
 
 
