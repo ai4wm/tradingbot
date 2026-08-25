@@ -1414,7 +1414,7 @@ class App:
                 analysis._selected_watch_code = ""
             analysis._refresh_realtime_watch_table()
             analysis._refresh_realtime_news_table()
-            analysis._refresh_limit_up_table()
+            analysis._refresh_limit_watch_marks()
         state = "등록" if enabled else "해제"
         log.info("realtime news watch %s: code=%s source=condition streak",
                  state, code)

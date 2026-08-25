@@ -612,7 +612,9 @@ class StockNewsTabMixin:
         self._news_watch_search.clear()
         self._refresh_realtime_watch_table()
         self._refresh_realtime_news_table()
-        self._refresh_limit_up_table()
+        # 상한가 표는 ★ 열만 달라진다. 통째로 다시 세우면 최대 600행을
+        # 새로 만들어 추가/해제가 눈에 띄게 느려진다.
+        self._refresh_limit_watch_marks()
         self.watchlist_changed.emit()
         if self._news_auto.isChecked():
             self._start_realtime_news_collection(True, False)
@@ -625,7 +627,7 @@ class StockNewsTabMixin:
         self._selected_watch_code = ""
         self._refresh_realtime_watch_table()
         self._refresh_realtime_news_table()
-        self._refresh_limit_up_table()
+        self._refresh_limit_watch_marks()
         self.watchlist_changed.emit()
 
     def _news_watch_table_clicked(self, row: int, column: int):
@@ -639,7 +641,7 @@ class StockNewsTabMixin:
             if self._selected_watch_code == code:
                 self._selected_watch_code = ""
             self._refresh_realtime_watch_table()
-            self._refresh_limit_up_table()
+            self._refresh_limit_watch_marks()
             self.watchlist_changed.emit()
         else:
             self._selected_watch_code = code

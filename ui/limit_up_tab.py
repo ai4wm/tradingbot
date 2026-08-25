@@ -247,6 +247,28 @@ class LimitUpTabMixin:
             self._limit_to.date().toString("yyyyMMdd"),
         )
 
+    LIMIT_WATCH_COL = 11  # ★ 열
+
+    def _refresh_limit_watch_marks(self):
+        """상한가 표의 ★ 열만 다시 칠한다.
+
+        감시목록이 바뀌어도 상한가 표에서 달라지는 것은 이 열뿐이다. 표를 통째로
+        다시 세우면 최대 600행 x 14열을 새로 만들어 추가/해제가 눈에 띄게 느려진다.
+        """
+        table = getattr(self, "_limit_table", None)
+        if table is None:
+            return
+        watched = realtime_watch_codes()
+        for row_index in range(table.rowCount()):
+            item = table.item(row_index, self.LIMIT_WATCH_COL)
+            if item is None:
+                continue
+            code = str(item.data(Qt.ItemDataRole.UserRole + 2) or "")
+            marked = code in watched
+            item.setText("★" if marked else "☆")
+            item.setForeground(
+                QColor("#f4b400") if marked else QColor("#808080"))
+
     def _refresh_limit_up_table(self):
         if not hasattr(self, "_limit_table"):
             return
@@ -361,7 +383,7 @@ class LimitUpTabMixin:
             except ValueError as error:
                 QMessageBox.warning(self, "실시간 감시", str(error))
                 return
-            self._refresh_limit_up_table()
+            self._refresh_limit_watch_marks()
             self._selected_watch_code = stock_code
             self._refresh_realtime_watch_table()
             self._refresh_realtime_news_table()
