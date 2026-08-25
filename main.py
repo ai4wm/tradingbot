@@ -3953,7 +3953,8 @@ class DetachedClockWindow(QWidget):
         self.setMouseTracking(True)
         # 배율 1.0일 때의 높이를 기준으로 삼아야 분석창과 글자 크기가 같다.
         self._owner._clock_scale = 1.0
-        self._owner._clock_pad_x = 2
+        # 좌우 여백 없이 테두리에 글자를 붙인다. 위아래는 1px 남긴다.
+        self._owner._clock_pad_x = 0
         self._owner._clock_pad_y = 1
         try:
             self._owner._clock_alpha = int(
@@ -4006,7 +4007,9 @@ class DetachedClockWindow(QWidget):
         time_font.setPixelSize(self._owner._clock_px(26))
         widest = max(metrics.horizontalAdvance(date_line),
                      QFontMetrics(time_font).horizontalAdvance("00:00:00"))
-        return widest + 2 * (self._owner._clock_pad_x + 2) + 6
+        # padding + 테두리(2px)만 더한다. 여유분을 두면 그만큼 좌우가 빈다.
+        # 2px는 리치텍스트 실제 폭이 metrics보다 조금 넓을 때의 잘림 방지다.
+        return widest + 2 * (self._owner._clock_pad_x + 2) + 2
 
     def _label(self):
         item = self.layout().itemAt(0)
@@ -4411,19 +4414,19 @@ class AnalysisWindow(
         if holiday_reason:
             border, background = "#E05252", "#351D22"
             day_color = "#FF8C98"
-            day_state = f" · {holiday_reason}"
+            day_state = f"·{holiday_reason}"
         elif krx_state in active_states or nxt_state in active_states:
             border, background = "#3FC56B", "#16291D"
             day_color = "#F7FF8A"
-            day_state = " · 거래일"
+            day_state = "·거래일"
         elif krx_state in auction_states:
             border, background = "#E3A522", "#332A16"
             day_color = "#FFD66B"
-            day_state = " · 개장 준비"
+            day_state = "·개장 준비"
         else:
             border, background = "#718096", "#202832"
             day_color = "#D7E3F2"
-            day_state = " · 거래 종료"
+            day_state = "·거래 종료"
 
         # 개장 직후 체결이 활발한 구간과 09:30 이후의 속도 저하 구간을
         # 시계만 보아도 구분할 수 있게 한다. 거래 자체를 막지는 않고,
