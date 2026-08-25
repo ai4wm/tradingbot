@@ -1580,6 +1580,10 @@ class App:
                 code, name, mode,
                 "auto" if auto_cancel else "manual",
                 price, quantities, sum(quantities))
+            # 진입만 하고 3단매도를 잊으면 붕괴 때 방어가 통째로 없다. 취소
+            # 방식과 무관하게 건다. 이미 걸린 종목은 화면이 그대로 둔다.
+            if screen.auto_balance_sell_on_order(code):
+                log.warning("balance sell auto-set on order code=%s", code)
         except Exception as e:  # noqa: BLE001
             log.exception(
                 "order batch rejected code=%s mode=%s count=%s "

@@ -3856,6 +3856,43 @@ class ConditionScreen(QWidget):
             self.model.dataChanged.emit(cell, cell)
         self.balance_sell_changed.emit(code, setting)
 
+    def auto_balance_sell_on_order(self, code: str) -> bool:
+        """주문을 낸 종목에 3단매도가 없으면 현재 잔량 기준으로 걸어 둔다.
+
+        이미 걸린 종목은 손으로 맞춰 둔 값이라 건드리지 않는다. 설정창과 같은
+        조건(최우선 매수호가 = 상한가)에서만 건다. 상한가가 아니면 잔량이
+        상한가 대기 물량을 뜻하지 않아 첫 호가 틱에 그대로 발동한다.
+        """
+        if code in self.model.balance_sell_settings:
+            return False
+        settings = getattr(self, "_settings", None)
+        if settings is None:
+            return False
+        row = self.model.rows.get(code) or {}
+        upper = int(row.get("upper") or 0)
+        if not upper or int(row.get("bid_price") or 0) != upper:
+            return False
+        current = max(0, int(row.get("bid_qty") or 0))
+        if current <= 0:
+            return False
+        values = _balance_sell_suggestion(current)
+        if any(value > current for value in values):
+            return False
+        # 체크 해제한 단계는 설정창과 같이 기준 0으로 둔다(그 단계 없음).
+        stages = [
+            value if _stored_bool(settings.value(last_key, "true")) else 0
+            for value, last_key in zip(values, BALANCE_SELL_STAGE_LAST_KEYS)]
+        if not any(stages):
+            return False
+        self.set_balance_sell_setting(code, {
+            "first": stages[0], "second": stages[1], "third": stages[2],
+            # 새 설정창과 같은 기본 비율: 1단 소리만, 2·3단 전량.
+            "first_ratio": 0.0, "second_ratio": 1.0, "third_ratio": 1.0,
+            "market_sell": _stored_bool(
+                settings.value(BALANCE_SELL_MARKET_LAST_KEY, "false")),
+        })
+        return True
+
     def set_balance_sell_stage(self, code: str, stage: int):
         previous = self.model.balance_sell_stage.get(code, 0)
         stage = max(previous, int(stage))
