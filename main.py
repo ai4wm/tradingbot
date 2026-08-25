@@ -3953,6 +3953,7 @@ class DetachedClockWindow(QWidget):
         self.setMouseTracking(True)
         # 배율 1.0일 때의 높이를 기준으로 삼아야 분석창과 글자 크기가 같다.
         self._owner._clock_scale = 1.0
+        self._owner._clock_time_px_value = 0
         # 좌우 여백 없이 테두리에 글자를 붙인다. 위아래는 1px 남긴다.
         self._owner._clock_pad_x = 0
         self._owner._clock_pad_y = 1
@@ -4096,6 +4097,15 @@ class DetachedClockWindow(QWidget):
             if needed > available:
                 base_px = max(7, int(base_px * available / needed))
         owner._clock_phase_px = base_px
+        # 시각 줄은 폭을 꽉 채운다. 날짜 줄이 정한 너비에 맞춰 따로 키운다.
+        time_font = QFont(self.font())
+        time_font.setPixelSize(owner._clock_px(26))
+        time_font.setBold(True)
+        width = QFontMetrics(time_font).horizontalAdvance("00:00:00")
+        room = self.width() - 2 * (owner._clock_pad_x + 2)
+        owner._clock_time_px_value = (
+            max(7, int(owner._clock_px(26) * room / width))
+            if width > 0 and room > 20 else 0)
         owner._update_analysis_clock()
         label = self._label()
         if label is None:
@@ -4104,8 +4114,13 @@ class DetachedClockWindow(QWidget):
         # 창 크기는 건드리지 않는다. 가로·세로 비율은 사용자가 정한다.
         wanted = max(1, label.heightForWidth(self.width()))
         if wanted > self.height():
-            owner._clock_scale = max(
-                0.4, owner._clock_scale * self.height() / wanted)
+            shrink = self.height() / wanted
+            owner._clock_scale = max(0.4, owner._clock_scale * shrink)
+            # 시각 줄도 같은 비율로 줄인다. 그대로 두면 나머지만 작아지고
+            # 시각만 커진 채 남아 다시 세로가 넘친다.
+            if owner._clock_time_px_value:
+                owner._clock_time_px_value = max(
+                    7, int(owner._clock_time_px_value * shrink))
             owner._update_analysis_clock()
 
     def _save_geo(self):
@@ -4382,6 +4397,14 @@ class AnalysisWindow(
         """분리 시계 배율을 반영한 글자 크기(px)."""
         return max(7, int(round(size * getattr(self, "_clock_scale", 1.0))))
 
+    def _clock_time_px(self) -> int:
+        """시각 줄 글자 크기. 분리 창에서는 폭을 채우도록 따로 잡는다.
+
+        창 너비는 더 긴 날짜 줄이 정한다. 시각 줄을 같은 배율로 그리면 그
+        차이만큼 양옆이 빈다(13px 기준 날짜 234px / 26px 기준 시각 208px).
+        """
+        return getattr(self, "_clock_time_px_value", 0) or self._clock_px(26)
+
     def _update_analysis_clock(self):
         now = datetime.now().astimezone()
         weekdays = (
@@ -4472,7 +4495,7 @@ class AnalysisWindow(
             f"{now:%Y-%m-%d} "
             f"<span style='color:{day_color};'>{weekday}{day_state}</span>"
             "</div>"
-            f"<div style='font-size:{self._clock_px(26)}px;"
+            f"<div style='font-size:{self._clock_time_px()}px;"
             " font-weight:900; letter-spacing:1px;'>"
             f"{now:%H:%M:%S}</div>"
             f"<div>{badge('KRX', krx_state)}&nbsp;"
@@ -4517,6 +4540,7 @@ class AnalysisWindow(
         self._clock_pad_x = 7
         self._clock_pad_y = 4
         self._clock_phase_px = 0
+        self._clock_time_px_value = 0
         self._clock_alpha = 255
         self._update_analysis_clock()
         self._principle_bar.insertWidget(0, self._analysis_clock_label)
