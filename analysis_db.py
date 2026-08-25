@@ -2381,6 +2381,10 @@ def theme_summary_rows(query: str = "", db_path: Path = DB_PATH) -> list[dict]:
 def active_theme_labels(db_path: Path = DB_PATH) -> dict[str, tuple[str, ...]]:
     """현재 유효한 종목별 테마명을 출처 우선순위대로 반환한다.
 
+    같은 출처 안에서는 그 테마가 **처음 붙은 날**이 늦은 것부터 놓는다.
+    마지막 언급 기준으로 잡으면 재탕 기사가 옛 재료를 새 재료 앞으로 끌어올린다
+    (2026-08-25 이건산업: 자사주는 8/24 공시의 재탕, 그날의 새 재료는 자산매각).
+
     조건검색 실시간 정렬은 수동 등록과 네이버 테마를 함께 기본 분류로 쓰고,
     둘 다 없는 종목만 키움 등 보조 출처로 묶는다. 한 종목의 복수 테마는 모두
     보존하며 화면에서 현재 가장 강한 묶음을 대표 테마로 선택한다.
@@ -2389,12 +2393,14 @@ def active_theme_labels(db_path: Path = DB_PATH) -> dict[str, tuple[str, ...]]:
         return {}
     with closing(connect(db_path)) as connection:
         rows = connection.execute(
-            """SELECT st.stock_code, t.theme_name, st.source
+            """SELECT st.stock_code, t.theme_name, st.source,
+                      MIN(st.valid_from) AS first_seen
                  FROM stock_themes st
                  JOIN themes t ON t.theme_id=st.theme_id
                 WHERE st.valid_to IS NULL
                   AND TRIM(t.theme_name)<>''
                   AND (st.source<>'NEWS' OR st.valid_from>=?)
+                GROUP BY st.stock_code, t.theme_name, st.source
                 ORDER BY st.stock_code,
                     CASE st.source
                         WHEN 'MANUAL' THEN 0
@@ -2406,6 +2412,7 @@ def active_theme_labels(db_path: Path = DB_PATH) -> dict[str, tuple[str, ...]]:
                         WHEN 'DART' THEN 6
                         ELSE 9
                     END,
+                    first_seen DESC,
                     t.theme_name""",
             (NEWS_THEME_CUTOFF(),),
         ).fetchall()
@@ -4034,21 +4041,31 @@ def backfill_news_themes(days: int = NEWS_THEME_MAX_AGE_DAYS,
     return linked
 
 
-def news_theme_labels(db_path: Path = DB_PATH) -> dict[str, tuple[str, ...]]:
-    """뉴스로 붙은 테마만 종목별로 반환한다. 화면에서 재료 표식에 쓴다."""
+def news_theme_labels(db_path: Path = DB_PATH,
+                      first_seen_on: str = "") -> dict[str, tuple[str, ...]]:
+    """뉴스로 붙은 테마만 종목별로 반환한다. 화면에서 재료 표식에 쓴다.
+
+    `first_seen_on`에 날짜를 주면 **그날 처음 붙은** 테마만 돌려준다. 재료는
+    며칠에 걸쳐 다시 기사화되므로, 마지막 언급으로는 오늘 새 재료와 재탕을
+    가를 수 없다(2026-08-25 이건산업 자사주는 8/24 공시의 재탕이다).
+    """
     if not db_path.exists():
         return {}
     result: dict[str, tuple[str, ...]] = {}
     with closing(connect(db_path)) as connection:
         for row in connection.execute(
-                """SELECT st.stock_code, t.theme_name
+                """SELECT st.stock_code, t.theme_name,
+                          MIN(st.valid_from) AS first_seen
                      FROM stock_themes st
                      JOIN themes t ON t.theme_id=st.theme_id
                     WHERE st.source='NEWS' AND st.valid_to IS NULL
-                      AND st.valid_from>=?""",
+                      AND st.valid_from>=?
+                    GROUP BY st.stock_code, t.theme_name""",
                 (NEWS_THEME_CUTOFF(),)).fetchall():
             code = str(row["stock_code"] or "").removesuffix("_AL")
             name = str(row["theme_name"] or "").strip()
+            if first_seen_on and str(row["first_seen"] or "") != first_seen_on:
+                continue
             if code and name and name not in result.get(code, ()):
                 result[code] = (*result.get(code, ()), name)
     return result
