@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-"""이미 설정된 종목에서 '현재 잔량으로 재설정'이 바로 적용되는지 확인한다.
+"""'현재 잔량으로 다시 계산'이 숫자만 바꾸고 저장하지 않는지 확인한다.
 
-설정이 없을 때는 예전처럼 제안만 하고 Enter를 기다린다.
+설정이 있든 없든 적용은 Enter다. 버튼 한 번에 실계좌 감시 기준이 바뀌면
+되돌릴 방법이 없다.
 """
 import os
 import tempfile
@@ -41,21 +42,19 @@ class Stub:
 def demo():
     app = QApplication.instance() or QApplication([])
 
-    # 잔량 100만주 -> 표에서 50만/30만/20만
+    # 잔량 100만주 -> 표에서 50만/30만/20만. 입력칸만 바뀌고 저장은 없다.
     screen = Stub(dict(SETTING), 1_000_000)
     dialog = gui.BalanceSellDialog(screen, CODE)
     dialog._rebase_now()
-    assert len(screen.saved) == 1, screen.saved
-    code, config = screen.saved[0]
-    assert code == CODE
-    assert (config["first"], config["second"], config["third"]) == (
-        500_000, 300_000, 200_000), config
-    # 비율·시장가 등 나머지 설정은 그대로 따라간다.
-    assert config["second_ratio"] == 0.5, config
-    assert config["market_sell"] is True, config
-    assert not dialog.isVisible()
+    assert screen.saved == [], screen.saved
+    assert (dialog.first_edit.value(), dialog.second_edit.value(),
+            dialog.third_edit.value()) == (500_000, 300_000, 200_000), (
+        dialog.first_edit.value())
+    # 적용 전이라 기존 설정은 그대로다.
+    assert screen.model.balance_sell_settings[CODE] == SETTING
+    assert dialog.error_label.text()
 
-    # 설정이 없으면 제안만 하고 저장하지 않는다.
+    # 설정이 없을 때도 같다.
     fresh = Stub(None, 1_000_000)
     fresh_dialog = gui.BalanceSellDialog(fresh, CODE)
     fresh_dialog._rebase_now()

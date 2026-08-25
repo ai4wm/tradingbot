@@ -2475,11 +2475,10 @@ class BalanceSellDialog(QDialog):
         self.apply_btn = QPushButton("설정 적용  Enter")
         cancel_btn = QPushButton("취소  Esc")
         off_btn = QPushButton("감시 해제")
-        rebase_btn = QPushButton(
-            "현재 잔량으로 재설정" if self.config else "현재 잔량으로 다시 계산")
+        rebase_btn = QPushButton("현재 잔량으로 다시 계산")
         rebase_btn.setToolTip(
-            "현재 매수잔량으로 3단 기준을 다시 잡습니다."
-            + (" 이미 설정된 종목은 바로 적용됩니다." if self.config else ""))
+            "현재 매수잔량으로 3단 기준 숫자만 다시 잡습니다."
+            " 적용은 Enter를 눌러야 됩니다.")
         self.apply_btn.setDefault(True)
         self.apply_btn.setAutoDefault(True)
         for button in (cancel_btn, off_btn, rebase_btn):
@@ -2632,10 +2631,6 @@ class BalanceSellDialog(QDialog):
         """취소물량이 나온 뒤 현재 안정잔량을 새 출발점으로 다시 제안한다."""
         self._refresh_suggestion()
         self._manual_edit = True
-        if self.config:
-            # 이미 감시 중인 종목은 되묻지 않고 바로 새 기준으로 갈아 끼운다.
-            self._apply()
-            return
         self.error_label.setText(
             "현재 잔량으로 다시 계산했습니다. Enter를 눌러야 적용됩니다.")
         self.apply_btn.setFocus()
