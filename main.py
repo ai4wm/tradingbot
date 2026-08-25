@@ -1235,9 +1235,9 @@ class App:
         analysis.activateWindow()
 
     def _open_realtime_news(self):
-        """본창 뉴스 버튼에서 분석창의 LS 실시간 뉴스 탭을 바로 연다."""
+        """본창 뉴스 버튼에서 분석창의 종목뉴스 탭을 바로 연다."""
         analysis = self._ensure_analysis_window()
-        analysis.open_ls_realtime_news()
+        analysis.open_stock_news()
         analysis.show()
         analysis.raise_()
         analysis.activateWindow()
@@ -4142,8 +4142,9 @@ class AnalysisWindow(
     limit_count_collect_requested = Signal()
 
     TABS = (
-        ("실시간 뉴스", "LS증권에서 수신한 전체 실시간 뉴스를 확인합니다."),
+        # 종목뉴스가 주 화면이다. 첫 탭이라 창을 처음 열면 여기가 잡힌다.
         ("종목뉴스·종토방", "직접 등록한 종목의 뉴스와 웹페이지를 확인합니다."),
+        ("실시간 뉴스", "LS증권에서 수신한 전체 실시간 뉴스를 확인합니다."),
         ("텔레그램 뉴스", "구독 중인 텔레그램 채널의 종목 글을 확인합니다."),
         ("상한가", "상한가 종목 수집·조회·성과 분석 화면입니다."),
         ("테마", "테마 강도와 종목 확산 흐름을 분석합니다."),
@@ -4997,10 +4998,17 @@ class AnalysisWindow(
 
     def open_ls_realtime_news(self):
         """LS 실시간 뉴스 탭을 선택한다."""
+        self._select_tab("실시간 뉴스")
+
+    def open_stock_news(self):
+        """종목뉴스·종토방 탭을 선택한다."""
+        self._select_tab("종목뉴스·종토방")
+
+    def _select_tab(self, title: str):
         for index in range(self._tabs.count()):
-            if self._tabs.tabText(index) == "실시간 뉴스":
+            if self._tabs.tabText(index) == title:
                 self._tabs.setCurrentIndex(index)
-                break
+                return
 
     def _open_selected_disclosures(self):
         row = self._limit_table.currentRow()
