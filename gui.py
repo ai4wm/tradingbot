@@ -2919,6 +2919,8 @@ class ConditionScreen(QWidget):
         # Qt가 시그널 뒤에 선택을 다시 걸기 때문에 이벤트루프 한 틱 뒤에 해제.
         self.refresh_interval.valueChanged.connect(
             lambda _: QTimer.singleShot(0, self.refresh_interval.lineEdit().deselect))
+        # 조건에서 빠졌지만 미체결 주문이 남아 붙잡아 둔 종목.
+        self._excluded_with_orders: set[str] = set()
         self.auto_remove = QCheckBox("자동삭제")  # 복원/저장은 _settings 준비 후(아래)
         self.auto_remove.setToolTip(
             "체크: 이탈 종목 행을 즉시 제거 · 해제: 이탈 신호는 받되 행과 실시간 추적은 유지")
@@ -3771,6 +3773,7 @@ class ConditionScreen(QWidget):
         if code == self._order_target_code:
             self.order_status_value.setText(detail)
         self._refresh_order_actions()
+        self._release_excluded(code)
 
     def _on_margin_order_toggled(self, checked: bool):
         if not self._margin_auto_change:
@@ -3865,6 +3868,8 @@ class ConditionScreen(QWidget):
             cell = self.model.index(row, BALANCE_SELL_COL)
             self.model.dataChanged.emit(cell, cell)
         self.balance_sell_changed.emit(code, setting)
+        # 3단매도 때문에 붙잡아 둔 행이면 해제와 함께 정리한다.
+        self._release_excluded(code)
 
     def auto_balance_sell_on_order(self, code: str) -> bool:
         """주문을 낸 종목에 3단매도가 없으면 현재 잔량 기준으로 걸어 둔다.
@@ -4597,13 +4602,35 @@ class ConditionScreen(QWidget):
 
     def on_excluded(self, code: str):
         """조건 이탈 (CNSRREQ D)"""
-        if self.auto_remove.isChecked():
-            if code == self._order_target_code:
-                self._order_target_code = ""
-                self.model.set_order_target("")
-                self.margin_order_check.setEnabled(True)
-                self._refresh_order_target_display()
-            self.model.remove_stock(code)
+        if not self.auto_remove.isChecked():
+            return
+        if self._holds_excluded_row(code):
+            # 상한가가 무너지면 그 종목은 조건에서도 빠진다. 그때 행을 지우면
+            # 미체결을 취소할 버튼도, 3단매도를 끌 셀도 함께 사라진다.
+            # 3단매도는 전량 매도 뒤에도 살아 있어서, 안 보인다고 꺼진 것으로
+            # 읽고 아래에 매수를 걸면 체결되는 순간 그대로 다시 팔린다.
+            self._excluded_with_orders.add(code)
+            return
+        self._remove_excluded(code)
+
+    def _holds_excluded_row(self, code: str) -> bool:
+        """조건에서 빠져도 행을 남겨야 하는 종목인지."""
+        return (code in self.model.order_cancellable
+                or code in self.model.balance_sell_settings)
+
+    def _release_excluded(self, code: str):
+        """붙잡아 둔 사유가 사라졌으면 그때 행을 지운다."""
+        if code in self._excluded_with_orders and not self._holds_excluded_row(code):
+            self._remove_excluded(code)
+
+    def _remove_excluded(self, code: str):
+        self._excluded_with_orders.discard(code)
+        if code == self._order_target_code:
+            self._order_target_code = ""
+            self.model.set_order_target("")
+            self.margin_order_check.setEnabled(True)
+            self._refresh_order_target_display()
+        self.model.remove_stock(code)
 
     def _refresh_bidqty_probe(self):
         """ponytail: 계측 구간(09:00~09:03)을 켜고 끄고, 끝나면 파일로 내린다."""
