@@ -181,22 +181,45 @@ class RestClient:
         self._last_call = 0.0
         # 주문 전송은 병렬로 두고, 이 락은 5건/초 창 계산만 순서대로 보호한다.
         self._order_gate = asyncio.Lock()
+        # 사용자가 방금 고른 종목의 조회는 배경 조회보다 먼저 나가야 한다.
+        # 초당 1건이라 뒤에 붙으면 버튼이 몇 초씩 잠긴 채로 남는다.
+        self._priority_pending = 0
         self._order_sent: deque[float] = deque(maxlen=ORDER_BURST)
         # 시세 접미사: "" KRX, "_AL" 통합. watch_info 백필이 WS 통합시세를 KRX 종가로
         # 덮어쓰지 않게 ws.real_suffix와 함께 전환 (ka10095 _AL 실측: NXT 야간가 반영)
         self.suffix = ""
 
-    async def _throttle(self):
+    async def _throttle(self, priority: bool = False):
+        """초당 1건 간격을 지키되, 우선 요청을 배경 조회보다 먼저 내보낸다.
+
+        세마포어는 FIFO라 이미 줄을 선 배경 조회를 제칠 수 없다. 그래서 순번이
+        온 배경 조회가 대기 중인 우선 요청을 보면 자리를 내주고 다시 줄을 선다.
+        """
         import time
-        async with self._sem:
-            wait = config.REST_RATE_LIMIT - (time.time() - self._last_call)
-            if wait > 0:
-                await asyncio.sleep(wait)
-            self._last_call = time.time()
+        if priority:
+            self._priority_pending += 1
+        try:
+            while True:
+                async with self._sem:
+                    if not priority and self._priority_pending:
+                        yielded = True
+                    else:
+                        wait = config.REST_RATE_LIMIT - (
+                            time.time() - self._last_call)
+                        if wait > 0:
+                            await asyncio.sleep(wait)
+                        self._last_call = time.time()
+                        return
+                if yielded:
+                    await asyncio.sleep(0.02)
+        finally:
+            if priority:
+                self._priority_pending -= 1
 
     async def _request_raw(self, api_id: str, body: dict, path: str,
-                           cont: str = "") -> httpx.Response:
-        await self._throttle()
+                           cont: str = "",
+                           priority: bool = False) -> httpx.Response:
+        await self._throttle(priority)
         token = await self.tokens.token()
         headers = {"authorization": f"Bearer {token}", "api-id": api_id,
                    "Content-Type": "application/json;charset=UTF-8"}
@@ -1020,7 +1043,8 @@ class RestClient:
             },
         }
 
-    async def orderable_quantity(self, code: str, price: int) -> dict:
+    async def orderable_quantity(self, code: str, price: int,
+                                 priority: bool = False) -> dict:
         """kt00011: 선택 종목·주문가격 기준 현금/미수 주문가능수량.
 
         kt00011은 증거금률별 주문가능수량 조회다. kt00010(주문인출가능금액)을
@@ -1033,6 +1057,7 @@ class RestClient:
                 "uv": str(int(price)),
             },
             "/api/dostk/acnt",
+            priority=priority,
         )
         data = r.json()
         if str(data.get("return_code", "0")) not in ("0", ""):

@@ -1460,7 +1460,8 @@ class App:
             self, screen: ConditionScreen, code: str, price: int):
         base = self.orders.committed_notional()
         try:
-            detail = await self.rest.orderable_quantity(code, price)
+            detail = await self.rest.orderable_quantity(
+                code, price, priority=True)
         except asyncio.CancelledError:
             return
         except Exception as e:  # noqa: BLE001
