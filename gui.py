@@ -3772,6 +3772,14 @@ class ConditionScreen(QWidget):
         self.model.set_order_status(code, compact, has_remaining)
         if code == self._order_target_code:
             self.order_status_value.setText(detail)
+        # 취소가 끝나면 상태를 스스로 지운다. 남겨 두면 매수 버튼이 잠긴 채
+        # 있고, 푸는 방법이 주문 상태 칸을 직접 누르는 것뿐이라 무너지는
+        # 순간에 재진입이 막힌다(2026-08-31 티케이지애강).
+        if "취소" in compact and not has_remaining:
+            self.model.set_order_status(code, "")
+            if code == self._order_target_code:
+                self.order_status_value.setText("")
+            self.order_status_acknowledged.emit(code)
         self._refresh_order_actions()
         self._release_excluded(code)
 
