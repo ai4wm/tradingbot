@@ -2678,9 +2678,10 @@ class App:
             cap: int | None = ORDER_BURST - 1) -> list[tuple[str, int, str]]:
         """미체결 매수 취소를 즉시 전송하고, 못 보낸 나머지를 돌려준다.
 
-        주문 TR은 1초에 5건이라 9분할처럼 취소가 많으면 매도가 창 밖으로
-        밀린다. 한 번에 ORDER_BURST-1건까지만 보내 매도 자리를 남기고,
-        나머지는 호출부가 매도를 보낸 뒤에 이어서 보낸다.
+        주문 TR 버스트는 실측 10건이다(api.ORDER_BURST). 한 번에
+        ORDER_BURST-1건까지만 보내 매도 자리를 남긴다. 9분할이면 취소 9건과
+        전량매도 1건이 같은 창에 들어간다. 그보다 많으면 나머지는 호출부가
+        매도를 보낸 뒤에 이어서 보낸다.
         """
         fresh = [
             order for order in orders
@@ -2777,6 +2778,22 @@ class App:
                 "%s open-buy sweep cancelled code=%s orders=%s qty=%s",
                 reason, code, count, qty)
 
+    async def _sweep_filled_buys(self, code: str, reason: str):
+        """100주 이상 체결된 미체결 매수만 계좌 조회로 확인해 취소한다.
+
+        자동취소의 마지막 안전장치다. 아직 체결이 없는 분할 주문은 배분을
+        기다리는 중이므로 건드리지 않는다. 전량 스윕과 다른 점이 이것이다.
+        """
+        try:
+            count, qty = await self.rest.cancel_filled_buy_orders(code)
+        except Exception:  # noqa: BLE001
+            log.exception("%s filled-buy sweep failed code=%s", reason, code)
+            return
+        if count:
+            log.warning(
+                "%s filled-buy sweep cancelled code=%s orders=%s qty=%s",
+                reason, code, count, qty)
+
     async def _auto_cancel_account(
             self, code: str, order_no: str, remaining_qty: int | None,
             exchange: str | None = None):
@@ -2814,6 +2831,9 @@ class App:
             log.exception(
                 "account auto-cancel failed code=%s event_order=%s",
                 code, order_no)
+            # 유량으로 끝내 못 보냈을 수 있다. 상한가가 무너지는 순간에
+            # 미체결 매수가 남으면 계속 사들이므로 계좌 조회로 마무리한다.
+            asyncio.ensure_future(self._sweep_filled_buys(code, "자동취소 실패"))
             return
         # 자동취소 감시는 유지한다. 다른 분할 주문도 각자 100주가 체결되면
         # 그 주문번호의 잔량만 같은 방식으로 취소한다.
