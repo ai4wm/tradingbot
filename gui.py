@@ -567,9 +567,13 @@ def _limit_tier(d: dict) -> int:
         return TIER_PREOPEN
     if actual_limit:
         return TIER_LIMIT_CLEAN if d["ask_qty"] == 0 else TIER_LIMIT
-    if d["ask_qty"] == 0 and d["price"] > 0:
-        # 현재가까지 있어야 '거래 중인데 매도가 빈' 종목이다. 방금 편입돼
-        # 시세가 아직 안 들어온 행은 값이 전부 0이라 이 자리에 오면 안 된다.
+    if d["ask_qty"] == 0 and d["price"] > 0 and d["bid_price"] > 0:
+        # 호가가 한 번은 들어와야 '거래 중인데 매도가 빈' 종목이다. 현재가만
+        # 보면 안 된다. 방금 편입된 행은 체결(0B)이 먼저 닿아 현재가·등락률만
+        # 차고 매도잔량은 0으로 남는다(잔량은 0D에만 실린다). REST 백필은
+        # 0.4초 뒤에야 나가므로 그 사이 새 종목이 이 자리로 올라왔다가 첫
+        # 호가에 내려갔다. 매도호가가 진짜 비어도 매수호가는 남으므로
+        # bid_price로 '호가를 받은 적 있음'을 가른다.
         return TIER_NO_ASK
     return TIER_PLAIN
 
