@@ -526,7 +526,6 @@ TIER_LIMIT_CLEAN = 3   # 실제 상한가 · 매도잔량 0
 TIER_LIMIT = 4         # 실제 상한가 · 매도잔량 있음
 TIER_NO_ASK = 5        # 거래 중인데 매도호가가 빈 종목 (상한가 직전)
 TIER_PLAIN = 6         # 그 밖의 일반 종목
-TIER_BLANK = 7         # 방금 편입돼 아직 아무 값도 못 받은 행
 
 
 def _limit_tier(d: dict) -> int:
@@ -552,12 +551,6 @@ def _limit_tier(d: dict) -> int:
     살아 있으면 그 값으로 비교해(`StockModel.data`) 곧 체결될 가격이 순서에
     반영되게 한다.
     """
-    if not (d["price"] or d["exp_price"] or d["bid_price"] or d["ask_price"]):
-        # 편입 직후 백필 전. 시세도 호가도 아직 없는 행은 어떤 묶음에도
-        # 넣지 않고 맨 아래에 둔다. 값이 전부 0인 채로 일반 비교에 섞이면
-        # 정렬컬럼과 방향에 따라(등락률이 음수인 종목들 위, 오름차순 등)
-        # 맨 위로 떠올랐다가 첫 시세가 닿는 순간 제자리로 떨어진다.
-        return TIER_BLANK
     actual_limit = d["upper"] > 0 and d["price"] == d["upper"]
     expected_limit = d["exp_price"] > 0 and (
         d["exp_price"] >= d["upper"] if d["upper"] > 0 else d["exp_rate"] >= LIMIT
@@ -583,6 +576,11 @@ def _limit_tier(d: dict) -> int:
         # bid_price로 '호가를 받은 적 있음'을 가른다.
         return TIER_NO_ASK
     return TIER_PLAIN
+
+
+def _row_blank(d: dict) -> bool:
+    """편입 직후 백필 전, 시세도 호가도 아직 못 받은 행."""
+    return not (d["price"] or d["exp_price"] or d["bid_price"] or d["ask_price"])
 
 
 class TieredProxy(QSortFilterProxyModel):
@@ -897,8 +895,17 @@ class TieredProxy(QSortFilterProxyModel):
         return super().data(index, role)
 
     def lessThan(self, left, right):
+        model = self.sourceModel()
+        left_blank = _row_blank(model.rows[model.codes[left.row()]])
+        right_blank = _row_blank(model.rows[model.codes[right.row()]])
+        if left_blank != right_blank:
+            # 편입 직후 행은 값이 전부 0이고 REST 백필은 0.4초 뒤에 나간다.
+            # 그 0을 일반 비교에 섞으면 등락률이 음수인 종목들 위로 올라가
+            # 맨 위에 떴다가 첫 시세가 닿는 순간 제자리로 떨어진다.
+            # 정렬 모드·컬럼·방향과 무관하게 값이 닿을 때까지 아래에 둔다.
+            return (left_blank if self.sortOrder() == Qt.DescendingOrder
+                    else right_blank)
         if self.pinned:
-            model = self.sourceModel()
             left_pinned = model.codes[left.row()] in self.pinned
             right_pinned = model.codes[right.row()] in self.pinned
             if left_pinned != right_pinned:
