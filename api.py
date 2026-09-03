@@ -61,13 +61,24 @@ def _is_rate_limited(message: str) -> bool:
     return any(hint in lowered for hint in RATE_LIMIT_HINTS)
 
 
-def is_nothing_to_cancel(error) -> bool:
-    """취소할 잔량이 이미 없다는 응답인지 본다(506550).
+# 취소가 이미 목적을 이룬 상태를 뜻하는 응답 코드.
+#   506550 취소할 잔량이 없다
+#   571435 원주문이 이미 취소주문이다
+#   571412 원주문번호가 존재하지 않는다
+# 스윕은 계좌 조회 결과로 도는데 그 조회는 앞서 보낸 취소가 반영되기 전의
+# 목록일 수 있다. 2026-09-03 11:21 023790에서 실제로 571435가 나왔다.
+NOTHING_TO_CANCEL = ("506550", "571435", "571412")
 
-    영웅문에서 먼저 취소했거나 그사이 전량 체결되면 나온다. 취소의 목적은
-    잔량을 없애는 것이므로 이미 달성된 상태다. 오류로 볼 일이 아니다.
+
+def is_nothing_to_cancel(error) -> bool:
+    """취소할 것이 이미 없다는 응답인지 본다.
+
+    영웅문에서 먼저 취소했거나, 그사이 전량 체결됐거나, 방금 보낸 취소가
+    이미 닿은 경우다. 취소의 목적은 잔량을 없애는 것이므로 이미 달성된
+    상태다. 오류로 볼 일이 아니다.
     """
-    return "506550" in str(error)
+    message = str(error)
+    return any(code in message for code in NOTHING_TO_CANCEL)
 
 
 def _maintenance_datetime(value: str) -> datetime:
@@ -979,17 +990,30 @@ class RestClient:
                 break
         return out
 
-    async def cancel_open_buy_orders(self, code: str) -> tuple[int, int]:
-        """주문 출처와 무관하게 해당 종목의 계좌 미체결 매수를 전부 취소한다."""
-        orders = await self.open_buy_orders(code)
+    async def _cancel_each(self, orders: list[dict]) -> tuple[int, int]:
+        """미체결 목록을 하나씩 취소한다. 한 건이 실패해도 멈추지 않는다.
+
+        이 갈래는 마지막 안전장치라 도중에 끊기면 안 된다. 앞서 보낸 취소가
+        먼저 닿아 '이미 취소됨'이 오는 것은 정상이므로 조용히 넘긴다.
+        """
         sent = 0
         qty = 0
         for order in orders:
-            await self.cancel_order(
-                order["code"], order["order_no"], 0, order["exchange"])
+            try:
+                await self.cancel_order(
+                    order["code"], order["order_no"], 0, order["exchange"])
+            except Exception as error:  # noqa: BLE001
+                if not is_nothing_to_cancel(error):
+                    log.warning("sweep cancel failed order=%s: %s",
+                                order["order_no"], error)
+                continue
             sent += 1
             qty += order["remaining_qty"]
         return sent, qty
+
+    async def cancel_open_buy_orders(self, code: str) -> tuple[int, int]:
+        """주문 출처와 무관하게 해당 종목의 계좌 미체결 매수를 전부 취소한다."""
+        return await self._cancel_each(await self.open_buy_orders(code))
 
     async def cancel_open_buy_order(
             self, code: str, order_no: str) -> tuple[int, int]:
@@ -1013,12 +1037,7 @@ class RestClient:
             order for order in orders
             if order["filled_qty"] >= max(1, int(minimum_filled))
         ]
-        qty = 0
-        for order in targets:
-            await self.cancel_order(
-                order["code"], order["order_no"], 0, order["exchange"])
-            qty += order["remaining_qty"]
-        return len(targets), qty
+        return await self._cancel_each(targets)
 
     async def account_summary(self) -> dict:
         """주문 화면용 실계좌 요약.
