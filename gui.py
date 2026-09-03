@@ -2686,16 +2686,19 @@ class BalanceSellDialog(QDialog):
             self.error_label.setText(
                 "사용할 단계를 하나 이상 체크하세요. 감시를 끄려면 '감시 해제'.")
             return
-        if not upper or bid_price != upper:
-            self.error_label.setText(
-                "현재 최우선 매수호가가 상한가가 아니므로 적용할 수 없습니다.")
-            return
+        # 상한가가 아니어도 걸 수 있다. 걸어 둔 뒤 상한가가 무너져도 감시는
+        # 계속 도는데 거는 순간에만 막는 것은 앞뒤가 맞지 않는다. 대신
+        # 상한가가 아닌 상태에서 건 것은 감사 로그에 그대로 남긴다.
+        # 주의: 이 상태에서는 감시 기준이 상한가 매수잔량이 아니라 그냥
+        # 최우선 매수잔량이다. 아래에 매수를 걸어 두면 1주 체결에도 발동한다.
+        at_upper = bool(upper) and bid_price == upper
         if any(value > current for value in (first, second, third)):
             self.error_label.setText(
                 f"각 단계 기준은 현재 매수잔량 {current:,}주 이하여야 합니다.")
             return
         self.screen.set_balance_sell_setting(
             self.code, {
+                "at_upper": at_upper,
                 "first": first, "second": second, "third": third,
                 "first_ratio": float(self.first_sell_combo.currentData()),
                 "second_ratio": float(self.second_sell_combo.currentData()),
@@ -3876,6 +3879,8 @@ class ConditionScreen(QWidget):
             self.model.balance_alert_ticks.pop(code, None)
         else:
             self.model.balance_sell_settings[code] = {
+                # 상한가에서 걸었는지. 감사 로그와 화면 표시에만 쓴다.
+                "at_upper": bool(setting.get("at_upper", True)),
                 "first": int(setting["first"]),
                 "second": int(setting["second"]),
                 "third": int(setting["third"]),
@@ -3926,6 +3931,7 @@ class ConditionScreen(QWidget):
         if not any(stages):
             return False
         self.set_balance_sell_setting(code, {
+            "at_upper": True,
             "first": stages[0], "second": stages[1], "third": stages[2],
             # 새 설정창과 같은 기본 비율: 1단 소리만, 2·3단 전량.
             "first_ratio": 0.0, "second_ratio": 1.0, "third_ratio": 1.0,
