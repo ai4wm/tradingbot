@@ -7,7 +7,8 @@
 - 키움 조건검색 및 KRX·NXT 실시간 시세
 - 조회순위, 등락률·거래량·거래대금 순위
 - 예상체결, VI, 상한가 진입시각과 체결 강도 지표
-- 분할매수, 주문 취소, 보유종목 단계별 매도와 비상청산 보조
+- 분할매수, 매수잔량 단계별 자동매도(3단매도), 100주 체결 뒤 잔량 자동취소, 비상청산
+- 뉴스 제목으로 테마를 붙이고, 사전을 고친 뒤 지난 기사에 소급 적용
 - LS증권 실시간 뉴스 및 누락 뉴스 서버 동기화
 - 네이버 관심종목 뉴스와 종목토론실
 - 텔레그램 채널 뉴스 소급·실시간 수집과 앱 안 원문 보기
@@ -73,13 +74,22 @@ Copy-Item .env.example .env
 | `ui/limit_up_tab.py` | 상한가 탭 |
 | `ui/theme_tab.py` | 테마 탭 |
 | `gui.py` | 조건검색 표, 주문·잔고 화면과 표시 모델 |
+| `rank.py` | 실시간 조회순위 창과 알림음 |
+| `config.py` | 환경변수 읽기와 실전·모의 전환 |
 | `api.py` | 키움 REST 클라이언트와 시장 조회 |
 | `ws.py` | 키움 웹소켓, 조건검색과 실시간 등록 |
-| `order.py` | 주문 분할 및 주문 처리 |
+| `order.py` | 상한가 점상용 분할매수 주문 묶음 |
 | `analysis_db.py` | 분석용 SQLite 스키마와 조회·저장 |
 | `ls_news_ws.py` | LS증권 실시간 뉴스 수신 |
 | `ls_news_server_sync.py` | 앱 종료 중 누락된 LS 뉴스 보완 |
+| `naver_news_api.py` | 네이버 뉴스 검색 API 클라이언트 |
 | `telegram_news.py` | 텔레그램 채널 뉴스 수집과 종목 추출 |
+| `theme_keywords.py` | 뉴스 제목에서 테마를 찾아내는 사전 |
+| `theme_keyword_candidates.py` | 상한가 종목 기사에서 새 테마 후보 추출 |
+| `classification_api.py` | WICS·KRX 업종별 분류 조회 |
+| `dart_api.py` | OpenDART 고유번호와 공시 조회 |
+| `krx_api.py` | KRX Data Marketplace 일별 시세 |
+| `global_market_api.py` | 해외 주요지표 지연 시세 조회 |
 | `prediction_model.py` | 상한가 후보 학습과 예측 |
 | `walkforward_validation.py` | 예측 모델 워크포워드 검증 |
 
@@ -99,9 +109,16 @@ Copy-Item .env.example .env
 ## 기본 점검
 
 ```powershell
-.\.venv\Scripts\python.exe -m py_compile config.py api.py ws.py gui.py rank.py main.py analysis_db.py prediction_model.py ls_news_ws.py ls_news_server_sync.py telegram_news.py ui\realtime_news_tab.py ui\stock_news_tab.py ui\telegram_news_tab.py ui\limit_up_tab.py ui\theme_tab.py
+.\.venv\Scripts\python.exe -m py_compile (Get-ChildItem *.py, ui\*.py | ForEach-Object FullName)
 .\.venv\Scripts\python.exe telegram_news.py
 git diff --check
+```
+
+`test_*.py`는 각각 단독 실행하는 자체 검사입니다. 프레임워크를 쓰지
+않으며 성공하면 `ok`만 찍습니다.
+
+```powershell
+Get-ChildItem test_*.py | ForEach-Object { .\.venv\Scripts\python.exe $_.Name }
 ```
 
 워크포워드 보고서를 다시 생성하려면 다음을 실행합니다.

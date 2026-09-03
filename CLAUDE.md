@@ -166,9 +166,16 @@ LS NWS는 종목코드를 12자리 고정 폭으로 이어 붙여 보냅니다. 
 ## 단계별 검증
 
 ```powershell
-.\.venv\Scripts\python.exe -m py_compile config.py api.py ws.py gui.py rank.py main.py analysis_db.py prediction_model.py ls_news_ws.py ls_news_server_sync.py telegram_news.py ui\realtime_news_tab.py ui\stock_news_tab.py ui\telegram_news_tab.py ui\limit_up_tab.py ui\theme_tab.py
+.\.venv\Scripts\python.exe -m py_compile (Get-ChildItem *.py, ui\*.py | ForEach-Object FullName)
 .\.venv\Scripts\python.exe telegram_news.py
 git diff --check
+```
+
+`test_*.py`는 각각 단독 실행하는 자체 검사입니다. 프레임워크를 쓰지
+않으며 성공하면 `ok`만 찍습니다.
+
+```powershell
+Get-ChildItem test_*.py | ForEach-Object { .\.venv\Scripts\python.exe $_.Name }
 ```
 
 추가로 확인할 항목:
