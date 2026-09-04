@@ -579,8 +579,13 @@ def _limit_tier(d: dict) -> int:
 
 
 def _row_blank(d: dict) -> bool:
-    """편입 직후 백필 전, 시세도 호가도 아직 못 받은 행."""
-    return not (d["price"] or d["exp_price"] or d["bid_price"] or d["ask_price"])
+    """편입 직후 백필 전, 시세도 호가도 아직 못 받은 행.
+
+    하나라도 값이 있으면 빈 행이 아니다. 넓게 잡으면 시세 일부만 들어온 행이
+    바닥에 눌려 오히려 순서가 틀어진다.
+    """
+    return not (d["price"] or d["exp_price"] or d["bid_price"]
+                or d["ask_price"] or d["rate"])
 
 
 class TieredProxy(QSortFilterProxyModel):
@@ -896,6 +901,15 @@ class TieredProxy(QSortFilterProxyModel):
 
     def lessThan(self, left, right):
         model = self.sourceModel()
+        if self.pinned:
+            left_pinned = model.codes[left.row()] in self.pinned
+            right_pinned = model.codes[right.row()] in self.pinned
+            if left_pinned != right_pinned:
+                # 어떤 정렬·방향에서도 위에 남긴다. 사용자가 직접 누른
+                # 것이므로 아래의 빈 행 규칙보다도 앞선다. Qt는 내림차순일 때
+                # lessThan 결과를 뒤집으므로 반대로 돌려준다.
+                return (right_pinned if self.sortOrder() == Qt.DescendingOrder
+                        else left_pinned)
         left_blank = _row_blank(model.rows[model.codes[left.row()]])
         right_blank = _row_blank(model.rows[model.codes[right.row()]])
         if left_blank != right_blank:
@@ -905,14 +919,6 @@ class TieredProxy(QSortFilterProxyModel):
             # 정렬 모드·컬럼·방향과 무관하게 값이 닿을 때까지 아래에 둔다.
             return (left_blank if self.sortOrder() == Qt.DescendingOrder
                     else right_blank)
-        if self.pinned:
-            left_pinned = model.codes[left.row()] in self.pinned
-            right_pinned = model.codes[right.row()] in self.pinned
-            if left_pinned != right_pinned:
-                # 어떤 정렬·방향에서도 위에 남긴다. Qt는 내림차순일 때
-                # lessThan 결과를 뒤집으므로 반대로 돌려준다.
-                return (right_pinned if self.sortOrder() == Qt.DescendingOrder
-                        else left_pinned)
         if self.theme_mode:
             model = self.sourceModel()
             left_code = model.codes[left.row()]

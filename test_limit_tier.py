@@ -19,8 +19,11 @@ from gui import _limit_tier
 
 def row(**changes) -> dict:
     """상한가 1204원 종목의 기본 상태. 필요한 값만 바꿔 쓴다."""
+    # 호가값도 함께 둔다. 매도호가가 빈 종목(tier 5) 판정이 "호가를 받은
+    # 적이 있는가"를 매수호가로 가르므로, 없으면 그 갈래를 못 밟는다.
     base = dict(name="", upper=1204, base=926, price=0, rate=0.0,
-                exp_price=0, exp_rate=0.0, ask_qty=0, bid_qty=0, vol=0)
+                exp_price=0, exp_rate=0.0, ask_qty=0, bid_qty=0, vol=0,
+                ask_price=0, bid_price=0)
     base.update(changes)
     return base
 
@@ -45,7 +48,8 @@ def demo():
     assert _limit_tier(row(**{**opened, "ask_qty": 500})) == 4, "실제 상한가·매도잔량"
 
     # 거래 중인데 매도호가가 비었으면 상한가 직전이다. 실제 상한가 바로 아래.
-    assert _limit_tier(row(price=1100, rate=18.8, vol=500_000)) == 5, "매도잔량 0"
+    assert _limit_tier(row(price=1100, rate=18.8, vol=500_000,
+                          bid_price=1100)) == 5, "매도잔량 0"
 
     # 장 시작 전 나머지는 예상상한이 아니어도 대기열에 남는다.
     assert _limit_tier(row(exp_price=1100, exp_rate=18.0, ask_qty=900,

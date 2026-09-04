@@ -352,7 +352,11 @@ def _bare_rest(post):
 
 
 async def check_order_rate_limit():
-    """주문 5건까지는 간격 없이 나가고, 6건째만 창이 열릴 때까지 기다린다."""
+    """ORDER_BURST건까지 간격 없이 나가고, 그다음만 창이 열릴 때까지 기다린다.
+
+    상한은 실측값이다(2026-09-03). 9분할 취소 9건과 전량매도 1건이 같은
+    창에 들어가야 하므로 10이며, 여기서 그 값을 그대로 확인한다.
+    """
     import time
     import api
 
@@ -364,17 +368,19 @@ async def check_order_rate_limit():
 
     rest = _bare_rest(fake_post)
     start = time.monotonic()
-    for _ in range(6):
+    for _ in range(api.ORDER_BURST + 1):
         try:
             await rest._order_request("kt10003", {})
         except RuntimeError:
             pass
-    assert len(sent) == 6, sent
-    assert sent[4] - start < 0.05, [round(t - start, 3) for t in sent]
-    assert sent[5] - start >= api.ORDER_WINDOW - 0.05, [
+    assert len(sent) == api.ORDER_BURST + 1, sent
+    assert api.ORDER_BURST >= 10, api.ORDER_BURST  # 9분할 취소 + 매도
+    assert sent[api.ORDER_BURST - 1] - start < 0.05, [
         round(t - start, 3) for t in sent]
-    print("주문제한     : 5건 즉시, 6건째 "
-          f"{sent[5] - start:.2f}초 대기")
+    assert sent[api.ORDER_BURST] - start >= api.ORDER_WINDOW - 0.05, [
+        round(t - start, 3) for t in sent]
+    print(f"주문제한     : {api.ORDER_BURST}건 즉시, 그다음 "
+          f"{sent[api.ORDER_BURST] - start:.2f}초 대기")
 
 
 async def check_order_rate_limit_retry():

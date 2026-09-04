@@ -77,7 +77,11 @@ class OrderBatch:
 
 
 class OrderEngine:
-    """취소(priority=0)가 신규매수(priority=10)보다 먼저 나가는 단일 송신 큐."""
+    """대기열을 통째로 비워 한꺼번에 보내는 송신 큐.
+
+    우선순위(취소 0 / 매수 10)는 남겨 두지만 한 묶음 안에서는 동시에 나가므로
+    순서를 가르지 않는다. 다음 묶음부터 취소가 앞선다.
+    """
 
     def __init__(self, rest, on_update=None):
         self.rest = rest
@@ -172,62 +176,80 @@ class OrderEngine:
         return count, qty
 
     async def _worker(self):
+        """대기열을 통째로 비우고 한꺼번에 보낸다.
+
+        예전에는 한 건씩 응답까지 기다렸다. 2026-09-04 09:01 에이프로젠에서
+        9분할 매수에 986ms가 걸렸고 9번째는 유량 거부까지 맞았다. 동시호가
+        마감선은 랜덤이라 그 1초가 그대로 배분 탈락으로 이어진다. 같은 9건을
+        동시에 던지면 78ms에 끝나고 유량 거부도 없다(048770 실측).
+
+        전송 도중에 남은 매수를 멈추는 기능은 이 방식으로는 없다. 동시호가
+        중에는 체결이 없어 취소할 것도 없고, 이미 나간 주문은 9건을 한 번에
+        취소하면 된다. 그 취소는 별도로 검증돼 있다.
+        """
         while not self._queue.empty():
-            _, _, action, batch, child = await self._queue.get()
-            try:
-                if action == "buy" and (batch.error or batch.stop_requested):
-                    child.remaining_qty = 0
-                    child.done = True
-                    continue
-                if action == "buy":
-                    child.submitting = True
-                    result = await self.rest.buy_order(
-                        batch.code, child.requested_qty, batch.price)
-                    child.order_no = result["order_no"]
-                    batch.sent_count += 1
-                    audit_log.info(
-                        "buy order accepted code=%s order=%s qty=%s "
-                        "price=%s cancel_mode=%s",
-                        batch.code, child.order_no, child.requested_qty,
-                        batch.price, "auto" if batch.auto_cancel else "manual")
-                    if child.order_no:
-                        self._by_order_no[child.order_no] = (batch, child)
-                    if (
-                        (batch.stop_requested or child.cancel_requested)
-                        and child.remaining_qty > 0
-                        and not child.cancel_sent
-                    ):
-                        child.cancel_requested = True
-                        child.cancel_sent = True
-                        self._put(0, "cancel", batch, child)
-                        self._notify(batch, "취소대기")
-                    else:
-                        self._notify(batch, "전송")
-                elif action == "cancel":
-                    await self.rest.cancel_order(
-                        batch.code, child.order_no, 0)
-                    audit_log.info(
-                        "local order cancel sent code=%s order=%s "
-                        "remaining=%s",
-                        batch.code, child.order_no, child.remaining_qty)
-                    self._notify(batch, "취소전송")
-            except Exception as exc:  # noqa: BLE001
-                if action == "cancel":
-                    child.cancel_sent = False
-                    batch.error = str(exc)
-                elif action == "buy":
-                    batch.error = str(exc)
-                    # 첫 매수 거절 뒤 같은 분할묶음의 나머지 주문은 전송하지 않는다.
-                    for pending in batch.children:
-                        if not pending.order_no:
-                            pending.remaining_qty = 0
-                            pending.done = True
-                self._notify(batch, "오류")
-                log.exception("%s %s failed", action, batch.code)
-            finally:
-                if action == "buy":
-                    child.submitting = False
-                self._queue.task_done()
+            batchload = []
+            while not self._queue.empty():
+                _, _, action, batch, child = self._queue.get_nowait()
+                batchload.append(
+                    asyncio.ensure_future(self._send(action, batch, child)))
+            await asyncio.gather(*batchload, return_exceptions=True)
+
+    async def _send(self, action: str, batch, child):
+        try:
+            if action == "buy" and (batch.error or batch.stop_requested):
+                child.remaining_qty = 0
+                child.done = True
+                return
+            if action == "buy":
+                child.submitting = True
+                result = await self.rest.buy_order(
+                    batch.code, child.requested_qty, batch.price)
+                child.order_no = result["order_no"]
+                batch.sent_count += 1
+                audit_log.info(
+                    "buy order accepted code=%s order=%s qty=%s "
+                    "price=%s cancel_mode=%s",
+                    batch.code, child.order_no, child.requested_qty,
+                    batch.price, "auto" if batch.auto_cancel else "manual")
+                if child.order_no:
+                    self._by_order_no[child.order_no] = (batch, child)
+                if (
+                    (batch.stop_requested or child.cancel_requested)
+                    and child.remaining_qty > 0
+                    and not child.cancel_sent
+                ):
+                    child.cancel_requested = True
+                    child.cancel_sent = True
+                    self._put(0, "cancel", batch, child)
+                    self._notify(batch, "취소대기")
+                else:
+                    self._notify(batch, "전송")
+            elif action == "cancel":
+                await self.rest.cancel_order(
+                    batch.code, child.order_no, 0)
+                audit_log.info(
+                    "local order cancel sent code=%s order=%s "
+                    "remaining=%s",
+                    batch.code, child.order_no, child.remaining_qty)
+                self._notify(batch, "취소전송")
+        except Exception as exc:  # noqa: BLE001
+            if action == "cancel":
+                child.cancel_sent = False
+                batch.error = str(exc)
+            elif action == "buy":
+                batch.error = str(exc)
+                # 첫 매수 거절 뒤 같은 분할묶음의 나머지 주문은 전송하지 않는다.
+                for pending in batch.children:
+                    if not pending.order_no:
+                        pending.remaining_qty = 0
+                        pending.done = True
+            self._notify(batch, "오류")
+            log.exception("%s %s failed", action, batch.code)
+        finally:
+            if action == "buy":
+                child.submitting = False
+            self._queue.task_done()
 
     def on_order_event(self, event: dict):
         """웹소켓 type=00 주문체결 이벤트 반영."""
