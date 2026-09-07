@@ -2367,11 +2367,12 @@ class App:
         if code:
             audit_log.info(
                 "account order event code=%s side=%s status=%s order=%s "
-                "original=%s order_qty=%s fill_qty=%s remaining=%s "
-                "fill_id=%s exchange=%s",
+                "original=%s order_qty=%s fill_qty=%s fill_price=%s "
+                "remaining=%s fill_id=%s exchange=%s",
                 code, event.get("side"), event.get("status"),
                 event.get("order_no"), event.get("original_order_no"),
                 event.get("order_qty"), event.get("fill_qty"),
+                event.get("fill_price"),
                 event.get("remaining_qty"), event.get("fill_id"),
                 event.get("exchange"))
         self.orders.on_order_event(event)
@@ -2691,6 +2692,14 @@ class App:
                     max(0, int(booked.get("sellable") or 0)))
         for view in self.views:
             view.screen.set_pending_orders(code, buy, sell, position, trim)
+
+    def _current_bid_qty(self, code: str) -> int:
+        """지금 화면에 들어와 있는 최우선 매수잔량. 기록용이라 없으면 0이다."""
+        for view in self.views:
+            row = view.screen.model.rows.get(code)
+            if row:
+                return max(0, int(row.get("bid_qty") or 0))
+        return 0
 
     def _pending_open_buys(self, code: str) -> list[tuple[str, int, str]]:
         """장부의 미체결 매수를 (주문번호, 잔량, 거래소)로 돌려준다. 조회 없음."""
@@ -3334,12 +3343,15 @@ class App:
             result = await self._send_sell_order(
                 code, qty, price, market_sell, reason)
             asyncio.ensure_future(self._prime_position_book())
+        # 주문이 나간 뒤에 찍는다. 잔량은 "얼마 남았을 때 팔았나"를 나중에
+        # 되짚기 위한 것이다(2026-09-07 223310: 발동 시점 값밖에 없었다).
         log.warning(
             "%s account sell sent code=%s held=%s sellable=%s qty=%s "
-            "order_type=%s price=%s order_no=%s src=%s",
+            "order_type=%s price=%s order_no=%s src=%s bid_qty=%s",
             reason, code, held, sellable, qty,
             "시장가" if market_sell else "지정가",
-            "" if market_sell else price, result["order_no"], source)
+            "" if market_sell else price, result["order_no"], source,
+            self._current_bid_qty(code))
         return qty
 
     def _emergency_exit(self, code: str, price: int, order_enabled: bool):
