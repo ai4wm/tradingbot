@@ -2526,6 +2526,8 @@ class App:
             filled = self._new_fill_qty(order_no, event)
             if filled:
                 position["held"] = max(0, position["held"] - filled)
+                if position["held"] <= 0:
+                    self._clear_spent_balance_sell(code)
         # 장부를 다 고친 뒤에 표시한다. 먼저 부르면 보유수량이 한 박자 늦는다.
         self._push_pending_orders(code)
 
@@ -3110,6 +3112,38 @@ class App:
         self._save_order_settings()
         audit_log.info(
             "balance sell setting code=%s setting=%s", code, setting)
+
+    def _clear_spent_balance_sell(self, code: str):
+        """다 팔고 잔고가 비면 3단매도와 자동취소를 스스로 내린다.
+
+        소진된 설정이 남아 있으면 같은 종목에 다시 들어갈 때가 문제다.
+        `auto_balance_sell_on_order`는 설정이 있으면 건드리지 않고,
+        `_check_balance_sell`은 이미 지나온 깊이를 다시 발동하지 않는다.
+        화면에는 3단매도가 걸린 것처럼 보이는데 실제로는 아무 감시도 없는
+        상태로 재진입하게 된다. 그래서 여기서 내려 다음 주문이 새 잔량
+        기준으로 다시 걸리게 한다. 자동취소도 재진입 주문을 자동취소 모드로
+        내면 그때 다시 무장한다.
+        """
+        setting = self._balance_sell_settings.get(code)
+        order = _balance_stage_order(setting or {})
+        if not order or self._balance_sell_stage.get(code, 0) < len(order):
+            return  # 아직 안 지나온 단계가 있다
+        if not self._position_book_primed:
+            return  # 잔고를 모르는 상태에서 감시를 내리면 안 된다
+        if (self._position_book.get(code) or {}).get("held", 0) > 0:
+            return
+        if self._pending_open_buys(code):
+            return  # 들어올 매수가 남아 있다
+        running = self._balance_sell_tasks.get(code)
+        if running and not running.done():
+            return  # 매도가 아직 도는 중이다
+        audit_log.info(
+            "balance sell cleared; position empty code=%s stages=%s "
+            "auto_cancel=%s",
+            code, len(order), code in self._account_auto_cancel_armed)
+        self._set_balance_sell(code, None)
+        if code in self._account_auto_cancel_armed:
+            self._set_account_auto_cancel(code, False)
 
     def _resell_late_buy_fill(self, code: str):
         """전량 매도 단계를 지난 뒤 늦게 체결된 매수를 같은 조건으로 판다.

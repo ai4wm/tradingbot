@@ -193,6 +193,43 @@ async def check_balance_trim_stage():
     print(f"나머지취소단계: 부분취소 {len(trimmed)}건, 매도 없음 → 다음 단계 매도")
 
 
+async def check_balance_cleared_when_empty():
+    """다 팔고 잔고가 비면 3단매도·자동취소가 스스로 내려가야 한다.
+
+    소진된 설정이 남으면 같은 종목에 다시 들어갈 때 자동 3단매도가 새로
+    걸리지 않는다. 화면에는 걸린 것처럼 보이는데 감시는 없는 상태가 된다.
+    """
+    code = "005930"
+    app = _app([])
+    app._position_book_primed = True
+    app._balance_sell_settings[code] = {
+        "first": 0, "second": 600_000, "third": 0,
+        "first_ratio": 0.0, "second_ratio": 1.0, "third_ratio": 1.0,
+        "market_sell": True}
+    app._balance_sell_date[code] = _main.datetime.now().strftime("%Y%m%d")
+    app._balance_sell_stage[code] = 1          # 켠 단계(1개)를 다 지났다
+    app._account_auto_cancel_armed.add(code)
+    app._position_book[code] = {"held": 100, "sellable": 0}
+
+    def sell_fill(remaining, fill, order_qty=100):
+        app._track_open_sell(code, "S1", {
+            "original_order_no": "0000000", "remaining_qty": remaining,
+            "order_qty": order_qty, "fill_qty": fill, "fill_id": f"f{fill}",
+            "exchange": "KRX"})
+
+    # 미체결 매수가 남아 있으면 아직 내리지 않는다.
+    app._open_buy_orders[code] = {"0009": (100, "KRX")}
+    sell_fill(60, 40)
+    assert code in app._balance_sell_settings, app._balance_sell_settings
+    app._open_buy_orders.pop(code)
+    sell_fill(0, 100)                          # 전량 체결 -> 보유 0
+    assert app._position_book[code]["held"] == 0, app._position_book
+    assert code not in app._balance_sell_settings, app._balance_sell_settings
+    assert code not in app._balance_sell_stage, app._balance_sell_stage
+    assert code not in app._account_auto_cancel_armed
+    print("잔고 소진     : 3단매도·자동취소 자동 해제")
+
+
 async def check_emergency_no_pending():
     app = _app([])
     await app._emergency_exit_async("005930", 69000, True)
@@ -678,6 +715,7 @@ async def main_check():
     await check_balance_pending()
     await check_balance_nine_splits()
     await check_balance_trim_stage()
+    await check_balance_cleared_when_empty()
     await check_balance_stages()
     await check_balance_refill_while_selling()
     await check_emergency_no_pending()
