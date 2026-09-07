@@ -229,6 +229,31 @@ async def check_balance_cleared_when_empty():
     assert code not in app._account_auto_cancel_armed
     print("잔고 소진     : 3단매도·자동취소 자동 해제")
 
+    # 사기 전에 미리 걸어 둔 것은 내려가면 안 된다. 진행도가 0이라 첫
+    # 관문에서 걸리고, 자동취소만 켠 종목은 3단매도 설정이 없어 그 앞에서
+    # 빠져나간다.
+    pre = _app([])
+    pre._position_book_primed = True
+    pre._balance_sell_settings[code] = {
+        "first": 0, "second": 600_000, "third": 0,
+        "first_ratio": 0.0, "second_ratio": 1.0, "third_ratio": 1.0,
+        "market_sell": True}
+    pre._balance_sell_date[code] = _main.datetime.now().strftime("%Y%m%d")
+    pre._account_auto_cancel_armed.add(code)
+    pre._position_book[code] = {"held": 0, "sellable": 0}
+    pre._clear_spent_balance_sell(code)
+    assert code in pre._balance_sell_settings, pre._balance_sell_settings
+    assert code in pre._account_auto_cancel_armed
+
+    # 자동취소만 미리 켠 종목도 마찬가지다.
+    only_cancel = _app([])
+    only_cancel._position_book_primed = True
+    only_cancel._account_auto_cancel_armed.add(code)
+    only_cancel._position_book[code] = {"held": 0, "sellable": 0}
+    only_cancel._clear_spent_balance_sell(code)
+    assert code in only_cancel._account_auto_cancel_armed
+    print("미리 걸어 둠  : 진행도 0·자동취소 단독은 유지")
+
 
 async def check_emergency_no_pending():
     app = _app([])
