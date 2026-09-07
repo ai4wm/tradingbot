@@ -69,6 +69,22 @@ BALANCE_SELL_MARKET_LAST_KEY = "balance_sell_market_last"
 BALANCE_SELL_STAGE_KEYS = ("first", "second", "third")
 BALANCE_SELL_STAGE_LAST_KEYS = tuple(
     f"balance_sell_stage_last/{key}" for key in BALANCE_SELL_STAGE_KEYS)
+BALANCE_SELL_RATIO_LAST_KEYS = tuple(
+    f"balance_sell_ratio_last/{key}" for key in BALANCE_SELL_STAGE_KEYS)
+# 1번 소리만, 2·3번 전량매도. 마지막 선택이 없을 때만 쓴다.
+BALANCE_SELL_RATIO_DEFAULTS = (0.0, 1.0, 1.0)
+
+
+def _balance_last_ratios(settings) -> tuple[float, float, float]:
+    """단계별 매도 비율의 마지막 선택. 체크·시장가와 같은 방식으로 기억한다."""
+    values = []
+    for key, default in zip(
+            BALANCE_SELL_RATIO_LAST_KEYS, BALANCE_SELL_RATIO_DEFAULTS):
+        try:
+            values.append(float(settings.value(key, default)))
+        except (TypeError, ValueError):
+            values.append(default)
+    return tuple(values)
 
 
 def _balance_stages_done(setting: dict, stage: int) -> bool:
@@ -1982,13 +1998,13 @@ class StockModel(QAbstractTableModel):
                         f"{'시장가' if setting.get('market_sell', False) else '지정가'}\n"
                         f"1번 {setting['first']:,}주 이하"
                         f"{' (꺼짐)' if not setting['first'] else ''}: "
-                        f"{int(float(setting.get('first_ratio', 0)) * 100)}% 매도\n"
+                        f"{_balance_ratio_text(setting.get('first_ratio', 0), '% 매도')}\n"
                         f"2번 {setting['second']:,}주 이하"
                         f"{' (꺼짐)' if not setting['second'] else ''}: "
-                        f"{int(float(setting.get('second_ratio', .5)) * 100)}%까지 매도\n"
+                        f"{_balance_ratio_text(setting.get('second_ratio', .5), '%까지 매도')}\n"
                         f"3번 {setting['third']:,}주 이하"
                         f"{' (꺼짐)' if not setting['third'] else ''}: "
-                        f"{int(float(setting.get('third_ratio', 1)) * 100)}%까지 매도\n"
+                        f"{_balance_ratio_text(setting.get('third_ratio', 1), '%까지 매도')}\n"
                         "클릭하면 수정")
                 return (
                     "현재 잔량의 50%부터 3단 기준을 자동 제안합니다.\n"
@@ -2385,6 +2401,12 @@ def _balance_sell_suggestion(current: int) -> tuple[int, int, int]:
     return max(3, first), max(2, second), max(1, third)
 
 
+def _balance_ratio_text(ratio, suffix: str) -> str:
+    """음수 비율은 매도 없이 미체결 매수만 100주씩 남기는 단계다."""
+    ratio = float(ratio)
+    return TRIM_BUTTON_TEXT if ratio < 0 else f"{int(ratio * 100)}{suffix}"
+
+
 class BalanceStepSpinBox(QSpinBox):
     """잔량 증감 단위를 화살표 1만·휠 10만으로 두고 보조키로 바꾼다."""
 
@@ -2463,10 +2485,11 @@ class BalanceSellDialog(QDialog):
                 self.first_sell_combo, self.second_sell_combo,
                 self.third_sell_combo):
             for label, ratio in (
-                    ("0% · 소리만", 0.0), ("50% 매도", .50),
-                    ("100% 전량매도", 1.0)):
+                    ("0% · 소리만", 0.0), (f"0% · {TRIM_BUTTON_TEXT}", -1.0),
+                    ("50% 매도", .50), ("100% 전량매도", 1.0)):
                 combo.addItem(label, ratio)
-            combo.currentIndexChanged.connect(self._mark_manual)
+            combo.setToolTip("마지막 선택을 기억합니다.")
+            combo.currentIndexChanged.connect(self._on_ratio_changed)
         self.market_sell_check = QCheckBox("시장가 매도")
         self.market_sell_check.setToolTip(
             "마지막 체크/해제 상태를 즉시 저장해 다음 설정창과 앱 재실행 때 "
@@ -2580,11 +2603,13 @@ class BalanceSellDialog(QDialog):
                 float(self.config.get("second_ratio", .50)),
                 float(self.config.get("third_ratio", 1.0)),
             )
-            for combo, ratio in zip((
-                    self.first_sell_combo, self.second_sell_combo,
-                    self.third_sell_combo), ratios):
+            for combo, ratio in zip(self._ratio_combos(), ratios):
                 combo_index = combo.findData(ratio)
+                # 적용값을 그대로 보여 줄 뿐이므로 마지막 선택으로 저장하지
+                # 않는다. 저장은 사용자가 직접 고를 때만 한다.
+                combo.blockSignals(True)
                 combo.setCurrentIndex(combo_index if combo_index >= 0 else 0)
+                combo.blockSignals(False)
             self.applied_label.setText(
                 ("시장가 · " if self.config.get("market_sell", False)
                  else "지정가 · ")
@@ -2596,9 +2621,11 @@ class BalanceSellDialog(QDialog):
                         (self.first_sell_combo, self.second_sell_combo,
                          self.third_sell_combo))))
         else:
-            self.first_sell_combo.setCurrentIndex(0)
-            self.third_sell_combo.setCurrentIndex(2)
-            self.second_sell_combo.setCurrentIndex(2)
+            # 적용값이 없으면 마지막으로 쓰던 비율을 되살린다(체크·시장가와 같다).
+            for combo, ratio in zip(self._ratio_combos(),
+                                    _balance_last_ratios(self._settings)):
+                index = combo.findData(ratio)
+                combo.setCurrentIndex(max(0, index))
             self.applied_label.setText("없음 — 실제 주문은 실행되지 않습니다")
             self._refresh_suggestion()
             self._manual_edit = False
@@ -2615,12 +2642,15 @@ class BalanceSellDialog(QDialog):
     def stage_checks(self):
         return (self.first_check, self.second_check, self.third_check)
 
+    def _ratio_combos(self):
+        return (self.first_sell_combo, self.second_sell_combo,
+                self.third_sell_combo)
+
     def _stage_rows(self):
         return zip(
             self.stage_checks(),
             (self.first_edit, self.second_edit, self.third_edit),
-            (self.first_sell_combo, self.second_sell_combo,
-             self.third_sell_combo))
+            self._ratio_combos())
 
     def _sync_stage_enabled(self):
         """해제한 단계의 입력만 잠근다. 번호 간 종속은 없다."""
@@ -2641,6 +2671,14 @@ class BalanceSellDialog(QDialog):
     def _mark_manual(self):
         self._manual_edit = True
         self.error_label.clear()
+
+    def _on_ratio_changed(self):
+        """단계별 비율의 마지막 선택을 즉시 기억한다(체크·시장가와 같다)."""
+        for combo, key in zip(self._ratio_combos(),
+                              BALANCE_SELL_RATIO_LAST_KEYS):
+            self._settings.setValue(key, str(float(combo.currentData())))
+        self._settings.sync()
+        self._mark_manual()
 
     def _on_market_sell_toggled(self, checked: bool):
         """시장가 체크박스의 마지막 선택 상태를 즉시 기억한다."""
@@ -2898,6 +2936,8 @@ class ConditionScreen(QWidget):
     order_requested = Signal(str, str, int, bool, int, int)
     cancel_requested = Signal(str)
     trim_requested = Signal(str)  # 미체결 매수에서 100주만 남기고 부분취소
+    order_restore_requested = Signal()  # 지난 실행의 3단매도·자동취소를 되살린다
+    order_restore_dismissed = Signal()  # 되살리지 않고 저장분을 버린다
     emergency_exit_requested = Signal(str, int, bool)
     order_status_acknowledged = Signal(str)
     exit_hotkey_changed = Signal(str, object)
@@ -3066,10 +3106,6 @@ class ConditionScreen(QWidget):
         self.withdrawable_value.setMinimumWidth(85)
         self.withdrawable_value.setToolTip(
             "키움 예수금 상세의 현재 인출가능금액")
-        self.loan_withdrawable_value = QLabel("-")
-        self.loan_withdrawable_value.setMinimumWidth(85)
-        self.loan_withdrawable_value.setToolTip(
-            "키움 응답에 제공되는 매도담보대출 포함 인출가능금액")
         self.orderable_qty_value = QLabel("-")
         self.orderable_qty_value.setMinimumWidth(70)
         self.margin_rate_value = QLabel("증거금 -")
@@ -3090,6 +3126,24 @@ class ConditionScreen(QWidget):
         self._margin_auto_change = False
         self.margin_order_check.toggled.connect(self._on_margin_order_toggled)
 
+        # 지난 실행에서 켜 뒀던 3단매도·자동취소는 저장돼 있어도 자동으로
+        # 켜지지 않는다. 이 버튼을 눌러야 감시가 돈다. 복원할 것이 없으면
+        # 숨어 있는다.
+        self.restore_order_btn = QPushButton()
+        self.restore_order_btn.setFixedHeight(24)
+        self.restore_order_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.restore_order_btn.setVisible(False)
+        self.restore_order_btn.setStyleSheet(
+            "QPushButton{border:2px solid #F9A825;border-radius:4px;"
+            "background:#FFF8E1;color:#5D4037;font-weight:bold;"
+            "padding:0px 10px}"
+            "QPushButton:hover{background:#FFECB3}")
+        self.restore_order_btn.clicked.connect(
+            self.order_restore_requested.emit)
+        # 우클릭은 '안 하겠다'다. 버튼을 하나 더 두면 주문 줄이 넓어진다.
+        self.restore_order_btn.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.restore_order_btn.customContextMenuRequested.connect(
+            lambda _pos: self.order_restore_dismissed.emit())
         account_bar = QHBoxLayout()
         account_bar.setSpacing(6)
         self.estimated_asset_btn = QPushButton("추정자산")
@@ -3110,8 +3164,7 @@ class ConditionScreen(QWidget):
         account_bar.addWidget(self.order_remaining_value)
         account_bar.addWidget(QLabel("인출가능금액"))
         account_bar.addWidget(self.withdrawable_value)
-        account_bar.addWidget(QLabel("대출인출가능금액"))
-        account_bar.addWidget(self.loan_withdrawable_value)
+        account_bar.addWidget(self.restore_order_btn)
         account_bar.addStretch(1)
         account_bar.addWidget(self.jumsang_check)
 
@@ -3844,13 +3897,9 @@ class ConditionScreen(QWidget):
         self.estimated_asset_value.setText(self._money_text(estimated))
         self.account_available_value.setText(self._money_text(self._account_available))
         withdrawable = summary.get("withdrawable")
-        loan_withdrawable = summary.get("loan_withdrawable")
         self.withdrawable_value.setText(
             self._money_text(int(withdrawable))
             if withdrawable is not None else "-")
-        self.loan_withdrawable_value.setText(
-            self._money_text(int(loan_withdrawable))
-            if loan_withdrawable is not None else "-")
         self._refresh_order_funds_display()
 
     def set_market_overview(self, text: str, regime: str = "중립"):
@@ -3871,6 +3920,30 @@ class ConditionScreen(QWidget):
             f" border:1px solid {border}; border-radius:3px;"
             " font-weight:600; }"
             "QPushButton:hover { border-width:2px; }")
+
+    def set_order_restore(self, summary: str):
+        """복원 대기 요약('3단매도 2 · 자동취소 3')을 버튼에 건다.
+
+        빈 문자열이면 복원할 것이 없다는 뜻이라 버튼을 숨긴다.
+        """
+        self.restore_order_btn.setVisible(bool(summary))
+        if summary:
+            # 내역은 툴팁으로 뺀다. 버튼에 붙이면 주문 줄 최소 폭이 그만큼
+            # 늘어나 창을 좁힐 수 없다.
+            self.restore_order_btn.setText("설정 복원")
+            self.restore_order_btn.setToolTip(
+                f"지난 실행에서 켜 두었던 설정입니다 — {summary}\n"
+                "누르면 그때부터 감시가 돌고, 조건이 맞으면 실제 주문이"
+                " 나갑니다.\n우클릭하면 되살리지 않고 저장분을 버립니다.")
+
+    def refresh_restored_cells(self):
+        """복원 뒤 3단매도·자동취소 열을 한 번에 다시 그린다."""
+        if not self.model.codes:
+            return
+        self.model.dataChanged.emit(
+            self.model.index(0, 0),
+            self.model.index(len(self.model.codes) - 1,
+                             self.model.columnCount() - 1))
 
     def set_order_reserved(self, amount: int):
         self._order_reserved = max(0, int(amount))
@@ -3936,11 +4009,13 @@ class ConditionScreen(QWidget):
             for value, last_key in zip(values, BALANCE_SELL_STAGE_LAST_KEYS)]
         if not any(stages):
             return False
+        # 비율도 설정창에서 마지막으로 고른 값을 그대로 쓴다.
+        ratios = _balance_last_ratios(settings)
         self.set_balance_sell_setting(code, {
             "at_upper": True,
             "first": stages[0], "second": stages[1], "third": stages[2],
-            # 새 설정창과 같은 기본 비율: 1단 소리만, 2·3단 전량.
-            "first_ratio": 0.0, "second_ratio": 1.0, "third_ratio": 1.0,
+            "first_ratio": ratios[0], "second_ratio": ratios[1],
+            "third_ratio": ratios[2],
             "market_sell": _stored_bool(
                 settings.value(BALANCE_SELL_MARKET_LAST_KEY, "false")),
         })

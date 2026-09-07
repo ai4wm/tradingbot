@@ -999,7 +999,16 @@ class App:
         self._account_auto_cancel_armed: set[str] = set()
         # 창 접두사별 청산키 원본 스펙. 창을 다시 만들 때 그대로 재등록한다.
         self._exit_hotkey_specs: dict[str, dict[str, dict]] = {}
+        # 지난 실행에서 켜 뒀던 3단매도·자동취소·주문상태. 여기 담아만 두고
+        # 사용자가 복원 버튼을 눌러야 실제 감시가 돈다. 자동으로 되살리면
+        # 앱을 켠 순간 잔량이 기준선을 스치기만 해도 매도가 나간다.
+        self._pending_order_restore: dict = {}
         self._load_order_settings()
+        application = QApplication.instance()
+        if application is not None:
+            # 주문상태는 체결 이벤트마다 바뀌는데 그때마다 ini에 쓰면 낭비다.
+            # 종료 직전에 한 번 담는다.
+            application.aboutToQuit.connect(self._save_order_settings)
         self._account_auto_cancel_filled: dict[tuple[str, str], int] = {}
         self._account_auto_cancel_fill_ids: set[tuple[str, str, str]] = set()
         self._account_auto_cancel_tasks: dict[tuple[str, str], asyncio.Task] = {}
@@ -1021,6 +1030,10 @@ class App:
         self._position_fill_ids: set[tuple[str, str]] = set()
         # 주문번호별로 장부에 이미 반영한 누적체결량.
         self._position_filled: dict[str, int] = {}
+        # 주문번호별 누적취소량. 부분취소를 해도 이벤트의 주문수량은 원주문
+        # 그대로 오므로, 주문수량-잔량으로 누적체결을 세면 취소분이 체결로
+        # 잡힌다(2026-09-07 09:58 223310).
+        self._order_cancelled: dict[str, int] = {}
         # 종목별 매도 접수 기록 (주문번호, 수량). 응답이 유실된 매도를 다시
         # 보내기 전에, 거래소가 실제로 접수했는지 여기서 확인한다.
         self._sell_accepts: dict[str, list[tuple[str, int]]] = {}
@@ -1140,6 +1153,8 @@ class App:
             self._submit_order(target, code, mode, count, auto, total, price))
         screen.cancel_requested.connect(self._cancel_order)
         screen.trim_requested.connect(self._trim_open_buys)
+        screen.order_restore_requested.connect(self._apply_order_restore)
+        screen.order_restore_dismissed.connect(self._dismiss_order_restore)
         screen.order_enable_check.toggled.connect(
             lambda enabled, source=screen:
             self._sync_order_enabled(enabled, source))
@@ -2454,6 +2469,12 @@ class App:
             else:
                 orders.pop(order_no, None)
         elif remaining <= 0:  # 취소·정정 확인 -> 원주문 소멸
+            # 취소 이벤트의 주문수량이 곧 취소수량이다. 부분취소면 원주문은
+            # 그만큼 줄어든 채 살아 있고, 그 값을 누적체결 계산에서 뺀다.
+            cancel_qty = max(0, int(event.get("order_qty") or 0))
+            if cancel_qty:
+                self._order_cancelled[original] = (
+                    self._order_cancelled.get(original, 0) + cancel_qty)
             cancelled = orders.pop(original, (0, ""))[0]
             orders.pop(order_no, None)
             self._cancel_sent_orders.discard(original)
@@ -2557,6 +2578,12 @@ class App:
         34와 100이 잇달아 와서 134로 세는 바람에 장부가 434주가 되었고,
         실제 400주라 매도가 거부됐다. 주문수량-잔량을 누적체결량의 권위값으로
         쓰고 이미 센 만큼을 뺀다. 자동취소 경로와 같은 기준이다.
+
+        부분취소(나머지취소)를 하면 원주문의 잔량만 줄고 이벤트의 주문수량은
+        108주 그대로 온다. 그대로 빼면 취소한 8주가 체결로 잡힌다.
+        2026-09-07 09:58 223310이 그랬다. 8건 중 7건을 100주로 깎았는데
+        장부가 854주(실제 800)가 되어 매도가 거부됐고, 재조회하는 사이
+        574ms를 썼다. 그래서 누적취소량을 함께 뺀다.
         """
         filled = max(0, int(event.get("fill_qty") or 0))
         if not filled:
@@ -2568,6 +2595,7 @@ class App:
             # 같은 이벤트가 두 번 와도 누적값이 같아 차분이 0이 된다.
             # 체결량이 누적이 아니라 그 체결분으로 오는 경우에 대비해 둘 중
             # 큰 값을 쓴다. 덜 세면 그만큼 덜 팔린다.
+            order_qty -= self._order_cancelled.get(order_no, 0)
             total = max(counted, filled, order_qty - max(0, int(remaining)))
         else:
             # 잔량이 없는 이벤트만 체결번호로 중복을 거른다.
@@ -2709,7 +2737,7 @@ class App:
             # 전송 표시를 지운다.
             self._cancel_sent_orders.discard(order_no)
             if is_nothing_to_cancel(error):
-                log.info(
+                audit_log.info(
                     "%s open-buy cancel already gone code=%s order=%s qty=%s",
                     reason, code, order_no, qty)
                 return
@@ -2751,7 +2779,7 @@ class App:
             await self.rest.cancel_order(code, order_no, qty, exchange)
         except Exception as error:  # noqa: BLE001
             if is_nothing_to_cancel(error):
-                log.info(
+                audit_log.info(
                     "trim cancel already gone code=%s order=%s qty=%s",
                     code, order_no, qty)
                 return
@@ -2824,7 +2852,7 @@ class App:
             self._cancel_sent_orders.discard(order_no)
             if is_nothing_to_cancel(error):
                 # 영웅문에서 먼저 취소했거나 그사이 전량 체결된 경우다.
-                log.info(
+                audit_log.info(
                     "account auto-cancel already gone code=%s event_order=%s",
                     code, order_no)
                 return
@@ -2842,16 +2870,39 @@ class App:
     # 3단매도·자동취소·청산키는 앱을 다시 열어도 그대로 살아 있어야 한다.
     # 실주문을 자동으로 내는 설정이므로 복원 내역은 audit 로그에 남긴다.
     def _save_order_settings(self):
-        """청산키만 날짜와 함께 남긴다. 3단매도와 자동취소는 저장하지 않는다.
+        """3단매도·자동취소·주문상태·청산키를 그날 날짜와 함께 남긴다.
 
         3단매도·자동취소는 켜져 있으면 조건이 맞는 순간 스스로 주문을 낸다.
-        앱을 켜자마자 되살아나면 사용자가 모르는 사이에 매도나 취소가 나간다.
-        매번 손으로 켜는 비용이 그 위험보다 싸다. 옛 저장분도 지운다.
+        그래서 저장은 해도 다음 실행에서 자동으로 켜지지는 않는다. 화면에
+        복원 버튼만 띄우고, 사용자가 누른 뒤에야 감시가 돈다. 자동으로
+        되살리면 앱을 켠 순간 잔량이 기준선을 스치기만 해도 매도가 나간다.
 
-        청산키는 사용자가 눌러야 나가지만, 앱이 뒤에 있어도 먹는 전역키라
-        어제 배정이 남으면 오늘 화면에 없는 종목이 청산된다. 그날만 유효하게
-        둔다.
+        청산키도 앱이 뒤에 있어도 먹는 전역키라, 어제 배정이 남으면 오늘
+        화면에 없는 종목이 청산된다. 다 그날만 유효하게 둔다.
         """
+        state = {
+            "date": datetime.now().strftime("%Y%m%d"),
+            "balance_sell": self._balance_sell_settings,
+            "balance_stage": self._balance_sell_stage,
+            "auto_cancel": sorted(self._account_auto_cancel_armed),
+            "order_status": {
+                view.screen.prefix: {
+                    code: [text, code in view.screen.model.order_cancellable]
+                    for code, text in view.screen.model.order_status.items()
+                }
+                for view in self.views
+                if view.screen.model.order_status
+            },
+        }
+        live = any(state[key] for key in (
+            "balance_sell", "auto_cancel", "order_status"))
+        if not live and self._pending_order_restore:
+            # 복원 버튼을 안 누른 채 또 껐다. 지난 저장분을 그대로 남긴다.
+            # 여기서 빈 값으로 덮으면 두 번 재시작하는 것만으로 사라진다.
+            state = self._pending_order_restore
+            live = True
+        self._settings.setValue("order/auto_state", json.dumps(
+            state if live else {}, ensure_ascii=False))
         self._settings.remove("order/auto_cancel_armed")
         self._settings.remove("order/balance_sell")
         specs = {
@@ -2864,12 +2915,26 @@ class App:
         self._settings.sync()
 
     def _load_order_settings(self):
-        """그날 배정한 청산키만 되돌린다. 화면 반영은 편입 시점.
+        """그날 배정한 청산키를 되돌리고, 나머지는 복원 대기함에 담는다.
 
-        3단매도와 자동취소는 일부러 안 되살린다. 스스로 주문을 내는 설정이라
-        앱을 켜자마자 조건이 맞으면 그대로 나간다. 남아 있던 옛 저장분도
-        지워, 예전 버전이 남긴 값이 되살아나지 않게 한다.
+        3단매도·자동취소·주문상태는 여기서 적용하지 않는다. 스스로 주문을
+        내는 설정이라 앱을 켜자마자 조건이 맞으면 그대로 나간다. 화면에
+        복원 버튼만 띄우고 사용자가 누를 때 `_apply_order_restore`가 켠다.
         """
+        raw_state = str(self._settings.value("order/auto_state", "") or "").strip()
+        try:
+            state = json.loads(raw_state) if raw_state else {}
+        except (ValueError, TypeError):
+            log.warning("order state reload failed: raw=%.200s", raw_state)
+            state = {}
+        if state and str(state.get("date") or "") == datetime.now().strftime(
+                "%Y%m%d"):
+            self._pending_order_restore = state
+        elif state:
+            # 어제 것이다. 기준 잔량도 진행도도 오늘과 무관하다.
+            self._settings.remove("order/auto_state")
+            audit_log.info("order state dropped (stale) date=%s",
+                           state.get("date"))
         raw = str(self._settings.value("order/exit_hotkeys", "") or "").strip()
         try:
             saved = json.loads(raw) if raw else {}
@@ -2894,15 +2959,79 @@ class App:
             self._settings.remove("order/exit_hotkeys")
         if dropped or expired:
             self._settings.sync()
-        if self._exit_hotkey_specs or dropped or expired:
+        if self._exit_hotkey_specs or dropped or expired or self._pending_order_restore:
             audit_log.info(
-                "order settings restored hotkeys=%s dropped=%s expired_hotkeys=%s",
+                "order settings restored hotkeys=%s dropped=%s expired_hotkeys=%s "
+                "pending=%s",
                 {prefix: sorted(values)
                  for prefix, values in self._exit_hotkey_specs.items()},
-                dropped, expired)
+                dropped, expired, self._order_restore_summary())
+
+    def _order_restore_summary(self) -> str:
+        """복원 대기 중인 항목을 '3단매도 2 · 자동취소 3' 꼴로 요약한다."""
+        state = self._pending_order_restore
+        if not state:
+            return ""
+        counts = (
+            ("3단매도", len(state.get("balance_sell") or {})),
+            ("자동취소", len(state.get("auto_cancel") or [])),
+            ("주문상태", sum(len(codes) for codes
+                          in (state.get("order_status") or {}).values())),
+        )
+        return " · ".join(f"{name} {n}" for name, n in counts if n)
+
+    def _show_order_restore(self):
+        """복원할 것이 남아 있는 동안 모든 창에 버튼을 띄운다."""
+        summary = self._order_restore_summary()
+        for view in self.views:
+            view.screen.set_order_restore(summary)
+
+    def _dismiss_order_restore(self):
+        """되살리지 않겠다(우클릭). 저장분을 버리고 버튼을 없앤다."""
+        if not self._pending_order_restore:
+            return
+        audit_log.info("order state dismissed pending=%s",
+                       self._order_restore_summary())
+        self._pending_order_restore = {}
+        self._settings.remove("order/auto_state")
+        self._settings.sync()
+        self._show_order_restore()
+
+    def _apply_order_restore(self):
+        """사용자가 복원 버튼을 눌렀다. 이제부터 감시가 돈다."""
+        state = self._pending_order_restore
+        if not state:
+            return
+        self._pending_order_restore = {}
+        today = datetime.now().strftime("%Y%m%d")
+        for code, setting in (state.get("balance_sell") or {}).items():
+            self._balance_sell_settings[code] = dict(setting)
+            self._balance_sell_stage[code] = int(
+                (state.get("balance_stage") or {}).get(code, 0))
+            self._balance_sell_date[code] = today
+        for code in (state.get("auto_cancel") or []):
+            self._account_auto_cancel_armed.add(str(code))
+        for view in self.views:
+            screen = view.screen
+            for code in list(screen.model.rows):
+                self._restore_stock_order_settings(screen, code)
+            for code, value in (
+                    (state.get("order_status") or {}).get(screen.prefix)
+                    or {}).items():
+                text, cancellable = (value if isinstance(value, list)
+                                     else [value, False])
+                screen.model.set_order_status(code, str(text), bool(cancellable))
+            screen.refresh_restored_cells()
+        self._show_order_restore()  # 대기함이 비었으니 버튼이 사라진다
+        audit_log.info(
+            "order state applied balance_sell=%s auto_cancel=%s",
+            sorted(state.get("balance_sell") or {}),
+            sorted(state.get("auto_cancel") or []))
+        self._save_order_settings()
 
     def _restore_screen_order_settings(self, screen: ConditionScreen):
         """창이 만들어질 때 그 창 몫의 청산키를 다시 등록한다."""
+        screen.set_order_restore(self._order_restore_summary())
         for code, spec in self._exit_hotkey_specs.get(screen.prefix, {}).items():
             screen.model.exit_hotkeys[code] = (
                 int(spec.get("key") or 0) | int(spec.get("modifiers") or 0),
@@ -3028,6 +3157,16 @@ class App:
             return
         threshold, number = order[depth - 1]
         ratio = _balance_stage_ratio(setting, number)
+        if ratio < 0:
+            # 나머지취소 단계. 매도는 하지 않고 미체결 매수를 100주씩만 남긴다.
+            # 취소 버튼과 같은 부분취소라 이미 체결된 물량은 그대로 둔다.
+            audit_log.info(
+                "balance sell stage trim code=%s slot=%s depth=%s "
+                "bid_qty=%s threshold=%s",
+                code, number, depth, bid_qty, threshold)
+            self._trim_open_buys(code)
+            self._complete_balance_stage(code, depth, sound="balance1")
+            return
         if ratio <= 0:
             audit_log.info(
                 "balance sell stage skipped code=%s slot=%s depth=%s "
@@ -3702,6 +3841,8 @@ class App:
             self._submit_order(target, code, mode, count, auto, total, price))
         screen.cancel_requested.connect(self._cancel_order)
         screen.trim_requested.connect(self._trim_open_buys)
+        screen.order_restore_requested.connect(self._apply_order_restore)
+        screen.order_restore_dismissed.connect(self._dismiss_order_restore)
         screen.order_enable_check.toggled.connect(
             lambda enabled, source=screen:
             self._sync_order_enabled(enabled, source))

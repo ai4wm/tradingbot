@@ -41,6 +41,13 @@ ORDER_BURST = 10
 ORDER_WINDOW = 1.05  # 서버 창 경계 오차를 감안한 5% 여유
 ORDER_RETRY = 3
 ORDER_RETRY_WAIT = 0.5
+# 첫 재시도만 짧게 간다. 2026-09-03 실측에서 창을 채운 뒤 다음 1건은
+# 0.14~0.47초에 돌아왔고, 0.4초 뒤 5건 동시 재전송만 전부 튕겼다. 붕괴
+# 순간에는 0.5초가 곧 실패다(2026-09-07 09:58 223310: 나머지취소 8건 중
+# 1건이 429 뒤 0.5초를 기다리는 사이 그 주문이 108주 전량 체결됐다.
+# 체결은 429로부터 217ms 뒤였다). 두 번째부터는 묶음이 통째로 밀린
+# 경우이므로 예전 간격을 그대로 쓴다.
+ORDER_RETRY_FIRST_WAIT = 0.15
 # 상한가가 무너지는 순간에 10초를 기다리는 것은 실패와 같다. 짧게 끊고
 # 접수 여부는 웹소켓 주문체결 이벤트로 확인한다.
 ORDER_TIMEOUT = 2.0
@@ -299,7 +306,8 @@ class RestClient:
             if r.status_code == 429 and attempt < ORDER_RETRY:
                 log.warning("order rate limited (429) api=%s retry=%s",
                             api_id, attempt + 1)
-                await asyncio.sleep(ORDER_RETRY_WAIT)
+                await asyncio.sleep(
+                    ORDER_RETRY_WAIT if attempt else ORDER_RETRY_FIRST_WAIT)
                 continue
             r.raise_for_status()
             data = r.json()
@@ -309,7 +317,8 @@ class RestClient:
             if attempt < ORDER_RETRY and _is_rate_limited(message):
                 log.warning("order rate limited api=%s retry=%s msg=%s",
                             api_id, attempt + 1, message)
-                await asyncio.sleep(ORDER_RETRY_WAIT)
+                await asyncio.sleep(
+                    ORDER_RETRY_WAIT if attempt else ORDER_RETRY_FIRST_WAIT)
                 continue
             raise RuntimeError(message or f"{api_id} 주문 실패")
         raise RuntimeError(f"{api_id} 주문 유량 재시도 실패")

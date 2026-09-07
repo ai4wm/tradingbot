@@ -90,12 +90,20 @@ def demo():
     assert setting["third"] == 0, setting        # 해제한 단계 = 기준 0
     assert setting["market_sell"] is True, setting
 
+    # 비율도 설정창에서 마지막으로 고른 값을 그대로 쓴다.
+    trim = Screen(row(1_000_000), settings_values=(
+        (gui.BALANCE_SELL_RATIO_LAST_KEYS[1], "-1.0"),))
+    assert trim.auto_balance_sell_on_order(CODE) is True
+    _, setting = trim.applied[0]
+    assert (setting["first_ratio"], setting["second_ratio"],
+            setting["third_ratio"]) == (0.0, -1.0, 1.0), setting
+
     # 모든 단계를 꺼 뒀으면 걸 것이 없다.
     none_on = Screen(row(1_000_000), settings_values=[
         (key, "false") for key in gui.BALANCE_SELL_STAGE_LAST_KEYS])
     assert none_on.auto_balance_sell_on_order(CODE) is False
 
-    for stub in (screen, manual, off, unknown, empty, last, none_on):
+    for stub in (screen, manual, off, unknown, empty, last, trim, none_on):
         os.unlink(stub._ini_path)
     print("ok")
 

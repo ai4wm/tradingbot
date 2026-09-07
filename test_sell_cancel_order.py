@@ -99,6 +99,8 @@ def _app(pending):
     app._open_sell_orders = {}
     app._position_fill_ids = set()
     app._position_filled = {}
+    app._order_cancelled = {}
+    app._pending_order_restore = {}
     app._sell_accepts = {}
     app._open_buy_orders = {
         "005930": {o["order_no"]: (o["remaining_qty"], o["exchange"])
@@ -155,6 +157,40 @@ async def check_balance_nine_splits():
     assert len(started) == 9, sorted(started)  # 나머지는 매도 뒤에 이어서
     print(f"balance(9분할): 매도 앞 취소 {len(before)}건, 총 취소 "
           f"{len(started)}건")
+
+
+async def check_balance_trim_stage():
+    """비율 -1 단계는 매도 없이 미체결 매수를 100주씩만 남겨야 한다."""
+    code = "005930"
+    app = _app(_splits(9))  # 534주 9건
+    app._balance_sell_settings[code] = {
+        "first": 0, "second": 600_000, "third": 300_000,
+        "first_ratio": 0.0, "second_ratio": -1.0, "third_ratio": 1.0,
+        "market_sell": True}
+    app._balance_sell_date[code] = _main.datetime.now().strftime("%Y%m%d")
+    app._position_book[code] = {"held": 900, "sellable": 900}
+
+    session, beep = _main._market_session_states, _main._beep
+    _main._market_session_states = lambda now: ("정규장", "정규장", "")
+    _main._beep = lambda *_args, **_kwargs: None
+    try:
+        app._check_balance_sell(code, 500_000)      # 2번: 나머지취소
+        await asyncio.sleep(0.1)
+        trimmed = [c for c in app.rest.calls if c.startswith("cancel_start")]
+        assert len(trimmed) == 9, app.rest.calls
+        assert "sell" not in app.rest.calls, app.rest.calls
+        assert app._balance_sell_stage[code] == 1, app._balance_sell_stage
+        # 부분취소는 취소확인이 오지 않는다. 전량취소 장부를 오염시키면
+        # 다음 단계의 취소가 이 주문들을 건너뛴다.
+        assert app._cancel_sent_orders == set(), app._cancel_sent_orders
+
+        app._check_balance_sell(code, 200_000)      # 3번: 전량매도
+        await app._balance_sell_tasks[code]
+        assert app.rest.calls.count("sell") == 1, app.rest.calls
+        assert app._balance_sell_stage[code] == 2, app._balance_sell_stage
+    finally:
+        _main._market_session_states, _main._beep = session, beep
+    print(f"나머지취소단계: 부분취소 {len(trimmed)}건, 매도 없음 → 다음 단계 매도")
 
 
 async def check_emergency_no_pending():
@@ -280,9 +316,11 @@ def check_position_book():
     app._position_book = {"005930": {"held": 0, "sellable": 0}}
     pos = app._position_book["005930"]
 
-    def buy(order_no, remaining, fill=0, fill_id="", original="0000000"):
+    def buy(order_no, remaining, fill=0, fill_id="", original="0000000",
+            order_qty=0):
         app._track_open_buy("005930", order_no, {
             "original_order_no": original, "remaining_qty": remaining,
+            "order_qty": order_qty,
             "fill_qty": fill, "fill_id": fill_id, "exchange": "KRX"})
 
     def sell(order_no, remaining, fill=0, fill_id="", original="0000000"):
@@ -303,6 +341,17 @@ def check_position_book():
     sell("S3", 20)                       # 20주 매도 접수
     sell("S3", 0, fill=20, fill_id="f2")  # 체결 -> 보유만 감소
     assert (pos["held"], pos["sellable"]) == (40, 40), pos
+
+    # 나머지취소: 108주 주문에서 8주만 끊으면 원주문은 100주로 남는다.
+    # 이벤트의 주문수량은 108 그대로 오므로 취소분을 빼지 않으면 108주를
+    # 체결로 세고, 그만큼 부풀린 장부로 매도를 내 거부된다.
+    # 2026-09-07 223310: 장부 854 vs 실제 800, 매도가 574ms 늦었다.
+    buy("B2", 108, order_qty=108)              # 접수
+    buy("C2", 8, order_qty=8, original="B2")   # 부분취소 접수
+    buy("C2", 0, order_qty=8, original="B2")   # 취소 확인
+    buy("B2", 100, order_qty=108)              # 원주문이 100주로 줄어 다시 온다
+    buy("B2", 0, fill=100, fill_id="f3", order_qty=108)  # 배분 100주로 끝
+    assert (pos["held"], pos["sellable"]) == (140, 140), pos  # 148이면 부풀었다
     print("잔고장부     :", pos)
 
 
@@ -418,7 +467,24 @@ async def check_order_rate_limit_retry():
     except RuntimeError as error:
         assert "주문가능수량" in str(error), error
     assert len(attempts) == 1, attempts  # 잔고 거부는 재전송 금지
-    print("유량 재시도  : 유량 거부만 재전송, 잔고 거부는 즉시 보고")
+
+    # 첫 재시도는 짧게, 두 번째부터는 예전 간격. 붕괴 순간에는 0.5초가
+    # 곧 실패다(2026-09-07 223310: 429 뒤 217ms 만에 체결됐다).
+    import time
+
+    assert api.ORDER_RETRY_FIRST_WAIT < api.ORDER_RETRY_WAIT
+    attempts.clear()
+    rest = _bare_rest(responder(["초당 요청 제한을 초과하였습니다", ""]))
+    started = time.monotonic()
+    try:
+        await rest._order_request("kt10003", {})
+    except RuntimeError:
+        pass  # 두 번째 응답은 유량이 아니라 그대로 올라온다
+    elapsed = time.monotonic() - started
+    assert len(attempts) == 2, attempts
+    assert elapsed < api.ORDER_RETRY_WAIT, elapsed
+    print(f"유량 재시도  : 유량 거부만 재전송, 첫 재시도 {elapsed * 1000:.0f}ms"
+          f" (잔고 거부는 즉시 보고)")
 
 
 async def check_order_send_is_parallel():
@@ -611,6 +677,7 @@ async def main_check():
     await check_balance_no_pending()
     await check_balance_pending()
     await check_balance_nine_splits()
+    await check_balance_trim_stage()
     await check_balance_stages()
     await check_balance_refill_while_selling()
     await check_emergency_no_pending()

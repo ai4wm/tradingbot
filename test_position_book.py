@@ -25,6 +25,7 @@ class Stub:
         self._position_book_primed = primed
         self._position_fill_ids = set()
         self._position_filled = {}
+        self._order_cancelled = {}
         self._cancel_sent_orders = set()
         self.pushed = []
         for name in ("_track_open_buy", "_track_order_book", "_new_fill_qty"):
