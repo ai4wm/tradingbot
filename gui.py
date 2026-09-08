@@ -2776,7 +2776,7 @@ class BidQtyPopup(QWidget):
         # 배경을 비워 라벨의 둥근 모서리가 창 모양이 되게 한다.
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setMouseTracking(True)
-        self.setMinimumSize(90, 44)
+        self.setMinimumSize(90, 56)  # 세 줄. 글자 최소값 탓에 44에서는 잘린다.
         self.setMaximumSize(1200, 800)
         self._screen = screen
         self.code = code
@@ -2785,6 +2785,13 @@ class BidQtyPopup(QWidget):
         # 종목 기록이 없을 때 쓰는 기준 크기·자리. 창별로 따로 남긴다.
         self._last_key = screen.prefix + "bidqty_popup_last"
         self._text = ""
+        self._vol_text = ""
+        # 체결 틱은 무너지는 순간 몰아친다. 값만 받아 두고 100ms에 한 번 그린다.
+        # 같은 스레드에서 3단매도 판정이 돌기 때문에 페인트가 밀리면 발동이 밀린다.
+        self._paint_timer = QTimer(self)
+        self._paint_timer.setSingleShot(True)
+        self._paint_timer.setInterval(100)
+        self._paint_timer.timeout.connect(self._refresh_text)
         self._drag_offset = None
         self._resize_from = None
         # 레이아웃 없이 라벨을 직접 채운다. 레이아웃을 쓰면 글자가 커질수록
@@ -2830,28 +2837,42 @@ class BidQtyPopup(QWidget):
             self.move(right, last.y())
         return True
 
-    def set_value(self, qty: int):
-        text = f"{qty:,}"
-        if text != self._text:
-            self._text = text
-            self._refresh()
+    def set_value(self, qty: int, vol: int = 0):
+        text, vol_text = f"{qty:,}", f"{vol:,}"
+        if text == self._text and vol_text == self._vol_text:
+            return
+        self._text, self._vol_text = text, vol_text
+        if not self._paint_timer.isActive():
+            self._paint_timer.start()
 
     def _refresh(self):
-        big = max(12, int(self.height() * 0.5))
-        small = max(8, int(big * 0.34))
+        """스타일과 툴팁까지 다시 세운다. 크기·투명도가 바뀔 때만 부른다.
+
+        setStyleSheet는 값이 같아도 Qt 스타일 재계산을 부르므로 틱마다 하면 안 된다.
+        """
         self._label.setStyleSheet(
             f"QLabel {{ background-color: rgba(23, 28, 34, {self._alpha});"
             f" border: 2px solid rgba(224, 93, 93, {self._alpha});"
             " border-radius: 10px; }")
-        self._label.setText(
-            f"<div style='font-size:{small}px; color:#C9A968'>{self._name}</div>"
-            f"<div style='font-size:{big}px; font-weight:900; color:#FFC24D'>"
-            f"{self._text}</div>")
         self.setToolTip(
-            f"{self._name} 매수잔량\n"
+            f"{self._name} 매수잔량 · 누적거래량\n"
             f"배경 불투명도 {self._alpha * 100 // 255}% (휠로 조절)\n"
             "끌어서 이동 · 우하단 모서리로 크기 조절\n"
             "더블클릭하면 닫습니다.")
+        self._paint_timer.stop()
+        self._refresh_text()
+
+    def _refresh_text(self):
+        # 세 줄이 창 높이를 넘지 않게 기준 글자를 0.42로 잡았다(줄간격 포함 약 0.84).
+        big = max(12, int(self.height() * 0.42))
+        small = max(8, int(big * 0.34))
+        volume = max(8, int(big * 0.40))
+        self._label.setText(
+            f"<div style='font-size:{small}px; color:#C9A968'>{self._name}</div>"
+            f"<div style='font-size:{big}px; font-weight:900; color:#FFC24D'>"
+            f"{self._text}</div>"
+            f"<div style='font-size:{volume}px; color:#6FD3C7'>"
+            f"{self._vol_text}</div>")
 
     def wheelEvent(self, event):
         """휠로 배경 불투명도를 조절하고 바로 저장한다."""
@@ -4433,7 +4454,7 @@ class ConditionScreen(QWidget):
     def _open_bid_popup(self, code: str):
         """매수잔량 셀 클릭 -> 종목별 확대 창. 이미 떠 있으면 앞으로 올린다.
 
-        갱신은 타이머가 아니라 0D 호가 푸시(on_tick)가 직접 한다.
+        갱신은 0D 호가·0B 체결 푸시(on_tick)가 직접 한다. 조회는 하지 않는다.
         """
         popup = self._bid_popups.get(code)
         if popup is not None:
@@ -4442,7 +4463,8 @@ class ConditionScreen(QWidget):
         stored = self.model.rows.get(code, {})
         popup = BidQtyPopup(
             self, code, str(stored.get("name") or code))
-        popup.set_value(int(stored.get("bid_qty") or 0))
+        popup.set_value(int(stored.get("bid_qty") or 0),
+                        int(stored.get("vol") or 0))
         self._bid_popups[code] = popup
         popup.show()
 
@@ -4776,11 +4798,14 @@ class ConditionScreen(QWidget):
             if stored is not None and _limit_tier(stored) == TIER_WAIT_CLEAN:
                 self._bidqty_probe.append(
                     (time.time(), code, stored["bid_qty"], stored["ask_qty"]))
-        # 0D는 매도쪽만 바뀌어도 오므로 매수잔량이 실린 틱만 확대 창에 넘긴다.
-        if self._bid_popups and "bid_qty" in fields:
+        # 0D는 매도쪽만, 0B는 체결만 바뀌어도 온다. 둘 중 하나가 실린 틱만
+        # 넘긴다. 값은 역행 틱을 걸러 낸 뒤인 표 기준으로 읽어야 표와 안 어긋난다.
+        if self._bid_popups and ("bid_qty" in fields or "vol" in fields):
             popup = self._bid_popups.get(code)
             if popup is not None:
-                popup.set_value(int(fields.get("bid_qty") or 0))
+                stored = self.model.rows.get(code) or {}
+                popup.set_value(int(stored.get("bid_qty") or 0),
+                                int(stored.get("vol") or 0))
         if code == self._order_target_code:
             self._refresh_order_target_display()
             upper = int(self.model.rows.get(code, {}).get("upper") or 0)
