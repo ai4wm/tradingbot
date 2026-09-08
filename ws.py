@@ -536,7 +536,9 @@ class WSClient:
             os.makedirs(VI_RAW_DIR, exist_ok=True)
             with open(_vi_raw_path(), "a", encoding="utf-8") as file:
                 file.write(json.dumps(row, ensure_ascii=False) + "\n")
-        except OSError as error:
+        except Exception as error:  # noqa: BLE001
+            # 곁다리 기록이 소켓을 끊으면 안 된다. 여기서 새어 나간 예외는
+            # 바깥 재접속 루프까지 올라가 접속을 다시 맺는다.
             if not self._vi_raw_failed:
                 self._vi_raw_failed = True   # 틱마다 같은 경고를 쏟지 않는다
                 log.warning("VI raw log write failed: %s", error)
