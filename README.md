@@ -102,6 +102,7 @@ Copy-Item .env.example .env
 - `layout.ini`: 창 위치, 열 너비와 사용자 설정
 - `bot.log`: 실행 로그
 - `data/market_analysis.db`: 분석 데이터베이스
+- `data/vi_raw_YYYYMMDD.jsonl`: 그날 수신한 VI 원본(시장 전체, 상한가 후보 분석용)
 - `data/telegram.session`: 텔레그램 로그인 세션
 - `data/web_profile`: 앱 안 웹 화면 캐시
 

@@ -11,6 +11,7 @@
 import asyncio
 import json
 import logging
+import os
 import time
 
 import websockets
@@ -68,6 +69,13 @@ FID_0W = {
 
 REAL_TYPES = ["0B", "0D", "0H", "0w", "1h"]  # 체결 / 호가 / 예상 / 프로그램 / VI
 REG_LIMIT_LOG_INTERVAL = 60.0
+
+VI_RAW_DIR = "data"
+
+
+def _vi_raw_path() -> str:
+    """VI 원본은 하루 한 파일. 날짜가 바뀌면 이름이 바뀐다."""
+    return os.path.join(VI_RAW_DIR, f"vi_raw_{time.strftime('%Y%m%d')}.jsonl")
 REG_LIMIT_LOG_SAMPLE = 5
 
 
@@ -196,10 +204,7 @@ class WSClient:
         self._real_stats: dict = {}        # 5초 단위 REAL 수신 빈도 (예상값 갱신속도 진단용)
         self._stats_t = 0.0
         self._last_reg_limit_log = 0.0
-        # ponytail: 1h가 등록 종목만 오는지 전 시장인지 실측. 미등록 발동이
-        # 잡히면 화면 밖 VI 포착이 공짜로 열린다. 확인되면 이 셋과 _vi_survey 삭제.
-        self._vi_survey: dict = {}
-        self._vi_survey_t = 0.0
+        self._vi_raw_failed = False        # VI 원본 기록 실패는 한 번만 알린다
 
     # --- 외부 API -------------------------------------------------------
     async def run(self, token_fn):
@@ -506,33 +511,35 @@ class WSClient:
     def _on_vi(self, item: dict):
         # 1h fid: 9001=코드(_AL 접미사), 9068=1 발동/2 해제, 1221=발동가격 (2026-07-07 실수신 확정)
         # 의심: 07-09 007390 해제가 하루종일 미처리(expOFF zero 0건). 9068이 발동/해제가 아니라
-        # 정적/동적 구분(1225와 동일)일 가능성 -> 우리 종목 raw 전체를 남겨 다음 VI에서 확정
+        # 정적/동적 구분(1225와 동일)일 가능성 -> 원본을 통째로 남겨 확정한다.
         v = item.get("values", {})
         code = (v.get("9001") or "").split("_")[0].lstrip("A")
         mine = any(c == code for c, _ in self._reg_codes)
-        if mine:
-            log.info("VI raw %s: %s", code, v)
-        self._survey_vi(code, mine, v.get("9068"))
+        self._log_vi_raw(code, mine, v)
         if code and self.on_vi:
             self.on_vi(code, v.get("9068") == "1", int(abs(_num(v.get("1221")))))
 
-    def _survey_vi(self, code: str, mine: bool, flag):
-        """1h 수신 범위 실측. bot.log는 WARNING 이상만 남아 warning으로 남긴다."""
-        s = self._vi_survey
-        s["mine" if mine else "other"] = s.get("mine" if mine else "other", 0) + 1
-        s.setdefault("codes", set()).add(("" if mine else "*") + code + str(flag))
-        now = time.monotonic()
-        if not self._vi_survey_t:
-            self._vi_survey_t = now
-            log.warning("VI survey start: first=%s mine=%s flag=%s reg=%d",
-                        code, mine, flag, len(self._reg_codes))
-        elif now - self._vi_survey_t >= 60:
-            log.warning("VI survey/%.0fs: mine=%d other=%d reg=%d samples=%s",
-                        now - self._vi_survey_t, s.get("mine", 0),
-                        s.get("other", 0), len(self._reg_codes),
-                        sorted(s["codes"])[:15])
-            self._vi_survey = {}
-            self._vi_survey_t = now
+    def _log_vi_raw(self, code: str, mine: bool, values: dict):
+        """VI 원본을 하루 한 파일에 그대로 남긴다.
+
+        1h는 등록 종목만이 아니라 시장 전체가 온다(2026-09-08 실측: 36분에
+        미등록 535건, 등록 120건). 상한가는 +10% 정적VI를 반드시 지나므로
+        이 파일이 화면 밖 종목까지 담은 상한가 후보 목록이 된다. 오늘 서전기전
+        (189860)은 VI가 상한가보다 7~8분, 조건검색 편입보다 2분 앞섰다.
+
+        FID를 골라 담지 않는 이유는 9068의 의미가 아직 확정이 아니어서다.
+        하루 2천여 건, 0.4MB라 압축하지 않는다.
+        """
+        row = {"ts": time.strftime("%H:%M:%S"), "code": code,
+               "mine": mine, "v": values}
+        try:
+            os.makedirs(VI_RAW_DIR, exist_ok=True)
+            with open(_vi_raw_path(), "a", encoding="utf-8") as file:
+                file.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except OSError as error:
+            if not self._vi_raw_failed:
+                self._vi_raw_failed = True   # 틱마다 같은 경고를 쏟지 않는다
+                log.warning("VI raw log write failed: %s", error)
 
     def _handle_condition(self, msg: dict):
         """CNSRREQ 응답 = 현재 편입 전체 스냅샷. 통째로 넘겨 diff는 main이 한다
@@ -571,6 +578,8 @@ class WSClient:
 
 def _demo():
     """소켓 없이 순수 로직 자가검증."""
+    import shutil
+    import tempfile
     # REG/REMOVE 빌드
     assert build_reg(["005930"], ["0B"])["data"][0]["item"] == ["005930"]
     assert build_remove(["005930"], ["0B"])["trnm"] == "REMOVE"
@@ -633,19 +642,17 @@ def _demo():
     c._on_real_condition({"type": "02", "values": {"841": "3", "9001": "011230", "843": "D", "20": "090430"}})
     c._on_real_condition({"type": "02", "values": {"841": "9", "9001": "005930", "843": "I"}})  # 미등록 조건 무시
     assert got == [("2", "294140", True), ("3", "011230", False)], got
-    # VI 발동/해제 (1h)
+    # VI 발동/해제 (1h). 원본 기록은 test_vi_raw_log.py가 따로 본다.
     vi = []
-    c.on_vi = lambda code, active, price: vi.append((code, active, price))
-    c._on_vi({"type": "1h", "values": {"9001": "109610_AL", "9068": "1", "1221": "2165"}})
-    c._on_vi({"type": "1h", "values": {"9001": "760006_AL", "9068": "2", "1221": "8260"}})
-    assert vi == [("109610", True, 2165), ("760006", False, 8260)], vi
-    # 수신 범위 실측: 등록 종목(109610)과 미등록(760006)을 갈라 세야 한다.
-    c._reg_codes = {("109610", None): 1}
-    c._vi_survey, c._vi_survey_t = {}, 0.0
-    c._on_vi({"type": "1h", "values": {"9001": "109610_AL", "9068": "1"}})
-    c._on_vi({"type": "1h", "values": {"9001": "760006_AL", "9068": "1"}})
-    assert c._vi_survey["mine"] == 1 and c._vi_survey["other"] == 1, c._vi_survey
-    assert c._vi_survey["codes"] == {"1096101", "*7600061"}, c._vi_survey
+    saved_dir, globals()["VI_RAW_DIR"] = VI_RAW_DIR, tempfile.mkdtemp()
+    try:
+        c.on_vi = lambda code, active, price: vi.append((code, active, price))
+        c._on_vi({"type": "1h", "values": {"9001": "109610_AL", "9068": "1", "1221": "2165"}})
+        c._on_vi({"type": "1h", "values": {"9001": "760006_AL", "9068": "2", "1221": "8260"}})
+        assert vi == [("109610", True, 2165), ("760006", False, 8260)], vi
+    finally:
+        shutil.rmtree(VI_RAW_DIR, ignore_errors=True)
+        globals()["VI_RAW_DIR"] = saved_dir
     # CNSRREQ 스냅샷 -> (seq, 코드 리스트)
     snap = []
     c.on_condition_snapshot = lambda seq, codes: snap.append((seq, codes))
