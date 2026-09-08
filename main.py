@@ -3293,6 +3293,10 @@ class App:
         self._save_order_settings()
         if sound:
             _beep(sound)
+        # 마지막 단계가 여기서 소진되면 그 뒤에 올 이벤트가 없다. 한 주도 못 산
+        # 종목은 매도 체결이 없어 `_track_open_sell` 갈래에 영영 닿지 않는다.
+        # 매도가 도는 중이면 관문이 막고, 그 경우는 체결 갈래가 맡는다.
+        self._clear_spent_balance_sell(code)
 
     async def _execute_balance_stage(
             self, code: str, depth: int, number: int, ratio: float,

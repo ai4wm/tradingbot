@@ -96,6 +96,7 @@ def _app(pending):
     app.orders.on_order_event = lambda event: None
     app._cancel_sent_orders = set()
     app._position_book = {}
+    app._position_book_primed = False
     app._open_sell_orders = {}
     app._position_fill_ids = set()
     app._position_filled = {}
@@ -253,6 +254,30 @@ async def check_balance_cleared_when_empty():
     only_cancel._clear_spent_balance_sell(code)
     assert code in only_cancel._account_auto_cancel_armed
     print("미리 걸어 둠  : 진행도 0·자동취소 단독은 유지")
+
+    # 한 주도 못 사고 미체결이 전부 취소된 종목. 매도 체결이 없으니 마지막
+    # 단계가 소진되는 그 자리에서 내려야 한다. 2026-09-08 224060 실제 사례다.
+    unheld = _app([])
+    unheld._position_book_primed = True
+    unheld._balance_sell_settings[code] = {
+        "first": 2_000_000, "second": 1_000_000, "third": 0,
+        "first_ratio": 0.0, "second_ratio": 1.0, "third_ratio": 1.0,
+        "market_sell": True}
+    unheld._balance_sell_date[code] = _main.datetime.now().strftime("%Y%m%d")
+    unheld._account_auto_cancel_armed.add(code)
+    unheld._position_book[code] = {"held": 0, "sellable": 0}
+    session, beep = _main._market_session_states, _main._beep
+    _main._market_session_states = lambda now: ("정규장", "정규장", "")
+    _main._beep = lambda *_args, **_kwargs: None
+    try:
+        unheld._check_balance_sell(code, 1_800_000)   # 1단: 소리만
+        assert code in unheld._balance_sell_settings   # 아직 2단이 남았다
+        unheld._check_balance_sell(code, 900_000)      # 2단: 팔 것이 없어 소진
+    finally:
+        _main._market_session_states, _main._beep = session, beep
+    assert code not in unheld._balance_sell_settings, unheld._balance_sell_settings
+    assert code not in unheld._account_auto_cancel_armed
+    print("매수 0 소진   : 매도 체결 없이도 해제")
 
 
 async def check_emergency_no_pending():
