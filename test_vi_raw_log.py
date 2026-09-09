@@ -25,6 +25,7 @@ def _client():
     client = ws.WSClient.__new__(ws.WSClient)
     client._reg_codes = {("189860", None): 1}
     client._vi_raw_failed = False
+    client._vi_seen = {}
     client.on_vi = None
     return client
 
@@ -72,6 +73,30 @@ def demo():
         # 파일 이름은 하루 하나. 이어 붙는다.
         assert os.path.basename(ws._vi_raw_path()).startswith("vi_raw_")
         assert len(rows) == 2, rows
+
+        # 1h는 같은 이벤트를 두 번씩 보낸다. 콜백은 한 번만 불러야 조회가
+        # 두 번 나가지 않는다. 원본 기록은 두 벌 다 남긴다.
+        twice = _client()
+        got = []
+        twice.on_vi = lambda *args: got.append(args)
+        event = {"type": "1h", "values": dict(RAW, **{"1223": "090403",
+                                                      "1224": "000000"})}
+        twice._on_vi(event)
+        twice._on_vi(event)
+        assert got == [("189860", True, 13650)], got
+        with open(ws._vi_raw_path(), encoding="utf-8") as file:
+            assert len(file.readlines()) == 4, "원본은 두 벌 다 남아야 한다"
+        # 해제는 발동과 다른 이벤트다. 접히면 안 된다.
+        twice._on_vi({"type": "1h", "values": dict(
+            RAW, **{"1223": "090403", "1224": "090611"})})
+        assert len(got) == 2, got
+        assert got[1] == ("189860", False, 13650), got
+        # 기억은 최근 것만 둔다. 하루치를 다 들고 있으면 안 된다.
+        for n in range(ws.VI_DEDUP_KEEP + 50):
+            twice._on_vi({"type": "1h", "values": dict(
+                RAW, **{"1223": f"{n:06d}", "1224": "000000"})})
+        assert len(twice._vi_seen) == ws.VI_DEDUP_KEEP, len(twice._vi_seen)
+        print("중복 수신  : 콜백 1회, 원본은 두 벌 다 남김")
 
         # 쓸 수 없어도 웹소켓 수신은 멈추면 안 된다. 경고는 한 번뿐이다.
         ws.VI_RAW_DIR = os.path.join(ws.VI_RAW_DIR, "vi_raw_x.jsonl")

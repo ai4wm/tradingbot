@@ -71,6 +71,7 @@ REAL_TYPES = ["0B", "0D", "0H", "0w", "1h"]  # 체결 / 호가 / 예상 / 프로
 REG_LIMIT_LOG_INTERVAL = 60.0
 
 VI_RAW_DIR = "data"
+VI_DEDUP_KEEP = 200  # 중복 수신을 접으려고 기억하는 최근 이벤트 수
 
 
 def _vi_raw_path() -> str:
@@ -219,6 +220,7 @@ class WSClient:
         self._stats_t = 0.0
         self._last_reg_limit_log = 0.0
         self._vi_raw_failed = False        # VI 원본 기록 실패는 한 번만 알린다
+        self._vi_seen: dict[tuple, None] = {}  # 중복 수신 접기(최근 것만)
 
     # --- 외부 API -------------------------------------------------------
     async def run(self, token_fn):
@@ -531,8 +533,26 @@ class WSClient:
         code = (v.get("9001") or "").split("_")[0].lstrip("A")
         mine = any(c == code for c, _ in self._reg_codes)
         self._log_vi_raw(code, mine, v)
-        if code and self.on_vi:
+        if code and self.on_vi and self._vi_first_time(code, v):
             self.on_vi(code, _vi_active(v), int(abs(_num(v.get("1221")))))
+
+    def _vi_first_time(self, code: str, values: dict) -> bool:
+        """같은 이벤트를 두 번째로 받은 것이면 False.
+
+        1h는 같은 이벤트를 두 번씩 보낸다(2026-09-09 1,114건 -> 접으면 560건).
+        그대로 흘리면 등록 종목마다 `_vi_fetch` 조회가 두 번 나간다.
+
+        원본 기록은 접지 않는다. 두 벌이 늘 같지는 않아서다 - 범한퓨얼셀
+        09:00:14은 누적거래량(13)만 2447297과 1로 달랐다.
+        """
+        key = (code, values.get("1223"), values.get("1224"),
+               values.get("1490"))
+        if key in self._vi_seen:
+            return False
+        self._vi_seen[key] = None
+        while len(self._vi_seen) > VI_DEDUP_KEEP:
+            del self._vi_seen[next(iter(self._vi_seen))]
+        return True
 
     def _log_vi_raw(self, code: str, mine: bool, values: dict):
         """VI 원본을 하루 한 파일에 그대로 남긴다.
