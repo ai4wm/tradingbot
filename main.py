@@ -1244,6 +1244,11 @@ class App:
                 _is_process_admin(), os.getpid())
             return
         screen.model.set_order_status(code, HOTKEY_CONFLICT_STATUS)
+        # 칸에 키가 남으면 앱이 뒤에 있을 때 안 먹는 줄 모른다. 청산키는
+        # 앱이 뒤에 있을 때 쓰는 물건이라 그대로 두면 안 된다. F12는 윈도우가
+        # 디버거용으로 영구 예약해 어떤 경우에도 등록되지 않는다.
+        screen.model.exit_hotkeys.pop(code, None)
+        screen._refresh_exit_hotkey_cell(code)
         log.error(
             "global exit hotkey registration failed code=%s key=%s screen=%s",
             code, spec.get("label"), screen.prefix)

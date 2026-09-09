@@ -4322,8 +4322,18 @@ class ConditionScreen(QWidget):
                     "text": event.text(),
                     "label": label,
                 })
-                log.warning("exit hotkey assigned code=%s key=%s", code, label)
-                QToolTip.showText(QCursor.pos(), f"{code} 청산키 {label} 등록")
+                # 전역 등록에 실패하면 main이 방금 넣은 배정을 도로 뺀다.
+                # 신호는 같은 스레드에서 바로 처리되므로 여기서 결과를 본다.
+                # 성공했다고 알린 뒤 실제로는 안 먹으면 앱이 뒤에 있을 때
+                # 눌러도 아무 일이 없다. 청산키는 그때 쓰는 물건이다.
+                ok = code in self.model.exit_hotkeys
+                log.warning(
+                    "exit hotkey %s code=%s key=%s",
+                    "assigned" if ok else "rejected", code, label)
+                QToolTip.showText(
+                    QCursor.pos(),
+                    f"{code} 청산키 {label} 등록" if ok else
+                    f"{code} 청산키 {label} 등록 실패 — 다른 키를 쓰세요")
                 return True
 
             focus = QApplication.focusWidget()
