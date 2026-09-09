@@ -29,7 +29,28 @@ def _client():
     return client
 
 
+def check_active_flag():
+    """발동/해제는 1224(해제 시각)로 가른다. 9068은 정적/동적 구분이다.
+
+    9068을 발동 플래그로 쓰던 시절에는 정적VI가 해제돼도 화면이 안 꺼지고
+    동적VI는 발동해도 안 켜졌다. 2026-09-09 수신 1,114건에서 9068은 1225와
+    100% 일치했다.
+    """
+    fire = dict(RAW, **{"1223": "090403", "1224": "000000"})
+    release = dict(RAW, **{"1223": "090403", "1224": "090611"})
+    assert ws._vi_active(fire) is True, fire
+    assert ws._vi_active(release) is False, release
+    # 동적VI(9068=2)도 발동이면 켜져야 한다. 예전에는 여기서 꺼졌다.
+    assert ws._vi_active(dict(fire, **{"9068": "2", "1225": "동적"})) is True
+    # 정적VI 해제는 꺼져야 한다. 예전에는 여기서 켜진 채로 남았다.
+    assert ws._vi_active(dict(release, **{"9068": "1"})) is False
+    # 값이 아예 없으면 발동으로 본다. 끄는 신호로 오해하면 안 된다.
+    assert ws._vi_active({}) is True
+    print("발동·해제  : 1224로 가름 (9068은 정적/동적)")
+
+
 def demo():
+    check_active_flag()
     client = _client()
     saved, ws.VI_RAW_DIR = ws.VI_RAW_DIR, tempfile.mkdtemp()
     try:

@@ -76,6 +76,20 @@ VI_RAW_DIR = "data"
 def _vi_raw_path() -> str:
     """VI 원본은 하루 한 파일. 날짜가 바뀌면 이름이 바뀐다."""
     return os.path.join(VI_RAW_DIR, f"vi_raw_{time.strftime('%Y%m%d')}.jsonl")
+
+
+def _vi_active(values: dict) -> bool:
+    """VI 발동이면 True, 해제면 False. 판별은 1224(해제 시각)로 한다.
+
+    발동 이벤트에는 아직 해제 시각이 없어 `000000`으로 온다. 랜덤엔드라
+    발동 시점에는 정해지지도 않는다.
+
+    예전에는 `9068 == "1"`을 발동으로 썼는데 그 값은 정적/동적 구분이다
+    (2026-09-09 수신 1,114건 전부 `1225`와 일치, 어긋난 건 0). 그래서 정적VI는
+    해제가 와도 안 꺼지고 동적VI는 발동해도 안 켜졌다. `ws.py`에 오래 적혀
+    있던 "07-09 007390 해제가 하루종일 미처리"가 이것이었다.
+    """
+    return str(values.get("1224") or "").strip() in ("", "0", "000000")
 REG_LIMIT_LOG_SAMPLE = 5
 
 
@@ -511,15 +525,14 @@ class WSClient:
     def _on_vi(self, item: dict):
         # 1h fid: 9001=코드(_AL 접미사), 1221=발동가격, 1223/1224=발동·해제 시각,
         # 1225=정적/동적, 1236=정적 기준가격, 1238=정적 괴리율(부호가 방향),
-        # 1279='+정적'/'-동적'. 표는 CLAUDE.md 11절에 있다(2026-09-08 실수신).
-        # 9068은 여전히 미확인이다(1만 관측). 발동/해제 판정을 여기에만 기대지
-        # 말고, 확정이 필요하면 vi_raw 파일의 1223·1224를 봐야 한다.
+        # 1279='+정적'/'-동적', 1490=그날 그 종목의 VI 발동 횟수.
+        # 표는 CLAUDE.md 11절에 있다.
         v = item.get("values", {})
         code = (v.get("9001") or "").split("_")[0].lstrip("A")
         mine = any(c == code for c, _ in self._reg_codes)
         self._log_vi_raw(code, mine, v)
         if code and self.on_vi:
-            self.on_vi(code, v.get("9068") == "1", int(abs(_num(v.get("1221")))))
+            self.on_vi(code, _vi_active(v), int(abs(_num(v.get("1221")))))
 
     def _log_vi_raw(self, code: str, mine: bool, values: dict):
         """VI 원본을 하루 한 파일에 그대로 남긴다.
@@ -651,8 +664,12 @@ def _demo():
     saved_dir, globals()["VI_RAW_DIR"] = VI_RAW_DIR, tempfile.mkdtemp()
     try:
         c.on_vi = lambda code, active, price: vi.append((code, active, price))
-        c._on_vi({"type": "1h", "values": {"9001": "109610_AL", "9068": "1", "1221": "2165"}})
-        c._on_vi({"type": "1h", "values": {"9001": "760006_AL", "9068": "2", "1221": "8260"}})
+        # 발동은 1224가 000000, 해제는 해제 시각이 실려 온다. 9068(정적/동적)로
+        # 가르면 정적VI가 해제돼도 안 꺼진다.
+        c._on_vi({"type": "1h", "values": {
+            "9001": "109610_AL", "9068": "1", "1224": "000000", "1221": "2165"}})
+        c._on_vi({"type": "1h", "values": {
+            "9001": "760006_AL", "9068": "1", "1224": "091133", "1221": "8260"}})
         assert vi == [("109610", True, 2165), ("760006", False, 8260)], vi
     finally:
         shutil.rmtree(VI_RAW_DIR, ignore_errors=True)
