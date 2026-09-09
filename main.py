@@ -208,6 +208,28 @@ class WindowsGlobalHotkeys(QAbstractNativeEventFilter):
                     return True, 0
         return False, 0
 
+# 청산키 등록 실패를 알리려고 주문상태 칸을 잠깐 빌려 쓰는 값. 주문 상태가
+# 아니므로 저장하지 않고, 다시 등록하거나 해제하면 지운다.
+HOTKEY_CONFLICT_STATUS = "키충돌"
+
+
+def _drop_hotkey_conflicts(order_status: dict | None) -> dict:
+    """저장·복원할 주문상태에서 청산키 실패 알림만 걷어낸다.
+
+    남기면 켤 때마다 되살아나고, 그 종목은 청산키를 다시 걸기 전까지 지울
+    길이 없다(2026-09-09 224060). 알림은 그때 한 번 보면 끝이다.
+    """
+    result = {}
+    for prefix, entries in (order_status or {}).items():
+        kept = {
+            code: value for code, value in (entries or {}).items()
+            if (value[0] if isinstance(value, list) else value)
+            != HOTKEY_CONFLICT_STATUS
+        }
+        if kept:
+            result[prefix] = kept
+    return result
+
 MAX_WINDOWS = 3  # 실시간 등록 ~100종목 한도 내 (조건당 20~30종목 기준)
 RANK_SEQ = "RANK"      # [순위]조회순위 (ka00198 폴 -> on_snapshot)
 HOLDINGS_SEQ = "HOLDINGS"  # [계좌]보유종목 (kt00018)
@@ -1194,6 +1216,7 @@ class App:
         if spec is None:
             self._global_hotkeys.unregister(token)
             self._exit_hotkey_specs.get(screen.prefix, {}).pop(code, None)
+            self._clear_hotkey_conflict(code)
             if persist:
                 self._save_order_settings()
             audit_log.info(
@@ -1211,6 +1234,7 @@ class App:
                                       | int(assigned.get("modifiers") or 0)) == combined:
                     specs.pop(other, None)
             specs[code] = dict(spec)
+            self._clear_hotkey_conflict(code)
             if persist:
                 self._save_order_settings()
             log.warning(
@@ -1219,10 +1243,21 @@ class App:
                 code, spec.get("label"), screen.prefix,
                 _is_process_admin(), os.getpid())
             return
-        screen.model.set_order_status(code, "키충돌")
+        screen.model.set_order_status(code, HOTKEY_CONFLICT_STATUS)
         log.error(
             "global exit hotkey registration failed code=%s key=%s screen=%s",
             code, spec.get("label"), screen.prefix)
+
+    def _clear_hotkey_conflict(self, code: str):
+        """등록에 성공했거나 해제했으면 실패 알림을 내린다.
+
+        주문상태 칸을 빌려 쓰는 값이라 진짜 주문상태는 건드리면 안 된다.
+        창마다 따로 뜨므로 모든 창에서 지운다.
+        """
+        for view in self.views:
+            model = view.screen.model
+            if model.order_status.get(code) == HOTKEY_CONFLICT_STATUS:
+                model.set_order_status(code, "")
 
     def _on_global_exit_hotkey(self, payload: tuple):
         screen, code, label = payload
@@ -2896,14 +2931,14 @@ class App:
             "balance_sell": self._balance_sell_settings,
             "balance_stage": self._balance_sell_stage,
             "auto_cancel": sorted(self._account_auto_cancel_armed),
-            "order_status": {
+            "order_status": _drop_hotkey_conflicts({
                 view.screen.prefix: {
                     code: [text, code in view.screen.model.order_cancellable]
                     for code, text in view.screen.model.order_status.items()
                 }
                 for view in self.views
                 if view.screen.model.order_status
-            },
+            }),
         }
         live = any(state[key] for key in (
             "balance_sell", "auto_cancel", "order_status"))
@@ -2940,6 +2975,9 @@ class App:
             state = {}
         if state and str(state.get("date") or "") == datetime.now().strftime(
                 "%Y%m%d"):
+            # 옛 저장분에 남은 청산키 실패 알림은 되살리지 않는다.
+            state["order_status"] = _drop_hotkey_conflicts(
+                state.get("order_status"))
             self._pending_order_restore = state
         elif state:
             # 어제 것이다. 기준 잔량도 진행도도 오늘과 무관하다.

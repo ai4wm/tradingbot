@@ -217,6 +217,29 @@ def demo():
     assert app._pending_order_restore == {}, app._pending_order_restore
     assert app._exit_hotkey_specs == {}, app._exit_hotkey_specs
 
+    # 10) 키충돌은 청산키 등록 실패 알림이지 주문 상태가 아니다. 저장도
+    #     복원도 하지 않는다. 남기면 켤 때마다 되살아나고, 그 종목은 청산키를
+    #     다시 걸기 전까지 지울 길이 없다(2026-09-09 224060).
+    seed()
+    app = Stub()
+    app._balance_sell_settings = {CODE: SETTING}
+    app.views[0].screen.model.set_order_status(CODE, "키충돌")
+    app._save_order_settings()
+    state = json.loads(QSettings(INI, QSettings.IniFormat).value("order/auto_state"))
+    assert state["order_status"] == {}, state
+
+    # 옛 저장분에 남아 있어도 되살리지 않는다. 진짜 주문상태는 그대로 온다.
+    seed(auto_state={"date": today, "balance_sell": {CODE: SETTING},
+                     "order_status": {"": {CODE: ["키충돌", True],
+                                           "005930": ["접수", True]}}})
+    app = Stub(codes=(CODE, "005930"))
+    app._load_order_settings()
+    assert app._order_restore_summary() == "3단매도 1 · 주문상태 1", \
+        app._order_restore_summary()
+    app._apply_order_restore()
+    model = app.views[0].screen.model
+    assert model.order_status == {"005930": "접수"}, model.order_status
+
     QSettings(INI, QSettings.IniFormat).clear()
     if os.path.exists(INI):
         os.remove(INI)
