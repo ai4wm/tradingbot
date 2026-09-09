@@ -4021,6 +4021,22 @@ def backfill_news_themes(days: int = NEWS_THEME_MAX_AGE_DAYS,
             linked += len(_link_news_themes(
                 connection, codes, row["title"],
                 str(row["published_at"])[:10].replace("-", ""), seen))
+        # 네이버 뉴스는 제목에 종목명이 그대로 있는 것만 본다. 이유는
+        # `save_news_items`의 같은 조건에 적어 두었다. 여기서 빼면
+        # 저장 때 붙인 연결을 아래 삭제 단계가 도로 지운다.
+        for row in connection.execute(
+                """SELECT n.published_at_source AS published_at,
+                          m.stock_code, n.current_title AS title
+                     FROM news_items n
+                     JOIN news_stock_maps m ON m.news_id=n.news_id
+                     JOIN stocks s ON s.stock_code=m.stock_code
+                    WHERE REPLACE(SUBSTR(n.published_at_source,1,10),'-','')>=?
+                      AND s.stock_name<>''
+                      AND INSTR(n.current_title, s.stock_name)>0""",
+                (since,)).fetchall():
+            linked += len(_link_news_themes(
+                connection, [row["stock_code"]], row["title"],
+                str(row["published_at"])[:10].replace("-", ""), seen))
         stale = [
             (row["stock_code"], row["theme_id"], row["valid_from"])
             for row in connection.execute(
@@ -5502,10 +5518,6 @@ def save_news_items(stock_code: str, stock_name: str, rows: list[dict],
                 )
                 result["new"] += 1
                 result["new_ids"].append(news_id)
-                # 네이버 뉴스는 테마 편입에 쓰지 않는다. 종목명으로 검색해
-                # 가져오므로 본문에 이름만 스친 남의 회사 기사까지 들어온다.
-                # "HD현대 조선그룹…" 기사가 본문의 증권사 이름 때문에 그
-                # 증권사 종목에 조선·원자력을 붙이는 식이다.
             else:
                 news_id = int(existing["news_id"])
                 incoming_hash = str(item.get("current_hash") or "")
@@ -5584,6 +5596,20 @@ def save_news_items(stock_code: str, stock_name: str, rows: list[dict],
                        mapped_at=excluded.mapped_at""",
                 (news_id, stock_code, stock_name, confidence, now),
             )
+            # 네이버 뉴스는 제목에 종목명이 그대로 있을 때만 테마에 붙인다.
+            # 종목명으로 검색해 가져오므로 요약문에 이름만 스친 시황 기사가
+            # 잔뜩 딸려 온다. 2026-09-07~09 표본에서 테마가 잡힌 47건 중 33건이
+            # 그런 것이었다("원전주 급등" 시황이 더코디에 원자력을, "반도체
+            # 장비주" 마감시황이 케이엠제약에 반도체장비를 붙이는 식).
+            # `confidence` 0.9로는 못 거른다. 요약문까지 보고 매기므로 종목명이
+            # 나열된 시황 기사도 0.9가 된다. 제목으로 자르면 14건만 남고
+            # 오염이 사라진다.
+            title = str(item.get("title") or "")
+            if stock_name and stock_name in title:
+                _link_news_themes(
+                    connection, [stock_code], title,
+                    published[:10].replace("-", "")
+                    or datetime.now().strftime("%Y%m%d"))
             connection.execute(
                 """INSERT INTO news_material_labels(
                        news_id, material_type, confidence,
