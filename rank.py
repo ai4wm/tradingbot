@@ -505,7 +505,9 @@ class RankScreen(QWidget):
         if not index.isValid() or index.column() != FIELDS.index("name"):
             return
         code = self.model.rows[index.row()]["code"]
-        QDesktopServices.openUrl(QUrl(f"https://finance.naver.com/item/board.naver?code={code}"))
+        # 2026-09-11 네이버 증권 새 화면 주소. 옛 board.naver는 리다이렉트된다.
+        QDesktopServices.openUrl(QUrl(
+            f"https://stock.naver.com/domestic/stock/{code}/discussion?filter=all"))
 
     def _save_layout(self):
         self._settings.setValue("rank_geometry", self.saveGeometry())

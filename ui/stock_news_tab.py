@@ -855,11 +855,18 @@ class StockNewsTabMixin:
             self._news_status.setText(
                 "왼쪽 감시목록에서 종목을 먼저 선택해 주세요.")
             return
+        # 스크롤 보정 없이 그대로 연다. 새 네이버 증권 화면에는 맞출 중간
+        # 메뉴가 없어서 "item" 갈래를 2026-09-11에 지웠다.
+        code = self._selected_watch_code
+        if page == "board.naver":
+            # 종목토론만 새 주소를 안다. 나머지 여덟은 옛 주소가 리다이렉트로
+            # 살아 있어 그대로 둔다. 주소를 확인하는 대로 하나씩 옮긴다.
+            self._show_news_web_url(
+                f"https://stock.naver.com/domestic/stock/{code}"
+                f"/discussion?filter=all")
+            return
         self._show_news_web_url(
-            f"https://finance.naver.com/item/{page}?code="
-            f"{self._selected_watch_code}",
-            "item",
-        )
+            f"https://finance.naver.com/item/{page}?code={code}")
 
     def _open_selected_watch_board(self):
         self._open_selected_watch_page("board.naver")
@@ -879,268 +886,44 @@ class StockNewsTabMixin:
         self._news_webview.setUrl(QUrl(self._news_current_url))
 
     def _news_web_load_finished(self, succeeded: bool):
-        """종목 페이지는 중간 메뉴, 뉴스 기사는 실제 제목부터 보이게 한다."""
+        """뉴스 기사는 실제 제목부터 보이게 스크롤한다.
+
+        종목 페이지 갈래(오늘글 강조·종목 중간 메뉴 정렬)는 2026-09-11에
+        지웠습니다. 네이버 증권이 새 화면으로 바뀌면서 기대던 DOM이 통째로
+        사라졌습니다 — `table tr`도 `ul.tabs_submenu`도 없고, 목록 시각이
+        "16분 전" 같은 상대 표기라 날짜 문자열로 오늘 글을 가릴 수도
+        없습니다. 오류 없이 조용히 안 돌고 있었습니다.
+        """
         if not succeeded or self._news_webview is None:
             return
-        current_url = self._news_webview.url()
-        loaded_url = current_url.toString()
-        item_menu_paths = {
-            "/item/main.naver", "/item/sise.naver", "/item/fchart.naver",
-            "/item/frgn.naver", "/item/news.naver", "/item/coinfo.naver",
-            "/item/board.naver", "/item/dart.naver",
-            "/item/short_trade.naver",
-        }
-        is_item_page = (
-            current_url.host().lower() == "finance.naver.com"
-            and (
-                current_url.path() in item_menu_paths
-                or current_url.path() == "/item/board_read.naver"
-            )
-        )
-        if is_item_page:
-            today_highlight = ""
-            today_page_labels = {
-                "/item/board.naver": "게시글",
-                "/item/news.naver": "뉴스",
-                "/item/dart.naver": "공시",
-            }
-            today_page_label = today_page_labels.get(current_url.path())
-            if today_page_label:
-                today_short = datetime.now().strftime("%y.%m.%d")
-                today_long_dot = datetime.now().strftime("%Y.%m.%d")
-                today_long_dash = datetime.now().strftime("%Y-%m-%d")
-                today_month_day = datetime.now().strftime("%m.%d")
-                today_highlight = f"""
-                    const todayLabels = [
-                        {today_short!r}, {today_long_dot!r},
-                        {today_long_dash!r}, {today_month_day!r}
-                    ];
-                    const applyTodayHighlight = () => {{
-                    let todayCount = 0;
-                    // 뉴스·공시 목록은 본문 iframe에 들어가므로 함께 검사한다.
-                    const documents = [document];
-                    for (const frame of document.querySelectorAll('iframe')) {{
-                        try {{
-                            if (frame.contentDocument) documents.push(frame.contentDocument);
-                        }} catch (_error) {{}}
-                    }}
-                    for (const source of documents) {{
-                        for (const row of source.querySelectorAll('table tr')) {{
-                            // 이미 칠한 행은 다시 만지지 않는다. 스윕이 여러 번
-                            // 돌 때 스타일 재계산이 그만큼 반복되기 때문이다.
-                            if (row.dataset.codexToday) {{
-                                todayCount += 1;
-                                continue;
-                            }}
-                            // innerText는 행마다 강제 레이아웃을 부른다.
-                            // 날짜 문자열만 찾으므로 textContent로 충분하다.
-                            const text = (row.textContent || '').replace(/\\s+/g, ' ');
-                            const isToday = todayLabels.some(label => text.includes(label));
-                            if (!isToday) continue;
-                            todayCount += 1;
-                            row.dataset.codexToday = '1';
-                            row.style.setProperty('background-color', '#FFF3B0', 'important');
-                            row.style.setProperty('box-shadow', 'inset 4px 0 #F57C00', 'important');
-                            row.style.setProperty('font-weight', '700', 'important');
-                            for (const cell of row.querySelectorAll('td, th')) {{
-                                cell.style.setProperty('background-color', '#FFF3B0', 'important');
-                                cell.style.setProperty('font-weight', '700', 'important');
-                            }}
-                            row.title = '오늘 {today_page_label}';
-                        }}
-                    }}
-                    const board = document.querySelector('#content, #container, body');
-                    if (board) {{
-                        let badge = document.getElementById('codex-today-item-badge');
-                        if (!badge) {{
-                            badge = document.createElement('div');
-                            badge.id = 'codex-today-item-badge';
-                            badge.style.cssText = [
-                                'position:sticky', 'top:0', 'z-index:9999',
-                                'display:inline-block', 'margin:4px 0',
-                                'padding:3px 8px', 'border-radius:3px',
-                                'background:#FFF3B0', 'color:#6D4300',
-                                'font:700 12px sans-serif'
-                            ].join(';');
-                            board.prepend(badge);
-                        }}
-                        badge.textContent = `오늘 {today_page_label} 강조: ${{todayCount}}건`;
-                    }}
-                    }};
-                    applyTodayHighlight();
-                    // 이 스크립트는 한 페이지에서 두 번 실행된다. 후속 스윕
-                    // 예약과 iframe 리스너는 첫 실행에서만 건다. 그러지 않으면
-                    // 리스너가 중복 등록되어 같은 훑기가 배로 돈다.
-                    if (!window.__analysisTodayHighlightBound) {{
-                        window.__analysisTodayHighlightBound = true;
-                        // 상위 문서는 먼저 끝나고 목록 iframe이 뒤늦게 채워진다.
-                        for (const frame of document.querySelectorAll('iframe')) {{
-                            frame.addEventListener('load', applyTodayHighlight);
-                        }}
-                        window.setTimeout(applyTodayHighlight, 500);
-                        window.setTimeout(applyTodayHighlight, 1500);
-                    }}
-                """
-            script = f"""
-                (() => {{
-                    const itemMenuPaths = new Set([
-                        '/item/main.naver', '/item/sise.naver',
-                        '/item/fchart.naver', '/item/frgn.naver',
-                        '/item/news.naver', '/item/coinfo.naver',
-                        '/item/board.naver', '/item/dart.naver',
-                        '/item/short_trade.naver'
-                    ]);
-                    const findItemMenu = () => {{
-                        // 목록과 본문에 공통으로 있는 정확한 종목 중간 메뉴를
-                        // 먼저 사용한다. inner_sub는 게시글 본문 영역이므로
-                        // 본문보기에서 스크롤 기준으로 사용하면 위치가 달라진다.
-                        const exactMenu = document.querySelector(
-                            'ul.tabs_submenu.tab_total_submenu'
-                        );
-                        if (exactMenu) return exactMenu;
-
-                        const candidates = Array.from(
-                            document.querySelectorAll(
-                                'ul.tabs_submenu, [class*="tabs_submenu"]'
-                            )
-                        );
-                        let bestTarget = null;
-                        let bestScore = 0;
-                        for (const candidate of candidates) {{
-                            const matchedPaths = new Set();
-                            for (const link of candidate.querySelectorAll(
-                                'a[href]'
-                            )) {{
-                                try {{
-                                    const path = new URL(
-                                        link.getAttribute('href'), location.href
-                                    ).pathname.replace(/\/$/, '');
-                                    if (itemMenuPaths.has(path)) {{
-                                        matchedPaths.add(path);
-                                    }}
-                                }} catch (_error) {{}}
-                            }}
-                            if (matchedPaths.size > bestScore) {{
-                                bestScore = matchedPaths.size;
-                                bestTarget = candidate;
-                            }}
-                        }}
-                        return bestScore >= 3 ? bestTarget : null;
-                    }};
-
-                    // 300ms마다 다시 찾으면 링크마다 new URL을 만드는 탐색이
-                    // 반복된다. 한 번 찾은 메뉴는 문서에 붙어 있는 동안 쓴다.
-                    let cachedMenu = null;
-                    const alignItemMenu = () => {{
-                        if (cachedMenu && !cachedMenu.isConnected) {{
-                            cachedMenu = null;
-                        }}
-                        const target = cachedMenu || (cachedMenu = findItemMenu());
-                        if (!target) return false;
-                        const top = Math.max(
-                            0,
-                            target.getBoundingClientRect().top
-                                + window.scrollY - 4
-                        );
-                        window.scrollTo(0, top);
-                        return true;
-                    }};
-
-                    try {{
-                        history.scrollRestoration = 'manual';
-                    }} catch (_error) {{}}
-                    const aligned = alignItemMenu();
-
-                    if (location.pathname.replace(/\/$/, '') ===
-                        '/item/board_read.naver') {{
-                        // Chromium이 내용보기에서 목록의 이전 스크롤 위치를
-                        // 뒤늦게 복원하거나 광고 영역 높이가 변해도 공통 메뉴가
-                        // 목록과 같은 자리에 있도록 잠깐만 보정한다.
-                        if (window.__analysisBoardMenuAlignTimer) {{
-                            window.clearInterval(
-                                window.__analysisBoardMenuAlignTimer
-                            );
-                        }}
-                        // 같은 2.4초를 덮되 훑는 횟수를 1/3로 줄인다. 100ms는
-                        // 사용자가 스크롤을 시작한 프레임과 겹쳐 손으로 잡아
-                        // 끄는 느낌을 준다.
-                        let remainingAlignments = 8;
-                        let userMovedPage = false;
-                        const cancelAlignment = () => {{
-                            userMovedPage = true;
-                            if (window.__analysisBoardMenuAlignTimer) {{
-                                window.clearInterval(
-                                    window.__analysisBoardMenuAlignTimer
-                                );
-                                window.__analysisBoardMenuAlignTimer = null;
-                            }}
-                        }};
-                        const moveEvents = [
-                            'wheel', 'touchstart', 'pointerdown', 'keydown'
-                        ];
-                        // 목록·본문이 iframe에 들어가면 그 안에서 굴린 휠은
-                        // 부모 window에 오지 않는다. 취소가 안 걸려 2.4초 내내
-                        // 스크롤이 튕기므로 하위 문서에도 같이 건다.
-                        const cancelTargets = [window];
-                        for (const frame of document.querySelectorAll('iframe')) {{
-                            try {{
-                                if (frame.contentWindow) {{
-                                    cancelTargets.push(frame.contentWindow);
-                                }}
-                            }} catch (_error) {{}}
-                        }}
-                        for (const target of cancelTargets) {{
-                            for (const eventName of moveEvents) {{
-                                try {{
-                                    target.addEventListener(
-                                        eventName, cancelAlignment,
-                                        {{ once: true, capture: true }}
-                                    );
-                                }} catch (_error) {{}}
-                            }}
-                        }}
-                        window.__analysisBoardMenuAlignTimer =
-                            window.setInterval(() => {{
-                                if (userMovedPage ||
-                                    --remainingAlignments <= 0) {{
-                                    cancelAlignment();
-                                    return;
-                                }}
-                                alignItemMenu();
-                            }}, 300);
-                    }}
-                    {today_highlight}
-                    return aligned;
-                }})();
-            """
-        elif self._news_scroll_mode == "article":
-            script = """
-                (() => {
-                    const selectors = [
-                        '#title_area', '.media_end_head_headline',
-                        'article h1', 'main h1', '.article_title',
-                        '.news_title', '.headline', 'h1',
-                        '[class*="article"] h2'
-                    ];
-                    for (const selector of selectors) {
-                        const candidates = document.querySelectorAll(selector);
-                        for (const target of candidates) {
-                            const style = window.getComputedStyle(target);
-                            const rect = target.getBoundingClientRect();
-                            if (style.display === 'none' ||
-                                style.visibility === 'hidden' ||
-                                rect.width === 0 || rect.height === 0 ||
-                                !target.textContent.trim()) continue;
-                            const top = rect.top + window.scrollY;
-                            window.scrollTo(0, Math.max(0, top - 6));
-                            return true;
-                        }
-                    }
-                    return false;
-                })();
-            """
-        else:
+        if self._news_scroll_mode != "article":
             return
+        loaded_url = self._news_webview.url().toString()
+        script = """
+            (() => {
+                const selectors = [
+                    '#title_area', '.media_end_head_headline',
+                    'article h1', 'main h1', '.article_title',
+                    '.news_title', '.headline', 'h1',
+                    '[class*="article"] h2'
+                ];
+                for (const selector of selectors) {
+                    const candidates = document.querySelectorAll(selector);
+                    for (const target of candidates) {
+                        const style = window.getComputedStyle(target);
+                        const rect = target.getBoundingClientRect();
+                        if (style.display === 'none' ||
+                            style.visibility === 'hidden' ||
+                            rect.width === 0 || rect.height === 0 ||
+                            !target.textContent.trim()) continue;
+                        const top = rect.top + window.scrollY;
+                        window.scrollTo(0, Math.max(0, top - 6));
+                        return true;
+                    }
+                }
+                return false;
+            })();
+        """
 
         def scroll_loaded_page():
             if self._news_webview is None:
@@ -1148,15 +931,8 @@ class StockNewsTabMixin:
             if self._news_webview.url().toString() == loaded_url:
                 self._news_webview.page().runJavaScript(script)
 
-        # 종목토론 내용보기는 자바스크립트가 약 2.4초 동안 레이아웃 변화를
-        # 추적한다. 바깥 타이머를 다시 걸면 사용자의 직접 스크롤 이후에도
-        # 위치를 되돌릴 수 있으므로 내용보기에는 한 번만 실행한다.
-        delays = (
-            (0,)
-            if current_url.path() == "/item/board_read.naver"
-            else (0, 500)
-        )
-        for delay in delays:
+        # 첫 실행이 레이아웃 전이면 놓치므로 0.5초 뒤 한 번 더 맞춘다.
+        for delay in (0, 500):
             QTimer.singleShot(delay, scroll_loaded_page)
 
     def _news_web_action(self, action: str):

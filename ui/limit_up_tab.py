@@ -404,8 +404,10 @@ class LimitUpTabMixin:
         stock_code = (
             item.data(Qt.ItemDataRole.UserRole + 2) or "")
         if stock_code:
+            # 2026-09-11 네이버 증권 새 화면 주소.
             QDesktopServices.openUrl(QUrl(
-                f"https://finance.naver.com/item/board.naver?code={stock_code}"))
+                f"https://stock.naver.com/domestic/stock/{stock_code}"
+                f"/discussion?filter=all"))
 
     def _limit_stock_code(self, row: int) -> str:
         item = self._limit_table.item(row, 0)

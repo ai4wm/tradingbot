@@ -4499,7 +4499,10 @@ class ConditionScreen(QWidget):
         if index.isValid() and index.column() == NAME_COL:
             code = self.model.codes[self.proxy.mapToSource(index).row()]
             QDesktopServices.openUrl(QUrl(
-                f"https://finance.naver.com/item/board.naver?code={code}"))
+                # 2026-09-11 네이버 증권 새 화면. 옛 board.naver는 여기로
+                # 넘어오지만 한 번 더 거치므로 직접 연다.
+                f"https://stock.naver.com/domestic/stock/{code}"
+                f"/discussion?filter=all"))
             return
         self._show_column_menu(self.table.viewport().mapToGlobal(pos))
 
