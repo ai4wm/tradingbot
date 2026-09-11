@@ -3540,6 +3540,39 @@ class App:
         if code in self._emergency_recheck:
             self._emergency_recheck.discard(code)
             self._queue_emergency_reconcile(code)
+            return
+        self._clear_after_emergency(code)
+
+    def _clear_after_emergency(self, code: str):
+        """청산이 끝나고 남은 것이 없으면 3단매도·자동취소·청산키를 내린다.
+
+        청산키는 "이 종목 끝"이라는 명시적 의사표시다. 단계를 다 지났는지
+        묻는 `_clear_spent_balance_sell`의 관문은 여기에 맞지 않는다 — 청산으로
+        끝내면 진행도가 0이라 영영 안 내려간다. 매도 체결도 없어서 그쪽
+        갈래에도 안 닿는다(2026-09-11 006490·007540, 둘 다 손으로 내렸다).
+        """
+        if code not in self._emergency_locked:
+            return  # 주문허용이 꺼져 실제로 청산이 나가지 않았다
+        if not self._position_book_primed:
+            return  # 잔고를 모르는 상태에서 감시를 내리면 안 된다
+        if (self._position_book.get(code) or {}).get("held", 0) > 0:
+            return
+        if self._pending_open_buys(code):
+            return
+        armed = code in self._account_auto_cancel_armed
+        setting = code in self._balance_sell_settings
+        hotkey = any(code in specs
+                     for specs in self._exit_hotkey_specs.values())
+        if not (armed or setting or hotkey):
+            return
+        audit_log.info(
+            "emergency cleared settings code=%s balance_sell=%s "
+            "auto_cancel=%s hotkey=%s", code, setting, armed, hotkey)
+        if setting:
+            self._set_balance_sell(code, None)
+        if armed:
+            self._set_account_auto_cancel(code, False)
+        self._clear_exit_hotkey(code)
 
     async def _emergency_exit_async(
             self, code: str, price: int, order_enabled: bool):
@@ -3547,9 +3580,16 @@ class App:
         # 청산 순간에 두 건을 부르면 그만큼 매도가 늦는다.
         booked = self._position_book.get(code)
         booked_buys = self._pending_open_buys(code)
-        if booked is not None:
+        if booked is not None or self._position_book_primed:
+            # 장부를 세운 뒤에는 항목이 없는 것도 보유 0으로 믿는다. 장부
+            # 항목은 체결이 있어야 생기므로, 미체결만 있고 아직 체결은 없는
+            # 상태 — 청산키를 가장 많이 누를 그 순간 — 이 정확히 가장 느렸다.
+            # 조회 큐가 1초에 1건이라 두 건을 부르면 그대로 1초가 붙는다
+            # (2026-09-11 10:39 006490 눌림→취소발사 1,085ms. 3단매도 정상은
+            # 191~242ms). `_check_balance_sell`은 이미 같은 규칙을 쓴다.
             position = {
-                "held_qty": booked["held"], "sellable_qty": booked["sellable"]}
+                "held_qty": (booked or {}).get("held", 0),
+                "sellable_qty": (booked or {}).get("sellable", 0)}
             open_buys = [
                 {"code": code, "order_no": order_no,
                  "remaining_qty": qty, "exchange": exchange}

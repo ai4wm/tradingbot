@@ -355,6 +355,69 @@ async def check_emergency_with_book():
     print("청산키(장부) :", calls)
 
 
+async def check_emergency_primed_without_entry():
+    """장부를 세운 뒤면 항목이 없어도 조회 없이 바로 나가야 한다.
+
+    장부 항목은 체결이 있어야 생긴다. 미체결만 있고 아직 체결은 없는 상태가
+    청산키를 가장 많이 누를 순간인데, 거기서 계좌조회 두 건을 기다렸다.
+    조회 큐가 1초에 1건이라 그대로 1초가 붙는다(2026-09-11 10:39 006490
+    눌림→취소발사 1,085ms, 3단매도 정상은 191~242ms).
+    """
+    app = _app(ONE_PENDING)
+    app._position_book_primed = True       # 계좌를 읽었고 이 종목은 보유 0
+    await app._emergency_exit_async("005930", 69000, True)
+    calls = app.rest.calls
+    assert "position" not in calls, calls
+    assert "open_buys_query" not in calls, calls
+    assert "cancel_start:0009" in calls, calls
+    print("청산키(항목없음):", calls)
+
+
+async def check_emergency_clears_settings():
+    """청산은 '이 종목 끝'이다. 3단매도·자동취소·청산키를 함께 내린다.
+
+    3단매도의 100% 전량매도와 하는 일이 같은데, 단계를 지나 끝낸 것이
+    아니라 진행도가 0이라 `_clear_spent_balance_sell`의 관문에 걸렸다.
+    매도 체결도 없어 그쪽 갈래에도 안 닿는다(2026-09-11 006490·007540).
+    """
+    code = "005930"
+    app = _app([])
+    app._position_book_primed = True
+    app._position_book[code] = {"held": 0, "sellable": 0}
+    app._balance_sell_settings[code] = {
+        "first": 0, "second": 600_000, "third": 0,
+        "first_ratio": 0.0, "second_ratio": 1.0, "third_ratio": 1.0,
+        "market_sell": True}
+    app._balance_sell_date[code] = _main.datetime.now().strftime("%Y%m%d")
+    app._account_auto_cancel_armed.add(code)
+    screen = _HotkeyScreen()
+    app.views = [types.SimpleNamespace(screen=screen)]
+    app._exit_hotkey_specs = {"": {code: {"key": 0x01000030, "label": "F1"}}}
+    screen.model.exit_hotkeys[code] = (0x01000030, "F1")
+    app._global_hotkeys = types.SimpleNamespace(
+        unregister=lambda token: None, register=lambda *a: True)
+
+    # 주문허용이 꺼져 있으면 청산이 안 나갔으므로 아무것도 내리지 않는다.
+    app._clear_after_emergency(code)
+    assert code in app._balance_sell_settings, app._balance_sell_settings
+
+    app._emergency_locked.add(code)        # 실제로 청산이 나갔다
+    app._clear_after_emergency(code)
+    assert code not in app._balance_sell_settings, app._balance_sell_settings
+    assert code not in app._account_auto_cancel_armed
+    assert app._exit_hotkey_specs.get("") == {}, app._exit_hotkey_specs
+    assert screen.model.exit_hotkeys == {}, screen.model.exit_hotkeys
+
+    # 아직 미체결이 남아 있으면 내리지 않는다. 곧 체결될 수 있다.
+    left = _app(ONE_PENDING)
+    left._position_book_primed = True
+    left._emergency_locked.add(code)
+    left._balance_sell_settings[code] = {"first": 0, "second": 1, "third": 0}
+    left._clear_after_emergency(code)
+    assert code in left._balance_sell_settings, left._balance_sell_settings
+    print("청산 뒤 해제 : 3단매도·자동취소·청산키 함께 내림")
+
+
 async def check_sell_resend_guard():
     """응답이 유실됐을 때 접수 이벤트 유무로 재전송을 갈라야 한다."""
     import api
@@ -813,6 +876,8 @@ async def main_check():
     await check_emergency_no_pending()
     await check_emergency_pending()
     await check_emergency_with_book()
+    await check_emergency_primed_without_entry()
+    await check_emergency_clears_settings()
     await check_sell_resend_guard()
     print("OK")
 
