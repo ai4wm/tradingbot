@@ -73,6 +73,21 @@ def demo():
     # 방금 편입돼 시세 백필 전인 행. 값이 전부 0이라도 상한가 직전이 아니다.
     assert _limit_tier(row(upper=0, base=0)) == 6, "편입 직후 빈 행은 맨 아래 묶음"
 
+    # 정리매매는 가격제한폭이 없어 상한가라는 개념이 없다. 맨 아래로 보낸다.
+    # 2026-09-11 코스나인(082660): 현재가 13원이라 한 호가가 7.7%다. 하필
+    # 전일 종가와 같은 13원이라 등락률이 정확히 0이 되고, 단일가라 예상값도
+    # 안 꺼져 장 시작 전 대기열로 잡혔다. 실제 상한가들 위에 앉아 있었다.
+    penny = row(upper=0, base=13, price=13, rate=0.0, exp_price=14,
+                exp_rate=7.69, vol=4_566_378, bid_qty=3_648_861)
+    assert _limit_tier(penny) == 2, "고치기 전: 장 시작 전 대기열로 잡힌다"
+    assert _limit_tier(penny, liquidation=True) == 6, "정리매매는 맨 아래"
+    # 17원이면 +30.7%다. 4틱 위다. 그때는 구분선 안으로 들어가 점상 알림까지
+    # 울린다. 이쪽이 더 위험해서 함께 막는다.
+    surge = row(upper=0, base=13, price=13, rate=0.0, exp_price=17,
+                exp_rate=30.77, bid_qty=3_648_861)
+    assert _limit_tier(surge) == 0, "고치기 전: 점상 대기 묶음까지 올라간다"
+    assert _limit_tier(surge, liquidation=True) == 6, "정리매매는 맨 아래"
+
     # 등락률 정렬 키: 예상값이 살아 있으면 그 값으로 비교한다. 표시는 그대로다.
     model = gui.StockModel()
     model.add_stock("VI", {**vi, "exp_hot": 1})
@@ -113,8 +128,12 @@ def check_group_lines():
         ("L2", opened),                                     # 3
         ("L3", {**opened, "ask_qty": 500}),                 # 4 상한가·매도잔량
         ("P1", row(price=900, rate=5.0, vol=100, ask_qty=10)),  # 6 일반
+        # 정리매매. 그냥 두면 tier 2라 상한가 위에 선다.
+        ("LQ", row(upper=0, base=13, price=13, rate=0.0, exp_price=14,
+                   exp_rate=7.69, vol=4_566_378, bid_qty=3_648_861)),
     ):
         model.add_stock(code, dict(data))
+    model.liquidation.add("LQ")
     proxy.sort(gui.RATE_COL, Qt.DescendingOrder)
 
     def code_at(proxy_row):
@@ -126,6 +145,10 @@ def check_group_lines():
     assert code_at(last_waiting + 1) == "A1", "첫 선은 점상 대기 바로 아래"
     assert code_at(last_limit) in {"L1", "L2"}, code_at(last_limit)
     assert code_at(last_limit + 1) == "L3", "둘째 선은 매도잔량 있는 상한가 위"
+    # 정리매매는 실제 상한가 아래여야 한다. 여기가 `m.liquidation` 배선을 본다.
+    rows = [code_at(i) for i in range(proxy.rowCount())]
+    assert rows.index("LQ") > rows.index("L3"), rows
+    assert "LQ" not in jumsang, jumsang
 
     # 매도잔량 0인 상한가가 없으면 둘째 선은 안 그린다.
     empty = gui.StockModel()

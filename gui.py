@@ -544,8 +544,15 @@ TIER_NO_ASK = 5        # 거래 중인데 매도호가가 빈 종목 (상한가 
 TIER_PLAIN = 6         # 그 밖의 일반 종목
 
 
-def _limit_tier(d: dict) -> int:
+def _limit_tier(d: dict, liquidation: bool = False) -> int:
     """상한가정렬 우선순위.
+
+    정리매매 종목은 맨 아래로 보낸다. 가격제한폭이 없어 '상한가'라는 개념
+    자체가 없고, `upper`가 0이라 아래 판정이 예상등락률만 보게 된다.
+    2026-09-11 코스나인(082660)은 현재가 13원·시총 12억인데 등락률이 정확히
+    0.00이라(13원짜리는 한 호가가 7.7%라 0 아니면 ±7.7%뿐) 장 시작 전
+    대기열로 잡혀 실제 상한가 위에 앉아 있었다. 17원만 돼도 +30.7%라
+    점상 대기 묶음에 들어가 알림까지 울렸을 자리다.
 
     맨 위(0)는 점상 대기, 즉 예상등락률이 상한가인데 매도잔량이 없고 매수만
     쌓인 종목이다. 구분선은 여기까지다. 점상알림 대상과 선 안이 정확히 같은
@@ -567,6 +574,8 @@ def _limit_tier(d: dict) -> int:
     살아 있으면 그 값으로 비교해(`StockModel.data`) 곧 체결될 가격이 순서에
     반영되게 한다.
     """
+    if liquidation:
+        return TIER_PLAIN
     actual_limit = d["upper"] > 0 and d["price"] == d["upper"]
     expected_limit = d["exp_price"] > 0 and (
         d["exp_price"] >= d["upper"] if d["upper"] > 0 else d["exp_rate"] >= LIMIT
@@ -958,10 +967,10 @@ class TieredProxy(QSortFilterProxyModel):
                     else left_key < right_key)
         if self.limit_mode:
             m = self.sourceModel()
-            a = m.rows[m.codes[left.row()]]
-            b = m.rows[m.codes[right.row()]]
-            ta = _limit_tier(a)
-            tb = _limit_tier(b)
+            code_a, code_b = m.codes[left.row()], m.codes[right.row()]
+            a, b = m.rows[code_a], m.rows[code_b]
+            ta = _limit_tier(a, code_a in m.liquidation)
+            tb = _limit_tier(b, code_b in m.liquidation)
             desc = self.sortOrder() == Qt.DescendingOrder
             if ta != tb:  # 우선순위 그룹 순서는 현재 정렬방향과 무관하게 고정
                 return ta > tb if desc else ta < tb
@@ -1057,7 +1066,7 @@ class ThemeGroupedTableView(QTableView):
             if not source_index.isValid():
                 break
             code = source.codes[source_index.row()]
-            tier = _limit_tier(source.rows[code])
+            tier = _limit_tier(source.rows[code], code in source.liquidation)
             if waiting and tier == TIER_WAIT_CLEAN:
                 jumsang.add(code)
             if code in proxy.pinned:
@@ -4805,7 +4814,9 @@ class ConditionScreen(QWidget):
         # ponytail: 계측. 켜져 있는 3분 동안 점상 대기 종목만 메모리에 모은다.
         if self._bidqty_probe_on and "bid_qty" in fields:
             stored = self.model.rows.get(code)
-            if stored is not None and _limit_tier(stored) == TIER_WAIT_CLEAN:
+            if stored is not None and _limit_tier(
+                    stored,
+                    code in self.model.liquidation) == TIER_WAIT_CLEAN:
                 self._bidqty_probe.append(
                     (time.time(), code, stored["bid_qty"], stored["ask_qty"]))
         # 0D는 매도쪽만, 0B는 체결만 바뀌어도 온다. 둘 중 하나가 실린 틱만
