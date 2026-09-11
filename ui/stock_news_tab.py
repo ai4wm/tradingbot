@@ -41,8 +41,27 @@ NEWS_WEB_AUTO_RELOAD_PATHS = {
     "/item/news.naver",   # 종목뉴스 목록
     "/item/dart.naver",   # 종목공시 목록
 }
-# 2026-09-11 새 화면 경로. 확인한 것만 넣는다. 뉴스·공시 주소를 확인하면 는다.
-NEWS_WEB_AUTO_RELOAD_TAILS = ("/discussion",)
+NEWS_WEB_AUTO_RELOAD_TAILS = ("/discussion", "/news")  # 2026-09-11 새 화면
+
+# 종목 페이지 메뉴. 2026-09-11 네이버 증권 새 화면의 탭 그대로다. 옛 화면의
+# 종합정보·차트·투자자별·전자공시는 다른 탭에 합쳐져 사라졌고, 리포트와
+# 인사이트가 새로 생겼다. 주소는 저장한 페이지에서 확인한 것이다.
+NAVER_STOCK_PAGES = (
+    ("차트·시세", "price"),
+    ("종목토론", "discussion"),
+    ("종목분석", "info"),          # 하위: info/company, info/investment
+    ("리포트", "research"),
+    ("뉴스·공시", "news"),
+    ("공매도현황", "shortTrade"),
+    ("인사이트", "investmentinfo"),
+)
+NAVER_STOCK_BOARD_PAGE = "discussion"
+
+
+def naver_stock_url(code: str, page: str = NAVER_STOCK_BOARD_PAGE) -> str:
+    """네이버 증권 종목 페이지 주소. 옛 `finance.naver.com/item/*`을 대신한다."""
+    url = f"https://stock.naver.com/domestic/stock/{code}/{page}"
+    return url + "?filter=all" if page == NAVER_STOCK_BOARD_PAGE else url
 
 NEWS_WEB_MIN_ZOOM = 0.5   # 더 줄이면 글자를 못 읽는다
 NEWS_WEB_FIT_SLACK = 8    # 스크롤바 폭 정도 넘치는 것은 무시한다
@@ -275,22 +294,11 @@ class StockNewsTabMixin:
 
         item_menu = QHBoxLayout()
         item_menu.setSpacing(2)
-        naver_item_pages = (
-            ("종합정보", "main.naver"),
-            ("시세", "sise.naver"),
-            ("차트", "fchart.naver"),
-            ("투자자별 매매동향", "frgn.naver"),
-            ("뉴스·공시", "news.naver"),
-            ("종목분석", "coinfo.naver"),
-            ("종목토론", "board.naver"),
-            ("전자공시", "dart.naver"),
-            ("공매도현황", "short_trade.naver"),
-        )
         self._news_item_menu_buttons = []
-        for title, path in naver_item_pages:
+        for title, path in NAVER_STOCK_PAGES:
             button = QPushButton(title)
             button.setToolTip(
-                f"선택한 감시 종목의 네이버 금융 {title}를 엽니다.")
+                f"선택한 감시 종목의 네이버 증권 {title}를 엽니다.")
             button.clicked.connect(
                 lambda _checked=False, page=path:
                 self._open_selected_watch_page(page))
@@ -884,19 +892,11 @@ class StockNewsTabMixin:
             return
         # 스크롤 보정 없이 그대로 연다. 새 네이버 증권 화면에는 맞출 중간
         # 메뉴가 없어서 "item" 갈래를 2026-09-11에 지웠다.
-        code = self._selected_watch_code
-        if page == "board.naver":
-            # 종목토론만 새 주소를 안다. 나머지 여덟은 옛 주소가 리다이렉트로
-            # 살아 있어 그대로 둔다. 주소를 확인하는 대로 하나씩 옮긴다.
-            self._show_news_web_url(
-                f"https://stock.naver.com/domestic/stock/{code}"
-                f"/discussion?filter=all")
-            return
         self._show_news_web_url(
-            f"https://finance.naver.com/item/{page}?code={code}")
+            naver_stock_url(self._selected_watch_code, page))
 
     def _open_selected_watch_board(self):
-        self._open_selected_watch_page("board.naver")
+        self._open_selected_watch_page(NAVER_STOCK_BOARD_PAGE)
 
     def _show_news_web_url(self, url: str, scroll_mode: str = ""):
         self._news_current_url = str(url or "")

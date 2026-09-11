@@ -413,11 +413,26 @@ SPA는 로드 완료 뒤에도 내용이 채워지므로 0ms와 1200ms에 두 �
 
 창 크기를 바꾸면 배율이 어긋난 채로 남습니다. 다시 열거나 자동 새로고침이
 돌면 맞춰집니다.
-- **종목토론 주소만** 새 형식으로 옮겼습니다 —
-  `stock.naver.com/domestic/stock/{code}/discussion?filter=all`. 네 곳입니다
-  (`gui.py` 조건검색 표, `rank.py` 조회순위, `ui/limit_up_tab.py` 상한가 탭,
-  `ui/stock_news_tab.py` 웹뷰). 나머지 여덟 메뉴는 옛 주소가 리다이렉트로
-  살아 있어 그대로 뒀습니다. 주소를 확인하는 대로 하나씩 옮깁니다.
+**주소는 전부 새 형식으로 옮겼습니다.** 저장한 실제 페이지(프리티 006490)에서
+확인한 것이라 추측이 없습니다. 조립은 `naver_stock_url()`이 합니다.
+
+| 버튼 | 새 경로 | 옛 경로 |
+| --- | --- | --- |
+| 차트·시세 | `/price` | `sise.naver` + `fchart.naver` |
+| 종목토론 | `/discussion?filter=all` | `board.naver` |
+| 종목분석 | `/info` | `coinfo.naver` |
+| 리포트 | `/research` | (새로 생김) |
+| 뉴스·공시 | `/news` | `news.naver` + `dart.naver` |
+| 공매도현황 | `/shortTrade` | `short_trade.naver` |
+| 인사이트 | `/investmentinfo` | (새로 생김) |
+
+9개가 7개가 됐습니다. 종합정보(`main.naver`)와 투자자별 매매동향
+(`frgn.naver`)은 새 화면에 대응 탭이 없어 뺐습니다. 종목분석 아래에
+`/info/company`(시세정보)와 `/info/investment`(투자정보)가 더 있습니다.
+
+웹뷰 밖 세 곳(`gui.py` 조건검색 표, `rank.py` 조회순위,
+`ui/limit_up_tab.py` 상한가 탭)은 종목토론 주소를 직접 적습니다. 서로 import
+방향이 달라 헬퍼를 공유하지 않습니다.
 
 ## 상한가 정렬과 정리매매
 

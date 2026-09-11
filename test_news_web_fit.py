@@ -12,7 +12,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QUrl
 
 from ui.stock_news_tab import (
-    NEWS_WEB_MIN_ZOOM, _fit_zoom, _is_news_web_auto_reload_url)
+    NAVER_STOCK_PAGES, NEWS_WEB_MIN_ZOOM, _fit_zoom,
+    _is_news_web_auto_reload_url, naver_stock_url)
 
 NEW = "https://stock.naver.com/domestic/stock/005930/discussion?filter=all"
 OLD = "https://finance.naver.com/item/board.naver?code=005930"
@@ -45,9 +46,14 @@ def check_zoom():
 def check_auto_reload():
     assert _is_news_web_auto_reload_url(QUrl(NEW)), "새 종목토론 주소"
     assert _is_news_web_auto_reload_url(QUrl(OLD)), "옛 주소도 계속 본다"
-    # 종목 페이지라도 토론 목록이 아니면 새로고침 대상이 아니다.
+    assert _is_news_web_auto_reload_url(
+        QUrl("https://stock.naver.com/domestic/stock/005930/news")), "뉴스·공시"
+    # 목록이 아닌 탭은 새로고침 대상이 아니다.
     assert not _is_news_web_auto_reload_url(
-        QUrl("https://stock.naver.com/domestic/stock/005930/total"))
+        QUrl("https://stock.naver.com/domestic/stock/005930/price"))
+    # 글 하나를 읽는 중에 새로고침하면 안 된다.
+    assert not _is_news_web_auto_reload_url(
+        QUrl("https://stock.naver.com/domestic/stock/005930/discussion/4292683"))
     # 남의 사이트는 경로가 비슷해도 아니다.
     assert not _is_news_web_auto_reload_url(
         QUrl("https://example.com/domestic/stock/005930/discussion"))
@@ -56,9 +62,29 @@ def check_auto_reload():
     print("자동 새로고침: 새 주소·옛 주소 둘 다 걸림")
 
 
+def check_pages():
+    """메뉴 주소는 저장한 실제 페이지(프리티 006490)에서 확인한 것이다."""
+    expected = {
+        "차트·시세": "https://stock.naver.com/domestic/stock/006490/price",
+        "종목토론": NEW.replace("005930", "006490"),
+        "종목분석": "https://stock.naver.com/domestic/stock/006490/info",
+        "리포트": "https://stock.naver.com/domestic/stock/006490/research",
+        "뉴스·공시": "https://stock.naver.com/domestic/stock/006490/news",
+        "공매도현황": "https://stock.naver.com/domestic/stock/006490/shortTrade",
+        "인사이트": "https://stock.naver.com/domestic/stock/006490/investmentinfo",
+    }
+    built = {title: naver_stock_url("006490", page)
+             for title, page in NAVER_STOCK_PAGES}
+    assert built == expected, built
+    # 토론만 전체보기 조건이 붙는다. 나머지에 붙이면 주소가 달라진다.
+    assert "?filter=all" not in naver_stock_url("006490", "news")
+    print(f"메뉴 주소  : {len(built)}개 모두 일치")
+
+
 def demo():
     check_zoom()
     check_auto_reload()
+    check_pages()
     print("ok")
 
 
