@@ -397,11 +397,8 @@ async def check_emergency_clears_settings():
     app._global_hotkeys = types.SimpleNamespace(
         unregister=lambda token: None, register=lambda *a: True)
 
-    # 주문허용이 꺼져 있으면 청산이 안 나갔으므로 아무것도 내리지 않는다.
-    app._clear_after_emergency(code)
-    assert code in app._balance_sell_settings, app._balance_sell_settings
-
-    app._emergency_locked.add(code)        # 실제로 청산이 나갔다
+    # 누른 행동이 기준이다. 주문허용이 꺼져 실제로 아무것도 안 나갔더라도
+    # 남은 것이 없으면 내린다. 남아 있으면 아래 미체결 관문이 막는다.
     app._clear_after_emergency(code)
     assert code not in app._balance_sell_settings, app._balance_sell_settings
     assert code not in app._account_auto_cancel_armed
@@ -411,7 +408,6 @@ async def check_emergency_clears_settings():
     # 아직 미체결이 남아 있으면 내리지 않는다. 곧 체결될 수 있다.
     left = _app(ONE_PENDING)
     left._position_book_primed = True
-    left._emergency_locked.add(code)
     left._balance_sell_settings[code] = {"first": 0, "second": 1, "third": 0}
     left._clear_after_emergency(code)
     assert code in left._balance_sell_settings, left._balance_sell_settings

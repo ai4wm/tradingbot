@@ -3551,8 +3551,10 @@ class App:
         끝내면 진행도가 0이라 영영 안 내려간다. 매도 체결도 없어서 그쪽
         갈래에도 안 닿는다(2026-09-11 006490·007540, 둘 다 손으로 내렸다).
         """
-        if code not in self._emergency_locked:
-            return  # 주문허용이 꺼져 실제로 청산이 나가지 않았다
+        # 여기까지 오는 길은 모두 청산키를 누른 데서 시작한다. 체결 뒤 재청산
+        # (`_track_order_event`)도 `_emergency_locked`인 종목만 부른다.
+        # 주문허용이 꺼져 실제로 아무것도 안 나갔더라도, 남은 것이 없으면
+        # 내리는 것이 맞다. 남아 있으면 아래 관문이 막는다.
         if not self._position_book_primed:
             return  # 잔고를 모르는 상태에서 감시를 내리면 안 된다
         if (self._position_book.get(code) or {}).get("held", 0) > 0:
