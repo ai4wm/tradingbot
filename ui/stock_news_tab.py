@@ -41,14 +41,41 @@ NEWS_WEB_AUTO_RELOAD_PATHS = {
     "/item/news.naver",   # 종목뉴스 목록
     "/item/dart.naver",   # 종목공시 목록
 }
+# 2026-09-11 새 화면 경로. 확인한 것만 넣는다. 뉴스·공시 주소를 확인하면 는다.
+NEWS_WEB_AUTO_RELOAD_TAILS = ("/discussion",)
+
+NEWS_WEB_MIN_ZOOM = 0.5   # 더 줄이면 글자를 못 읽는다
+NEWS_WEB_FIT_SLACK = 8    # 스크롤바 폭 정도 넘치는 것은 무시한다
 
 
 def _is_news_web_auto_reload_url(url: QUrl) -> bool:
-    """자동 새로고침이 필요한 네이버 종목 목록 화면인지 판정한다."""
-    return (
-        url.host().lower() == "finance.naver.com"
-        and url.path() in NEWS_WEB_AUTO_RELOAD_PATHS
-    )
+    """자동 새로고침이 필요한 네이버 종목 목록 화면인지 판정한다.
+
+    새 화면은 경로가 `/domestic/stock/{코드}/discussion` 꼴이다. 호스트만
+    보고 판정하던 때는 새 주소에서 자동 새로고침이 조용히 안 걸렸다.
+    옛 주소도 리다이렉트로 남아 있어 둘 다 본다.
+    """
+    host, path = url.host().lower(), url.path()
+    if host == "finance.naver.com":
+        return path in NEWS_WEB_AUTO_RELOAD_PATHS
+    if host.endswith("stock.naver.com"):
+        return (path.startswith("/domestic/stock/")
+                and path.endswith(NEWS_WEB_AUTO_RELOAD_TAILS))
+    return False
+
+
+def _fit_zoom(zoom: float, scroll_width: float, client_width: float) -> float:
+    """가로 스크롤이 사라지는 줌 배율. 줄이기만 하고 키우지 않는다.
+
+    기준 폭을 코드에 박지 않고 페이지가 알려주는 값으로 계산한다. 새 네이버
+    증권 화면은 좌우 패널을 달고 나와 요구 폭이 창보다 크다.
+
+    키우지 않으므로 같은 페이지에서 두 번 재도 진동하지 않는다. 원래대로
+    돌리는 일은 다음 이동에서 1.0으로 초기화하는 `_show_news_web_url`이 한다.
+    """
+    if client_width <= 0 or scroll_width <= client_width + NEWS_WEB_FIT_SLACK:
+        return zoom
+    return max(NEWS_WEB_MIN_ZOOM, min(1.0, zoom * client_width / scroll_width))
 
 
 class StockNewsTabMixin:
@@ -883,6 +910,9 @@ class StockNewsTabMixin:
             return
         self._news_web_placeholder.hide()
         self._news_webview.show()
+        # 새 페이지는 다시 재서 맞춘다. 직전 페이지에서 줄인 배율을 물려받으면
+        # 이동할수록 계속 작아진다.
+        self._news_webview.setZoomFactor(1.0)
         self._news_webview.setUrl(QUrl(self._news_current_url))
 
     def _news_web_load_finished(self, succeeded: bool):
@@ -896,6 +926,7 @@ class StockNewsTabMixin:
         """
         if not succeeded or self._news_webview is None:
             return
+        self._fit_news_web_zoom()
         if self._news_scroll_mode != "article":
             return
         loaded_url = self._news_webview.url().toString()
@@ -934,6 +965,42 @@ class StockNewsTabMixin:
         # 첫 실행이 레이아웃 전이면 놓치므로 0.5초 뒤 한 번 더 맞춘다.
         for delay in (0, 500):
             QTimer.singleShot(delay, scroll_loaded_page)
+
+    def _fit_news_web_zoom(self):
+        """페이지 폭을 재서 가로 스크롤이 없어질 만큼 줌을 줄인다.
+
+        SPA는 `loadFinished` 뒤에도 내용이 채워지므로 잠시 뒤 한 번 더 잰다.
+        `_fit_zoom`이 줄이기만 하니 두 번 재도 진동하지 않는다.
+        """
+        view = self._news_webview
+        if view is None:
+            return
+        script = (
+            "[Math.max(document.documentElement.scrollWidth,"
+            " document.body ? document.body.scrollWidth : 0),"
+            " document.documentElement.clientWidth]"
+        )
+
+        def apply(measured):
+            # 재는 사이에 창을 닫거나 다른 곳으로 이동했을 수 있다.
+            if view is not self._news_webview or not measured:
+                return
+            try:
+                scroll_width, client_width = (float(v) for v in measured)
+            except (TypeError, ValueError):
+                return
+            view.setZoomFactor(
+                _fit_zoom(view.zoomFactor(), scroll_width, client_width))
+
+        def measure():
+            if view is not self._news_webview:
+                return
+            page = view.page()
+            if page is not None:
+                page.runJavaScript(script, apply)
+
+        for delay in (0, 1200):
+            QTimer.singleShot(delay, measure)
 
     def _news_web_action(self, action: str):
         if self._news_webview is None:
