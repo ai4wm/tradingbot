@@ -324,7 +324,7 @@ async def check_balance_cleared_when_empty():
 
 async def check_emergency_no_pending():
     app = _app([])
-    await app._emergency_exit_async("005930", 69000, True)
+    await app._emergency_exit_async("005930", 69000)
     calls = app.rest.calls
     assert calls == ["position", "open_buys_query", "sell"], calls
     print("청산키(미체결 0):", calls)
@@ -332,7 +332,7 @@ async def check_emergency_no_pending():
 
 async def check_emergency_pending():
     app = _app(ONE_PENDING)
-    await app._emergency_exit_async("005930", 69000, True)
+    await app._emergency_exit_async("005930", 69000)
     calls = app.rest.calls
     assert calls.index("cancel_start:0009") < calls.index("sell"), calls
     assert "cancel_done:0009" not in calls, calls
@@ -347,7 +347,7 @@ async def check_emergency_with_book():
     """장부가 서 있으면 청산키가 계좌조회 없이 취소+매도를 바로 낸다."""
     app = _app(ONE_PENDING)
     app._position_book = {"005930": {"held": 500, "sellable": 500}}
-    await app._emergency_exit_async("005930", 69000, True)
+    await app._emergency_exit_async("005930", 69000)
     calls = app.rest.calls
     assert "position" not in calls, calls
     assert "open_buys_query" not in calls, calls
@@ -365,7 +365,7 @@ async def check_emergency_primed_without_entry():
     """
     app = _app(ONE_PENDING)
     app._position_book_primed = True       # 계좌를 읽었고 이 종목은 보유 0
-    await app._emergency_exit_async("005930", 69000, True)
+    await app._emergency_exit_async("005930", 69000)
     calls = app.rest.calls
     assert "position" not in calls, calls
     assert "open_buys_query" not in calls, calls

@@ -1336,7 +1336,7 @@ class App:
         # 작업표시줄로만 알린다. 청산키에는 3단매도 경고음을 재사용하지 않는다.
         if not active:
             QApplication.alert(screen.window(), 4000)
-        self._emergency_exit(code, price, self._order_enabled)
+        self._emergency_exit(code, price)
 
     def _open_market_status(self):
         analysis = self._ensure_analysis_window()
@@ -3497,15 +3497,14 @@ class App:
             self._current_bid_qty(code))
         return qty
 
-    def _emergency_exit(self, code: str, price: int, order_enabled: bool):
+    def _emergency_exit(self, code: str, price: int):
         # 새 청산키 입력은 새 결과이므로 이전 사용자의 상태 확인 기록을 해제한다.
         self._emergency_status_dismissed.discard(code)
         if price > 0:
             self._emergency_prices[code] = int(price)
-        if order_enabled:
-            self._emergency_locked.add(code)
-            self.orders.stop_local_submissions(code)
-        self._queue_emergency_reconcile(code, price, order_enabled)
+        self._emergency_locked.add(code)
+        self.orders.stop_local_submissions(code)
+        self._queue_emergency_reconcile(code, price)
 
     def _acknowledge_order_status(self, code: str):
         """종료 상태를 모든 창에서 지우고 진행 중인 이전 결과의 재표시를 막는다."""
@@ -3517,19 +3516,15 @@ class App:
             ):
                 view.screen.set_order_state(code, "", "", False)
 
-    def _queue_emergency_reconcile(
-            self, code: str, price: int | None = None,
-            order_enabled: bool | None = None):
+    def _queue_emergency_reconcile(self, code: str, price: int | None = None):
         if price and price > 0:
             self._emergency_prices[code] = int(price)
         running = self._emergency_tasks.get(code)
         if running and not running.done():
             self._emergency_recheck.add(code)
             return
-        enabled = (
-            self._order_enabled if order_enabled is None else order_enabled)
         task = asyncio.ensure_future(self._emergency_exit_async(
-            code, self._emergency_prices.get(code, 0), enabled))
+            code, self._emergency_prices.get(code, 0)))
         self._emergency_tasks[code] = task
         task.add_done_callback(
             lambda _task, stock_code=code:
@@ -3576,8 +3571,7 @@ class App:
             self._set_account_auto_cancel(code, False)
         self._clear_exit_hotkey(code)
 
-    async def _emergency_exit_async(
-            self, code: str, price: int, order_enabled: bool):
+    async def _emergency_exit_async(self, code: str, price: int):
         # 장부가 서 있으면 계좌조회를 기다리지 않는다. 조회 큐는 1초에 1건이라
         # 청산 순간에 두 건을 부르면 그만큼 매도가 늦는다.
         booked = self._position_book.get(code)
@@ -3635,20 +3629,9 @@ class App:
                     "acknowledgement code=%s", code)
             log.warning("emergency exit ignored no-position code=%s", code)
             return
-        if not order_enabled:
-            for view in self.views:
-                if code in view.screen.model.rows:
-                    view.screen.set_order_state(
-                        code, "허용꺼짐",
-                        (f"상태 청산 차단 · 주문허용 꺼짐 · "
-                         f"미체결 {pending_qty:,}주 / "
-                         f"보유 {held_qty:,}주"),
-                        pending_qty > 0)
-            log.warning(
-                "emergency exit blocked order-disabled code=%s "
-                "pending=%s held=%s sellable=%s",
-                code, pending_qty, held_qty, sellable_qty)
-            return
+        # 주문허용 체크는 보지 않는다. 3단매도·자동취소·스윕도 안 본다
+        # (`_order_enabled`가 그 경로에 한 군데도 없다). 청산만 막히면 앞뒤가
+        # 안 맞고, 청산이 안 나가는 쪽이 더 큰 손해다. 2026-09-11 결정.
         if int(price) <= 0:
             for view in self.views:
                 if code in view.screen.model.rows:
