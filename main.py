@@ -2501,6 +2501,11 @@ class App:
         if event.get("side") != "buy":
             return
         self._track_open_buy(code, order_no, event)
+        # 취소확인은 취소를 보낸 뒤에야 온다. 청산 작업이 끝나는 시점에는 아직
+        # 미체결이 남아 있어 뒤처리가 관문에 걸린다. 장부가 빈 뒤에 다시 본다
+        # (2026-09-11 10:56 006490: 취소 발사 +1ms, 취소확인 +71ms).
+        if code in self._emergency_locked:
+            self._clear_after_emergency(code)
         if int(event.get("fill_qty") or 0) > 0:
             # 장부를 갱신한 뒤에 부른다. 먼저 부르면 방금 체결된 물량이
             # 매도가능수량에 아직 없어 그대로 남는다.
@@ -2626,6 +2631,9 @@ class App:
                 position["held"] = max(0, position["held"] - filled)
                 if position["held"] <= 0:
                     self._clear_spent_balance_sell(code)
+        if code in self._emergency_locked:
+            # 청산 매도가 체결돼 비었을 때도 뒤처리가 돌아야 한다.
+            self._clear_after_emergency(code)
         # 장부를 다 고친 뒤에 표시한다. 먼저 부르면 보유수량이 한 박자 늦는다.
         self._push_pending_orders(code)
 
@@ -3556,6 +3564,9 @@ class App:
             return
         if self._pending_open_buys(code):
             return
+        # 여기 왔으면 남은 것이 없다. 표식을 내려 이 뒤의 새 주문이 영향을 받지
+        # 않게 한다. 다시 청산키를 누르면 다시 선다.
+        self._emergency_locked.discard(code)
         armed = code in self._account_auto_cancel_armed
         setting = code in self._balance_sell_settings
         hotkey = any(code in specs

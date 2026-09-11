@@ -408,10 +408,25 @@ async def check_emergency_clears_settings():
     # 아직 미체결이 남아 있으면 내리지 않는다. 곧 체결될 수 있다.
     left = _app(ONE_PENDING)
     left._position_book_primed = True
+    left._emergency_locked.add(code)
     left._balance_sell_settings[code] = {"first": 0, "second": 1, "third": 0}
     left._clear_after_emergency(code)
     assert code in left._balance_sell_settings, left._balance_sell_settings
-    print("청산 뒤 해제 : 3단매도·자동취소·청산키 함께 내림")
+    assert code in left._emergency_locked, "아직 끝나지 않았으니 표식은 남는다"
+
+    # 취소확인이 오면 그때 내려간다. 청산 작업이 끝나는 시점에는 아직
+    # 미체결이 남아 있어 관문에 걸렸다(2026-09-11 10:56 006490).
+    left._open_buy_orders["005930"]["0009"] = (0, "KRX")
+    left._track_open_sell  # noqa: B018  (아래는 매수 취소확인 경로다)
+    left._on_account_order_event({
+        "code": code, "side": "buy", "status": "확인",
+        "order_no": "0009", "original_order_no": "0000000",
+        "order_qty": 300, "fill_qty": 0, "remaining_qty": 0,
+        "fill_id": "", "exchange": "KRX"})
+    assert code not in left._balance_sell_settings, left._balance_sell_settings
+    # 표식을 내려 뒤에 새로 건 설정이 휩쓸리지 않게 한다.
+    assert code not in left._emergency_locked, left._emergency_locked
+    print("청산 뒤 해제 : 취소확인까지 기다렸다가 셋 다 내림")
 
 
 async def check_sell_resend_guard():
