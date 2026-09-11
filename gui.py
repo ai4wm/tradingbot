@@ -4456,14 +4456,24 @@ class ConditionScreen(QWidget):
             armed = code not in self.model.account_auto_cancel_armed
             self.account_auto_cancel_changed.emit(code, armed)
         elif index.column() == EXIT_HOTKEY_COL:
+            current = self.model.exit_hotkeys.get(code)
+            if current:
+                # 걸려 있으면 한 번 눌러 바로 푼다. 주문과 함께 자동으로
+                # 걸리므로 손으로 하는 일은 거의 푸는 쪽이다.
+                self._hotkey_capture_code = ""
+                self.model.exit_hotkeys.pop(code, None)
+                self._refresh_exit_hotkey_cell(code)
+                self.exit_hotkey_changed.emit(code, None)
+                audit_log.info(
+                    "exit hotkey cleared by click code=%s key=%s",
+                    code, current[1])
+                QToolTip.showText(QCursor.pos(), f"{code} 청산키 {current[1]} 해제")
+                return
             self._hotkey_capture_code = code
             self.table.setFocus(Qt.FocusReason.MouseFocusReason)
-            current = self.model.exit_hotkeys.get(code)
             QToolTip.showText(
                 QCursor.pos(),
-                (f"{code}: 새 청산키를 누르세요"
-                 + (f" (현재 {current[1]})" if current else "")
-                 + "\nDelete/Backspace: 해제 · Esc: 취소"))
+                f"{code}: 새 청산키를 누르세요\nEsc: 취소")
         elif index.column() == BID_QTY_COL:
             self._open_bid_popup(code)
         elif index.column() == NAME_COL:

@@ -212,6 +212,17 @@ class WindowsGlobalHotkeys(QAbstractNativeEventFilter):
 # 아니므로 저장하지 않고, 다시 등록하거나 해제하면 지운다.
 HOTKEY_CONFLICT_STATUS = "키충돌"
 
+# 주문과 함께 자동으로 거는 청산키 후보. 앞에서부터 빈 키를 집는다. 쓰던 키가
+# 풀리면 다음 주문은 다시 앞쪽을 집는다. 보통 세 개를 넘지 않는다.
+# F12는 윈도우가 디버거용으로 영구 예약해 어떤 경우에도 등록되지 않으므로 뺐다.
+AUTO_EXIT_HOTKEY_LABELS = ("F1", "F5", "F9", "F2", "F6", "F10")
+
+
+def _function_key_spec(label: str) -> dict:
+    """`F1` 같은 이름을 청산키 스펙으로 바꾼다."""
+    return {"key": int(Qt.Key.Key_F1) + int(label[1:]) - 1, "modifiers": 0,
+            "text": "", "label": label}
+
 
 def _drop_hotkey_conflicts(order_status: dict | None) -> dict:
     """저장·복원할 주문상태에서 청산키 실패 알림만 걷어낸다.
@@ -1253,6 +1264,51 @@ class App:
             "global exit hotkey registration failed code=%s key=%s screen=%s",
             code, spec.get("label"), screen.prefix)
 
+    def _auto_assign_exit_hotkey(self, screen: ConditionScreen, code: str):
+        """주문과 함께 청산키를 자동으로 건다. 후보 앞에서부터 빈 키를 집는다.
+
+        3단매도·자동취소는 이미 주문과 함께 걸리는데 청산키만 손으로 걸어야
+        했습니다. 청산키는 앱이 뒤에 있을 때 쓰는 물건이라 잊으면 그때 아무
+        것도 못 합니다.
+
+        쓰던 키가 풀리면 다음 주문은 다시 앞쪽 후보를 집습니다. 다른
+        프로그램이 잡고 있는 키는 `RegisterHotKey`가 거부하므로 그냥 다음
+        후보로 넘어갑니다. 다만 **키보드 후킹 방식 매크로는 거부되지
+        않습니다** — 그런 키는 `AUTO_EXIT_HOTKEY_LABELS`에서 빼야 합니다.
+        """
+        if code in (self._exit_hotkey_specs.get(screen.prefix) or {}):
+            return  # 이미 걸려 있다. 손으로 고른 키를 덮지 않는다.
+        taken = {
+            str(spec.get("label") or "")
+            for specs in self._exit_hotkey_specs.values()
+            for spec in specs.values()
+        }
+        for label in AUTO_EXIT_HOTKEY_LABELS:
+            if label in taken:
+                continue
+            spec = _function_key_spec(label)
+            screen.model.exit_hotkeys[code] = (spec["key"], label)
+            screen.refresh_exit_hotkey_cell(code)
+            self._set_global_exit_hotkey(screen, code, spec)
+            if code in (self._exit_hotkey_specs.get(screen.prefix) or {}):
+                log.warning(
+                    "auto exit hotkey assigned code=%s key=%s", code, label)
+                return
+            # 거부됐다. `_set_global_exit_hotkey`가 칸을 되돌려 놓았다.
+        log.warning(
+            "auto exit hotkey unavailable code=%s candidates=%s",
+            code, ",".join(AUTO_EXIT_HOTKEY_LABELS))
+
+    def _clear_exit_hotkey(self, code: str):
+        """걸려 있던 청산키를 내린다. 창마다 따로 걸리므로 전부 본다."""
+        for view in self.views:
+            screen = view.screen
+            if code not in (self._exit_hotkey_specs.get(screen.prefix) or {}):
+                continue
+            screen.model.exit_hotkeys.pop(code, None)
+            screen.refresh_exit_hotkey_cell(code)
+            self._set_global_exit_hotkey(screen, code, None)
+
     def _clear_hotkey_conflict(self, code: str):
         """등록에 성공했거나 해제했으면 실패 알림을 내린다.
 
@@ -1640,6 +1696,8 @@ class App:
             # 방식과 무관하게 건다. 이미 걸린 종목은 화면이 그대로 둔다.
             if screen.auto_balance_sell_on_order(code):
                 log.warning("balance sell auto-set on order code=%s", code)
+            # 청산키도 같이 건다. 잊으면 앱이 뒤에 있을 때 손쓸 방법이 없다.
+            self._auto_assign_exit_hotkey(screen, code)
         except Exception as e:  # noqa: BLE001
             log.exception(
                 "order batch rejected code=%s mode=%s count=%s "
@@ -3182,11 +3240,15 @@ class App:
             return  # 매도가 아직 도는 중이다
         audit_log.info(
             "balance sell cleared; position empty code=%s stages=%s "
-            "auto_cancel=%s",
-            code, len(order), code in self._account_auto_cancel_armed)
+            "auto_cancel=%s hotkey=%s",
+            code, len(order), code in self._account_auto_cancel_armed,
+            any(code in specs for specs in self._exit_hotkey_specs.values()))
         self._set_balance_sell(code, None)
         if code in self._account_auto_cancel_armed:
             self._set_account_auto_cancel(code, False)
+        # 청산키도 같이 내린다. 다 판 종목의 키가 살아 있으면 나중에 눌렀을 때
+        # 엉뚱하게 동작한다. 다시 주문하면 자동 배정이 새로 건다.
+        self._clear_exit_hotkey(code)
 
     def _resell_late_buy_fill(self, code: str):
         """전량 매도 단계를 지난 뒤 늦게 체결된 매수를 같은 조건으로 판다.

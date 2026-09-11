@@ -45,25 +45,30 @@ class FakeScreen:
     def _refresh_exit_hotkey_cell(self, code):
         self.refreshed.append(code)
 
+    refresh_exit_hotkey_cell = _refresh_exit_hotkey_cell
+
 
 class FakeHotkeys:
-    def __init__(self, ok):
+    def __init__(self, ok, refuse=()):
         self.ok = ok
+        self.refuse = set(refuse)   # 다른 프로그램이 잡고 있는 키
         self.unregistered = []
 
     def register(self, token, spec, payload):
-        return self.ok
+        return self.ok and str(spec.get("label") or "") not in self.refuse
 
     def unregister(self, token):
         self.unregistered.append(token)
 
 
-def _app(ok: bool):
+def _app(ok: bool, refuse=()):
     app = main.App.__new__(main.App)
     app._exit_hotkey_specs = {}
-    app._global_hotkeys = FakeHotkeys(ok)
+    app._global_hotkeys = FakeHotkeys(ok, refuse)
     app.views = [types.SimpleNamespace(screen=FakeScreen())]
-    for name in ("_set_global_exit_hotkey", "_clear_hotkey_conflict"):
+    app._save_order_settings = lambda: None
+    for name in ("_set_global_exit_hotkey", "_clear_hotkey_conflict",
+                 "_auto_assign_exit_hotkey"):
         setattr(app, name, types.MethodType(getattr(main.App, name), app))
     return app
 
@@ -106,7 +111,60 @@ def demo():
     assert screen.model.order_status == {CODE: "접수"}, screen.model.order_status
     print("해제   : 키충돌만 지우고 주문상태는 그대로")
 
+    check_auto_assign()
     print("ok")
+
+
+def _label(app, code, prefix=""):
+    return (app._exit_hotkey_specs.get(prefix) or {}).get(code, {}).get("label")
+
+
+def check_auto_assign():
+    """주문과 함께 청산키를 자동으로 건다. 후보 앞에서부터 빈 키를 집는다."""
+    assert main.AUTO_EXIT_HOTKEY_LABELS[:3] == ("F1", "F5", "F9"), \
+        main.AUTO_EXIT_HOTKEY_LABELS
+    assert "F12" not in main.AUTO_EXIT_HOTKEY_LABELS, "윈도우 예약키는 후보 밖"
+
+    # 첫 주문은 맨 앞 후보를 집는다.
+    app = _app(ok=True)
+    screen = app.views[0].screen
+    app._auto_assign_exit_hotkey(screen, "000001")
+    assert _label(app, "000001") == "F1", app._exit_hotkey_specs
+    assert screen.model.exit_hotkeys["000001"][1] == "F1"
+
+    # 다음 종목은 그다음 빈 키로 간다. 셋까지 차례대로다.
+    app._auto_assign_exit_hotkey(screen, "000002")
+    app._auto_assign_exit_hotkey(screen, "000003")
+    assert [_label(app, c) for c in ("000001", "000002", "000003")] == \
+        ["F1", "F5", "F9"], app._exit_hotkey_specs
+
+    # 이미 걸린 종목은 다시 걸지 않는다. 손으로 고른 키를 덮으면 안 된다.
+    app._auto_assign_exit_hotkey(screen, "000001")
+    assert _label(app, "000001") == "F1"
+
+    # F5가 풀리면 다음 주문은 앞으로 돌아가 F5를 집는다.
+    app._set_global_exit_hotkey(screen, "000002", None)
+    app._auto_assign_exit_hotkey(screen, "000004")
+    assert _label(app, "000004") == "F5", app._exit_hotkey_specs
+
+    # 다른 프로그램이 F1을 잡고 있으면 거부되고 다음 후보로 넘어간다.
+    blocked = _app(ok=True, refuse={"F1"})
+    blocked_screen = blocked.views[0].screen
+    blocked._auto_assign_exit_hotkey(blocked_screen, "000005")
+    assert _label(blocked, "000005") == "F5", blocked._exit_hotkey_specs
+    # 실패한 F1의 흔적이 남으면 안 된다. 칸에도 키충돌에도.
+    assert blocked_screen.model.exit_hotkeys["000005"][1] == "F5"
+    assert blocked_screen.model.order_status == {}, \
+        blocked_screen.model.order_status
+
+    # 후보가 전부 막히면 조용히 포기한다. 주문 자체를 막으면 안 된다.
+    none_left = _app(ok=False)
+    none_screen = none_left.views[0].screen
+    none_left._auto_assign_exit_hotkey(none_screen, "000006")
+    assert none_left._exit_hotkey_specs.get("", {}) == {}
+    assert none_screen.model.order_status == {"000006": "키충돌"}, \
+        none_screen.model.order_status
+    print("자동배정: F1→F5→F9, 풀리면 앞으로, 막히면 건너뜀")
 
 
 if __name__ == "__main__":

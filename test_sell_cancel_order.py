@@ -110,6 +110,38 @@ def _app(pending):
     return app
 
 
+class _HotkeyScreen:
+    """청산키 해제만 확인하는 최소 창. `_clear_exit_hotkey`가 쓰는 것만 둔다."""
+
+    prefix = ""
+
+    def __init__(self):
+        self.model = types.SimpleNamespace(
+            rows={"005930": {}}, codes=["005930"],
+            exit_hotkeys={}, order_status={},
+            balance_sell_settings={}, balance_sell_stage={},
+            balance_alert_stage={}, balance_alert_ticks={},
+            index=lambda *a: None,
+            dataChanged=types.SimpleNamespace(emit=lambda *a: None),
+            order_cancellable=set(),
+            set_order_status=lambda *a, **k: None,
+            set_balance_sell_setting=lambda *a: None,
+            set_balance_sell_stage=lambda *a: None,
+            set_account_auto_cancel_armed=lambda *a: None)
+
+    def refresh_exit_hotkey_cell(self, code):
+        pass
+
+    def set_pending_orders(self, *args, **kwargs):
+        pass
+
+    def set_balance_sell_setting(self, *args, **kwargs):
+        pass
+
+    def set_order_state(self, *args, **kwargs):
+        pass
+
+
 def _splits(count):
     return [{"code": "005930", "order_no": f"{i:04d}",
              "remaining_qty": 534, "exchange": "KRX"}
@@ -211,6 +243,14 @@ async def check_balance_cleared_when_empty():
     app._balance_sell_stage[code] = 1          # 켠 단계(1개)를 다 지났다
     app._account_auto_cancel_armed.add(code)
     app._position_book[code] = {"held": 100, "sellable": 0}
+    # 청산키도 같이 내려가야 한다. 다 판 종목의 키가 살아 있으면 나중에
+    # 눌렀을 때 엉뚱하게 동작한다.
+    screen = _HotkeyScreen()
+    app.views = [types.SimpleNamespace(screen=screen)]
+    app._exit_hotkey_specs = {"": {code: {"key": 0x01000030, "label": "F1"}}}
+    screen.model.exit_hotkeys[code] = (0x01000030, "F1")
+    app._global_hotkeys = types.SimpleNamespace(
+        unregister=lambda token: None, register=lambda *a: True)
 
     def sell_fill(remaining, fill, order_qty=100):
         app._track_open_sell(code, "S1", {
@@ -228,7 +268,9 @@ async def check_balance_cleared_when_empty():
     assert code not in app._balance_sell_settings, app._balance_sell_settings
     assert code not in app._balance_sell_stage, app._balance_sell_stage
     assert code not in app._account_auto_cancel_armed
-    print("잔고 소진     : 3단매도·자동취소 자동 해제")
+    assert app._exit_hotkey_specs.get("") == {}, app._exit_hotkey_specs
+    assert screen.model.exit_hotkeys == {}, screen.model.exit_hotkeys
+    print("잔고 소진     : 3단매도·자동취소·청산키 자동 해제")
 
     # 사기 전에 미리 걸어 둔 것은 내려가면 안 된다. 진행도가 0이라 첫
     # 관문에서 걸리고, 자동취소만 켠 종목은 3단매도 설정이 없어 그 앞에서
