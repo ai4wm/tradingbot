@@ -235,21 +235,6 @@ class TelegramNewsTabMixin:
             lambda *_: self._telegram_search_timer.start(400))
         self._telegram_search.returnPressed.connect(
             self._reload_telegram_news)
-        self._telegram_sound = QCheckBox("소리")
-        self._telegram_sound.setToolTip(
-            "체크하면 새 텔레그램 글이 도착할 때 알림음을 재생합니다.\n"
-            "종목코드 있음: "
-            r"C:\KiwoomHero4\sound\sound10.wav"
-            "\n종목코드 없음: "
-            r"C:\KiwoomHero4\sound\sound9.wav")
-        self._telegram_sound.setChecked(
-            str(self._settings.value(
-                "analysis_telegram_sound", "false"
-            )).strip().lower() in {"1", "true", "yes"}
-        )
-        self._telegram_sound.toggled.connect(
-            lambda checked: self._settings.setValue(
-                "analysis_telegram_sound", "true" if checked else "false"))
         self._telegram_stock_only = QCheckBox("종목")
         self._telegram_stock_only.setToolTip(
             "종목코드가 연결된 글만 표시합니다.")
@@ -273,7 +258,6 @@ class TelegramNewsTabMixin:
         status_row.addWidget(self._telegram_status)
         status_row.addWidget(self._telegram_count)
         status_row.addWidget(self._telegram_search, 1)
-        status_row.addWidget(self._telegram_sound)
         self._telegram_clear_new_button = QPushButton("신규해제")
         self._telegram_clear_new_button.setEnabled(False)
         self._telegram_clear_new_button.setToolTip(
@@ -432,7 +416,7 @@ class TelegramNewsTabMixin:
         self._renumber_telegram_table()
         if is_new:
             self._show_latest_telegram_news(row)
-            if self._telegram_sound.isChecked():
+            if self.news_sound_enabled():
                 _beep("telegram_news_with_code" if codes
                       else "telegram_news_without_code")
 

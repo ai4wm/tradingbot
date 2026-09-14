@@ -37,14 +37,17 @@ FID = {
     "16": "open",      # 시가 (전일대비 부호가 붙어 옴 -> abs)
     "17": "high",      # 당일 고가
     "18": "low",       # 당일 저가
+    # 0D는 10단계를 다 보낸다(41~50 매도호가, 51~60 매수호가, 61~70 매도잔량,
+    # 71~80 매수잔량). 5단계까지만 받던 것을 2026-09-14에 10단계로 늘렸다.
+    # `FID discover`가 46~50·56~60·66~70·76~80을 UNMAPPED로 계속 찍고 있었다.
     "41": "ask_price",  # 매도호가1
-    "42": "ask_price2", "43": "ask_price3", "44": "ask_price4", "45": "ask_price5",
+    **{str(40 + n): f"ask_price{n}" for n in range(2, 11)},
     "51": "bid_price",  # 매수호가1
-    "52": "bid_price2", "53": "bid_price3", "54": "bid_price4", "55": "bid_price5",
+    **{str(50 + n): f"bid_price{n}" for n in range(2, 11)},
     "61": "ask_qty",   # 최우선 매도잔량 (0D 매도호가1 잔량)
-    "62": "ask_qty2", "63": "ask_qty3", "64": "ask_qty4", "65": "ask_qty5",
+    **{str(60 + n): f"ask_qty{n}" for n in range(2, 11)},
     "71": "bid_qty",   # 최우선 매수잔량 (0D 매수호가1 잔량)
-    "72": "bid_qty2", "73": "bid_qty3", "74": "bid_qty4", "75": "bid_qty5",
+    **{str(70 + n): f"bid_qty{n}" for n in range(2, 11)},
     # 예상가: 0D 23/24는 장중에도 값이 바뀌며 옴(상한가 종목 등) -> 표시 ON 신호로 못 씀.
     # gui가 0H/단일가/VI/동시호가REST로 켠 상태에서만 갱신용으로 반영한다.
     "23": "exp_price",

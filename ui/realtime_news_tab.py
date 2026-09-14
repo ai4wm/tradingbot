@@ -585,13 +585,18 @@ class RealtimeNewsTabMixin:
             self._ls_news_search.clear)
         self._ls_news_sound = QCheckBox("소리")
         self._ls_news_sound.setToolTip(
-            "체크하면 새 실시간 뉴스가 화면에 추가될 때 알림음을 재생합니다.\n"
+            "뉴스 알림음 전체 스위치입니다. 실시간·네이버·텔레그램 모두 "
+            "이 체크 하나로 켜고 끕니다.\n"
             "종목코드 있음: "
             r"C:\KiwoomHero4\sound\sound8.wav"
             "\n종목코드 없음: "
             r"C:\KiwoomHero4\sound\sound11.wav"
             "\n네이버 API 관심종목 새 뉴스: "
-            r"C:\KiwoomHero4\sound\sound12.wav")
+            r"C:\KiwoomHero4\sound\sound12.wav"
+            "\n텔레그램 종목코드 있음: "
+            r"C:\KiwoomHero4\sound\sound10.wav"
+            "\n텔레그램 종목코드 없음: "
+            r"C:\KiwoomHero4\sound\sound9.wav")
         self._ls_news_sound.setChecked(
             str(self._settings.value(
                 "analysis_ls_news_sound", "false"
@@ -1023,9 +1028,7 @@ class RealtimeNewsTabMixin:
             self._update_ls_news_count()
         if was_at_top:
             table.scrollToTop()
-        if (
-            persist and matches_search and self._ls_news_sound.isChecked()
-        ):
+        if persist and matches_search and self.news_sound_enabled():
             _beep(
                 "ls_news_with_code"
                 if valid_stock_codes else "ls_news_without_code")
@@ -1168,6 +1171,15 @@ class RealtimeNewsTabMixin:
         self._reload_ls_news_current_rows()
         if rerun_db_search:
             QTimer.singleShot(0, self._start_ls_news_db_search)
+
+    def news_sound_enabled(self) -> bool:
+        """뉴스 알림음 전체 스위치. 실시간 뉴스 탭의 `소리` 체크 하나로 묶는다.
+
+        전에는 탭마다 체크가 따로 있어 하나만 꺼도 다른 탭이 계속 울렸다.
+        탭이 만들어지기 전에 뉴스가 들어올 수 있으므로 없으면 끈 것으로 본다.
+        """
+        check = getattr(self, "_ls_news_sound", None)
+        return bool(check is not None and check.isChecked())
 
     def _set_ls_news_sound(self, checked: bool):
         """LS 실시간 뉴스 알림음 사용 여부를 저장한다."""

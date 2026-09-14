@@ -835,10 +835,7 @@ class StockNewsTabMixin:
             if total_new:
                 if latest_new_news is not None:
                     self._show_latest_naver_news(latest_new_news)
-                if (
-                    hasattr(self, "_ls_news_sound")
-                    and self._ls_news_sound.isChecked()
-                ):
+                if self.news_sound_enabled():
                     _beep("naver_news")
                 self.new_news_found.emit(total_new)
 
