@@ -374,6 +374,27 @@ def _krx_holiday_reason(day: date) -> str:
     return ""
 
 
+# 3단매도 잔량 감시가 도는 국면.
+#
+# 종가 동시호가(15:20~15:30)를 보는 이유는 그 10분에 상이 무너지면 미체결
+# 매수가 그대로 종가에 체결되기 때문이다. 호가잔량은 동시호가에도 실시간으로
+# 들어온다.
+#
+# 애프터마켓(16~20시)도 본다. 다만 16시에 호가창이 백지에서 시작하므로 정규장
+# 기준선을 그대로 두면 첫 틱에 2단이 바로 걸린다. 저녁에 쓰려면 잔량이 쌓인
+# 것을 보고 기준선을 새로 잡아야 한다. 15:33에 정규장 설정이 내려가는 것이
+# 그 안전장치다.
+#
+# 시가 동시호가와 시간외종가(15:40~16:00)는 넣지 않는다. 앞은 9분할 매수가
+# 나가는 구간이라 자기 주문에 반응하고, 뒤는 종가 한 값으로만 거래된다.
+BALANCE_SELL_SESSIONS = ("정규장", "종가 동시호가", "애프터마켓")
+
+# 3단매도·자동취소를 내리는 시각. 감시가 끝난 뒤여야 한다. 종가는 15:30에
+# 정해지고 애프터마켓은 20:00에 끝나는데, 체결 통보가 몇 초 늦게 오므로
+# 각각 3분과 5분을 둔다.
+SESSION_CLEANUP_TIMES = ((15, 33), (20, 5))
+
+
 def _market_session_states(now: datetime) -> tuple[str, str, str]:
     """현재 KRX·NXT 세션 표시와 휴장 사유를 반환한다."""
     reason = _krx_holiday_reason(now.date())
@@ -394,8 +415,12 @@ def _market_session_states(now: datetime) -> tuple[str, str, str]:
         krx = "종가 동시호가"
     elif seconds < at(15, 40):
         krx = "정규장 종료"
-    elif seconds < at(18):
-        krx = "시간외"
+    elif seconds < at(16):
+        krx = "시간외종가"
+    elif seconds < at(20):
+        # 2026-09-14 시간외단일가(16~18시, 10분 단일가) 폐지. 같은 자리에
+        # 접속매매 애프터마켓이 20시까지 선다.
+        krx = "애프터마켓"
     else:
         krx = "종료"
 
@@ -409,6 +434,9 @@ def _market_session_states(now: datetime) -> tuple[str, str, str]:
         nxt = "메인마켓"
     elif seconds < at(15, 30):
         nxt = "일시휴장"
+    elif seconds < at(15, 40):
+        # NXT 애프터마켓은 15:30~15:40 호가만 받고 15:40부터 체결한다.
+        nxt = "호가접수"
     elif seconds < at(20):
         nxt = "애프터마켓"
     else:
@@ -472,6 +500,34 @@ def _balance_stage3_limit_price(row: dict) -> int:
         price = _previous_krx_quote_price(price)
     lower = int(row.get("lower") or 0)
     return max(lower, price) if lower > 0 else price
+
+
+def _emergency_exit_price(row: dict) -> int:
+    """청산은 하한가 지정가로 낸다.
+
+    하한가로 내도 체결은 매수 호가를 위에서부터 훑으므로 결과가 시장가와
+    같다. 하한가까지 긁히는 것은 호가가 실제로 빈 경우뿐이고 그때는 시장가도
+    마찬가지다. 대신 두 가지가 다르다 - 2026-09-14부터 KRX 애프터마켓
+    (16~20시)이 시장가를 받지 않고, 하한가는 `bid_price4`에 매달리지 않는다.
+    4호가로 내던 시절에는 점상이 무너져 호가가 증발하는 바로 그 순간 가격이
+    0이 되어 매도가 거부됐다. 청산키가 가장 필요한 순간이다.
+
+    하한가는 편입 조회(`lst_pric`)로 들어와 행에 남는다. 없으면 행에 실린
+    마지막 매수호가에 낸다 - 이쪽은 웹소켓이 따로 채우므로 조회가 안 붙은
+    행에도 있다. 전일종가로 물러나는 길은 없다. `base`와 `lower`가 같은
+    조회에 실려 오므로 하한가가 없으면 전일종가도 없다.
+    """
+    return (int(row.get("lower") or 0) or _deepest_bid(row)
+            or _balance_stage3_limit_price(row))
+
+
+def _deepest_bid(row: dict) -> int:
+    """행에 실린 매수호가 중 가장 낮은 값. 호가창이 얕으면 위에서 찾는다."""
+    for level in range(10, 1, -1):
+        price = int(row.get(f"bid_price{level}") or 0)
+        if price > 0:
+            return price
+    return int(row.get("bid_price") or 0)
 
 
 def _largest_shareholder_evidence(
@@ -1086,6 +1142,12 @@ class App:
         self._single_timer = QTimer()
         self._single_timer.timeout.connect(self._on_single_poll)
         self._single_timer.start(3000)
+        # 장이 끝나면 3단매도·자동취소를 스스로 내린다. 한 번만 울리는
+        # 타이머라 그때까지 아무 일도 하지 않는다.
+        self._session_cleanup_timer = QTimer()
+        self._session_cleanup_timer.setSingleShot(True)
+        self._session_cleanup_timer.timeout.connect(self._on_session_cleanup)
+        self._schedule_session_cleanup()
         self._rank = None
         self._analysis = None
         # 네이버 뉴스 API 자동수집은 저장된 체크 상태와 주기에만 따른다.
@@ -1323,7 +1385,7 @@ class App:
     def _on_global_exit_hotkey(self, payload: tuple):
         screen, code, label = payload
         row = screen.model.rows.get(code, {})
-        price = int(row.get("bid_price4") or 0)
+        price = _emergency_exit_price(row)
         # 등록한 조건검색창이 아니라 분석창/다른 조건검색창을 보고 있어도
         # 같은 Qt 앱 안에 활성 창이 하나라도 있으면 '앱 활성'으로 본다.
         active = QApplication.activeWindow() is not None
@@ -3258,6 +3320,47 @@ class App:
         # 엉뚱하게 동작한다. 다시 주문하면 자동 배정이 새로 건다.
         self._clear_exit_hotkey(code)
 
+    def _schedule_session_cleanup(self):
+        """다음 정리 시각에 한 번 울리도록 건다. 다 지났으면 내일 첫 차례로."""
+        now = datetime.now()
+        times = [now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                 for hour, minute in SESSION_CLEANUP_TIMES]
+        cutoff = next((t for t in sorted(times) if t > now),
+                      min(times) + timedelta(days=1))
+        self._session_cleanup_timer.start(
+            max(1, int((cutoff - now).total_seconds() * 1000)))
+
+    def _on_session_cleanup(self):
+        """장이 끝나면 남은 3단매도·자동취소를 전부 내린다.
+
+        설정이 그대로 남으면 화면에는 걸린 것처럼 보이고 다음 날 아침
+        `auto_balance_sell_on_order`가 새 잔량 기준으로 다시 걸지도 않는다
+        (설정이 있으면 건드리지 않는다).
+
+        감시는 종가 동시호가까지 돈다(`BALANCE_SELL_SESSIONS`). 그래서 그것이
+        끝나고 체결 통보까지 온 뒤에 내린다.
+
+        미체결 매수는 건드리지 않는다. 종가 동시호가에 그대로 들어가고,
+        무너지면 3단매도가 끊고, 안 되면 15:30에 거래소가 지운다.
+
+        청산키는 내리지 않는다. 2026-09-14부터 애프터마켓(16~20시)이 열려
+        16시 이후 손쓸 수 있는 수단이 그것뿐이다.
+        """
+        codes = sorted(set(self._balance_sell_settings)
+                       | set(self._account_auto_cancel_armed))
+        if not codes:
+            self._schedule_session_cleanup()
+            return
+        audit_log.info("session cleanup codes=%s balance=%s auto_cancel=%s",
+                       len(codes), len(self._balance_sell_settings),
+                       len(self._account_auto_cancel_armed))
+        for code in codes:
+            if code in self._balance_sell_settings:
+                self._set_balance_sell(code, None)
+            if code in self._account_auto_cancel_armed:
+                self._set_account_auto_cancel(code, False)
+        self._schedule_session_cleanup()
+
     def _resell_late_buy_fill(self, code: str):
         """전량 매도 단계를 지난 뒤 늦게 체결된 매수를 같은 조건으로 판다.
 
@@ -3299,7 +3402,7 @@ class App:
                 "expired balance sell setting cleared code=%s", code)
             return
         krx_state, _, reason = _market_session_states(datetime.now())
-        if reason or krx_state != "정규장":
+        if reason or krx_state not in BALANCE_SELL_SESSIONS:
             return
         # 번호는 이름일 뿐이고 실행 순서는 기준 잔량이 큰 쪽 -> 작은 쪽이다.
         # 여러 기준을 한 번에 밑돌면 기준이 가장 작은 단계 하나만 실행하고
@@ -3355,7 +3458,12 @@ class App:
             view.screen.model.rows[code]
             for view in self.views if code in view.screen.model.rows), {})
         if market_sell:
-            price = 0
+            # 체크 이름은 그대로지만 나가는 것은 하한가 지정가다. 체결 결과는
+            # 시장가와 같고, 애프터마켓(16~20시)은 시장가를 받지 않는다.
+            # 하한가도 4호가도 모르면 그때만 시장가로 물러난다. 안 나가는
+            # 것이 제일 나쁘다.
+            price = _emergency_exit_price(row)
+            market_sell = price <= 0
         elif number == 3:
             # 매수 4호가 잔량/존재 여부와 무관하게 3틱 아래 가격으로
             # 지정가를 즉시 낸다. 실제 4호가가 비면 가격을 직접 계산한다.
@@ -3375,7 +3483,7 @@ class App:
             "balance sell stage triggered code=%s slot=%s depth=%s "
             "bid_qty=%s threshold=%s ratio=%s order_type=%s price=%s refill=%s",
             code, number, depth, bid_qty, threshold,
-            ratio, "market" if market_sell else "limit", price, refill)
+            ratio, "low" if market_sell else "limit", price, refill)
         task = asyncio.ensure_future(
             self._execute_balance_stage(
                 code, depth, number, ratio, price, bid_qty, market_sell))
@@ -3505,9 +3613,15 @@ class App:
             self._current_bid_qty(code))
         return qty
 
-    def _emergency_exit(self, code: str, price: int):
+    def _emergency_exit(self, code: str, price: int = 0, *_ignored):
         # 새 청산키 입력은 새 결과이므로 이전 사용자의 상태 확인 기록을 해제한다.
         self._emergency_status_dismissed.discard(code)
+        # 가격은 부르는 쪽을 믿지 않고 여기서 정한다. 전역키와 창 안 키가
+        # 따로 계산하던 것을 한 곳으로 모았다.
+        row = next((view.screen.model.rows[code]
+                    for view in self.views
+                    if code in view.screen.model.rows), {})
+        price = _emergency_exit_price(row) or int(price)
         if price > 0:
             self._emergency_prices[code] = int(price)
         self._emergency_locked.add(code)

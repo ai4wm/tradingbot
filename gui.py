@@ -42,7 +42,7 @@ FIELDS  = ["qrank", "qrank_chg", "rate",   "streak", "name", "theme", "price", "
 # streak(연상)/mcap(시가총액)은 저장 안 함: 매번 계산
 BOOK_FIELDS = {f"{side}_{kind}{level if level > 1 else ''}"
                for side in ("ask", "bid") for kind in ("price", "qty")
-               for level in range(1, 6)}
+               for level in range(1, 11)}
 STORED = (set(FIELDS) - {
     "streak", "theme", "mcap", "order", "balance_sell",
     "auto_cancel_arm", "exit_hotkey"}) | {
@@ -1181,7 +1181,7 @@ class StockModel(QAbstractTableModel):
         self._minute_volume_ready: set[str] = set()  # 누적거래량 최초 기준점 확보 종목
         self._minute_volume_source: dict[str, str] = {}  # 종목별 KRX/NXT/통합 누적값 출처
         self._minute_volume_day: dict[str, str] = {}  # 날짜가 바뀔 때만 누적값 기준 초기화
-        self.quotes: dict[str, deque] = {}   # (시각, 1~5호가 (매도/매수 가격·잔량)) 최근 15초
+        self.quotes: dict[str, deque] = {}   # (시각, 1~10호가 (매도/매수 가격·잔량)) 최근 15초
         self.prediction_history: dict[str, deque] = {}  # 최근 5분 1초 체결 요약
         self.program_history: dict[str, deque] = {}  # 최근 5분 0w 매수/매도수량 차분
         self._program_cumulative: dict[str, tuple] = {}  # 마지막 (매수수량누적, 매도수량누적, 출처)
@@ -1441,7 +1441,7 @@ class StockModel(QAbstractTableModel):
         quote_changed = any(f in fields for f in BOOK_FIELDS)
         if quote_changed:
             levels = []
-            for level in range(1, 6):
+            for level in range(1, 11):
                 suffix = "" if level == 1 else str(level)
                 names = tuple(f"{side}_{kind}{suffix}" for side, kind in (
                     ("ask", "price"), ("ask", "qty"), ("bid", "price"), ("bid", "qty")))
@@ -2004,7 +2004,7 @@ class StockModel(QAbstractTableModel):
                     return (
                         f"적용 중인 보조 설정\n"
                         f"주문방식: "
-                        f"{'시장가' if setting.get('market_sell', False) else '지정가'}\n"
+                        f"{'하한가' if setting.get('market_sell', False) else '지정가'}\n"
                         f"1번 {setting['first']:,}주 이하"
                         f"{' (꺼짐)' if not setting['first'] else ''}: "
                         f"{_balance_ratio_text(setting.get('first_ratio', 0), '% 매도')}\n"
@@ -2499,8 +2499,10 @@ class BalanceSellDialog(QDialog):
                 combo.addItem(label, ratio)
             combo.setToolTip("마지막 선택을 기억합니다.")
             combo.currentIndexChanged.connect(self._on_ratio_changed)
-        self.market_sell_check = QCheckBox("시장가 매도")
+        self.market_sell_check = QCheckBox("하한가 매도")
         self.market_sell_check.setToolTip(
+            "하한가 지정가로 냅니다. 체결 결과는 시장가와 같고 "
+            "애프터마켓(16~20시)에서도 나갑니다.\n"
             "마지막 체크/해제 상태를 즉시 저장해 다음 설정창과 앱 재실행 때 "
             "복원합니다. 실제 주문에는 해당 종목에서 설정 적용해야 반영됩니다.")
         self.market_sell_check.setStyleSheet(
@@ -2620,7 +2622,7 @@ class BalanceSellDialog(QDialog):
                 combo.setCurrentIndex(combo_index if combo_index >= 0 else 0)
                 combo.blockSignals(False)
             self.applied_label.setText(
-                ("시장가 · " if self.config.get("market_sell", False)
+                ("하한가 · " if self.config.get("market_sell", False)
                  else "지정가 · ")
                 + " / ".join(
                     f"{_compact_shares(self.config[key])}↓ {combo.currentText()}"
@@ -2690,7 +2692,7 @@ class BalanceSellDialog(QDialog):
         self._mark_manual()
 
     def _on_market_sell_toggled(self, checked: bool):
-        """시장가 체크박스의 마지막 선택 상태를 즉시 기억한다."""
+        """하한가 매도 체크박스의 마지막 선택 상태를 즉시 기억한다."""
         self._settings.setValue(
             self._market_sell_key, "true" if checked else "false")
         self._settings.sync()
@@ -4366,10 +4368,12 @@ class ConditionScreen(QWidget):
                     # 전달한다. 여기서도 실행하면 활성 창에서 두 번 청산된다.
                     return super().eventFilter(watched, event)
                 row = self.model.rows.get(code, {})
-                price = int(row.get("bid_price4") or 0)
+                # 하한가 지정가. 가격은 main이 다시 정하므로 여기 값은
+                # 로그와 예비용이다.
+                price = int(row.get("lower") or row.get("bid_price4") or 0)
                 if price <= 0:
                     log.warning(
-                        "exit hotkey no-bid4 code=%s key=%s",
+                        "exit hotkey no-price code=%s key=%s",
                         code, self.model.exit_hotkeys[code][1])
                 log.warning(
                     "exit hotkey triggered code=%s key=%s price=%s enabled=%s",

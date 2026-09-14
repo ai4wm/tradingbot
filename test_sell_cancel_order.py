@@ -29,6 +29,7 @@ class FakeRest:
 
     def __init__(self):
         self.calls = []
+        self.sells = []
 
     async def cancel_order(self, code, order_no, qty, exchange="KRX"):
         self.calls.append(f"cancel_start:{order_no}")
@@ -50,6 +51,7 @@ class FakeRest:
 
     async def sell_order(self, code, qty, price, market=False):
         self.calls.append("sell")
+        self.sells.append(("시장가" if market else price, qty))
         return {"order_no": "0001"}
 
 
@@ -728,6 +730,77 @@ async def check_order_send_is_parallel():
           "(취소 응답 0.3초를 기다리지 않음)")
 
 
+async def check_balance_low_limit():
+    """`하한가 매도` 체크는 시장가가 아니라 하한가 지정가로 나가야 한다.
+
+    2026-09-14부터 KRX 애프터마켓(16~20시)이 시장가를 받지 않는다. 하한가로
+    내도 체결은 매수 호가를 위에서부터 훑으므로 결과가 같다. 하한가를 끝내
+    모를 때만 시장가로 물러난다 - 안 나가는 것이 제일 나쁘다.
+    """
+    code = "005930"
+    app = _app([])
+    screen = _HotkeyScreen()
+    screen.model.rows[code] = {"lower": 6090, "upper": 11310,
+                               "bid_price": 11310, "bid_price4": 11250}
+    screen.set_balance_sell_stage = lambda *a: None
+    app.views = [types.SimpleNamespace(screen=screen)]
+    app._balance_sell_settings[code] = {
+        "first": 0, "second": 0, "third": 300_000,
+        "first_ratio": 0.0, "second_ratio": 0.0, "third_ratio": 1.0,
+        "market_sell": True}
+    app._balance_sell_date[code] = _main.datetime.now().strftime("%Y%m%d")
+    app._position_book[code] = {"held": 100, "sellable": 100}
+
+    session, beep = _main._market_session_states, _main._beep
+    _main._market_session_states = lambda now: ("정규장", "정규장", "")
+    _main._beep = lambda *_args, **_kwargs: None
+    try:
+        app._check_balance_sell(code, 200_000)
+        await app._balance_sell_tasks[code]
+        assert app.rest.sells == [(6090, 100)], app.rest.sells
+
+        # 하한가를 모르는 행이면 시장가로 물러난다. 안 나가면 안 된다.
+        app2 = _app([])
+        app2.views = []
+        app2._balance_sell_settings[code] = app._balance_sell_settings[code]
+        app2._balance_sell_date[code] = app._balance_sell_date[code]
+        app2._position_book[code] = {"held": 100, "sellable": 100}
+        app2._check_balance_sell(code, 200_000)
+        await app2._balance_sell_tasks[code]
+        assert app2.rest.sells == [("시장가", 100)], app2.rest.sells
+    finally:
+        _main._market_session_states, _main._beep = session, beep
+    print("하한가 매도 : 체크하면 하한가 지정가, 행이 없으면 시장가")
+
+
+def check_emergency_price():
+    """청산 가격은 하한가 지정가다.
+
+    4호가로 내던 시절에는 점상이 무너져 호가가 증발하면 가격이 0이 되어
+    매도가 거부됐다. 청산키가 가장 필요한 순간이다. 그리고 2026-09-14부터
+    KRX 애프터마켓(16~20시)은 시장가를 받지 않는다.
+    """
+    row = {"lower": 6090, "bid_price4": 11250, "bid_price": 11310,
+           "upper": 11310}
+    assert _main._emergency_exit_price(row) == 6090, "4호가가 있어도 하한가"
+
+    # 하한가를 모르면 행에 실린 마지막 매수호가에 낸다. 0D가 10단계를 보낸다.
+    deep = {f"bid_price{n}": 11310 - (n - 1) * 10 for n in range(2, 11)}
+    assert _main._emergency_exit_price({**deep, "lower": 0}) == 11220
+    # 호가창이 얕으면 있는 것 중 가장 낮은 곳으로 간다.
+    assert _main._emergency_exit_price(
+        {"bid_price4": 11250, "lower": 0}) == 11250
+    # 1호가만 아는 행이면 거기에 낸다. 없는 호가를 계산해 내려가지 않는다.
+    assert _main._emergency_exit_price({"bid_price": 11310, "lower": 0}) == 11310
+    # 호가가 하나도 없으면 그때만 상한가 기준 3틱 아래를 계산한다.
+    guessed = _main._emergency_exit_price({"upper": 11310, "lower": 0})
+    assert 0 < guessed < 11310, guessed
+
+    # 행 자체가 없으면 0이고, 그때만 부르는 쪽이 넘긴 값을 쓴다.
+    assert _main._emergency_exit_price({}) == 0
+    print("청산 가격 : 하한가 지정가, 없으면 마지막 호가")
+
+
 def check_nothing_to_cancel():
     """영웅문에서 먼저 취소한 건은 오류가 아니라 이미 목적 달성이다.
 
@@ -890,6 +963,8 @@ async def main_check():
     await check_emergency_primed_without_entry()
     await check_emergency_clears_settings()
     await check_sell_resend_guard()
+    await check_balance_low_limit()
+    check_emergency_price()
     print("OK")
 
 
