@@ -4,6 +4,10 @@
 계좌 주문가능금액은 미체결 접수분을 이미 뺀 값이라, 앱 로컬 누적 주문액을
 또 빼면 같은 주문이 두 번 차감된다. 계좌 조회가 언제 도느냐와 무관하게
 같은 수량이 나와야 한다.
+
+기대값이 딱 떨어지는 수(350·500·1000)보다 1주씩 적은 것은 매수 수수료
+몫(`gui.BUY_FEE_RATE` 0.05%)을 빼고 세기 때문이다. 2026-09-17 092600에서
+그 1주가 모자라 9분할 중 마지막 한 건이 증거금 부족으로 거부됐다.
 """
 import os
 
@@ -56,7 +60,7 @@ def demo():
         "B", 20000, _detail("B", 20000, 7_000_000, 350, ordered))
     after_poll = fresh._current_orderable_qty()
 
-    assert before_poll == after_poll == 350, (before_poll, after_poll)
+    assert before_poll == after_poll == 349, (before_poll, after_poll)
 
     # 계좌 요약(kt00001) 경로도 같은 기준선을 쓴다.
     summary = _screen()
@@ -70,7 +74,7 @@ def demo():
     })
     summary.set_orderable_quantity(
         "B", 20000, _detail("B", 20000, 7_000_000, 350, ordered))
-    assert summary._current_orderable_qty() == 350, summary._current_orderable_qty()
+    assert summary._current_orderable_qty() == 349, summary._current_orderable_qty()
 
     # 기준선이 없는 응답(구버전·조회 실패 후)은 예약금을 전액 빼는 안전 방향.
     unknown = _screen()
@@ -78,13 +82,13 @@ def demo():
     unknown.set_order_reserved(ordered)
     unknown.set_orderable_quantity(
         "B", 20000, _detail("B", 20000, 10_000_000, 500, None))
-    assert unknown._current_orderable_qty() == 350, unknown._current_orderable_qty()
+    assert unknown._current_orderable_qty() == 349, unknown._current_orderable_qty()
 
     # 아직 아무 주문도 없으면 계좌 가능수량이 그대로 나온다.
     idle = _screen()
     idle._order_target_code = "B"
     idle.set_orderable_quantity("B", 20000, _detail("B", 20000, 10_000_000, 500, 0))
-    assert idle._current_orderable_qty() == 500, idle._current_orderable_qty()
+    assert idle._current_orderable_qty() == 499, idle._current_orderable_qty()
 
     # 한도를 다 쓰면 0주. 남은금액이 음수로 넘어가지 않아야 한다.
     spent = _screen()
@@ -127,17 +131,17 @@ def demo_consecutive():
         screen.set_orderable_quantity(
             code, 10000, _detail(code, 10000, 10_000_000, 1000, 0))
         remaining_seen.append(screen._current_orderable_qty())
-        assert remaining_seen[-1] == 1000 - step * 100, remaining_seen
+        assert remaining_seen[-1] == 999 - step * 100, remaining_seen
         fill(engine.submit(code, code, 10000, [100], False))
 
-    assert remaining_seen == [1000, 900, 800, 700], remaining_seen
+    assert remaining_seen == [999, 899, 799, 699], remaining_seen
 
     # 5번째로 A를 재주문해도 앞선 400만원이 예약금에 남아 있어야 한다.
     screen._order_target_code = "A"
     screen.set_order_reserved(engine.committed_notional())
     screen.set_orderable_quantity(
         "A", 10000, _detail("A", 10000, 10_000_000, 1000, 0))
-    assert screen._current_orderable_qty() == 600, (
+    assert screen._current_orderable_qty() == 599, (
         screen._current_orderable_qty())
     engine.submit("A", "A", 10000, [50], False)
     assert engine.committed_notional() == 4_500_000, engine.committed_notional()
@@ -234,7 +238,7 @@ def demo_cancel_then_other_stock():
     batch = engine.submit("A", "가", 10000, [500], False)
     batch.children[0].order_no = "O1"
     batch.sent_count = 1
-    assert pick_b(screen, engine, 10_000_000, 500, 0) == 250, "A 주문 중 B 과다"
+    assert pick_b(screen, engine, 10_000_000, 500, 0) == 249, "A 주문 중 B 과다"
 
     # (2) A를 전량 취소하면 B는 전액을 쓸 수 있다 — 캐시/재조회 결과가 같아야 한다.
     batch.children[0].remaining_qty = 0
@@ -243,7 +247,7 @@ def demo_cancel_then_other_stock():
     _, fresh_screen = board()
     fresh_screen.model.rows["B"] = {"name": "나", "upper": 20000}
     refetched = pick_b(fresh_screen, engine, 10_000_000, 500, 0)  # 취소 뒤 재조회
-    assert cached == refetched == 500, (cached, refetched)
+    assert cached == refetched == 499, (cached, refetched)
 
     # (3) 200주만 체결되고 나머지를 취소한 경우, 체결분 200만원만 빠져야 한다.
     engine, screen = board()
@@ -257,7 +261,7 @@ def demo_cancel_then_other_stock():
     _, screen2 = board()
     screen2.model.rows["B"] = {"name": "나", "upper": 20000}
     polled = pick_b(screen2, engine, 8_000_000, 400, 2_000_000)   # 서버 갱신본
-    assert stale == polled == 400, (stale, polled)
+    assert stale == polled == 399, (stale, polled)
 
     del app
     print("ok (취소 후 다른 종목)")
@@ -358,11 +362,49 @@ def demo_stale_qty_after_other_order():
         "reserved_base": 860_400,
     })
     fresh = screen._current_orderable_qty()
-    assert fresh == 269, fresh
+    assert fresh == 268, fresh
     assert stale > fresh, (stale, fresh)
 
     del app
     print(f"ok (다른 종목 주문 뒤 수량 재조회) {stale}주 -> {fresh}주")
+
+
+def demo_fee_headroom():
+    """보유종목을 판 직후 9분할이 9건 다 나가는지 확인한다.
+
+    2026-09-17 092600 앤씨앤. 미투온 900주를 4,215원에 팔아 들어온
+    4,423,975원을 상한가 2,825원에 9분할했다. 키움 주문가능수량이 1,566주로
+    와서 174주씩 9건을 냈는데, 8건(1,392주)이 접수된 뒤 9번째가
+    `[2000](855056:매수증거금이 부족합니다. 173주 매수가능)`으로 거부됐다.
+    남은 증거금 491,575원에 174주(491,550원)가 들어갈 것 같지만 수수료
+    몫 2,850원이 더 필요했다.
+
+    수수료를 빼고 세면 1,565주가 나오고, 9분할이 174×8 + 173으로 딱 맞는다.
+    """
+    from order import split_quantity
+
+    app = QApplication.instance() or QApplication([])
+
+    upper, funds, api_qty = 2825, 4_423_975, 1566
+    screen = ConditionScreen()
+    screen.model.rows["C"] = {"name": "앤씨앤", "upper": upper}
+    screen._order_target_code = "C"
+    screen.set_orderable_quantity(
+        "C", upper, _detail("C", upper, funds, api_qty, 0))
+
+    total = screen._current_orderable_qty()
+    assert total == 1565, total
+    assert api_qty * upper <= funds, "그날 키움 값은 금액 안에 들어갔었다"
+
+    plan = split_quantity(total, 9)
+    assert plan == [174] * 8 + [173], plan
+    # 서버가 8건 접수 뒤 허용한 수량이 173주였다.
+    assert plan[-1] == 173, plan
+    # 수수료까지 치르고도 계좌 안에 들어와야 한다.
+    assert sum(plan) * upper * 1.0005 <= funds, sum(plan) * upper
+
+    del app
+    print(f"ok (수수료 여유) {api_qty}주 -> {total}주")
 
 
 if __name__ == "__main__":
@@ -372,3 +414,4 @@ if __name__ == "__main__":
     demo_cancel_then_other_stock()
     demo_status_clears_after_cancel()
     demo_stale_qty_after_other_order()
+    demo_fee_headroom()

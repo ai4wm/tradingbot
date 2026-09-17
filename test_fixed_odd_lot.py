@@ -3,6 +3,9 @@
 
 100주 단위로만 끊어 보내면 100주에 못 미치는 잔량이 통째로 남았다. 설정한
 주문 건수를 넘기지 않는 선에서 그 잔량까지 태운다.
+
+가능수량은 매수 수수료 몫(`gui.BUY_FEE_RATE` 0.05%)을 뺀 값이라 850주면
+849주가 나간다. 그래서 자투리가 50이 아니라 49다.
 """
 import os
 
@@ -47,13 +50,13 @@ def _sent(available_qty, split_count):
 def demo():
     app = QApplication.instance() or QApplication([])
 
-    # 설정 9회에 850주: 100주 8건으로는 50주가 남는다 -> 마지막 1건에 붙인다.
+    # 설정 9회에 850주: 100주 8건으로는 49주가 남는다 -> 마지막 1건에 붙인다.
     count, total, plan = _sent(850, 9)
-    assert (count, total) == (9, 850), (count, total)
-    assert plan == [100] * 8 + [50], plan
+    assert (count, total) == (9, 849), (count, total)
+    assert plan == [100] * 8 + [49], plan
 
-    # 딱 떨어지면 자투리 건이 생기지 않는다.
-    count, total, plan = _sent(900, 9)
+    # 딱 떨어지면 자투리 건이 생기지 않는다(901주 -> 수수료 제하고 900주).
+    count, total, plan = _sent(901, 9)
     assert (count, total) == (9, 900), (count, total)
     assert plan == [100] * 9, plan
 
@@ -72,8 +75,8 @@ def demo():
 
     # 예상주문 줄에도 자투리 건이 드러나야 한다.
     preview = _screen(850, 9).order_preview_value.text()
-    assert "실제 9회" in preview and "100주씩+50주" in preview, preview
-    assert "총 850주" in preview, preview
+    assert "실제 9회" in preview and "100주씩+49주" in preview, preview
+    assert "총 849주" in preview, preview
 
     # 총수량만으로 분할내역이 정해진다(main._submit_order가 쓰는 갈래).
     assert fixed_quantities(0) == []

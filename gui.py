@@ -58,6 +58,11 @@ BID_QTY_COL = FIELDS.index("bid_qty")
 MINUTE_VALUE_COL = FIELDS.index("minute_value")
 ACC_VALUE_COL = FIELDS.index("acc_value")
 MINUTE_VALUE_DISPLAY_STEP = 10_000_000  # 화면의 0.1억원과 정렬 구간을 일치시킨다.
+# 매수 수수료. 키움 주문가능수량·금액(kt00010·kt00001)은 이 몫을 빼지 않은
+# 값이라 그대로 다 쓰면 마지막 한 건이 증거금 부족으로 튕긴다.
+# 온라인 수수료 0.015% + 유관기관 제비용 0.0036%인데 계좌마다 다르므로
+# 0.05%로 넉넉히 잡는다. 1,000만원 주문에 5,000원(상한가 3,000원이면 1주)이다.
+BUY_FEE_RATE = 0.0005
 NON_LIMIT_IGNORED_SORT_COLS = {TIME_COL, BID_QTY_COL}
 STREAK_COL = FIELDS.index("streak")
 MCAP_COL = FIELDS.index("mcap")
@@ -3706,7 +3711,13 @@ class ConditionScreen(QWidget):
             else detail["cash_qty"])
         remaining = max(
             0, self._usable_order_funds() - self._effective_reserved())
-        return min(api_qty, remaining // upper)
+        # 수수료까지 치르고 살 수 있는 수량이다. 키움이 주는 수량·금액은
+        # 수수료를 안 본 값이라 그대로 쓰면 마지막 한 건이 증거금 부족으로
+        # 거부된다(2026-09-17 092600: 1,566주를 9분할해 8건 접수 뒤 9번째가
+        # `173주 매수가능`으로 거부, 1주 부족). 보유종목을 판 직후처럼
+        # 여윳돈이 없을 때만 드러난다.
+        budget = min(api_qty * upper, remaining)
+        return int(budget / (upper * (1 + BUY_FEE_RATE)))
 
     @staticmethod
     def _fixed_total(available_qty: int, count: int) -> int:

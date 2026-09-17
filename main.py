@@ -1809,7 +1809,12 @@ class App:
         if state == "긴급정리":
             compact = "긴급정리"
         elif batch.error:
+            # 한 건만 튕겨도 '오류'만 떠서 전멸로 보였다(2026-09-17 092600:
+            # 8건이 접수된 상태였는데 전부 취소하고 영웅문에서 다시 넣어
+            # 32초 늦은 주문 순서를 받았다). 들어간 건수를 같이 낸다.
             compact = "장종료" if "장종료" in batch.error else "오류"
+            if batch.sent_count:
+                compact = f"{mode} {batch.sent_count}/{count} {compact}"
         elif batch.remaining_qty == 0 and batch.sent_count == count:
             compact = f"{mode} 완료"
         elif state.startswith("취소") or batch.stop_requested:
