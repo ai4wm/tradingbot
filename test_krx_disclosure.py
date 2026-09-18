@@ -110,9 +110,64 @@ def demo_presets():
     print("ok (즐겨찾기 기본값)")
 
 
+def demo_star_never_deletes():
+    """★은 넣기만 한다.
+
+    토글로 뒀더니 즐겨찾기를 고른 직후 검색창에 그 식이 그대로 들어가 있어서,
+    저장하려고 누른 ★이 그것을 지웠다(2026-09-18: 4개가 2개로 줄었다).
+    빼기는 목록 우클릭으로 옮겼다.
+    """
+    import shutil
+    import tempfile
+    import types
+    from PySide6.QtCore import QSettings
+    from PySide6.QtWidgets import QApplication, QComboBox, QLineEdit
+    from ui.realtime_news_tab import RealtimeNewsTabMixin as Mixin
+
+    QApplication.instance() or QApplication([])
+    project, temp = os.getcwd(), tempfile.mkdtemp(prefix="ls_presets_")
+    os.chdir(temp)  # 사용자 layout.ini를 건드리지 않는다
+    try:
+        screen = type("Fake", (), {
+            name: getattr(Mixin, name) for name in (
+                "_ls_news_search_preset_list",
+                "_reload_ls_news_search_presets",
+                "_save_ls_news_search_presets",
+                "_add_ls_news_search_preset")})()
+        screen._settings = QSettings("layout.ini", QSettings.IniFormat)
+        screen._ls_news_search = QLineEdit()
+        screen._ls_news_search_presets = QComboBox()
+        screen.statusBar = lambda: types.SimpleNamespace(
+            showMessage=lambda *a, **k: None)
+
+        before = list(DEFAULT_LS_NEWS_SEARCH_PRESETS)
+        # 즐겨찾기를 고르면 검색창에 그 식이 그대로 들어간다. 그 상태로 ★.
+        screen._ls_news_search.setText(before[0])
+        for _ in range(3):
+            screen._add_ls_news_search_preset()
+            assert screen._ls_news_search_preset_list() == before, \
+                screen._ls_news_search_preset_list()
+
+        # 새 식은 맨 앞에 들어간다.
+        screen._ls_news_search.setText("한국거래소 무상증자")
+        screen._add_ls_news_search_preset()
+        assert screen._ls_news_search_preset_list() == (
+            ["한국거래소 무상증자"] + before)
+
+        # 빈 검색어로는 아무 일도 없다.
+        screen._ls_news_search.setText("   ")
+        screen._add_ls_news_search_preset()
+        assert len(screen._ls_news_search_preset_list()) == len(before) + 1
+        print("ok (★은 지우지 않는다)")
+    finally:
+        os.chdir(project)
+        shutil.rmtree(temp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     demo_source()
     demo_material()
     demo_top()
     demo_banner_color()
     demo_presets()
+    demo_star_never_deletes()

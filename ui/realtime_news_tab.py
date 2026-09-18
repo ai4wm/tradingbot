@@ -661,12 +661,19 @@ class RealtimeNewsTabMixin:
             "저장한 검색식을 고릅니다.\n★ 버튼으로 현재 검색어를 넣고 뺍니다.")
         self._ls_news_search_presets.activated.connect(
             self._apply_ls_news_search_preset)
+        # 넣기 전용이다. 토글로 뒀더니 즐겨찾기를 고른 직후 검색창에 그 식이
+        # 그대로 들어가 있어서, 저장하려고 누른 ★이 그것을 지웠다.
+        self._ls_news_search_presets.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self._ls_news_search_presets.customContextMenuRequested.connect(
+            self._ls_news_search_preset_menu)
         self._ls_news_search_preset_button = QPushButton("★")
         self._ls_news_search_preset_button.setFixedWidth(28)
         self._ls_news_search_preset_button.setToolTip(
-            "현재 검색어를 즐겨찾기에 넣습니다. 이미 있으면 뺍니다.")
+            "현재 검색어를 즐겨찾기에 넣습니다.\n"
+            "빼거나 기본값을 되살리려면 왼쪽 목록을 우클릭하세요.")
         self._ls_news_search_preset_button.clicked.connect(
-            self._toggle_ls_news_search_preset)
+            self._add_ls_news_search_preset)
         self._reload_ls_news_search_presets()
         self._ls_news_search_clear_shortcut = QShortcut(
             QKeySequence(Qt.Key.Key_Escape), self._ls_news_search)
@@ -1488,7 +1495,14 @@ class RealtimeNewsTabMixin:
             return
         self._ls_news_search.setText(query)
 
-    def _toggle_ls_news_search_preset(self):
+    def _save_ls_news_search_presets(self, presets: list[str],
+                                     select: str = ""):
+        self._settings.setValue("analysis_ls_news_search_presets", presets)
+        self._settings.sync()
+        self._reload_ls_news_search_presets(select)
+
+    def _add_ls_news_search_preset(self):
+        """★. 넣기만 한다 — 빼기는 목록 우클릭이다."""
         query = self._ls_news_search.text().strip()
         if not query:
             self.statusBar().showMessage(
@@ -1496,16 +1510,38 @@ class RealtimeNewsTabMixin:
             return
         presets = self._ls_news_search_preset_list()
         if query in presets:
-            presets.remove(query)
-            message = f"즐겨찾기에서 뺐습니다: {query}"
-            select = ""
-        else:
-            presets.insert(0, query)
-            message = f"즐겨찾기에 넣었습니다: {query}"
-            select = query
-        self._settings.setValue("analysis_ls_news_search_presets", presets)
-        self._reload_ls_news_search_presets(select)
-        self.statusBar().showMessage(message, 3000)
+            self._reload_ls_news_search_presets(query)
+            self.statusBar().showMessage(
+                f"이미 즐겨찾기에 있습니다: {query}", 3000)
+            return
+        presets.insert(0, query)
+        self._save_ls_news_search_presets(presets, query)
+        self.statusBar().showMessage(f"즐겨찾기에 넣었습니다: {query}", 3000)
+
+    def _ls_news_search_preset_menu(self, position):
+        combo = self._ls_news_search_presets
+        current = str(combo.itemData(combo.currentIndex()) or "")
+        presets = self._ls_news_search_preset_list()
+        menu = QMenu(combo)
+        drop = menu.addAction(f"빼기: {current}" if current else "빼기")
+        drop.setEnabled(bool(current))
+        missing = [
+            entry for entry in DEFAULT_LS_NEWS_SEARCH_PRESETS
+            if entry not in presets]
+        restore = menu.addAction(
+            f"기본 즐겨찾기 되살리기 ({len(missing)})")
+        restore.setEnabled(bool(missing))
+        chosen = menu.exec(combo.mapToGlobal(position))
+        if chosen is drop and current:
+            presets.remove(current)
+            self._save_ls_news_search_presets(presets)
+            self.statusBar().showMessage(
+                f"즐겨찾기에서 뺐습니다: {current}", 3000)
+        elif chosen is restore and missing:
+            # 사용자가 넣은 것은 앞에 그대로 두고 빠진 기본값만 뒤에 붙인다.
+            self._save_ls_news_search_presets(presets + missing)
+            self.statusBar().showMessage(
+                f"기본 즐겨찾기 {len(missing)}개를 되살렸습니다.", 3000)
 
     def _ls_news_row_matches_search(self, row: int) -> bool:
         """현재 행이 포함·OR·제외 검색식과 일치하는지 확인한다."""
