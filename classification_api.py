@@ -11,15 +11,17 @@ import httpx
 
 
 _WICS_RE = re.compile(r"WICS\s*:\s*([^<\r\n]+)", re.IGNORECASE)
-_NAVER_THEME_RE = re.compile(
-    r'href=["\'](/sise/sise_group_detail\.naver\?type=theme'
-    r'(?:&|&amp;)no=(\d+))'
-    r'["\'][^>]*>(.*?)</a>',
-    re.IGNORECASE | re.DOTALL,
-)
-_NAVER_STOCK_RE = re.compile(
-    r'href=["\']/item/main\.naver\?code=(\d{6})["\']', re.IGNORECASE)
 _TAG_RE = re.compile(r"<[^>]+>")
+
+# 새 네이버 증권 화면이 쓰는 JSON. 옛 `sise/theme.naver`는 여기로
+# 리다이렉트되고 옛 DOM은 남아 있지 않다(2026-09-18 확인).
+NAVER_THEME_LIST_URL = "https://m.stock.naver.com/api/stocks/theme"
+NAVER_THEME_DETAIL_URL = "https://m.stock.naver.com/api/stocks/theme"
+NAVER_PAGE_SIZE = 100
+NAVER_API_HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Referer": "https://m.stock.naver.com/",
+}
 
 
 class _TableParser(HTMLParser):
@@ -121,23 +123,39 @@ class ClassificationClient:
         self, progress=None, cancelled=None, concurrency: int = 4,
         known_codes: set[str] | None = None,
     ) -> list[dict]:
-        """네이버 금융 테마를 수집하며 known_codes는 상세조회를 건너뛴다."""
+        """네이버 금융 테마를 수집하며 known_codes는 상세조회를 건너뛴다.
+
+        2026-09-18. `finance.naver.com/sise/theme.naver`가 새 화면
+        (`stock.naver.com/market/stock/kr/theme`)으로 넘어가면서 옛 DOM을
+        긁던 정규식이 0개를 돌려줬다. 조용히 0개였지 예외가 아니라서
+        09-15 수집이 `COMPLETED · 테마 0개`로 끝났고 기존 6,421건이
+        통째로 만료됐다. 이제 새 화면이 쓰는 JSON을 그대로 받는다.
+        """
         themes: dict[str, str] = {}
-        page = 1
-        while True:
+        page, pages = 1, 1
+        while page <= pages:
             response = await self._client.get(
-                f"https://finance.naver.com/sise/theme.naver?page={page}")
+                f"{NAVER_THEME_LIST_URL}?page={page}&pageSize={NAVER_PAGE_SIZE}",
+                headers=NAVER_API_HEADERS)
             response.raise_for_status()
-            text = response.content.decode("euc-kr", "replace")
-            found = 0
-            for _path, number, raw_name in _NAVER_THEME_RE.findall(text):
-                name = html.unescape(_TAG_RE.sub("", raw_name)).strip()
-                if name and number not in themes:
-                    themes[number] = name
-                    found += 1
-            if found == 0:
+            payload = response.json()
+            groups = payload.get("groups") or []
+            if not groups:
                 break
+            # 마지막 다음 페이지는 빈 목록이 아니라 404다. 총건수로 끊는다.
+            total = int(payload.get("totalCount") or 0)
+            if total:
+                pages = -(-total // NAVER_PAGE_SIZE)
+            for group in groups:
+                number = str(group.get("no") or "").strip()
+                name = html.unescape(str(group.get("name") or "")).strip()
+                if number and name:
+                    themes.setdefault(number, name)
             page += 1
+        if not themes:
+            # 0개를 정상으로 넘기면 저장 단계가 기존 연결을 전부 만료시킨다.
+            raise RuntimeError(
+                "네이버 테마 목록이 비어 있습니다. 원문 화면이 또 바뀐 것입니다.")
 
         if known_codes is not None:
             themes = {
@@ -155,11 +173,15 @@ class ClassificationClient:
                 return None
             async with semaphore:
                 response = await self._client.get(
-                    "https://finance.naver.com/sise/"
-                    f"sise_group_detail.naver?type=theme&no={number}")
+                    f"{NAVER_THEME_DETAIL_URL}/{number}"
+                    "?page=1&pageSize=100",
+                    headers=NAVER_API_HEADERS)
                 response.raise_for_status()
-                text = response.content.decode("euc-kr", "replace")
-                members = list(dict.fromkeys(_NAVER_STOCK_RE.findall(text)))
+                members = list(dict.fromkeys(
+                    str(stock.get("itemCode") or "").strip()
+                    for stock in (response.json().get("stocks") or [])
+                    if str(stock.get("itemCode") or "").strip()
+                ))
             completed += 1
             if progress:
                 progress(completed, total, name, len(members))

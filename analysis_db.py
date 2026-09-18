@@ -4222,8 +4222,19 @@ def save_theme_snapshot(theme_rows: list[dict], snapshot_date: str,
                         confidence: float = 0.8,
                         replace_source: bool = True,
                         db_path: Path = DB_PATH) -> tuple[int, int]:
-    """현재 테마 구성 스냅샷을 변경 구간 형태로 저장한다."""
+    """현재 테마 구성 스냅샷을 변경 구간 형태로 저장한다.
+
+    **빈 스냅샷으로 기존 연결을 지우지 않는다.** 2026-09-15 네이버 테마
+    수집이 화면 교체로 0개를 받아 왔는데 예외가 아니라 `COMPLETED · 테마
+    0개`로 끝났고, `replace_source=True`가 그 0개로 살아 있던 6,421건을
+    전부 만료시켰다. 전 종목의 세부 테마가 사라져 동양(001520)은
+    `건축자재`(WICS) 하나만 남았다. 수집이 0개면 성공이 아니라 고장이다.
+    """
     initialize(db_path)
+    if replace_source and not theme_rows:
+        raise ValueError(
+            "빈 테마 스냅샷으로는 기존 연결을 교체하지 않습니다"
+            " (수집이 0개면 원본 화면이 바뀐 것입니다)")
     now = datetime.now().astimezone().isoformat(timespec="seconds")
     previous_date = (
         datetime.strptime(snapshot_date, "%Y%m%d") - timedelta(days=1)
