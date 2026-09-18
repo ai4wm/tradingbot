@@ -785,8 +785,13 @@ class StockNewsTabMixin:
                             f"{item.get('summary') or ''}"
                         ).lower()
                     ]
+                    # 네이버가 이 종목에 직접 걸어 둔 기사 목록. 검색으로는
+                    # 「[특징주] 전기장비株…」처럼 제목에 종목명이 없는
+                    # 섹터 재료를 그 종목 것이라고 판정할 수 없다.
+                    naver_keys = await client.stock_news_keys(code)
                     saved = save_news_items(
-                        code, stock_name, matched_items)
+                        code, stock_name, matched_items,
+                        naver_linked_keys=naver_keys)
                     code_new_ids = {
                         int(news_id) for news_id in saved["new_ids"]
                     }

@@ -17,6 +17,15 @@ import aiohttp
 
 
 NEWS_SEARCH_URL = "https://openapi.naver.com/v1/search/news.json"
+# 네이버 증권 종목뉴스. 검색 API와 달리 **네이버가 그 종목에 직접 매핑한**
+# 기사만 온다. 「[특징주] 전기장비株, 아마존 AI 전력장비 계약」처럼 제목에
+# 종목명이 없는 섹터 기사도 여기 걸려 있으면 그 종목 재료가 맞다.
+# 검색 API는 종목명으로 찾는 것이라 이 판정을 못 한다.
+STOCK_NEWS_URL = "https://m.stock.naver.com/api/news/stock"
+STOCK_NEWS_HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Referer": "https://m.stock.naver.com/",
+}
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _SPACE_RE = re.compile(r"\s+")
 _TRACKING_QUERY_KEYS = {
@@ -28,6 +37,17 @@ _TRACKING_QUERY_KEYS = {
 def _plain_text(value: str) -> str:
     text = html.unescape(_HTML_TAG_RE.sub("", str(value or "")))
     return _SPACE_RE.sub(" ", text).strip()
+
+
+def title_key(title: str) -> str:
+    """제목만으로 같은 기사를 알아보는 열쇠.
+
+    검색 API와 종목뉴스 API는 기사 식별자가 서로 다르다(URL 대 officeId·
+    articleId). 둘 다 주는 것은 제목뿐이라 그것으로 맞춘다.
+    """
+    normalized = re.sub(
+        r"[^0-9a-z가-힣]+", "", _plain_text(title).lower())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def _canonical_url(value: str) -> str:
@@ -126,10 +146,7 @@ class NaverNewsClient:
             current_hash = hashlib.sha256(
                 f"{title}\n{summary}\n{canonical}".encode("utf-8")
             ).hexdigest()
-            normalized_title = re.sub(
-                r"[^0-9a-z가-힣]+", "", title.lower())
-            duplicate_key = hashlib.sha256(
-                normalized_title.encode("utf-8")).hexdigest()
+            duplicate_key = title_key(title)
             host = urlsplit(original_url or naver_url).netloc.lower()
             material, confidence = _material_type(f"{title} {summary}")
             result.append({
@@ -147,3 +164,36 @@ class NaverNewsClient:
                 "material_confidence": confidence,
             })
         return result
+
+    async def stock_news_keys(self, stock_code: str,
+                              page_size: int = 40) -> set[str]:
+        """네이버가 그 종목에 걸어 둔 기사들의 제목 열쇠.
+
+        인증이 필요 없는 공개 화면 API다. 실패해도 예외를 올리지 않는다 —
+        이것이 없으면 제목에 종목명이 있는 기사만 붙던 예전 동작으로
+        돌아갈 뿐이라, 뉴스 수집 전체를 멈출 이유가 없다.
+        """
+        stock_code = str(stock_code or "").strip()
+        if not stock_code:
+            return set()
+        url = f"{STOCK_NEWS_URL}/{stock_code}?pageSize={int(page_size)}&page=1"
+        timeout = aiohttp.ClientTimeout(total=10)
+        try:
+            async with aiohttp.ClientSession(
+                    timeout=timeout, headers=STOCK_NEWS_HEADERS) as session:
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        return set()
+                    payload = await response.json(content_type=None)
+        except Exception:  # noqa: BLE001 - 보조 신호라 조용히 포기한다.
+            return set()
+        # 응답은 [{"total":n,"items":[...]}, ...] 꼴로 블록이 여럿 온다.
+        keys = set()
+        for block in payload if isinstance(payload, list) else [payload]:
+            if not isinstance(block, dict):
+                continue
+            for item in block.get("items") or []:
+                title = _plain_text(item.get("title"))
+                if title:
+                    keys.add(title_key(title))
+        return keys

@@ -4021,9 +4021,10 @@ def backfill_news_themes(days: int = NEWS_THEME_MAX_AGE_DAYS,
             linked += len(_link_news_themes(
                 connection, codes, row["title"],
                 str(row["published_at"])[:10].replace("-", ""), seen))
-        # 네이버 뉴스는 제목에 종목명이 그대로 있는 것만 본다. 이유는
-        # `save_news_items`의 같은 조건에 적어 두었다. 여기서 빼면
-        # 저장 때 붙인 연결을 아래 삭제 단계가 도로 지운다.
+        # 네이버 뉴스는 제목에 종목명이 그대로 있는 것, 또는 네이버 증권
+        # 종목뉴스에 걸려 있던 것(`NAVER_STOCK_PAGE`)만 본다. 이유는
+        # `save_news_items`의 같은 조건에 적어 두었다. **두 조건이 어긋나면
+        # 저장 때 붙인 연결을 아래 삭제 단계가 도로 지운다.**
         for row in connection.execute(
                 """SELECT n.published_at_source AS published_at,
                           m.stock_code, n.current_title AS title
@@ -4032,7 +4033,8 @@ def backfill_news_themes(days: int = NEWS_THEME_MAX_AGE_DAYS,
                      JOIN stocks s ON s.stock_code=m.stock_code
                     WHERE REPLACE(SUBSTR(n.published_at_source,1,10),'-','')>=?
                       AND s.stock_name<>''
-                      AND INSTR(n.current_title, s.stock_name)>0""",
+                      AND (m.match_method='NAVER_STOCK_PAGE'
+                           OR INSTR(n.current_title, s.stock_name)>0)""",
                 (since,)).fetchall():
             linked += len(_link_news_themes(
                 connection, [row["stock_code"]], row["title"],
@@ -5460,9 +5462,16 @@ def _market_session(published_at: str) -> str:
 
 
 def save_news_items(stock_code: str, stock_name: str, rows: list[dict],
-                    db_path: Path = DB_PATH) -> dict:
-    """공식 뉴스 검색 결과와 변경 버전·종목매핑·재료분류를 저장한다."""
+                    db_path: Path = DB_PATH,
+                    naver_linked_keys: set | None = None) -> dict:
+    """공식 뉴스 검색 결과와 변경 버전·종목매핑·재료분류를 저장한다.
+
+    `naver_linked_keys`는 네이버 증권 종목뉴스에 걸려 있던 기사의 제목
+    열쇠다(`naver_news_api.title_key`). 거기 있으면 네이버가 그 종목 기사로
+    직접 매핑한 것이므로 제목에 종목명이 없어도 테마를 붙인다.
+    """
     initialize(db_path)
+    naver_linked = set(naver_linked_keys or ())
     now = datetime.now().astimezone().isoformat(timespec="seconds")
     result = {
         "received": len(rows), "new": 0, "updated": 0,
@@ -5594,18 +5603,25 @@ def save_news_items(stock_code: str, stock_name: str, rows: list[dict],
                     )
                     result["updated"] += 1
             text = f"{item.get('title') or ''} {item.get('summary') or ''}"
+            linked_by_naver = (
+                str(item.get("duplicate_key") or "") in naver_linked)
             confidence = 0.9 if stock_name and stock_name in text else 0.5
+            if linked_by_naver:
+                confidence = 0.95
             connection.execute(
                 """INSERT INTO news_stock_maps(
                        news_id, stock_code, match_method, matched_text,
                        confidence, is_primary, mapped_at)
-                   VALUES (?, ?, 'QUERY_STOCK', ?, ?, 1, ?)
+                   VALUES (?, ?, ?, ?, ?, 1, ?)
                    ON CONFLICT(news_id, stock_code) DO UPDATE SET
+                       match_method=excluded.match_method,
                        matched_text=excluded.matched_text,
                        confidence=MAX(news_stock_maps.confidence,
                                       excluded.confidence),
                        mapped_at=excluded.mapped_at""",
-                (news_id, stock_code, stock_name, confidence, now),
+                (news_id, stock_code,
+                 "NAVER_STOCK_PAGE" if linked_by_naver else "QUERY_STOCK",
+                 stock_name, confidence, now),
             )
             # 네이버 뉴스는 제목에 종목명이 그대로 있을 때만 테마에 붙인다.
             # 종목명으로 검색해 가져오므로 요약문에 이름만 스친 시황 기사가
@@ -5615,8 +5631,12 @@ def save_news_items(stock_code: str, stock_name: str, rows: list[dict],
             # `confidence` 0.9로는 못 거른다. 요약문까지 보고 매기므로 종목명이
             # 나열된 시황 기사도 0.9가 된다. 제목으로 자르면 14건만 남고
             # 오염이 사라진다.
+            # 네이버 종목뉴스에 걸린 기사는 이 관문을 면제한다. 검색이 아니라
+            # 네이버가 그 종목 기사로 매핑해 둔 것이라 제목에 이름이 없어도
+            # 그 종목 재료가 맞다(2026-09-18 선도전기 007610:
+            # 「[특징주] 전기장비株, 아마존 AI 전력장비 계약」).
             title = str(item.get("title") or "")
-            if stock_name and stock_name in title:
+            if linked_by_naver or (stock_name and stock_name in title):
                 _link_news_themes(
                     connection, [stock_code], title,
                     published[:10].replace("-", "")
