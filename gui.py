@@ -2882,7 +2882,7 @@ class BidQtyPopup(QWidget):
         # 세 줄이 창 높이를 넘지 않게 기준 글자를 0.42로 잡았다(줄간격 포함 약 0.84).
         big = max(12, int(self.height() * 0.42))
         small = max(8, int(big * 0.34))
-        volume = max(8, int(big * 0.40))
+        volume = max(8, int(big * 0.48))
         self._label.setText(
             f"<div style='font-size:{small}px; color:#C9A968'>{self._name}</div>"
             f"<div style='font-size:{big}px; font-weight:900; color:#FFC24D'>"

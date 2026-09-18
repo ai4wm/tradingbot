@@ -32,14 +32,14 @@ def demo():
     popup = gui.BidQtyPopup(screen, "223310", "사토시홀딩스")
     popup.resize(240, 96)
 
-    # 1) 두 값이 다 나오고, 거래량은 매수잔량의 40% 크기다.
+    # 1) 두 값이 다 나오고, 거래량은 매수잔량의 48% 크기다.
     popup.set_value(842_253, 1_234_567)
     popup._refresh_text()
     text = popup._label.text()
     assert "842,253" in text and "1,234,567" in text, text
     big = max(12, int(popup.height() * 0.42))
     assert f"font-size:{big}px" in text, text
-    assert f"font-size:{max(8, int(big * 0.40))}px" in text, text
+    assert f"font-size:{max(8, int(big * 0.48))}px" in text, text
 
     # 2) 같은 값이 또 오면 다시 그리지 않는다. 호가는 매도쪽만 바뀌어도 온다.
     popup._paint_timer.stop()
