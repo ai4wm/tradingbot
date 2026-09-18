@@ -4820,6 +4820,9 @@ class AnalysisWindow(
         self._load_saved_telegram_news()
         QTimer.singleShot(0, self._start_ls_news_stream)
         QTimer.singleShot(0, self._start_telegram_stream)
+        # 탭 복원은 맨 뒤다. 바꾸는 순간 `_analysis_tab_changed`가 그 탭을
+        # 새로 그리는데, 그때 위 초기화가 다 끝나 있어야 한다.
+        QTimer.singleShot(0, self._restore_analysis_tab)
 
     def _ensure_titlebar_visible(self):
         screens = QApplication.screens()
@@ -5048,8 +5051,22 @@ class AnalysisWindow(
         box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         box.open()
 
+    def _restore_analysis_tab(self):
+        """지난번에 보던 탭으로 연다. 번호가 아니라 이름으로 찾는다.
+
+        `TABS` 순서가 바뀌면 번호는 엉뚱한 탭을 가리킨다.
+        """
+        title = str(self._settings.value("analysis_tab", "") or "").strip()
+        if not title:
+            return
+        for index in range(self._tabs.count()):
+            if self._tabs.tabText(index) == title:
+                self._tabs.setCurrentIndex(index)
+                return
+
     def _analysis_tab_changed(self, index: int):
         title = self._tabs.tabText(index)
+        self._settings.setValue("analysis_tab", title)
         if title == "종목뉴스·종토방":
             self._refresh_realtime_watch_table()
             self._refresh_realtime_news_table()

@@ -1459,13 +1459,29 @@ class RealtimeNewsTabMixin:
                 self._ls_news_db_search_button.setEnabled(True)
                 self._ls_news_db_search_button.setText("검색")
 
-    def _ls_news_search_preset_list(self) -> list[str]:
-        saved = self._settings.value("analysis_ls_news_search_presets")
+    @staticmethod
+    def _as_preset_list(saved) -> list[str]:
+        """QSettings는 한 줄짜리 목록을 문자열로 돌려준다."""
         if saved is None:
-            return list(DEFAULT_LS_NEWS_SEARCH_PRESETS)
+            return []
         if isinstance(saved, str):
             saved = [saved] if saved.strip() else []
         return [str(entry).strip() for entry in saved if str(entry).strip()]
+
+    def _ls_news_search_preset_list(self) -> list[str]:
+        """저장분 + 손으로 빼지 않은 기본값.
+
+        전에는 저장분만 썼다. 그래서 ★ 오작동으로 기본값이 지워진 뒤로는
+        되살릴 길이 우클릭 메뉴뿐이었다(2026-09-18: 4개가 2개로 줄었다).
+        이제 뺀 것만 따로 기억하고 나머지 기본값은 늘 뒤에 채운다.
+        """
+        saved = self._as_preset_list(
+            self._settings.value("analysis_ls_news_search_presets"))
+        dropped = set(self._as_preset_list(
+            self._settings.value("analysis_ls_news_search_presets_dropped")))
+        return saved + [
+            entry for entry in DEFAULT_LS_NEWS_SEARCH_PRESETS
+            if entry not in saved and entry not in dropped]
 
     def _reload_ls_news_search_presets(self, select: str = ""):
         presets = self._ls_news_search_preset_list()
@@ -1525,23 +1541,28 @@ class RealtimeNewsTabMixin:
         menu = QMenu(combo)
         drop = menu.addAction(f"빼기: {current}" if current else "빼기")
         drop.setEnabled(bool(current))
-        missing = [
-            entry for entry in DEFAULT_LS_NEWS_SEARCH_PRESETS
-            if entry not in presets]
-        restore = menu.addAction(
-            f"기본 즐겨찾기 되살리기 ({len(missing)})")
-        restore.setEnabled(bool(missing))
+        dropped = self._as_preset_list(
+            self._settings.value("analysis_ls_news_search_presets_dropped"))
+        restore = menu.addAction(f"뺀 기본값 되살리기 ({len(dropped)})")
+        restore.setEnabled(bool(dropped))
         chosen = menu.exec(combo.mapToGlobal(position))
         if chosen is drop and current:
             presets.remove(current)
+            # 기본값을 뺐으면 기억해 둔다. 안 그러면 다음에 다시 채워진다.
+            if (current in DEFAULT_LS_NEWS_SEARCH_PRESETS
+                    and current not in dropped):
+                self._settings.setValue(
+                    "analysis_ls_news_search_presets_dropped",
+                    dropped + [current])
             self._save_ls_news_search_presets(presets)
             self.statusBar().showMessage(
                 f"즐겨찾기에서 뺐습니다: {current}", 3000)
-        elif chosen is restore and missing:
-            # 사용자가 넣은 것은 앞에 그대로 두고 빠진 기본값만 뒤에 붙인다.
-            self._save_ls_news_search_presets(presets + missing)
+        elif chosen is restore and dropped:
+            self._settings.remove("analysis_ls_news_search_presets_dropped")
+            self._settings.sync()
+            self._reload_ls_news_search_presets()
             self.statusBar().showMessage(
-                f"기본 즐겨찾기 {len(missing)}개를 되살렸습니다.", 3000)
+                f"뺀 기본값 {len(dropped)}개를 되살렸습니다.", 3000)
 
     def _ls_news_row_matches_search(self, row: int) -> bool:
         """현재 행이 포함·OR·제외 검색식과 일치하는지 확인한다."""

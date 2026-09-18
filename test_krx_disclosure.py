@@ -128,8 +128,10 @@ def demo_star_never_deletes():
     project, temp = os.getcwd(), tempfile.mkdtemp(prefix="ls_presets_")
     os.chdir(temp)  # 사용자 layout.ini를 건드리지 않는다
     try:
+        # __dict__로 꺼내야 staticmethod 래퍼가 살아 있다.
         screen = type("Fake", (), {
-            name: getattr(Mixin, name) for name in (
+            name: Mixin.__dict__[name] for name in (
+                "_as_preset_list",
                 "_ls_news_search_preset_list",
                 "_reload_ls_news_search_presets",
                 "_save_ls_news_search_presets",
@@ -158,7 +160,23 @@ def demo_star_never_deletes():
         screen._ls_news_search.setText("   ")
         screen._add_ls_news_search_preset()
         assert len(screen._ls_news_search_preset_list()) == len(before) + 1
-        print("ok (★은 지우지 않는다)")
+
+        # 저장분에 기본값이 빠져 있으면 다시 채운다. ★ 오작동으로 잃어버린
+        # 것을 재시작만으로 되찾게 하려는 것이다.
+        screen._settings.setValue(
+            "analysis_ls_news_search_presets", ["내가 넣은 식"])
+        screen._settings.sync()
+        healed = screen._ls_news_search_preset_list()
+        assert healed == ["내가 넣은 식"] + before, healed
+
+        # 손으로 뺀 기본값만 안 돌아온다.
+        screen._settings.setValue(
+            "analysis_ls_news_search_presets_dropped", [before[-1]])
+        screen._settings.sync()
+        after = screen._ls_news_search_preset_list()
+        assert before[-1] not in after, after
+        assert len(after) == len(before), after
+        print("ok (★은 지우지 않는다 · 기본값 자동 복구)")
     finally:
         os.chdir(project)
         shutil.rmtree(temp, ignore_errors=True)
