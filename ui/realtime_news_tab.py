@@ -23,14 +23,14 @@ from PySide6.QtGui import (
     QColor, QDesktopServices, QFont, QKeySequence, QShortcut, QTextCursor,
 )
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QDialog, QHBoxLayout, QHeaderView, QLabel,
-    QLineEdit, QMenu, QMessageBox, QPushButton, QTableWidget,
+    QApplication, QCheckBox, QComboBox, QDialog, QHBoxLayout, QHeaderView,
+    QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QTableWidget,
     QTableWidgetItem, QTextBrowser, QVBoxLayout, QWidget,
 )
 
 import config
 from analysis_db import (
-    DB_PATH, log_content_request, news_request_count_today,
+    DB_PATH, last_close_price, log_content_request, news_request_count_today,
     resolve_analysis_stock, set_realtime_watch, ls_realtime_news_detail, ls_realtime_news_rows,
     parse_ls_news_search_query, realtime_watch_codes, save_ls_realtime_news,
     search_ls_realtime_news, split_ls_news_stock_codes,
@@ -46,6 +46,7 @@ from ls_news_ws import (
     infer_news_original_url, infer_news_source, news_source_from_url,
     normalize_news_title, source_label,
 )
+from disclosure import parse_rights_offering, score_rights_offering
 from rank import _beep
 from ui import (
     NEWS_NEW_TIME_BACKGROUND, NEWS_NEW_TIME_FOREGROUND,
@@ -130,7 +131,82 @@ LATEST_NEWS_BANNER_COLORS = {
     "LS": ("#1B3A4A", "#4E8FB0", "#1F5E80", "#7FDBFF"),
     "NAVER": ("#17402C", "#3E9160", "#1E7A47", "#62E58F"),
     "TELEGRAM": ("#33265A", "#7A63C8", "#4E37A8", "#C0A8FF"),
+    # 한국거래소 = 공시. 기사와 색을 갈라 4천건 흐름에서 눈에 띄게 한다.
+    "KRX": ("#4A3216", "#B08A4E", "#7A4E12", "#FFC24D"),
+    # 제3자배정은 한 칸 더 올린다. 빨강은 이 하나만 쓴다.
+    "KRX_TOP": ("#5C1A1A", "#D4544E", "#8E1F1F", "#FF7B6B"),
 }
+
+# LS는 한국거래소 공시를 기사와 같은 줄로 흘려보낸다. 2026-08-20~09-18
+# 실측으로 하루 351건이고 전부 공시다 — ETF·ETN 기준가 안내 99건, 종목
+# 공시 223건, 시장 안내 29건이다. 그 223건도 IR 개최·투자주의·주주명부
+# 설정 같은 정기물이 대부분이라 재료급은 6~8건/일뿐이다.
+KRX_DISCLOSURE_SOURCE = "한국거래소"
+
+# 제3자배정이 이 화면에서 제일 센 신호다. 2026-05-26~09-18 실측으로
+# 공시가 난 168종목 중 30종목(17.9%)이 5영업일 안에 상한가였다. 같은
+# 기간 임의 종목·임의 시점의 기저확률이 1.2%이므로 15배다. 그 기간
+# 2연상 이상 100건 중 18건이 이 종목들이었다(엑시온그룹·앱튼 4연상,
+# 사토시홀딩스·미투온). 공시 시각은 거의 전부 14~18시 — 애프터마켓
+# 직전이거나 한복판이다.
+# 다만 "연상은 전부 제3자배정"은 아니다. 같은 기간 서산(079650) 5연상은
+# 제3자배정이 아니었다.
+TOP_DISCLOSURE_KEYWORD = "제3자배정"
+
+# 소리를 낼 값어치가 있는 공시명. 2026-09-15 15:55:12 미투온
+# 「유상증자결정(제3자배정)」이 기사보다 18초, 애프터마켓 개장보다
+# 4분 48초 빨랐는데 4천건에 묻혀 아무도 누르지 않았다.
+MATERIAL_DISCLOSURE_KEYWORDS = (
+    TOP_DISCLOSURE_KEYWORD,  # 유상증자결정 말고 추가상장·발행결과도 잡는다
+    "타법인주식및출자증권취득",
+    "최대주주",
+    "유상증자결정",
+    "무상증자결정",
+    "공급계약체결",
+    "투자판단 관련 주요경영사항",
+    "풍문 또는 보도에 대한 해명",
+    "회사합병",
+    "영업양수",
+    "주식교환",
+)
+
+# 공시 행 배경. 신규 강조가 시간·제목 칸(1·3)을 쓰고 신규해제가 그 둘을
+# 지우므로 번호·종목명·출처 칸(0·2·4)에만 칠한다. 해제해도 남는다.
+DISCLOSURE_ROW_BACKGROUND = "#2E2A3C"
+MATERIAL_DISCLOSURE_BACKGROUND = "#4A3216"
+TOP_DISCLOSURE_BACKGROUND = "#5C1A1A"
+DISCLOSURE_TINT_COLUMNS = (0, 2, 4)
+
+# 검색창 즐겨찾기 기본값. 저녁마다 같은 식을 다시 치지 않게 한다.
+DEFAULT_LS_NEWS_SEARCH_PRESETS = (
+    "한국거래소 제3자배정 -정정",
+    "한국거래소 -ETF -ETN -투자주의 -IR",
+    "한국거래소 유상증자 | 타법인 | 최대주주 | 공급계약",
+    "한국거래소",
+)
+
+
+def is_krx_disclosure(source_name: str) -> bool:
+    """한국거래소 출처는 전부 공시다."""
+    return str(source_name or "").strip() == KRX_DISCLOSURE_SOURCE
+
+
+def is_material_disclosure(source_name: str, title: str) -> bool:
+    """소리를 낼 공시인지. 정정은 뺀다 — 원본(3.7건/일)보다 많다(4.3건/일)."""
+    if not is_krx_disclosure(source_name):
+        return False
+    text = str(title or "")
+    if "(정정)" in text:
+        return False
+    return any(keyword in text for keyword in MATERIAL_DISCLOSURE_KEYWORDS)
+
+
+def is_top_disclosure(source_name: str, title: str) -> bool:
+    """제3자배정. 기저 대비 15배라 소리와 색을 따로 준다."""
+    return (
+        is_material_disclosure(source_name, title)
+        and TOP_DISCLOSURE_KEYWORD in str(title or "")
+    )
 
 
 class LatestLSNewsLabel(QLabel):
@@ -577,6 +653,20 @@ class RealtimeNewsTabMixin:
             "최신순으로 최대 500건을 표시합니다.")
         self._ls_news_db_search_button.clicked.connect(
             self._start_ls_news_db_search)
+        # 저녁마다 `한국거래소 -ETF -ETN`을 다시 치지 않게 한다.
+        self._ls_news_search_presets = QComboBox()
+        self._ls_news_search_presets.setFixedWidth(150)
+        self._ls_news_search_presets.setToolTip(
+            "저장한 검색식을 고릅니다.\n★ 버튼으로 현재 검색어를 넣고 뺍니다.")
+        self._ls_news_search_presets.activated.connect(
+            self._apply_ls_news_search_preset)
+        self._ls_news_search_preset_button = QPushButton("★")
+        self._ls_news_search_preset_button.setFixedWidth(28)
+        self._ls_news_search_preset_button.setToolTip(
+            "현재 검색어를 즐겨찾기에 넣습니다. 이미 있으면 뺍니다.")
+        self._ls_news_search_preset_button.clicked.connect(
+            self._toggle_ls_news_search_preset)
+        self._reload_ls_news_search_presets()
         self._ls_news_search_clear_shortcut = QShortcut(
             QKeySequence(Qt.Key.Key_Escape), self._ls_news_search)
         self._ls_news_search_clear_shortcut.setContext(
@@ -636,6 +726,8 @@ class RealtimeNewsTabMixin:
         status_row.addWidget(self._ls_news_count)
         status_row.addWidget(self._ls_news_search, 1)
         status_row.addWidget(self._ls_news_db_search_button)
+        status_row.addWidget(self._ls_news_search_presets)
+        status_row.addWidget(self._ls_news_search_preset_button)
         status_row.addWidget(self._ls_news_sound)
         status_row.addWidget(self._ls_news_stock_only)
         status_row.addWidget(self._ls_news_watched_only)
@@ -716,6 +808,7 @@ class RealtimeNewsTabMixin:
         self._ls_news_source_pending: set[str] = set()
         self._ls_news_source_attempts: dict[str, int] = {}
         self._ls_news_source_tasks: set[asyncio.Task] = set()
+        self._disclosure_prefetch_pending: set[str] = set()
 
     def _start_ls_news_stream(self):
         if self._ls_news_task and not self._ls_news_task.done():
@@ -870,12 +963,21 @@ class RealtimeNewsTabMixin:
     def _clear_latest_ls_news_highlight(self):
         self._set_latest_ls_news_highlight(False)
 
+    @staticmethod
+    def _latest_ls_news_provider(context: dict) -> str:
+        source_name = context.get("source_name")
+        title = context.get("title")
+        if is_top_disclosure(source_name, title):
+            return "KRX_TOP"
+        return "KRX" if is_krx_disclosure(source_name) else "LS"
+
     def _show_latest_ls_news(self, context: dict):
         title = " ".join(str(context.get("title") or "").split())
         if not title:
             return
         self._latest_ls_news_context = {
-            **dict(context), "provider": "LS",
+            **dict(context),
+            "provider": self._latest_ls_news_provider(context),
         }
         self._latest_ls_news_label.set_headline(title)
         self._set_latest_ls_news_highlight(True)
@@ -1002,6 +1104,15 @@ class RealtimeNewsTabMixin:
         table.setItem(0, 2, stock_item)
         table.setItem(0, 3, title_item)
         table.setItem(0, 4, source_item)
+        material = is_material_disclosure(source_name, item.title)
+        top = is_top_disclosure(source_name, item.title)
+        if is_krx_disclosure(source_name):
+            tint = QColor(
+                TOP_DISCLOSURE_BACKGROUND if top
+                else MATERIAL_DISCLOSURE_BACKGROUND if material
+                else DISCLOSURE_ROW_BACKGROUND)
+            for column in DISCLOSURE_TINT_COLUMNS:
+                table.item(0, column).setBackground(tint)
         matches_search = self._ls_news_row_matches_search(0)
         table.setRowHidden(0, not matches_search)
         if self._ls_news_db_search_active and not matches_search:
@@ -1028,8 +1139,14 @@ class RealtimeNewsTabMixin:
             self._update_ls_news_count()
         if was_at_top:
             table.scrollToTop()
+        if persist and material:
+            # 본문은 눌러야 온다. 저장된 35,884건 중 본문이 있는 건 1건뿐이다.
+            # 재료급만 미리 받아 두면 발행가·주식수·납입일이 이미 DB에 있다.
+            self._schedule_disclosure_prefetch(item)
         if persist and matches_search and self.news_sound_enabled():
             _beep(
+                "krx_disclosure_top" if top else
+                "krx_disclosure" if material else
                 "ls_news_with_code"
                 if valid_stock_codes else "ls_news_without_code")
 
@@ -1325,6 +1442,51 @@ class RealtimeNewsTabMixin:
                 self._ls_news_search_task = None
                 self._ls_news_db_search_button.setEnabled(True)
                 self._ls_news_db_search_button.setText("검색")
+
+    def _ls_news_search_preset_list(self) -> list[str]:
+        saved = self._settings.value("analysis_ls_news_search_presets")
+        if saved is None:
+            return list(DEFAULT_LS_NEWS_SEARCH_PRESETS)
+        if isinstance(saved, str):
+            saved = [saved] if saved.strip() else []
+        return [str(entry).strip() for entry in saved if str(entry).strip()]
+
+    def _reload_ls_news_search_presets(self, select: str = ""):
+        presets = self._ls_news_search_preset_list()
+        combo = self._ls_news_search_presets
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("즐겨찾기", "")
+        for entry in presets:
+            combo.addItem(entry, entry)
+        index = combo.findData(select) if select else 0
+        combo.setCurrentIndex(max(0, index))
+        combo.blockSignals(False)
+
+    def _apply_ls_news_search_preset(self, index: int):
+        query = str(self._ls_news_search_presets.itemData(index) or "")
+        if not query:
+            return
+        self._ls_news_search.setText(query)
+
+    def _toggle_ls_news_search_preset(self):
+        query = self._ls_news_search.text().strip()
+        if not query:
+            self.statusBar().showMessage(
+                "검색어를 입력한 뒤 ★을 누르세요.", 3000)
+            return
+        presets = self._ls_news_search_preset_list()
+        if query in presets:
+            presets.remove(query)
+            message = f"즐겨찾기에서 뺐습니다: {query}"
+            select = ""
+        else:
+            presets.insert(0, query)
+            message = f"즐겨찾기에 넣었습니다: {query}"
+            select = query
+        self._settings.setValue("analysis_ls_news_search_presets", presets)
+        self._reload_ls_news_search_presets(select)
+        self.statusBar().showMessage(message, 3000)
 
     def _ls_news_row_matches_search(self, row: int) -> bool:
         """현재 행이 포함·OR·제외 검색식과 일치하는지 확인한다."""
@@ -2128,6 +2290,75 @@ class RealtimeNewsTabMixin:
             self._resolve_ls_news_source(source_id, item.realkey))
         self._ls_news_source_tasks.add(task)
         task.add_done_callback(self._ls_news_source_tasks.discard)
+
+    def _schedule_disclosure_prefetch(self, item: LSNewsItem):
+        """재료급 공시 본문을 미리 받아 DB에 넣는다. 하루 6~8건이다."""
+        realkey = str(item.realkey or "").strip()
+        if (
+            not realkey or self._ls_news_stream is None
+            or realkey in self._disclosure_prefetch_pending
+        ):
+            return
+        self._disclosure_prefetch_pending.add(realkey)
+        code = next(
+            (part for part in split_ls_news_stock_codes(item.code)
+             if len(part) == 6 and part.isdigit()), "")
+        task = asyncio.ensure_future(
+            self._prefetch_disclosure(realkey, code, item.title))
+        self._ls_news_source_tasks.add(task)
+        task.add_done_callback(self._ls_news_source_tasks.discard)
+
+    async def _prefetch_disclosure(self, realkey: str, code: str = "",
+                                   title: str = ""):
+        try:
+            detail = await self._ls_news_stream.news_detail(realkey)
+            if not str(detail.body or "").strip():
+                return
+            update_ls_realtime_news_detail(
+                realkey, detail.body, detail.stock_codes)
+            log.info(
+                "disclosure body prefetched key=%s bytes=%s",
+                realkey, len(detail.body))
+            self._report_disclosure_strength(detail.body, code, title)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - 제목 수신은 유지한다.
+            log.info(
+                "disclosure prefetch failed key=%s type=%s",
+                realkey, type(error).__name__)
+        finally:
+            self._disclosure_prefetch_pending.discard(realkey)
+
+    def _report_disclosure_strength(self, body: str, code: str, title: str):
+        """선취한 본문을 그 자리에서 채점한다. 제목만으로는 강도를 모른다.
+
+        같은 「유상증자결정(제3자배정)」인데 2026-09 미투온은 희석 30.0%,
+        앤씨앤은 79.7%였다. 그 차이가 결과를 갈랐다.
+        """
+        parsed = parse_rights_offering(body)
+        if not parsed:
+            return
+        result = score_rights_offering(
+            parsed, last_close_price(code),
+            datetime.now().strftime("%Y%m%d"))
+        dilution = result["dilution"]
+        log.warning(
+            "disclosure strength code=%s score=%s dilution=%s "
+            "raise_ratio=%s owner_change=%s pay=%s title=%s",
+            code, result["score"],
+            f"{dilution:.3f}" if dilution is not None else "-",
+            f"{result['raise_ratio']:.3f}"
+            if result["raise_ratio"] is not None else "-",
+            parsed["owner_change"], parsed["pay_date"], title)
+        parts = [f"공시강도 {result['score']}"]
+        if dilution is not None:
+            parts.append(f"희석 {dilution * 100:.1f}%")
+        if result["raise_ratio"] is not None:
+            parts.append(f"조달/시총 {result['raise_ratio'] * 100:.0f}%")
+        if parsed["owner_change"]:
+            parts.append("최대주주변경")
+        self.statusBar().showMessage(
+            f"{' · '.join(parts)} — {title}", 15000)
 
     def _remember_ls_news_source(self, source_id: str, source_name: str):
         source_id = str(source_id or "").strip()

@@ -62,6 +62,11 @@ TONES = {  # (주파수Hz, 길이ms) 나열 -> 멜로디. 시스템 테마 무�
     "telegram_news": [(1245, 120), (1568, 200)],
     "telegram_news_with_code": [(1245, 120), (1568, 200)],
     "telegram_news_without_code": [(880, 120), (1108, 200)],
+    # 재료급 거래소 공시. 기사음보다 낮게 시작해 길게 끌어 구분한다.
+    "krx_disclosure": [(659, 160), (880, 160), (1175, 420)],
+    # 제3자배정. 기저 대비 15배라 혼자 다른 소리를 낸다.
+    "krx_disclosure_top": [
+        (1175, 150), (1568, 150), (1175, 150), (1568, 500)],
     "jumsang": [(1568, 120), (1568, 120), (2093, 320)],  # 점상 편입
 }
 
@@ -109,6 +114,8 @@ KIWOOM_ALERT_FILES = {
     "telegram_news": Path(r"C:\KiwoomHero4\sound\sound10.wav"),
     "telegram_news_with_code": Path(r"C:\KiwoomHero4\sound\sound10.wav"),
     "telegram_news_without_code": Path(r"C:\KiwoomHero4\sound\sound9.wav"),
+    "krx_disclosure": Path(r"C:\KiwoomHero4\sound\sound6.wav"),
+    "krx_disclosure_top": Path(r"C:\KiwoomHero4\sound\sound1.wav"),
     "jumsang": Path(r"C:\KiwoomHero4\sound\sound0.wav"),
 }
 

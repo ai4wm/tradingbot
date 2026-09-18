@@ -1,0 +1,118 @@
+# -*- coding: utf-8 -*-
+"""한국거래소 공시 판별과 재료급 선별을 확인한다.
+
+LS는 공시를 기사와 같은 줄로 흘려보낸다. 하루 351건 전부 공시인데 그중
+소리를 낼 값어치가 있는 것은 6~8건뿐이라, 무엇을 울리고 무엇을 넘길지가
+이 화면의 전부다. 실제 제목은 2026-08-20~09-18 수신분에서 가져왔다.
+"""
+import os
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from ui.realtime_news_tab import (  # noqa: E402
+    DEFAULT_LS_NEWS_SEARCH_PRESETS, LATEST_NEWS_BANNER_COLORS,
+    is_krx_disclosure, is_material_disclosure, is_top_disclosure)
+
+KRX = "한국거래소"
+
+# (제목, 재료급인가) — 앞 넷이 실제로 상한가로 이어진 공시다.
+SAMPLES = (
+    ("(주)미투온 유상증자결정(제3자배정)", True),
+    ("(주)앤씨앤 유상증자결정(제3자배정)", True),
+    ("(주)미투온 최대주주 변경을 수반하는 주식양수도 계약 체결", True),
+    ("(주)엑시온그룹 타법인주식및출자증권취득결정", True),
+    ("(주)아무개 단일판매ㆍ공급계약체결", True),
+    ("(주)아무개 풍문 또는 보도에 대한 해명(미확정)", True),
+    ("(주)아무개 투자판단 관련 주요경영사항", True),
+    # 매일 나오는 정기물 — 울리면 안 된다.
+    ("(주)아무개 기업설명회(IR) 개최(안내공시)", False),
+    ("(주)아무개 주주명부폐쇄기간 또는 기준일 설정", False),
+    ("[투자주의]소수계좌 거래집중 종목", False),
+    ("(주)아무개 주주총회소집결의(임시주주총회)", False),
+    ("(주)아무개 대표이사변경", False),
+    ("(주)아무개 공매도 과열종목 지정(공매도 거래 금지 적용)", False),
+    # 정정은 원본(3.7건/일)보다 많다(4.3건/일). 빼지 않으면 소리가 두 배다.
+    ("(주)아무개 (정정)단일판매ㆍ공급계약체결", False),
+    ("(주)아무개 (정정)타인에대한채무보증결정", False),
+)
+
+
+def demo_source():
+    assert is_krx_disclosure(KRX)
+    assert is_krx_disclosure(f" {KRX} ")
+    for other in ("이데일리", "연합뉴스", "인포스탁데일리", "", None):
+        assert not is_krx_disclosure(other), other
+    # 출처가 거래소가 아니면 제목이 공시 모양이어도 공시가 아니다.
+    assert not is_material_disclosure(
+        "이데일리", "미투온, 279억 규모 제3자배정 유상증자 결정")
+    print("ok (출처 판별)")
+
+
+def demo_material():
+    for title, expected in SAMPLES:
+        got = is_material_disclosure(KRX, title)
+        assert got is expected, (title, got, expected)
+    print(f"ok (재료급 선별) {len(SAMPLES)}건")
+
+
+def demo_top():
+    """제3자배정은 한 칸 위다. 2026-05-26~09-18 실측 15배(17.9% vs 1.2%)."""
+    tops = (
+        "(주)미투온 유상증자결정(제3자배정)",
+        "(주)앱튼 유상증자결정(제3자배정)",
+        "(주)엑시온그룹 증권 발행결과(자율공시)(제3자배정 유상증자)",
+        "(주)앤로보틱스 추가상장(유상증자(제3자배정))",
+        "(주)하이딥 유상증자결정(제3자배정-현물출자)",
+        "(주)본느 유상증자결정(제3자배정-소액공모)",
+    )
+    for title in tops:
+        assert is_top_disclosure(KRX, title), title
+        # 최상급은 재료급의 부분집합이다. 소리 분기가 뒤집히면 안 된다.
+        assert is_material_disclosure(KRX, title), title
+    # 제3자배정이 아닌 유상증자는 한 칸 아래에 머문다.
+    plain = "(주)아무개 유상증자결정(주주배정후 실권주 일반공모)"
+    assert is_material_disclosure(KRX, plain)
+    assert not is_top_disclosure(KRX, plain)
+    # 정정은 최상급에서도 빠진다.
+    assert not is_top_disclosure(KRX, "(주)아무개 (정정)유상증자결정(제3자배정)")
+    # 출처가 기사면 제목이 같아도 아니다.
+    assert not is_top_disclosure("이데일리", tops[0])
+    print(f"ok (제3자배정 최상급) {len(tops)}건")
+
+
+def demo_banner_color():
+    # 전광판이 공시를 기사와 다른 색으로 낸다. 네 값이 다 있어야 한다.
+    seen = set()
+    for key in ("LS", "KRX", "KRX_TOP"):
+        colors = LATEST_NEWS_BANNER_COLORS[key]
+        assert len(colors) == 4, (key, colors)
+        assert colors not in seen, key
+        seen.add(colors)
+    print("ok (전광판 색) 3단계")
+
+
+def demo_presets():
+    # 기본 즐겨찾기는 그대로 검색창에 넣으면 동작해야 한다.
+    from ui.realtime_news_tab import parse_ls_news_search_query
+    for query in DEFAULT_LS_NEWS_SEARCH_PRESETS:
+        include, exclude = parse_ls_news_search_query(query)
+        assert include, query
+        assert any(KRX in term for group in include for term in group), query
+    # 첫 식은 제3자배정만 남긴다. 이게 제일 센 신호라 맨 앞이다.
+    include, exclude = parse_ls_news_search_query(
+        DEFAULT_LS_NEWS_SEARCH_PRESETS[0])
+    assert any("제3자배정" in term for g in include for term in g), include
+    assert "정정" in exclude, exclude
+    # ETF·ETN을 걷어내는 식도 하나 있어야 한다(잡음이 99건/일).
+    assert any(
+        {"ETF", "ETN"} <= set(parse_ls_news_search_query(query)[1])
+        for query in DEFAULT_LS_NEWS_SEARCH_PRESETS)
+    print("ok (즐겨찾기 기본값)")
+
+
+if __name__ == "__main__":
+    demo_source()
+    demo_material()
+    demo_top()
+    demo_banner_color()
+    demo_presets()

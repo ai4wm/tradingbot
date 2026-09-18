@@ -5799,3 +5799,22 @@ def news_request_count_today(db_path: Path = DB_PATH) -> int:
                  AND SUBSTR(l.requested_at, 1, 10)=?""",
             (today,),
         ).fetchone()[0])
+
+
+def last_close_price(stock_code: str, db_path: Path = DB_PATH) -> int:
+    """저장된 마지막 정규장 종가. 공시 강도의 시총 계산에 쓴다.
+
+    없으면 0을 돌려주고, 부르는 쪽이 그 항목을 0점으로 둔다. 추정치로
+    채우면 조달/시총이 실제와 다른 값으로 점수에 들어간다.
+    """
+    stock_code = str(stock_code or "").strip()
+    if not stock_code or not db_path.exists():
+        return 0
+    with closing(connect(db_path)) as connection:
+        row = connection.execute(
+            """SELECT close_price FROM daily_prices
+               WHERE stock_code=? AND close_price>0
+               ORDER BY trade_date DESC LIMIT 1""",
+            (stock_code,),
+        ).fetchone()
+    return int(row["close_price"]) if row else 0
