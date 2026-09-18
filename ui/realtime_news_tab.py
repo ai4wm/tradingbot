@@ -59,6 +59,11 @@ log = logging.getLogger("realtime_news_tab")
 
 LS_NEWS_VISIBLE_LIMIT = 500
 LS_NEWS_NEW_ROLE = Qt.ItemDataRole.UserRole + 40
+# 번호 칸의 정렬값은 화면에 찍힌 번호가 아니라 **도착 순번**이다. 두 곳이
+# 이것을 쓴다 — 번호 머리글을 눌러 원래 순서로 되돌릴 때, 그리고 500행을
+# 넘겨 잘라 낼 때 "가장 오래된 행"을 찾을 때다. 등락률로 정렬해 두면
+# 맨 아랫행은 제일 많이 내린 종목일 뿐이라 거기를 지우면 엉뚱한 뉴스가 날아간다.
+LS_NEWS_SEQ_ROLE = Qt.ItemDataRole.UserRole
 LS_NEWS_NEW_TIME_BACKGROUND = NEWS_NEW_TIME_BACKGROUND
 LS_NEWS_NEW_TITLE_BACKGROUND = NEWS_NEW_TITLE_BACKGROUND
 LS_NEWS_NEW_TIME_FOREGROUND = NEWS_NEW_TIME_FOREGROUND
@@ -838,6 +843,11 @@ class RealtimeNewsTabMixin:
             self._ls_news_table_context_menu)
         layout.addWidget(self._ls_news_table, 1)
 
+        self._ls_news_seq = 0
+        self._ls_news_sort_column = -1
+        self._ls_news_sort_desc = True
+        header.setSectionsClickable(True)
+        header.sectionClicked.connect(self._sort_ls_news_table)
         self._ls_news_rates: dict[str, float] = {}
         self._ls_news_rate_task = None
         self._ls_news_rate_timer = QTimer(self)
@@ -1130,7 +1140,8 @@ class RealtimeNewsTabMixin:
         table = self._ls_news_table
         was_at_top = table.verticalScrollBar().value() <= 1
         table.insertRow(0)
-        number_item = NumericTableWidgetItem("1", 1)
+        self._ls_news_seq += 1
+        number_item = NumericTableWidgetItem("1", self._ls_news_seq)
         number_item.setTextAlignment(
             Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
         time_item = QTableWidgetItem(format_news_time(item.date, item.time))
@@ -1199,11 +1210,11 @@ class RealtimeNewsTabMixin:
                 self._show_latest_ls_news(context)
 
         while table.rowCount() > LS_NEWS_VISIBLE_LIMIT:
-            last_row = table.rowCount() - 1
-            if self._ls_news_row_is_new(last_row):
+            oldest = self._ls_news_oldest_row()
+            if self._ls_news_row_is_new(oldest):
                 self._ls_news_new_count = max(
                     0, self._ls_news_new_count - 1)
-            table.removeRow(last_row)
+            table.removeRow(oldest)
         if not self._ls_news_loading_saved:
             self._renumber_ls_news_table()
         self._update_ls_news_new_button()
@@ -1293,13 +1304,14 @@ class RealtimeNewsTabMixin:
             if item is None:
                 item = NumericTableWidgetItem("", 0)
                 table.setItem(row, 0, item)
+            # 정렬값(도착 순번)은 건드리지 않는다. 화면 번호로 덮어쓰면
+            # 번호 머리글을 눌러도 이미 보이는 순서 그대로가 되고,
+            # 잘라 낼 행을 고르는 기준도 사라진다.
             if table.isRowHidden(row):
                 item.setText("")
-                item.setData(Qt.ItemDataRole.UserRole, 0)
             else:
                 visible_number += 1
                 item.setText(str(visible_number))
-                item.setData(Qt.ItemDataRole.UserRole, visible_number)
             item.setTextAlignment(
                 Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
 
@@ -2398,6 +2410,45 @@ class RealtimeNewsTabMixin:
             if len(stock_codes) > 1 else tooltip_lines[0]
         )
         return label, stock_codes, tooltip
+
+    def _ls_news_oldest_row(self) -> int:
+        """가장 먼저 도착한 행. 500행을 넘길 때 이것을 지운다.
+
+        정렬하지 않았을 때는 맨 아랫행과 같은 답이다. 등락률로 정렬해 두면
+        맨 아랫행은 제일 많이 내린 종목일 뿐이라 답이 갈린다.
+        """
+        table = self._ls_news_table
+        oldest, lowest = table.rowCount() - 1, None
+        for row in range(table.rowCount()):
+            item = table.item(row, 0)
+            seq = item.data(LS_NEWS_SEQ_ROLE) if item else None
+            if seq is None:
+                continue
+            if lowest is None or seq < lowest:
+                oldest, lowest = row, seq
+        return oldest
+
+    def _sort_ls_news_table(self, column: int):
+        """머리글을 누르면 그 칸으로 한 번 정렬한다.
+
+        `setSortingEnabled(True)`는 쓰지 않는다. 켜 두면 행을 만드는 도중
+        `setItem`마다 표가 다시 정렬돼 만들던 행이 딴 데로 간다. 여기서는
+        다 만든 뒤 한 번만 부르고, 새 뉴스는 계속 맨 위로 들어온다.
+        """
+        table = self._ls_news_table
+        if column == self._ls_news_sort_column:
+            self._ls_news_sort_desc = not self._ls_news_sort_desc
+        else:
+            self._ls_news_sort_column = column
+            # 등락률·번호는 큰 값부터, 글자 칸은 가나다순이 자연스럽다.
+            self._ls_news_sort_desc = column in (0, LS_NEWS_RATE_COLUMN)
+        table.sortItems(
+            column,
+            Qt.SortOrder.DescendingOrder if self._ls_news_sort_desc
+            else Qt.SortOrder.AscendingOrder)
+        # 숨김은 행 번호에 붙어 있어 정렬을 따라오지 않는다. 다시 건다.
+        self._apply_ls_news_search_filter()
+        table.scrollToTop()
 
     # --- 등락률 칸 -------------------------------------------------------
     # 웹소켓 등록은 95칸뿐이고 매매 화면이 그것을 쓴다. 뉴스 500행의 종목만

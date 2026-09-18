@@ -24,26 +24,42 @@ from ui.realtime_news_tab import (  # noqa: E402
 
 
 def _screen(rows):
-    """행만 채운 최소 화면. AnalysisWindow 전체를 세우지 않는다."""
+    """행만 채운 최소 화면. AnalysisWindow 전체를 세우지 않는다.
+
+    실제 화면과 같이 **새 행이 맨 위(0행)로 들어가고** 도착 순번은 늘어난다.
+    """
     table = QTableWidget(0, 6)
-    for code, name in rows:
-        row = table.rowCount()
-        table.insertRow(row)
-        table.setItem(row, 0, QTableWidgetItem(str(row + 1)))
-        table.setItem(row, 1, QTableWidgetItem("09:00:00"))
+    for seq, (code, name) in enumerate(rows, 1):
+        table.insertRow(0)
+        table.setItem(0, 0, NumericTableWidgetItem(str(seq), seq))
+        table.setItem(0, 1, QTableWidgetItem(f"09:{seq:02d}:00"))
         stock = QTableWidgetItem(name)
         stock.setData(Qt.ItemDataRole.UserRole, [code] if code else [])
-        table.setItem(row, 2, stock)
-        table.setItem(row, 3, QTableWidgetItem("제목"))
-        table.setItem(row, 4, QTableWidgetItem("한국거래소"))
-        table.setItem(row, LS_NEWS_RATE_COLUMN,
+        table.setItem(0, 2, stock)
+        table.setItem(0, 3, QTableWidgetItem("제목"))
+        table.setItem(0, 4, QTableWidgetItem("한국거래소"))
+        table.setItem(0, LS_NEWS_RATE_COLUMN,
                       NumericTableWidgetItem("", 0.0))
     screen = type("Fake", (), {
         name: Mixin.__dict__[name] for name in (
-            "_ls_news_visible_codes", "_paint_ls_news_rate")})()
+            "_ls_news_visible_codes", "_paint_ls_news_rate",
+            "_ls_news_oldest_row", "_sort_ls_news_table",
+            "_renumber_ls_news_table", "_apply_ls_news_search_filter",
+            "_ls_news_row_matches_search")})()
     screen._ls_news_table = table
     screen._ls_news_rates = {}
+    screen._ls_news_sort_column = -1
+    screen._ls_news_sort_desc = True
+    screen._ls_news_search = _EmptySearch()
+    screen._update_ls_news_count = lambda *a: None
     return screen
+
+
+class _EmptySearch:
+    """검색어가 없는 상태. 정렬 뒤 필터 재적용 경로만 태운다."""
+
+    def text(self):
+        return ""
 
 
 def demo_visible_only():
@@ -60,11 +76,12 @@ def demo_visible_only():
     assert codes, codes
     # 400행이 다 오면 조회가 4번으로 늘어난다. 한 화면치만 와야 한다.
     assert len(codes) <= 20, len(codes)
-    assert codes[0] == "000001", codes[:3]
+    # 맨 위는 가장 나중에 들어온 행이다.
+    assert codes[0] == "000400", codes[:3]
 
     # 숨긴 행은 세지 않는다 — 검색식이 걸러 낸 행까지 조회할 이유가 없다.
     table.setRowHidden(0, True)
-    assert "000001" not in screen._ls_news_visible_codes()
+    assert "000400" not in screen._ls_news_visible_codes()
 
     # 종목코드가 없는 행(시장 안내 공시)은 건너뛴다.
     blank = _screen([("", "-"), ("005930", "삼성전자")])
@@ -90,6 +107,7 @@ def demo_max_codes():
 def demo_paint():
     """받은 값만 그린다. 색은 상승 빨강·하락 파랑이다."""
     QApplication.instance() or QApplication([])
+    # 새 행이 위로 들어가므로 표시 순서는 선도전기·동양·앤씨앤이다.
     screen = _screen([("092600", "앤씨앤"), ("001520", "동양"),
                       ("007610", "선도전기")])
     screen._ls_news_rates = {"092600": 29.93, "001520": -3.5}
@@ -98,17 +116,78 @@ def demo_paint():
         screen._paint_ls_news_rate(row)
     cell = lambda row: screen._ls_news_table.item(row, LS_NEWS_RATE_COLUMN)
 
-    assert cell(0).text() == "+29.93", cell(0).text()
-    assert cell(0).foreground().color() == RED
-    assert cell(1).text() == "-3.50", cell(1).text()
+    assert cell(2).text() == "+29.93", cell(2).text()   # 앤씨앤
+    assert cell(2).foreground().color() == RED
+    assert cell(1).text() == "-3.50", cell(1).text()    # 동양
     assert cell(1).foreground().color() == BLUE
     # 아직 안 받은 종목은 빈칸이다. 0.00으로 채우면 하한가와 구별이 안 된다.
-    assert cell(2).text() == "", cell(2).text()
+    assert cell(0).text() == "", cell(0).text()         # 선도전기
 
     # 정렬용 숫자가 함께 들어가야 한다(문자열 정렬은 -3.5 > +29.93).
-    assert cell(0).data(Qt.ItemDataRole.UserRole) == 29.93
-    assert cell(1) < cell(0)
+    assert cell(2).data(Qt.ItemDataRole.UserRole) == 29.93
+    assert cell(1) < cell(2)
     print("ok (등락률 표시·색·정렬)")
+
+
+def demo_sort():
+    """머리글을 누르면 그 칸으로 정렬하고, 번호 칸이 원래 순서로 되돌린다."""
+    QApplication.instance() or QApplication([])
+    screen = _screen([("092600", "앤씨앤"), ("001520", "동양"),
+                      ("007610", "선도전기")])
+    screen._ls_news_rates = {
+        "092600": 29.93, "001520": -3.50, "007610": 12.00}
+    for row in range(3):
+        screen._paint_ls_news_rate(row)
+    names = lambda: [screen._ls_news_table.item(r, 2).text()
+                     for r in range(3)]
+    # 새 행이 위로 들어갔으니 처음은 도착 역순이다.
+    assert names() == ["선도전기", "동양", "앤씨앤"], names()
+
+    screen._sort_ls_news_table(LS_NEWS_RATE_COLUMN)
+    assert names() == ["앤씨앤", "선도전기", "동양"], names()
+    # 같은 칸을 다시 누르면 뒤집는다.
+    screen._sort_ls_news_table(LS_NEWS_RATE_COLUMN)
+    assert names() == ["동양", "선도전기", "앤씨앤"], names()
+
+    # 번호 칸은 화면 번호가 아니라 도착 순번으로 정렬한다. 화면 번호로
+    # 정렬하면 이미 보이는 순서 그대로라 원래 순서로 못 돌아온다.
+    screen._sort_ls_news_table(0)
+    assert names() == ["선도전기", "동양", "앤씨앤"], names()
+    print("ok (정렬 · 번호 칸으로 원래 순서 복귀)")
+
+
+def demo_trim_drops_oldest():
+    """500행을 넘겨 지울 때는 맨 아랫행이 아니라 가장 먼저 온 행이다.
+
+    등락률로 정렬해 두면 맨 아랫행은 제일 많이 내린 종목일 뿐이다. 거기를
+    지우면 방금 들어온 뉴스가 날아간다.
+    """
+    QApplication.instance() or QApplication([])
+    screen = _screen([("092600", "앤씨앤"), ("001520", "동양"),
+                      ("007610", "선도전기")])
+    screen._ls_news_rates = {
+        "092600": 29.93, "001520": -3.50, "007610": 12.00}
+    for row in range(3):
+        screen._paint_ls_news_rate(row)
+
+    # 정렬 전: 맨 아랫행이 곧 가장 오래된 행이다(앤씨앤이 1번으로 왔다).
+    assert screen._ls_news_oldest_row() == 2
+    assert screen._ls_news_table.item(2, 2).text() == "앤씨앤"
+
+    # 등락률 오름차순으로 정렬하면 맨 아래가 앤씨앤(+29.93)이 된다.
+    screen._sort_ls_news_table(LS_NEWS_RATE_COLUMN)
+    screen._sort_ls_news_table(LS_NEWS_RATE_COLUMN)
+    assert screen._ls_news_table.item(2, 2).text() == "앤씨앤"
+    # 그래도 가장 오래된 행은 여전히 앤씨앤이라 답이 같아야 한다.
+    oldest = screen._ls_news_oldest_row()
+    assert screen._ls_news_table.item(oldest, 2).text() == "앤씨앤", oldest
+
+    # 내림차순이면 맨 아래가 동양인데, 지울 것은 앤씨앤이다.
+    screen._sort_ls_news_table(LS_NEWS_RATE_COLUMN)
+    assert screen._ls_news_table.item(2, 2).text() == "동양"
+    oldest = screen._ls_news_oldest_row()
+    assert screen._ls_news_table.item(oldest, 2).text() == "앤씨앤", oldest
+    print("ok (잘라 낼 행은 가장 먼저 온 행)")
 
 
 def demo_column_layout():
@@ -126,4 +205,6 @@ if __name__ == "__main__":
     demo_visible_only()
     demo_max_codes()
     demo_paint()
+    demo_sort()
+    demo_trim_drops_oldest()
     demo_column_layout()
