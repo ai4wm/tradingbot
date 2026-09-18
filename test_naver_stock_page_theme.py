@@ -60,6 +60,82 @@ def _prepare(db_path: Path):
                VALUES ('007610', '선도전기', '2026-09-18T00:00:00+09:00')""")
 
 
+def demo_own_theme_mark():
+    """종목이 이미 가진 테마는 제목에 종목명이 없어도 오늘 재료로 표시한다.
+
+    선도전기는 `전력설비`와 `철도`를 함께 가지고 있다. 오늘 어느 쪽으로
+    오르는지가 정보인데 지금은 둘 다 회색으로 나란히 있어 알 수 없다.
+
+    **없던 테마는 만들지 않는다.** 그래서 「원전주 급등」 시황이 더코디에
+    원자력을 붙이던 사고는 이 갈래로는 일어나지 않는다.
+    """
+    from analysis_db import news_theme_labels
+
+    temp = Path(tempfile.mkdtemp(prefix="own_theme_mark_"))
+    db_path = temp / "test.db"
+    try:
+        _prepare(db_path)
+        # 선도전기에 전력설비·철도를 NAVER 분류로 심는다.
+        from analysis_db import save_theme_snapshot
+        save_theme_snapshot(
+            [{"code": "1", "name": "전력설비", "members": ["007610"]},
+             {"code": "2", "name": "철도", "members": ["007610"]}],
+            "20260917", "NAVER", 0.95, db_path=db_path)
+
+        base = dict(SECTOR)
+        # 제목에 종목명이 없고, 종목이 이미 가진 테마가 제목에 걸린다.
+        hit = {
+            **base, "source_item_key": "k1",
+            "canonical_url": "https://example.test/1",
+            "title": "AI 데이터센터 전력 폭증… 전력설비주 매수세 몰린다",
+            "summary": "선도전기 등이 강세다.",
+            "current_hash": "h1", "current_hash2": "",
+            "duplicate_key": title_key(
+                "AI 데이터센터 전력 폭증… 전력설비주 매수세 몰린다"),
+        }
+        # 종목이 안 가진 테마 → 붙으면 안 된다(덱스터에 로봇을 붙이던 경우).
+        miss = {
+            **base, "source_item_key": "k2",
+            "canonical_url": "https://example.test/2",
+            "title": "로봇에 힘 싣는 삼성…전문 자회사 거래 3배 '쑥'",
+            "summary": "선도전기도 언급됐다.",
+            "current_hash": "h2",
+            "duplicate_key": title_key(
+                "로봇에 힘 싣는 삼성…전문 자회사 거래 3배 '쑥'"),
+        }
+        # 지수·시황은 어느 테마로 올랐는지 못 알려 준다.
+        wrap = {
+            **base, "source_item_key": "k3",
+            "canonical_url": "https://example.test/3",
+            "title": "코스피, 6900선 회복…2차전지·전력설비 강세",
+            "summary": "선도전기도 올랐다.",
+            "current_hash": "h3",
+            "duplicate_key": title_key(
+                "코스피, 6900선 회복…2차전지·전력설비 강세"),
+        }
+        save_news_items(
+            "007610", "선도전기", [hit, miss, wrap], db_path=db_path)
+
+        fresh = news_theme_labels(db_path, first_seen_on="20260918")
+        marked = set(fresh.get("007610") or ())
+        assert marked == {"전력설비"}, marked
+
+        # 종목이 가진 테마 자체는 늘지 않았다. 표식만 붙었다.
+        labels = set(active_theme_labels(db_path).get("007610") or ())
+        assert labels == {"전력설비", "철도"}, labels
+        assert "로봇" not in labels and "데이터센터" not in labels, labels
+
+        # 소급이 그 표식을 지우면 안 된다.
+        backfill_news_themes(db_path=db_path)
+        after = set(
+            news_theme_labels(db_path, first_seen_on="20260918")
+            .get("007610") or ())
+        assert after == {"전력설비"}, after
+        print("ok (가진 테마만 오늘 재료로 표시)")
+    finally:
+        shutil.rmtree(temp, ignore_errors=True)
+
+
 def demo():
     temp = Path(tempfile.mkdtemp(prefix="naver_stock_page_"))
     db_path = temp / "test.db"
@@ -102,3 +178,4 @@ def demo():
 
 if __name__ == "__main__":
     demo()
+    demo_own_theme_mark()

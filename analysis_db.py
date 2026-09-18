@@ -3934,17 +3934,23 @@ def _preferred_siblings(connection, names: dict[str, str]) -> set[str]:
 
 
 def _link_news_themes(connection, stock_codes, text: str,
-                      day: str, seen: set | None = None) -> tuple[str, ...]:
+                      day: str, seen: set | None = None,
+                      only: set | None = None) -> tuple[str, ...]:
     """열린 트랜잭션에서 뉴스 한 건의 종목-테마 NEWS 연결을 더한다.
 
     `seen`을 주면 이 뉴스가 뒷받침하는 (종목, 테마명, 날짜)를 모아 담는다.
     재분류가 "지금 사전으로 재현되지 않는 연결"을 가려내는 데 쓴다.
+
+    `only`를 주면 그 안의 테마만 붙인다. 종목이 **이미 가진** 테마를 오늘
+    재료로 표시할 때 쓴다 — 없던 테마를 만들지 않으므로 안전하다.
     """
     codes = list(dict.fromkeys(
         str(code).removesuffix("_AL") for code in (stock_codes or ()) if code))
     if not codes or len(codes) > NEWS_THEME_MAX_CODES:
         return ()
     themes = match_news_themes(text)
+    if only is not None:
+        themes = tuple(theme for theme in themes if theme in only)
     if not themes:
         return ()
     now = datetime.now().astimezone().isoformat(timespec="seconds")
@@ -4039,6 +4045,27 @@ def backfill_news_themes(days: int = NEWS_THEME_MAX_AGE_DAYS,
             linked += len(_link_news_themes(
                 connection, [row["stock_code"]], row["title"],
                 str(row["published_at"])[:10].replace("-", ""), seen))
+        # 제목에 종목명이 없어도 그 종목이 이미 가진 테마는 오늘 재료로
+        # 표시한다. 저장 때와 같은 조건이어야 아래 삭제 단계가 안 지운다.
+        for row in connection.execute(
+                """SELECT n.published_at_source AS published_at,
+                          m.stock_code, n.current_title AS title
+                     FROM news_items n
+                     JOIN news_stock_maps m ON m.news_id=n.news_id
+                     JOIN stocks s ON s.stock_code=m.stock_code
+                    WHERE REPLACE(SUBSTR(n.published_at_source,1,10),'-','')>=?
+                      AND s.stock_name<>''
+                      AND m.match_method<>'NAVER_STOCK_PAGE'
+                      AND INSTR(n.current_title, s.stock_name)=0
+                      AND INSTR(COALESCE(n.current_summary,''),
+                                s.stock_name)>0""",
+                (since,)).fetchall():
+            if _MARKET_WRAP_RE.search(str(row["title"] or "")):
+                continue
+            linked += len(_link_news_themes(
+                connection, [row["stock_code"]], row["title"],
+                str(row["published_at"])[:10].replace("-", ""), seen,
+                only=_own_theme_names(connection, row["stock_code"])))
         stale = [
             (row["stock_code"], row["theme_id"], row["valid_from"])
             for row in connection.execute(
@@ -4087,6 +4114,27 @@ def news_theme_labels(db_path: Path = DB_PATH,
             if code and name and name not in result.get(code, ()):
                 result[code] = (*result.get(code, ()), name)
     return result
+
+
+# 종목이 이미 가진 테마에 「오늘 재료」 표식(★)을 달 때만 쓰는 제외 목록.
+# 지수·시황 기사와 내린 날 기사는 어느 테마로 올랐는지를 알려 주지 않는다
+# (「로봇주 일제히 밀렸다」로 ★로봇이 뜨면 거짓 신호다).
+_MARKET_WRAP_RE = re.compile(
+    r"시황|마감|출발|증시|코스피|코스닥|지수|풍향계|데이터랩"
+    r"|밀렸|하락|약세|급락|조정|차익실현|부담|우려|경계")
+
+
+def _own_theme_names(connection, stock_code: str) -> set[str]:
+    """그 종목에 지금 붙어 있는 테마 이름. 출처를 가리지 않는다."""
+    return {
+        str(row[0] or "").strip()
+        for row in connection.execute(
+            """SELECT t.theme_name FROM stock_themes st
+                 JOIN themes t ON t.theme_id=st.theme_id
+                WHERE st.stock_code=? AND st.valid_to IS NULL""",
+            (str(stock_code).removesuffix("_AL"),)).fetchall()
+        if str(row[0] or "").strip()
+    }
 
 
 _PRICE_TICKER_RE = re.compile(
@@ -5636,11 +5684,21 @@ def save_news_items(stock_code: str, stock_name: str, rows: list[dict],
             # 그 종목 재료가 맞다(2026-09-18 선도전기 007610:
             # 「[특징주] 전기장비株, 아마존 AI 전력장비 계약」).
             title = str(item.get("title") or "")
+            day = (published[:10].replace("-", "")
+                   or datetime.now().strftime("%Y%m%d"))
             if linked_by_naver or (stock_name and stock_name in title):
-                _link_news_themes(
-                    connection, [stock_code], title,
-                    published[:10].replace("-", "")
-                    or datetime.now().strftime("%Y%m%d"))
+                _link_news_themes(connection, [stock_code], title, day)
+            elif stock_name and stock_name in str(item.get("summary") or ""):
+                # 제목에 종목명이 없어도 **그 종목이 이미 가진** 테마가 제목에
+                # 걸리면 오늘 재료로 표시한다. 종목이 전력설비·철도를 함께
+                # 가지고 있을 때 오늘 어느 쪽으로 오르는지가 정보인데, 지금은
+                # 둘 다 회색으로 나란히 있어 알 수 없다(2026-09-18 선도전기).
+                # 없던 테마는 만들지 않으므로 「원전주 급등」 시황이 더코디에
+                # 원자력을 붙이던 사고는 이 갈래로는 일어나지 않는다.
+                if not _MARKET_WRAP_RE.search(title):
+                    _link_news_themes(
+                        connection, [stock_code], title, day,
+                        only=_own_theme_names(connection, stock_code))
             connection.execute(
                 """INSERT INTO news_material_labels(
                        news_id, material_type, confidence,
