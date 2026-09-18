@@ -56,12 +56,23 @@ def demo_material():
 
 
 def demo_top():
-    """제3자배정은 한 칸 위다. 2026-05-26~09-18 실측 15배(17.9% vs 1.2%)."""
+    """최상급은 「유상증자결정(제3자배정)」 원본뿐이다.
+
+    2026-05-01~09-18 실측, 5영업일 안 상한가(무작위 2만 표본 기저 1.41%):
+
+        유상증자결정 원본   135건  20.0%   ← 최상급
+        (정정)              261건   8.8%   ← 재료급
+        발행결과             63건   6.3%   ← 재료급
+        추가상장            122건   2.5%   ← 재료급, 기저와 거의 같다
+        철회                 14건   7.1%   ← 악재, 최상급에서 뺀다
+
+    한때 이 넷을 뭉뚱그려 15배라 불렀다. 실제로 센 것은 원본 하나뿐이고
+    추가상장이 최상급 소리의 34%를 먹고 있었다 — 2026-09-18 빨간 소리
+    세 번이 전부 추가상장이었고, 그날 원본은 0건이었다.
+    """
     tops = (
         "(주)미투온 유상증자결정(제3자배정)",
         "(주)앱튼 유상증자결정(제3자배정)",
-        "(주)엑시온그룹 증권 발행결과(자율공시)(제3자배정 유상증자)",
-        "(주)앤로보틱스 추가상장(유상증자(제3자배정))",
         "(주)하이딥 유상증자결정(제3자배정-현물출자)",
         "(주)본느 유상증자결정(제3자배정-소액공모)",
     )
@@ -69,15 +80,49 @@ def demo_top():
         assert is_top_disclosure(KRX, title), title
         # 최상급은 재료급의 부분집합이다. 소리 분기가 뒤집히면 안 된다.
         assert is_material_disclosure(KRX, title), title
-    # 제3자배정이 아닌 유상증자는 한 칸 아래에 머문다.
-    plain = "(주)아무개 유상증자결정(주주배정후 실권주 일반공모)"
-    assert is_material_disclosure(KRX, plain)
-    assert not is_top_disclosure(KRX, plain)
-    # 정정은 최상급에서도 빠진다.
-    assert not is_top_disclosure(KRX, "(주)아무개 (정정)유상증자결정(제3자배정)")
+
+    # 한 칸 아래에 머무는 것들. 소리는 나되 빨간 소리는 아니다.
+    seconds = (
+        # 이미 끝난 증자의 뒤처리다. 재료가 아니라 물량 출회다.
+        "(주)앤로보틱스 추가상장(유상증자(제3자배정))",
+        "(주)한탑 추가상장(유상증자(제3자배정))",
+        "(주)엑시온그룹 증권 발행결과(자율공시)(제3자배정 유상증자)",
+        "(주)아무개 유상증자최종발행가액확정(제3자배정-소액공모)",
+        # 제3자배정이 아닌 유상증자.
+        "(주)아무개 유상증자결정(주주배정후 실권주 일반공모)",
+        # 2026-09-18 앤씨앤(2연상 점상 중)·사토시홀딩스가 이 모양이었다.
+        # 전에는 정정을 통째로 빼서 화면에도 안 뜨고 소리도 안 났다.
+        "(주)앤씨앤 (정정)유상증자결정(제3자배정)",
+        "사토시홀딩스(주) (정정)유상증자결정(제3자배정)",
+        # 철회는 악재다. 붙여 쓴 것도 띄어 쓴 것도 빨간 소리를 주지 않는다.
+        "(주)아이톡시 (정정)유상증자결정(제3자배정-철회)",
+        "퓨쳐메디신 주식회사 기타 주요경영사항(유상증자결정(제3자배정) 철회)",
+        "(주)캐리 기타 주요경영사항(제3자배정 유상증자 결정 철회)",
+    )
+    for title in seconds:
+        assert not is_top_disclosure(KRX, title), title
+
     # 출처가 기사면 제목이 같아도 아니다.
     assert not is_top_disclosure("이데일리", tops[0])
-    print(f"ok (제3자배정 최상급) {len(tops)}건")
+    print(f"ok (제3자배정 최상급) {len(tops)}건 · 한 칸 아래 {len(seconds)}건")
+
+
+def demo_correction_still_sounds():
+    """제3자배정 유상증자결정의 정정만 정정 제외를 면제받는다.
+
+    8.8%로 기저(1.41%)의 6배다. 발행가나 납입일이 바뀌면 그것이 재료다.
+    나머지 정정은 그대로 조용하다 — 원본보다 많아서 소리가 두 배가 된다.
+    """
+    assert is_material_disclosure(KRX, "(주)앤씨앤 (정정)유상증자결정(제3자배정)")
+    silent = (
+        "(주)아무개 (정정)단일판매ㆍ공급계약체결",
+        "(주)아무개 (정정)타법인주식및출자증권취득결정",
+        "(주)아무개 (정정)유상증자결정(주주배정후 실권주 일반공모)",
+        "(주)아무개 (정정)최대주주변경",
+    )
+    for title in silent:
+        assert not is_material_disclosure(KRX, title), title
+    print(f"ok (제3자배정 정정만 통과) 조용한 정정 {len(silent)}건")
 
 
 def demo_banner_color():
@@ -98,11 +143,14 @@ def demo_presets():
         include, exclude = parse_ls_news_search_query(query)
         assert include, query
         assert any(KRX in term for group in include for term in group), query
-    # 첫 식은 제3자배정만 남긴다. 이게 제일 센 신호라 맨 앞이다.
+    # 첫 식은 최상급만 남긴다. 이게 제일 센 신호라 맨 앞이다.
+    # 「유상증자결정」이 있어야 추가상장·발행결과가 빠지고, 정정은 들어온다.
     include, exclude = parse_ls_news_search_query(
         DEFAULT_LS_NEWS_SEARCH_PRESETS[0])
-    assert any("제3자배정" in term for g in include for term in g), include
-    assert "정정" in exclude, exclude
+    flat = {term for group in include for term in group}
+    assert {"제3자배정", "유상증자결정"} <= flat, flat
+    assert "철회" in exclude, exclude
+    assert "정정" not in exclude, exclude
     # ETF·ETN을 걷어내는 식도 하나 있어야 한다(잡음이 99건/일).
     assert any(
         {"ETF", "ETN"} <= set(parse_ls_news_search_query(query)[1])
@@ -186,6 +234,7 @@ if __name__ == "__main__":
     demo_source()
     demo_material()
     demo_top()
+    demo_correction_still_sounds()
     demo_banner_color()
     demo_presets()
     demo_star_never_deletes()

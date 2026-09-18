@@ -153,12 +153,22 @@ KRX_DISCLOSURE_SOURCE = "한국거래소"
 # 다만 "연상은 전부 제3자배정"은 아니다. 같은 기간 서산(079650) 5연상은
 # 제3자배정이 아니었다.
 TOP_DISCLOSURE_KEYWORD = "제3자배정"
+# 최상급은 「유상증자결정(제3자배정)」뿐이다. 같은 말이 제목에 있어도
+# 추가상장·발행결과는 이미 끝난 증자의 뒤처리라 효과가 기저와 같다.
+# 2026-05-01~09-18, 5영업일 안 상한가(기저 1.41%):
+#   유상증자결정 135건 20.0% · 발행결과 63건 6.3% · 추가상장 122건 2.5%
+# 정정도 261건 8.8%라 버릴 물건이 아니다. 최상급에는 안 넣고 재료급으로
+# 통과시킨다 — 발행가·납입일이 바뀌면 그것이 재료다.
+TOP_DISCLOSURE_PAIR = "유상증자결정"
+# 「제3자배정 유상증자결정 철회」는 악재다(14건 7.1%). 띄어쓴 「유상증자 결정
+# 철회」는 위 무공백 키워드에 안 걸리지만 붙여 쓴 19건이 새어 들어온다.
+TOP_DISCLOSURE_EXCLUDE = "철회"
 
 # 소리를 낼 값어치가 있는 공시명. 2026-09-15 15:55:12 미투온
 # 「유상증자결정(제3자배정)」이 기사보다 18초, 애프터마켓 개장보다
 # 4분 48초 빨랐는데 4천건에 묻혀 아무도 누르지 않았다.
 MATERIAL_DISCLOSURE_KEYWORDS = (
-    TOP_DISCLOSURE_KEYWORD,  # 유상증자결정 말고 추가상장·발행결과도 잡는다
+    TOP_DISCLOSURE_KEYWORD,  # 추가상장·발행결과는 여기서 주황으로 받는다
     "타법인주식및출자증권취득",
     "최대주주",
     "유상증자결정",
@@ -180,7 +190,7 @@ DISCLOSURE_TINT_COLUMNS = (0, 2, 4)
 
 # 검색창 즐겨찾기 기본값. 저녁마다 같은 식을 다시 치지 않게 한다.
 DEFAULT_LS_NEWS_SEARCH_PRESETS = (
-    "한국거래소 제3자배정 -정정",
+    "한국거래소 유상증자결정 제3자배정 -철회",
     "한국거래소 -ETF -ETN -투자주의 -IR",
     "한국거래소 유상증자 | 타법인 | 최대주주 | 공급계약",
     "한국거래소",
@@ -192,21 +202,41 @@ def is_krx_disclosure(source_name: str) -> bool:
     return str(source_name or "").strip() == KRX_DISCLOSURE_SOURCE
 
 
+def _is_third_party_offering(title: str) -> bool:
+    """「유상증자결정(제3자배정)」인지. 추가상장·발행결과·철회는 아니다."""
+    text = str(title or "")
+    return (
+        TOP_DISCLOSURE_KEYWORD in text
+        and TOP_DISCLOSURE_PAIR in text
+        and TOP_DISCLOSURE_EXCLUDE not in text
+    )
+
+
 def is_material_disclosure(source_name: str, title: str) -> bool:
-    """소리를 낼 공시인지. 정정은 뺀다 — 원본(3.7건/일)보다 많다(4.3건/일)."""
+    """소리를 낼 공시인지. 정정은 뺀다 — 원본(3.7건/일)보다 많다(4.3건/일).
+
+    다만 제3자배정 유상증자결정의 정정은 통과시킨다. 8.8%로 기저(1.41%)의
+    6배이고, 2026-09-18 앤씨앤(2연상 점상 중)의 정정이 화면에도 안 뜨고
+    소리도 안 났다.
+    """
     if not is_krx_disclosure(source_name):
         return False
     text = str(title or "")
-    if "(정정)" in text:
+    if "(정정)" in text and not _is_third_party_offering(text):
         return False
     return any(keyword in text for keyword in MATERIAL_DISCLOSURE_KEYWORDS)
 
 
 def is_top_disclosure(source_name: str, title: str) -> bool:
-    """제3자배정. 기저 대비 15배라 소리와 색을 따로 준다."""
+    """제3자배정 유상증자결정 원본. 기저 대비 14배라 소리와 색을 따로 준다.
+
+    정정은 8.8%로 원본(20.0%)의 절반이라 한 칸 아래 재료급에 둔다.
+    """
+    text = str(title or "")
     return (
-        is_material_disclosure(source_name, title)
-        and TOP_DISCLOSURE_KEYWORD in str(title or "")
+        is_krx_disclosure(source_name)
+        and "(정정)" not in text
+        and _is_third_party_offering(text)
     )
 
 
