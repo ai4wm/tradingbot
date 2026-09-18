@@ -38,7 +38,7 @@ from analysis_db import (
     update_ls_realtime_news_detail, update_ls_realtime_news_original_url,
     update_ls_realtime_news_source,
 )
-from gui import NumericTableWidgetItem
+from gui import BLUE, RED, TRACK as TRACK_GRAY, NumericTableWidgetItem
 from naver_news_api import NaverNewsClient
 from ls_news_server_sync import LSNewsServerSync
 from ls_news_ws import (
@@ -186,7 +186,18 @@ MATERIAL_DISCLOSURE_KEYWORDS = (
 DISCLOSURE_ROW_BACKGROUND = "#2E2A3C"
 MATERIAL_DISCLOSURE_BACKGROUND = "#4A3216"
 TOP_DISCLOSURE_BACKGROUND = "#5C1A1A"
-DISCLOSURE_TINT_COLUMNS = (0, 2, 4)
+DISCLOSURE_TINT_COLUMNS = (0, 2, 4, 5)
+
+# 등락률 칸. 맨 뒤에 붙인다 — 앞에 끼우면 0~4를 박아 쓰는 23곳이 전부
+# 어긋난다. 대신 머리글을 끌어 옮길 수 있게 했으니 종목명 옆으로 옮겨
+# 두면 그 자리를 기억한다(`analysis_ls_news_header_v3`).
+LS_NEWS_RATE_COLUMN = 5
+# 웹소켓은 못 쓴다. 실시간 등록은 95칸(`config.REAL_REG_LIMIT`)뿐이고 그것은
+# 매매 화면이 쓴다. 뉴스 500행에 실린 종목만 252개라 등록하면 매매 종목이
+# 밀려난다. 그래서 REST `ka10095`로 **보이는 행만** 주기 조회한다 — 한 번에
+# 100종목까지 실리므로 보통 1회로 끝나고, 조회는 초당 1건이 상한이다.
+LS_NEWS_RATE_INTERVAL_MS = 4000
+LS_NEWS_RATE_MAX_CODES = 100
 
 # 검색창 즐겨찾기 기본값. 저녁마다 같은 식을 다시 치지 않게 한다.
 DEFAULT_LS_NEWS_SEARCH_PRESETS = (
@@ -780,9 +791,12 @@ class RealtimeNewsTabMixin:
         status_row.addWidget(self._ls_news_clear_new_button)
         layout.addLayout(status_row)
 
-        self._ls_news_table = QTableWidget(0, 5)
+        self._ls_news_table = QTableWidget(0, 6)
         self._ls_news_table.setHorizontalHeaderLabels(
-            ("번호", "시간", "종목명", "제목", "뉴스출처"))
+            ("번호", "시간", "종목명", "제목", "뉴스출처", "등락률"))
+        self._ls_news_table.horizontalHeaderItem(5).setToolTip(
+            "화면에 보이는 행만 4초마다 조회합니다(REST ka10095).\n"
+            "머리글을 끌어 종목명 옆으로 옮길 수 있습니다.")
         self._ls_news_table.horizontalHeaderItem(2).setToolTip(
             "좌클릭: 대표 종목코드 복사\n"
             "우클릭: 대표 종목을 관심종목에 추가하고 종토방 열기")
@@ -800,12 +814,13 @@ class RealtimeNewsTabMixin:
         self._ls_news_table.verticalHeader().setVisible(False)
         self._ls_news_table.verticalHeader().setDefaultSectionSize(24)
         header = self._ls_news_table.horizontalHeader()
-        header.setSectionsMovable(False)
+        # 등락률을 맨 뒤에 붙였으니 종목명 옆으로 끌어다 둘 수 있어야 한다.
+        header.setSectionsMovable(True)
         header.setStretchLastSection(False)
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        saved_header = self._settings.value("analysis_ls_news_header_v2")
+        saved_header = self._settings.value("analysis_ls_news_header_v3")
         if saved_header is None or not header.restoreState(saved_header):
-            for column, width in enumerate((48, 105, 120, 650, 120)):
+            for column, width in enumerate((48, 105, 120, 650, 120, 70)):
                 self._ls_news_table.setColumnWidth(column, width)
         self._ls_news_header_timer = QTimer(self)
         self._ls_news_header_timer.setSingleShot(True)
@@ -823,6 +838,11 @@ class RealtimeNewsTabMixin:
             self._ls_news_table_context_menu)
         layout.addWidget(self._ls_news_table, 1)
 
+        self._ls_news_rates: dict[str, float] = {}
+        self._ls_news_rate_task = None
+        self._ls_news_rate_timer = QTimer(self)
+        self._ls_news_rate_timer.timeout.connect(self._tick_ls_news_rates)
+        self._ls_news_rate_timer.start(LS_NEWS_RATE_INTERVAL_MS)
         self._ls_news_received = 0
         self._ls_news_new_count = 0
         self._ls_news_db_error = ""
@@ -1150,6 +1170,12 @@ class RealtimeNewsTabMixin:
         table.setItem(0, 2, stock_item)
         table.setItem(0, 3, title_item)
         table.setItem(0, 4, source_item)
+        rate_item = NumericTableWidgetItem("", 0.0)
+        rate_item.setTextAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        table.setItem(0, LS_NEWS_RATE_COLUMN, rate_item)
+        # 이미 받아 둔 값이 있으면 조회를 기다리지 않고 바로 채운다.
+        self._paint_ls_news_rate(0, stock_codes)
         material = is_material_disclosure(source_name, item.title)
         top = is_top_disclosure(source_name, item.title)
         if is_krx_disclosure(source_name):
@@ -2373,11 +2399,91 @@ class RealtimeNewsTabMixin:
         )
         return label, stock_codes, tooltip
 
+    # --- 등락률 칸 -------------------------------------------------------
+    # 웹소켓 등록은 95칸뿐이고 매매 화면이 그것을 쓴다. 뉴스 500행의 종목만
+    # 252개라 등록하면 매매 종목이 밀려난다(2026-09-18 실측). 그래서 REST로
+    # 보이는 행만 조회한다 — 한 화면이 20~30행이라 보통 ka10095 한 번이다.
+
+    def _ls_news_visible_codes(self) -> list[str]:
+        """지금 눈에 보이는 행의 대표 종목코드. 숨긴 행은 세지 않는다."""
+        table = self._ls_news_table
+        height = table.viewport().height()
+        first = table.rowAt(0)
+        last = table.rowAt(max(0, height - 1))
+        if first < 0:
+            return []
+        if last < 0:  # 마지막 행이 화면 끝에 못 미칠 때
+            last = table.rowCount() - 1
+        codes = []
+        for row in range(first, min(last, table.rowCount() - 1) + 1):
+            if table.isRowHidden(row):
+                continue
+            item = table.item(row, 2)
+            if item is None:
+                continue
+            for code in item.data(Qt.ItemDataRole.UserRole) or ():
+                code = str(code)
+                if len(code) == 6 and code not in codes:
+                    codes.append(code)
+                    break  # 행마다 대표 하나만 본다
+            if len(codes) >= LS_NEWS_RATE_MAX_CODES:
+                break
+        return codes
+
+    def _paint_ls_news_rate(self, row: int, codes=None):
+        """캐시에 있는 등락률을 한 행에 그린다. 없으면 빈칸 그대로 둔다."""
+        item = self._ls_news_table.item(row, LS_NEWS_RATE_COLUMN)
+        if item is None:
+            return
+        if codes is None:
+            stock_item = self._ls_news_table.item(row, 2)
+            codes = (stock_item.data(Qt.ItemDataRole.UserRole) or ()
+                     if stock_item else ())
+        rate = None
+        for code in codes:
+            if str(code) in self._ls_news_rates:
+                rate = self._ls_news_rates[str(code)]
+                break
+        if rate is None:
+            return
+        item.setText(f"{rate:+.2f}")
+        item.setData(Qt.ItemDataRole.UserRole, float(rate))
+        item.setForeground(
+            RED if rate > 0 else BLUE if rate < 0 else TRACK_GRAY)
+
+    def _tick_ls_news_rates(self):
+        """4초마다 보이는 행의 시세를 한 번 조회한다."""
+        if self._rest is None or not self.isVisible():
+            return
+        task = self._ls_news_rate_task
+        if task is not None and not task.done():
+            return
+        if not self._ls_news_table.isVisible():
+            return  # 다른 탭을 보는 중이면 조회를 아낀다
+        codes = self._ls_news_visible_codes()
+        if not codes:
+            return
+        self._ls_news_rate_task = asyncio.ensure_future(
+            self._refresh_ls_news_rates(codes))
+
+    async def _refresh_ls_news_rates(self, codes: list[str]):
+        try:
+            rows = await self._rest.watch_info(codes)
+        except Exception as error:  # noqa: BLE001 - 시세는 보조 칸이다.
+            log.debug("LS news rate refresh failed: %s", error)
+            return
+        for row in rows:
+            code = str(row.get("code") or "").removeprefix("A")
+            if len(code) == 6:
+                self._ls_news_rates[code] = float(row.get("rate") or 0.0)
+        for index in range(self._ls_news_table.rowCount()):
+            self._paint_ls_news_rate(index)
+
     def _save_ls_news_header(self, *_args):
         if not hasattr(self, "_ls_news_table"):
             return
         self._settings.setValue(
-            "analysis_ls_news_header_v2",
+            "analysis_ls_news_header_v3",
             self._ls_news_table.horizontalHeader().saveState(),
         )
         self._settings.sync()
