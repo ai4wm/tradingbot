@@ -20,7 +20,8 @@ from urllib.parse import quote, urlsplit
 from PySide6.QtCore import (
     QPoint, QSettings, Qt, QTimer, QUrl, QUrlQuery, Signal)
 from PySide6.QtGui import (
-    QColor, QDesktopServices, QFont, QKeySequence, QShortcut, QTextCursor,
+    QColor, QDesktopServices, QFont, QFontMetrics, QKeySequence, QShortcut,
+    QTextCursor,
 )
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QHBoxLayout, QHeaderView,
@@ -1459,9 +1460,19 @@ class RealtimeNewsTabMixin:
         combo.addItem("즐겨찾기", "")
         for entry in presets:
             combo.addItem(entry, entry)
+            # 닫힌 칸은 150px이라 `한국거래소 -ETF -ETN -투자주의 -IR`이
+            # 「한국거래소 -ET…」로 잘린다. 어느 식인지 구분이 안 된다.
+            combo.setItemData(
+                combo.count() - 1, entry, Qt.ItemDataRole.ToolTipRole)
         index = combo.findData(select) if select else 0
         combo.setCurrentIndex(max(0, index))
         combo.blockSignals(False)
+        # 펼친 목록만 글자 길이에 맞춘다. 닫힌 칸까지 늘리면 주문줄이 밀린다.
+        metrics = QFontMetrics(combo.font())
+        widest = max(
+            (metrics.horizontalAdvance(entry) for entry in presets),
+            default=0)
+        combo.view().setMinimumWidth(widest + 40)
 
     def _apply_ls_news_search_preset(self, index: int):
         query = str(self._ls_news_search_presets.itemData(index) or "")
