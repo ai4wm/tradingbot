@@ -48,7 +48,7 @@ from ls_news_ws import (
     normalize_news_title, source_label,
 )
 from disclosure import parse_rights_offering, score_rights_offering
-from rank import _beep
+from rank import SoundSettingsDialog, _beep
 from ui import (
     NEWS_NEW_TIME_BACKGROUND, NEWS_NEW_TIME_FOREGROUND,
     NEWS_NEW_TITLE_BACKGROUND, NEWS_NEW_TITLE_FOREGROUND,
@@ -694,6 +694,13 @@ class RealtimeNewsTabMixin:
             )).strip().lower() in {"1", "true", "yes"}
         )
         self._ls_news_sound.toggled.connect(self._set_ls_news_sound)
+        # 전체 스위치 아래를 종류별로 가른다. 공시만 남기고 기사를 끄는 식이다.
+        self._ls_news_sound_settings = QPushButton("🔔")
+        self._ls_news_sound_settings.setFixedWidth(30)
+        self._ls_news_sound_settings.setToolTip(
+            "알림음 종류별로 켜고 끄기, 듣기, 파일 바꾸기")
+        self._ls_news_sound_settings.clicked.connect(
+            lambda: SoundSettingsDialog(self).exec())
         self._ls_news_stock_only = QCheckBox("종목")
         self._ls_news_stock_only.setToolTip(
             "종목코드가 연결된 뉴스만 표시합니다.")
@@ -730,6 +737,7 @@ class RealtimeNewsTabMixin:
         status_row.addWidget(self._ls_news_search_presets)
         status_row.addWidget(self._ls_news_search_preset_button)
         status_row.addWidget(self._ls_news_sound)
+        status_row.addWidget(self._ls_news_sound_settings)
         status_row.addWidget(self._ls_news_stock_only)
         status_row.addWidget(self._ls_news_watched_only)
         status_row.addWidget(self._ls_news_clear_new_button)

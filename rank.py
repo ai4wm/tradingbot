@@ -14,8 +14,9 @@ from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSettings, Qt, QTim
 from PySide6.QtGui import QColor, QCursor, QDesktopServices
 from PySide6.QtMultimedia import QSoundEffect
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QHBoxLayout, QHeaderView, QLabel, QPushButton,
-    QSpinBox, QTableView, QToolTip, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout,
+    QHeaderView, QLabel, QPushButton, QSpinBox, QTableView, QTableWidget,
+    QTableWidgetItem, QToolTip, QVBoxLayout, QWidget,
 )
 
 from api import MarketInfo
@@ -119,10 +120,73 @@ KIWOOM_ALERT_FILES = {
     "jumsang": Path(r"C:\KiwoomHero4\sound\sound0.wav"),
 }
 
+# 알림음 설정창에 나올 순서와 이름. 여기 없는 종류는 창에 안 뜨고 기본값
+# 그대로 운다(`ls_news`·`telegram_news`는 옛 이름 호환용이라 뺐다).
+SOUND_LABELS = (
+    ("krx_disclosure_top", "제3자배정 공시"),
+    ("krx_disclosure", "재료급 거래소 공시"),
+    ("ls_news_with_code", "실시간 뉴스 · 종목 있음"),
+    ("ls_news_without_code", "실시간 뉴스 · 종목 없음"),
+    ("naver_news", "네이버 관심종목 뉴스"),
+    ("telegram_news_with_code", "텔레그램 · 종목 있음"),
+    ("telegram_news_without_code", "텔레그램 · 종목 없음"),
+    ("jumsang", "점상 편입"),
+    ("in", "조건 편입"),
+    ("jump", "급상승"),
+    ("balance1", "3단매도 · 단계 도달"),
+    ("balance_sold", "3단매도 · 매도 체결"),
+    ("balance_unheld", "3단매도 · 미보유 소진"),
+)
+
+_SOUND_PREFIX = "alert_sound/"
+
+
+def _sound_settings() -> QSettings:
+    return QSettings("layout.ini", QSettings.IniFormat)
+
+
+def alert_sound_muted(kind: str) -> bool:
+    return str(_sound_settings().value(
+        f"{_SOUND_PREFIX}{kind}/muted", "false")).strip().lower() in {
+            "1", "true", "yes"}
+
+
+def alert_sound_path(kind: str) -> Path | None:
+    """사용자가 고른 파일. 없거나 사라졌으면 기본 파일로 돌아간다."""
+    chosen = str(_sound_settings().value(
+        f"{_SOUND_PREFIX}{kind}/file", "") or "").strip()
+    if chosen:
+        path = Path(chosen)
+        if path.is_file():
+            return path
+    return KIWOOM_ALERT_FILES.get(kind)
+
+
+def set_alert_sound(kind: str, path: str | None):
+    settings = _sound_settings()
+    key = f"{_SOUND_PREFIX}{kind}/file"
+    if path:
+        settings.setValue(key, str(path))
+    else:
+        settings.remove(key)
+    settings.sync()
+
+
+def set_alert_sound_muted(kind: str, muted: bool):
+    settings = _sound_settings()
+    settings.setValue(f"{_SOUND_PREFIX}{kind}/muted", "true" if muted else "false")
+    settings.sync()
+
 
 def _beep(kind: str):
-    """서명된 PowerShell의 Console.Beep으로 수정 전 Windows 원음을 재생한다."""
-    kiwoom_sound = KIWOOM_ALERT_FILES.get(kind)
+    """서명된 PowerShell의 Console.Beep으로 수정 전 Windows 원음을 재생한다.
+
+    종류별로 끄거나 다른 파일을 지정할 수 있다(`alert_sound/<종류>`).
+    끈 것은 생성음까지 통째로 건너뛴다 — 파일만 비우면 대체음이 울린다.
+    """
+    if alert_sound_muted(kind):
+        return
+    kiwoom_sound = alert_sound_path(kind)
     if kiwoom_sound and kiwoom_sound.is_file():
         try:
             winsound.PlaySound(
@@ -171,6 +235,116 @@ def _beep(kind: str):
     except Exception as error:  # noqa: BLE001
         # 실패 시 Windows 기본 경고음으로 대체하지 않는다.
         log.warning("Qt tone playback failed: kind=%s error=%s", kind, error)
+
+
+class SoundSettingsDialog(QDialog):
+    """종류별로 알림음을 끄고, 듣고, 파일을 바꾼다.
+
+    뉴스 `소리` 체크는 전체 스위치 그대로 두고 그 아래를 가른다. 공시만
+    남기고 기사 알림을 끄는 식이다 — 거래소 공시는 하루 20여 건인데 기사는
+    4,000건이라 섞여 울리면 공시가 묻힌다.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("알림음 설정")
+        self.resize(640, 460)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "체크를 끄면 그 종류만 울리지 않습니다. "
+            "파일을 바꾸지 않으면 기본 소리를 씁니다."))
+        self._table = QTableWidget(len(SOUND_LABELS), 4)
+        self._table.setHorizontalHeaderLabels(("켬", "알림", "소리 파일", ""))
+        self._table.verticalHeader().setVisible(False)
+        self._table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        header = self._table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self._checks = {}
+        self._paths = {}
+        for row, (kind, label) in enumerate(SOUND_LABELS):
+            check = QCheckBox()
+            check.setChecked(not alert_sound_muted(kind))
+            check.toggled.connect(
+                lambda on, k=kind: set_alert_sound_muted(k, not on))
+            holder = QWidget()
+            box = QHBoxLayout(holder)
+            box.setContentsMargins(8, 0, 8, 0)
+            box.addWidget(check)
+            self._table.setCellWidget(row, 0, holder)
+            self._checks[kind] = check
+            self._table.setItem(row, 1, QTableWidgetItem(label))
+            path_item = QTableWidgetItem()
+            self._table.setItem(row, 2, path_item)
+            self._paths[kind] = path_item
+            self._refresh_path(kind)
+
+            buttons = QWidget()
+            bar = QHBoxLayout(buttons)
+            bar.setContentsMargins(0, 0, 0, 0)
+            bar.setSpacing(4)
+            listen = QPushButton("듣기")
+            listen.setFixedWidth(48)
+            # 껐어도 들린다. 무슨 소리인지 확인하려고 누르는 버튼이다.
+            listen.clicked.connect(lambda _c, k=kind: self._play(k))
+            pick = QPushButton("찾기")
+            pick.setFixedWidth(48)
+            pick.clicked.connect(lambda _c, k=kind: self._pick(k))
+            reset = QPushButton("기본")
+            reset.setFixedWidth(48)
+            reset.clicked.connect(lambda _c, k=kind: self._reset(k))
+            for button in (listen, pick, reset):
+                bar.addWidget(button)
+            self._table.setCellWidget(row, 3, buttons)
+        self._table.resizeRowsToContents()
+        layout.addWidget(self._table, 1)
+        close = QPushButton("닫기")
+        close.clicked.connect(self.accept)
+        bottom = QHBoxLayout()
+        bottom.addStretch(1)
+        bottom.addWidget(close)
+        layout.addLayout(bottom)
+
+    def _refresh_path(self, kind: str):
+        path = alert_sound_path(kind)
+        item = self._paths[kind]
+        default = KIWOOM_ALERT_FILES.get(kind)
+        if path is None:
+            item.setText("(파일 없음 · 생성음)")
+        elif default is not None and path == default:
+            item.setText(f"{path.name}  (기본)")
+        else:
+            item.setText(str(path))
+        item.setToolTip(str(path) if path else "WAV 파일이 없어 생성음을 냅니다.")
+
+    def _play(self, kind: str):
+        path = alert_sound_path(kind)
+        if path is not None and path.is_file():
+            try:
+                winsound.PlaySound(
+                    str(path), winsound.SND_FILENAME | winsound.SND_ASYNC)
+                return
+            except Exception as error:  # noqa: BLE001
+                log.warning("preview failed kind=%s error=%s", kind, error)
+        _beep(kind)
+
+    def _pick(self, kind: str):
+        current = alert_sound_path(kind)
+        start = str(current.parent) if current else r"C:\KiwoomHero4\sound"
+        chosen, _ = QFileDialog.getOpenFileName(
+            self, f"{dict(SOUND_LABELS)[kind]} 알림음 고르기",
+            start, "소리 파일 (*.wav)")
+        if not chosen:
+            return
+        set_alert_sound(kind, chosen)
+        self._refresh_path(kind)
+        self._play(kind)
+
+    def _reset(self, kind: str):
+        set_alert_sound(kind, None)
+        self._refresh_path(kind)
 
 
 class RankModel(QAbstractTableModel):
