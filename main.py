@@ -2649,6 +2649,22 @@ class App:
             cancelled = orders.pop(original, (0, ""))[0]
             orders.pop(order_no, None)
             self._cancel_sent_orders.discard(original)
+        elif "확인" in str(event.get("status") or ""):
+            # 정정 확인이 잔량을 싣고 온다 -> 원주문이 신주문으로 갈아탄다.
+            # 이 갈래가 없으면 신주문이 장부에 안 들어가고, 원주문은 뒤이어
+            # 오는 자기 이벤트(잔량 0)에서 `is_self`로 조용히 사라진다.
+            # 2026-09-21 092600이 그랬다 — 101주 매도가 장부에서 지워져
+            # 매도가능이 영영 안 풀렸다. 정정은 취소가 아니므로
+            # `_order_cancelled`에는 더하지 않는다.
+            #
+            # **상태를 봐야 한다.** 취소 주문의 접수 이벤트도 원주문번호를
+            # 싣고 잔량>0으로 오는데, 그때는 원주문이 아직 살아 있고 곧
+            # 올 취소 확인(잔량 0)이 죽인다. 여기서 갈아타면 그 원주문이
+            # 장부에서 사라진다.
+            cancelled = orders.pop(original, (0, ""))[0]
+            orders[order_no] = (
+                remaining, str(event.get("exchange") or "KRX") or "KRX")
+            self._cancel_sent_orders.discard(original)
         if remaining <= 0:
             self._cancel_sent_orders.discard(order_no)
         if not orders:
