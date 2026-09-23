@@ -16,6 +16,7 @@ REST는 한 건도 안 나간다. `ka10095`는 5단까지만 주므로 편입 �
 6~10단이 비고 다음 호가 틱이 채운다.
 """
 import os
+import re
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -68,34 +69,54 @@ def demo_axis_fills_gaps():
     print("ok (가격 축 · 구간 경계)")
 
 
-def demo_draws_continuous_axis():
-    """호가 20단을 덮는 연속 축이 나오고 빈 줄이 생긴다."""
+def demo_axis_is_centered_and_stable():
+    """기준선이 가운데 고정이고, 현재가가 움직여도 자리와 글자가 안 변한다.
+
+    축을 호가 폭에 맞춰 늘였다 줄이면 줄 수가 바뀌어 글자가 커졌다 작아지고
+    현재가 줄도 위아래로 움직인다. 단타에서 눈이 그 줄을 따라다녀야 한다.
+    """
     QApplication.instance() or QApplication([])
     screen = ConditionScreen()
     popup = DepthPopup(screen, "387690", "레메디")
+    popup.resize(300, 560)
+
+    seen = set()
+    for price in (18910, 18950, 18870, 19200):
+        popup.set_book(_book(price=price))
+        popup._refresh_text()
+        html = popup._label.text()
+        rows = html.count("<tr")
+        cell = re.search(r"font-size:(\d+)px", html).group(1)
+        center = html[:html.index("#ffe066")].count("<tr")
+        seen.add((rows, cell, center))
+        # 기준선은 가운데 한 자리다.
+        assert abs(center - rows // 2) <= 1, (price, center, rows)
+    assert len(seen) == 1, seen      # 넷이 전부 같아야 한다
+    popup.close()
+    print(f"ok (기준선 고정 · 글자 고정) {seen}")
+
+
+def demo_axis_fills_and_covers():
+    """축이 호가단위로 연속이고 10단을 다 덮는다."""
+    QApplication.instance() or QApplication([])
+    screen = ConditionScreen()
+    popup = DepthPopup(screen, "387690", "레메디")
+    popup.resize(300, 560)
     popup.set_book(_book())
     popup._refresh_text()
+    html = popup._label.text()
 
-    prices = [p for p, _a, _b in popup._rows]
-    # 매도 10단(19,010) ~ 매수 10단(18,810)에 위아래 한 틱 여유. 여유를 더
-    # 주면 그만큼 창을 먹어 10단이 다 안 들어간다(2026-09-23 두산에너빌리티).
-    assert prices[0] == 19020, prices[:3]
-    assert prices[-1] == 18800, prices[-3:]
-    assert prices == sorted(prices, reverse=True)
-    # 축이 호가단위로 연속이어야 한다.
-    assert all(a - b == 10 for a, b in zip(prices, prices[1:]))
+    axis = DepthPopup._axis(18910, 11)
+    assert axis[11] == 18910, axis[9:14]          # 가운데가 기준가
+    assert all(a - b == 10 for a, b in zip(axis, axis[1:]))
+    # 매도 10단(19,010)과 매수 10단(18,810)이 축 안에 들어온다.
+    assert 19010 in axis and 18810 in axis
 
-    quoted = [(p, a, b) for p, a, b in popup._rows if a or b]
-    assert len(quoted) == 20, len(quoted)
-    blanks = [(p, a, b) for p, a, b in popup._rows if not a and not b]
-    assert blanks, "빈 가격대가 하나도 없다"
-
-    text = popup._label.text()
-    assert "기준 15,520" in text and "시 15,800" in text
-    assert "상한 20,150" in text and "하한 10,870" in text
-    assert "+21.84%" in text, "현재가 등락률"   # (18910-15520)/15520
+    assert "기준 15,520" in html and "시 15,800" in html
+    assert "상한 20,150" in html and "하한 10,870" in html
+    assert "+21.84%" in html, "현재가 등락률"
     popup.close()
-    print(f"ok (연속 축 {len(popup._rows)}줄 · 호가 20단 · 빈 줄 {len(blanks)})")
+    print("ok (연속 축 · 10단 포함)")
 
 
 def demo_fits_in_window():
@@ -141,10 +162,12 @@ def demo_partial_depth_survives():
     QApplication.instance() or QApplication([])
     screen = ConditionScreen()
     popup = DepthPopup(screen, "387690", "레메디")
+    popup.resize(300, 560)
     popup.set_book(_book(depth=5))
     popup._refresh_text()
-    quoted = [(p, a, b) for p, a, b in popup._rows if a or b]
-    assert len(quoted) == 10, len(quoted)
+    html = popup._label.text()
+    assert popup._asks and popup._bids and "<tr" in html
+    assert len(popup._asks) == 5 and len(popup._bids) == 5
     popup.close()
     print("ok (5단만 와도 안 깨짐)")
 
@@ -194,8 +217,7 @@ def demo_tick_updates_without_query():
     assert "bid_qty" in BOOK_FIELDS
     screen.on_tick("387690", {"bid_qty": 9999})
     assert popup._paint_timer.isActive(), "호가 틱인데 안 그렸다"
-    row = next(r for r in popup._rows if r[0] == 18900)
-    assert row[2] == 9999, row
+    assert popup._bids[18900] == 9999, popup._bids[18900]
     popup.close()
     print("ok (호가 틱으로 갱신)")
 
@@ -203,7 +225,8 @@ def demo_tick_updates_without_query():
 if __name__ == "__main__":
     demo_tick_size()
     demo_axis_fills_gaps()
-    demo_draws_continuous_axis()
+    demo_axis_is_centered_and_stable()
+    demo_axis_fills_and_covers()
     demo_fits_in_window()
     demo_row_columns_are_fixed()
     demo_partial_depth_survives()
