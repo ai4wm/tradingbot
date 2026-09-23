@@ -55,6 +55,7 @@ THEME_COL = FIELDS.index("theme")
 TIME_COL = FIELDS.index("time")
 VOLUME_COL = FIELDS.index("vol")
 BID_QTY_COL = FIELDS.index("bid_qty")
+ASK_QTY_COL = FIELDS.index("ask_qty")   # 클릭하면 10호가 창
 MINUTE_VALUE_COL = FIELDS.index("minute_value")
 ACC_VALUE_COL = FIELDS.index("acc_value")
 MINUTE_VALUE_DISPLAY_STEP = 10_000_000  # 화면의 0.1억원과 정렬 구간을 일치시킨다.
@@ -2781,6 +2782,10 @@ class BidQtyPopup(QWidget):
 
     GRIP = 14
     SPAWN_GAP = 2  # 새 종목 창을 직전 창 옆에 붙일 때 남기는 틈
+    # 파생 창이 같은 배관(드래그·크기조절·휠·저장·닫기)을 쓰되 자기 목록과
+    # 자기 설정 키를 갖도록 두 값만 바꿔 끼운다.
+    POPUPS_ATTR = "_bid_popups"
+    KEY_PREFIX = "bidqty_popup_"
 
     def __init__(self, screen: "ConditionScreen", code: str, name: str):
         super().__init__(
@@ -2797,9 +2802,9 @@ class BidQtyPopup(QWidget):
         self._screen = screen
         self.code = code
         self._name = name
-        self._key = screen.prefix + "bidqty_popup_" + code
+        self._key = screen.prefix + self.KEY_PREFIX + code
         # 종목 기록이 없을 때 쓰는 기준 크기·자리. 창별로 따로 남긴다.
-        self._last_key = screen.prefix + "bidqty_popup_last"
+        self._last_key = screen.prefix + self.KEY_PREFIX + "last"
         self._text = ""
         self._vol_text = ""
         # 체결 틱은 무너지는 순간 몰아친다. 값만 받아 두고 100ms에 한 번 그린다.
@@ -2836,7 +2841,7 @@ class BidQtyPopup(QWidget):
         띄운 종목은 자기 기록으로 돌아가 버려, 여러 종목을 늘어놓는 중에
         한 종목만 엉뚱한 자리에 뜬다. 창이 하나도 없을 때만 기록을 쓴다.
         """
-        opened = list(self._screen._bid_popups.values())
+        opened = list(getattr(self._screen, self.POPUPS_ATTR).values())
         last = opened[-1] if opened else None
         if last is None or last is self:
             return False
@@ -2961,8 +2966,112 @@ class BidQtyPopup(QWidget):
 
     def closeEvent(self, event):
         self._save_geo()
-        self._screen._bid_popups.pop(self.code, None)
+        getattr(self._screen, self.POPUPS_ATTR).pop(self.code, None)
         super().closeEvent(event)
+
+
+class DepthPopup(BidQtyPopup):
+    """10호가와 등락률을 한 종목만 띄우는 단타용 창. 조회가 없다.
+
+    필요한 값이 전부 웹소켓으로 이미 온다 — `0D`가 41~80으로 10단 호가와
+    잔량을, `0B`가 현재가·등락률을 싣는다(`ws.FID`). REST는 한 건도 안
+    나가고, 실시간 등록은 화면에 있는 종목이라 이미 잡혀 있다.
+
+    **REST(`ka10095`)는 5단까지만 준다.** 편입 직후 한 틱은 6~10단이 비고
+    다음 호가 틱이 채우므로, 창을 열자마자 아래 다섯 줄이 잠깐 빈다.
+
+    갱신과 조작은 `BidQtyPopup`과 같은 배관이다 — 100ms 묶음 페인트, 휠
+    투명도, 드래그 이동, 우하단 크기 조절, 더블클릭 닫기.
+    """
+
+    POPUPS_ATTR = "_depth_popups"
+    KEY_PREFIX = "depth_popup_"
+
+    def __init__(self, screen, code: str, name: str):
+        self._rows: list[tuple] = []     # 부모 __init__이 _refresh를 부른다
+        self._head = ""
+        super().__init__(screen, code, name)
+        self.setMinimumSize(150, 180)    # 20줄 + 머리글
+        if self.width() < 150 or self.height() < 180:
+            self.resize(200, 320)
+
+    def set_book(self, stored: dict):
+        """표에 저장된 값으로 다시 그린다. 값이 그대로면 페인트를 건너뛴다."""
+        price = int(stored.get("price") or 0)
+        rate = float(stored.get("rate") or 0.0)
+        head = f"{price:,}|{rate:+.2f}"
+        rows = []
+        for level in range(10, 0, -1):   # 매도는 위에서 아래로 10 -> 1
+            suffix = "" if level == 1 else str(level)
+            rows.append(("ask",
+                         int(stored.get(f"ask_price{suffix}") or 0),
+                         int(stored.get(f"ask_qty{suffix}") or 0)))
+        for level in range(1, 11):       # 매수는 1 -> 10
+            suffix = "" if level == 1 else str(level)
+            rows.append(("bid",
+                         int(stored.get(f"bid_price{suffix}") or 0),
+                         int(stored.get(f"bid_qty{suffix}") or 0)))
+        if head == self._head and rows == self._rows:
+            return
+        self._head, self._rows = head, rows
+        self._price = price
+        if not self._paint_timer.isActive():
+            self._paint_timer.start()
+
+    def _refresh(self):
+        self._label.setStyleSheet(
+            f"QLabel {{ background-color: rgba(23, 28, 34, {self._alpha});"
+            f" border: 2px solid rgba(93, 140, 224, {self._alpha});"
+            " border-radius: 10px; }")
+        self.setToolTip(
+            f"{self._name} 10호가 · 등락률\n"
+            "웹소켓 푸시로만 갱신합니다(조회 없음).\n"
+            f"배경 불투명도 {self._alpha * 100 // 255}% (휠로 조절)\n"
+            "끌어서 이동 · 우하단 모서리로 크기 조절\n"
+            "더블클릭하면 닫습니다.")
+        self._paint_timer.stop()
+        self._refresh_text()
+
+    def _refresh_text(self):
+        if not self._rows:
+            return
+        # 20줄 + 머리글 + 합계가 창 높이에 들어가도록 잡는다.
+        cell = max(7, int(self.height() * 0.037))
+        head = max(9, int(cell * 1.7))
+        widest = max((qty for _side, _p, qty in self._rows), default=0) or 1
+        price = getattr(self, "_price", 0)
+        rate = float(self._head.split("|")[1])
+        head_color = "#e83030" if rate > 0 else "#2050d0" if rate < 0 else "#d8d8d8"
+        lines = [
+            f"<div style='font-size:{cell}px; color:#C9A968'>{self._name}</div>"
+            f"<div style='font-size:{head}px; font-weight:900;"
+            f" color:{head_color}'>{price:,} "
+            f"<span style='font-size:{cell}px'>{rate:+.2f}%</span></div>"
+        ]
+        ask_sum = bid_sum = 0
+        for side, row_price, qty in self._rows:
+            if side == "ask":
+                ask_sum += qty
+                color, bar = "#2050d0", "#2f4f9e"
+            else:
+                bid_sum += qty
+                color, bar = "#e83030", "#9e3f3f"
+            if not row_price:
+                lines.append(f"<div style='font-size:{cell}px'>&nbsp;</div>")
+                continue
+            width = max(1, int(qty / widest * 100))
+            mark = "font-weight:900;" if row_price == price else ""
+            lines.append(
+                f"<div style='font-size:{cell}px; color:{color}; {mark}'>"
+                f"<span style='background-color:{bar}'>"
+                f"{'&nbsp;' * max(1, width // 8)}</span> "
+                f"{row_price:,} · {qty:,}</div>")
+        total = ask_sum + bid_sum
+        share = int(bid_sum / total * 100) if total else 0
+        lines.append(
+            f"<div style='font-size:{cell}px; color:#6FD3C7'>"
+            f"매수 {share}% · {bid_sum:,} / {ask_sum:,}</div>")
+        self._label.setText("".join(lines))
 
 
 class ConditionScreen(QWidget):
@@ -2993,6 +3102,7 @@ class ConditionScreen(QWidget):
         self._settings = QSettings("layout.ini", QSettings.IniFormat)
         self.model = StockModel()
         self._bid_popups: dict[str, BidQtyPopup] = {}
+        self._depth_popups: dict[str, DepthPopup] = {}
 
         # 툴바: 조건목록 새로고침 / 조건식 선택 / 등록 토글 / 이탈삭제 / 종목수
         self.reload_btn = QPushButton()  # 조건 목록(CNSRLST) 새로 받기: 영웅문서 조건 추가/수정 시
@@ -3401,6 +3511,7 @@ class ConditionScreen(QWidget):
         self.model.rowsInserted.connect(self._on_data_changed)
         self.model.rowsRemoved.connect(self._on_data_changed)
         self.model.rowsRemoved.connect(self._close_orphan_bid_popups)
+        self.model.rowsRemoved.connect(self._close_orphan_depth_popups)
         self._balance_blink_timer = QTimer(self)
         self._balance_blink_timer.timeout.connect(
             self._refresh_balance_alert_blink)
@@ -4491,6 +4602,8 @@ class ConditionScreen(QWidget):
                 f"{code}: 새 청산키를 누르세요\nEsc: 취소")
         elif index.column() == BID_QTY_COL:
             self._open_bid_popup(code)
+        elif index.column() == ASK_QTY_COL:
+            self._open_depth_popup(code)
         elif index.column() == NAME_COL:
             QApplication.clipboard().setText(code)
             QToolTip.showText(QCursor.pos(), f"{code} 복사됨")
@@ -4515,6 +4628,27 @@ class ConditionScreen(QWidget):
     def _close_orphan_bid_popups(self, *_):
         """조건 이탈로 행이 사라진 종목은 확대 창도 닫는다."""
         for code, popup in list(self._bid_popups.items()):
+            if code not in self.model.rows:
+                popup.close()
+
+    def _open_depth_popup(self, code: str):
+        """매도잔량 셀 클릭 -> 종목별 10호가 창. 떠 있으면 앞으로 올린다.
+
+        갱신은 0D 호가·0B 체결 푸시(on_tick)가 직접 한다. 조회는 하지 않는다.
+        """
+        popup = self._depth_popups.get(code)
+        if popup is not None:
+            popup.raise_()
+            return
+        stored = self.model.rows.get(code, {})
+        popup = DepthPopup(self, code, str(stored.get("name") or code))
+        popup.set_book(stored)
+        self._depth_popups[code] = popup
+        popup.show()
+
+    def _close_orphan_depth_popups(self, *_):
+        """조건 이탈로 행이 사라진 종목은 10호가 창도 닫는다."""
+        for code, popup in list(self._depth_popups.items()):
             if code not in self.model.rows:
                 popup.close()
 
@@ -4855,6 +4989,14 @@ class ConditionScreen(QWidget):
                 stored = self.model.rows.get(code) or {}
                 popup.set_value(int(stored.get("bid_qty") or 0),
                                 int(stored.get("vol") or 0))
+        # 10호가 창은 호가 한 단이라도 바뀌거나 체결가·등락률이 오면 다시
+        # 그린다. `set_book`이 값이 같으면 스스로 건너뛴다.
+        if self._depth_popups and (
+                "price" in fields or "rate" in fields
+                or any(f in fields for f in BOOK_FIELDS)):
+            popup = self._depth_popups.get(code)
+            if popup is not None:
+                popup.set_book(self.model.rows.get(code) or {})
         if code == self._order_target_code:
             self._refresh_order_target_display()
             upper = int(self.model.rows.get(code, {}).get("upper") or 0)
