@@ -939,6 +939,45 @@ if before == 0 and after > 0:  # 그다음 신주문이 묶인다
 수치를 그대로 태웁니다. 오늘 실제 이벤트 51건을 청산 직전까지 돌리면
 `held=9 sellable=0`으로 계좌와 일치합니다(옛 코드는 15였습니다).
 
+### 거부 뒤 장부는 버리지 않고 덮어씁니다 (2026-09-23)
+
+같은 날 같은 종목에서, 청산이 **실패한 21ms 뒤에 청산키가 스스로
+풀렸습니다.** 보유 9주가 그대로 남아 있었습니다.
+
+```
+09:08:05.298  ERROR emergency cancel/sell failed  held=9 sellable=0
+09:08:05.319  emergency cleared settings  hotkey=True
+09:08:05.340  exit hotkey cleared
+```
+
+거부 경로가 `self._position_book.pop(code, None)`로 장부를 버렸기
+때문입니다. `_clear_after_emergency`는 **「장부에 항목이 없으면 보유 0」**
+으로 읽습니다 — 체결이 없는 종목을 계좌조회 없이 판정하려고 일부러 둔
+규칙인데(`_check_balance_sell`도 같은 규칙입니다), `pop`은 「없다」가 아니라
+**「모른다」**라서 그 규칙을 오염시킵니다.
+
+바로 다음 줄에서 계좌를 읽으므로 그 값으로 채우는 것이 맞습니다.
+
+```python
+position = await self.rest.holding_position(code)
+held_qty = ...; sellable_qty = ...
+self._position_book[code] = {"held": held_qty, "sellable": sellable_qty}
+```
+
+**두 곳이 같은 패턴이었습니다** — `_sell_account_position`(3단매도)과
+`_emergency_exit_async`(청산)입니다. 성공하면 `_prime_position_book()`이
+뒤따라 전체를 다시 읽지만, **매도가능이 0이라 재시도도 못 하고 빠져나가는
+갈래에는 그것이 없어** 장부가 빈 채로 남았습니다. 오늘이 정확히 그
+갈래였습니다.
+
+「항목 없음 = 보유 0」 규칙 자체는 그대로 둡니다. 그것을 없애면 청산이
+계좌조회 두 건을 기다려 1초 느려집니다(2026-09-11 006490 실측 1,085ms).
+고칠 것은 `pop`이지 규칙이 아닙니다.
+
+`test_emergency_clear_guard.py`가 넷을 봅니다 — 보유가 남으면 안 내리는지,
+항목이 없으면 내리는지(기존 규칙), 두 갈래에 `pop`이 없는지, 미체결 매수가
+남으면 안 내리는지입니다.
+
 ## 3단매도 감시 국면
 
 `_check_balance_sell`의 관문이 `정규장`만 보던 것을 `BALANCE_SELL_SESSIONS`로
@@ -1289,6 +1328,7 @@ Get-ChildItem test_*.py | ForEach-Object { .\.venv\Scripts\python.exe $_.Name }
 - 매도주문을 정정한 뒤 취소했을 때 예상주문 줄의 매도가능수량이 원래대로 돌아오는지, 청산이 전량 나가는지 확인
 - 보유 일부를 매도로 걸어 둔 채 정정해도 매도가능수량이 안 늘어나는지 확인
 - 보유 전량을 매도로 걸어 둔 상태에서 청산키를 누르면 그 주문이 취소되고 하한가로 다시 나가는지 확인
+- 청산이나 3단매도가 거부로 끝났을 때 보유가 남아 있으면 청산키·3단매도가 안 풀리는지 확인
 - 재실행 때 `설정 복원` 버튼이 뜨고, 누르기 전에는 감시가 돌지 않는지 확인
 - 복원도 무시도 하지 않은 채 두 번 재시작해도 저장분이 남아 있는지 확인
 

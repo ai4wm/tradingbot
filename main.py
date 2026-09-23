@@ -3654,15 +3654,17 @@ class App:
         except Exception as error:  # noqa: BLE001
             if source != "book":
                 raise
-            # 장부 수량이 실제와 어긋나 거부된 경우다. 장부를 버리고 계좌를
-            # 다시 읽어 한 번만 재시도한다. 이후 매도는 조회 경로로 돈다.
-            self._position_book.pop(code, None)
+            # 장부 수량이 실제와 어긋나 거부된 경우다. 계좌를 다시 읽어
+            # 한 번만 재시도한다.
             log.warning(
                 "%s book sell rejected; requery code=%s qty=%s error=%s",
                 reason, code, qty, error)
             position = await self.rest.holding_position(code)
             held = max(0, int(position.get("held_qty") or 0))
             sellable = max(0, int(position.get("sellable_qty") or 0))
+            # 청산과 같은 이유로 버리지 않고 덮어쓴다. 장부를 비우면 보유가
+            # 남았는데도 「항목 없음 = 보유 0」으로 읽는 자리들이 오판한다.
+            self._position_book[code] = {"held": held, "sellable": sellable}
             if sellable <= 0:
                 return 0
             qty = sellable if ratio >= 1.0 else max(1, int(sellable * ratio))
@@ -3885,13 +3887,19 @@ class App:
                     if booked is None:
                         raise
                     # 장부 수량이 어긋나 거부된 경우에만 계좌를 다시 읽는다.
-                    self._position_book.pop(code, None)
                     log.warning(
                         "emergency book sell rejected; requery code=%s "
                         "qty=%s error=%s", code, sellable_qty, error)
                     position = await self.rest.holding_position(code)
                     sellable_qty = max(0, int(position.get("sellable_qty") or 0))
                     held_qty = max(0, int(position.get("held_qty") or 0))
+                    # **버리지 않고 방금 읽은 값으로 덮어쓴다.** 비워 두면
+                    # `_clear_after_emergency`가 「항목 없음 = 보유 0」으로
+                    # 읽어, 보유가 남았는데도 3단매도·자동취소·청산키를
+                    # 전부 내린다. 2026-09-23 0010S0이 그랬다 — 9주가 남은
+                    # 채 매도가 거부됐는데 21ms 뒤에 청산키가 풀렸다.
+                    self._position_book[code] = {
+                        "held": held_qty, "sellable": sellable_qty}
                     if sellable_qty <= 0:
                         raise
                     result = await self._send_sell_order(

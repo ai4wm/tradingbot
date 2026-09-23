@@ -586,7 +586,11 @@ async def check_sell_uses_book():
         "005930", 1.0, 70000, "잔량 3단계")
     assert sold == 500, sold
     assert calls == ["sell:500", "position", "sell:500"], calls
-    assert "005930" not in rejected._position_book
+    # 장부는 버리지 않고 방금 읽은 계좌 값으로 덮어쓴다. 비워 두면 보유가
+    # 남았는데도 「항목 없음 = 보유 0」으로 읽는 자리들이 오판한다
+    # (2026-09-23 0010S0: 9주가 남은 채 청산키가 21ms 뒤 풀렸다).
+    assert rejected._position_book["005930"] == {
+        "held": 500, "sellable": 500}, rejected._position_book
     print("매도 경로    :", calls)
 
 
