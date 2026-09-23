@@ -1440,6 +1440,15 @@ git diff --check
 `test_*.py`는 각각 단독 실행하는 자체 검사입니다. 프레임워크를 쓰지
 않으며 성공하면 `ok`만 찍습니다.
 
+**검증은 소리를 내지 않습니다.** 알림음도 운영 환경입니다 —
+`test_sell_cancel_order.py`가 3단매도 완료 경로를 태우면서
+`balance_sold`(기본값이 영웅문 `주문접수완료1.wav`)를 실제로 울려,
+검증할 때마다 「주문접수완료」가 세 번씩 났습니다. 함수마다 손으로 막던
+것을 파일 맨 위에서 `_main._beep = _rank._beep = lambda *a, **k: None`으로
+한 번에 막습니다. 새 검증을 더할 때 빠뜨리지 않습니다.
+
+`winsound.PlaySound`를 가로채 전 검증을 훑으면 새는 곳이 바로 나옵니다.
+
 ```powershell
 Get-ChildItem test_*.py | ForEach-Object { .\.venv\Scripts\python.exe $_.Name }
 ```

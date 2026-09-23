@@ -23,6 +23,13 @@ for _handler in list(logging.getLogger().handlers):
         _handler.close()
 logging.getLogger().setLevel(logging.CRITICAL)
 
+# 알림음도 운영 환경이다. 3단매도 완료 경로가 `balance_sold`를 울려
+# 검증할 때마다 「주문접수완료」가 세 번씩 났다. 함수마다 손으로 막던 것을
+# 여기서 한 번에 막는다 — 새 검증을 더할 때 빠뜨리지 않는다.
+import rank as _rank  # noqa: E402
+
+_main._beep = _rank._beep = lambda *_args, **_kwargs: None
+
 
 class FakeRest:
     """호출 순서를 기록하는 최소 REST 대역. 취소 응답은 일부러 느리다."""
