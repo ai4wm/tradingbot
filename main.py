@@ -2705,10 +2705,16 @@ class App:
             del accepts[:-20]
         position = self._position_book.get(code)
         if position is not None:
-            if before == 0 and after > 0:  # 접수된 수량만큼 묶인다
-                position["sellable"] = max(0, position["sellable"] - after)
-            if cancelled:                  # 매도 취소 -> 다시 팔 수 있다
+            # **더하기가 먼저다.** 정정은 원주문이 풀리고 신주문이 묶이는
+            # 동시 사건이라 한 이벤트에 둘이 함께 온다. 빼기를 먼저 하면
+            # `max(0, ...)`가 모자란 만큼을 삼키고, 뒤이은 더하기가 그 몫을
+            # 없던 수량으로 만든다 — 2026-09-23 0010S0이 매도가능 9에서
+            # 24주 정정을 받아 9-24→0, 0+24→24가 되어 15주가 생겼고,
+            # 청산이 그 15주로 매도를 내 「0주 매도가능」으로 거부됐다.
+            if cancelled:                  # 원주문이 풀리고
                 position["sellable"] += cancelled
+            if before == 0 and after > 0:  # 그다음 신주문이 묶인다
+                position["sellable"] = max(0, position["sellable"] - after)
             filled = self._new_fill_qty(order_no, event)
             if filled:
                 position["held"] = max(0, position["held"] - filled)
@@ -2926,6 +2932,47 @@ class App:
                 reason, code, len(head), sum(qty for _, qty, _ex in head),
                 len(tail))
         return tail
+
+    async def _cancel_open_sells_now(self, code: str, reason: str) -> int:
+        """걸어 둔 매도를 거두고 풀린 수량을 돌려준다. 청산만 쓴다.
+
+        **매수 취소와 달리 응답을 기다린다.** 매수 취소는 그 돈을 쓸 일이
+        없어 띄워 두고 매도를 먼저 보내지만, 매도 취소는 그 수량이 풀려야
+        팔 수 있다. 안 기다리고 내면 「매도가능수량이 부족합니다」로 거부된다.
+
+        보통 0~2건이라 버스트 상한(10건)에 걸리지 않는다. 미체결 매도가
+        없으면 조회도 대기도 없이 0으로 끝나므로 평소 경로는 그대로다.
+        """
+        orders = [
+            (order_no, max(0, int(qty)), exchange)
+            for order_no, (qty, exchange)
+            in (self._open_sell_orders.get(code) or {}).items()
+            if int(qty) > 0
+        ]
+        if not orders:
+            return 0
+        results = await asyncio.gather(*(
+            self.rest.cancel_order(code, order_no, 0, exchange)
+            for order_no, _qty, exchange in orders
+        ), return_exceptions=True)
+        recovered = 0
+        for (order_no, qty, _ex), result in zip(orders, results):
+            if isinstance(result, BaseException):
+                # 이미 체결·취소됐으면 풀 수량도 없다. 조용히 넘긴다.
+                if is_nothing_to_cancel(result):
+                    audit_log.info(
+                        "%s open-sell cancel already gone code=%s order=%s "
+                        "qty=%s", reason, code, order_no, qty)
+                else:
+                    log.warning(
+                        "%s open-sell cancel failed code=%s order=%s qty=%s "
+                        "error=%s", reason, code, order_no, qty, result)
+                continue
+            recovered += qty
+        log.warning(
+            "%s open-sell cancel code=%s orders=%s recovered=%s",
+            reason, code, len(orders), recovered)
+        return recovered
 
     async def _cancel_one_open_buy(
             self, code: str, order_no: str, qty: int, exchange: str,
@@ -3789,7 +3836,12 @@ class App:
                 "emergency exit blocked no-bid4 code=%s pending=%s held=%s",
                 code, pending_qty, held_qty)
             return
-        if sellable_qty <= 0 and pending_qty <= 0:
+        # 걸어 둔 매도가 있으면 매도가능이 0이어도 막지 않는다. 그것을 거두면
+        # 그만큼 풀린다.
+        open_sell_qty = sum(
+            max(0, int(qty))
+            for qty, _ex in (self._open_sell_orders.get(code) or {}).values())
+        if sellable_qty <= 0 and pending_qty <= 0 and open_sell_qty <= 0:
             for view in self.views:
                 if code in view.screen.model.rows:
                     view.screen.set_order_state(
@@ -3801,6 +3853,13 @@ class App:
                 "emergency exit ignored sellable-zero code=%s held=%s",
                 code, held_qty)
             return
+        # 걸어 둔 매도를 먼저 거둔다. 그 수량이 풀려야 하한가로 다시 낼 수
+        # 있다. 2026-09-23 0010S0은 보유 9주가 전량 걸려 있어 청산이 한 주도
+        # 못 냈고, 13초 뒤 원래 걸어 둔 값에 체결됐다 — 청산키를 눌렀는데
+        # 통제권이 없었다.
+        recovered = await self._cancel_open_sells_now(code, "긴급정리")
+        if recovered:
+            sellable_qty = min(held_qty, sellable_qty + recovered)
         sold_qty = 0
         # 미체결 목록은 위에서 이미 조회했다. 다시 조회하지 않고 그 주문번호로
         # 바로 취소를 띄운 뒤, 매도는 취소 응답을 기다리지 않고 내보낸다.

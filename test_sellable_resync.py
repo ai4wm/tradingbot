@@ -125,6 +125,43 @@ def demo_amendment_keeps_binding():
     print("ok (정정 중에도 걸어 둔 수량은 묶임)")
 
 
+def demo_amendment_when_sellable_is_short():
+    """묶인 수량이 매도가능보다 클 때 정정을 받아도 수량이 생기지 않는다.
+
+    2026-09-23 0010S0. 보유 33주 중 24주가 이미 걸려 매도가능이 9주인
+    상태에서 그 24주 주문을 정정했다. 빼기를 먼저 하면 `max(0, 9-24)`가
+    모자란 15를 삼키고, 뒤이은 되돌림 +24가 그 몫을 없던 수량으로 만든다.
+    청산이 그 15주로 매도를 내 「0주 매도가능」으로 거부됐다.
+    """
+    code = "0010S0"
+    app = _app(code, 33)
+    position = app._position_book[code]
+    position["sellable"] = 33
+
+    app._track_open_sell(code, "0008557", _event("0008557", "0000000", 24, 0, 24))
+    assert position["sellable"] == 9, position      # 24주 묶임
+
+    # 정정 — 원주문이 풀리고 신주문이 묶인다. 합은 0이어야 한다.
+    app._track_open_sell(
+        code, "0008569", _event("0008569", "0008557", 24, 0, 24, "접수"))
+    app._track_open_sell(
+        code, "0008569", _event("0008569", "0008557", 24, 0, 24, "확인"))
+    assert position["sellable"] == 9, position      # 옛 코드는 24였다
+    assert set(app._open_sell_orders[code]) == {"0008569"}, \
+        app._open_sell_orders
+
+    # 그 24주가 체결되면 보유만 줄고 매도가능은 그대로다.
+    app._track_open_sell(
+        code, "0008569", _event("0008569", "0008557", 24, 24, 0, "체결"))
+    assert (position["held"], position["sellable"]) == (9, 9), position
+
+    # 남은 9주를 걸면 매도가능이 0이 된다. 청산은 이 주문을 거둬야 판다.
+    app._track_open_sell(code, "0008609", _event("0008609", "0000000", 9, 0, 9))
+    assert (position["held"], position["sellable"]) == (9, 0), position
+    assert _live_sell(app, code) == 9
+    print("ok (매도가능이 모자랄 때 정정해도 수량이 안 생김)")
+
+
 def demo_cancel_accept_is_not_amendment():
     """취소 주문의 접수는 원주문을 건드리지 않는다.
 
@@ -191,6 +228,7 @@ def demo_buy_fill_respects_open_sell():
 if __name__ == "__main__":
     demo_amendment_does_not_leak()
     demo_amendment_keeps_binding()
+    demo_amendment_when_sellable_is_short()
     demo_cancel_accept_is_not_amendment()
     demo_fill_updates_both()
     demo_buy_fill_respects_open_sell()
