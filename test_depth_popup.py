@@ -97,6 +97,44 @@ def demo_draws_continuous_axis():
     print(f"ok (연속 축 {len(popup._rows)}줄 · 호가 20단 · 빈 줄 {len(blanks)})")
 
 
+def demo_fits_in_window():
+    """글자가 창을 넘지 않는다. 넘으면 아래 두 줄이 안 보인다.
+
+    막대를 글자로 그리던 때는 길이에 따라 옆 칸이 밀려 세로줄이 어긋났고,
+    글자 크기를 높이만 보고 정해서 하한가·합계 줄이 창 밖으로 나갔다.
+    """
+    QApplication.instance() or QApplication([])
+    screen = ConditionScreen()
+    for width, height in ((300, 560), (200, 320), (170, 200), (420, 900)):
+        popup = DepthPopup(screen, "387690", "레메디")
+        popup.resize(width, height)
+        popup.set_book(_book())
+        popup._refresh_text()
+        popup._label.resize(popup.size())
+        need = popup._label.heightForWidth(width) or popup._label.sizeHint().height()
+        assert need <= height, (width, height, need)
+        popup.close()
+    print("ok (네 가지 크기에서 안 잘림)")
+
+
+def demo_row_columns_are_fixed():
+    """호가 줄이 표로 나가고 현재가 줄에 배경이 붙는지."""
+    QApplication.instance() or QApplication([])
+    screen = ConditionScreen()
+    popup = DepthPopup(screen, "387690", "레메디")
+    popup.resize(300, 560)
+    popup.set_book(_book())
+    popup._refresh_text()
+    html = popup._label.text()
+    # 칸 폭을 못 박은 표라야 세로줄이 맞는다.
+    assert "<table" in html and "nowrap" in html, html[:200]
+    assert html.count("nowrap") % 4 == 0, html.count("nowrap")
+    # 현재가 줄은 노랑 배경.
+    assert html.count("#ffe066") == 1, html.count("#ffe066")
+    popup.close()
+    print("ok (칸 고정 표 · 현재가 줄 강조)")
+
+
 def demo_partial_depth_survives():
     """편입 직후 5단만 온 상태에서도 그려진다."""
     QApplication.instance() or QApplication([])
@@ -165,6 +203,8 @@ if __name__ == "__main__":
     demo_tick_size()
     demo_axis_fills_gaps()
     demo_draws_continuous_axis()
+    demo_fits_in_window()
+    demo_row_columns_are_fixed()
     demo_partial_depth_survives()
     demo_same_book_skips_paint()
     demo_opens_and_closes_with_row()

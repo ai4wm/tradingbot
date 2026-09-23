@@ -3087,10 +3087,27 @@ class DepthPopup(BidQtyPopup):
         if not self._rows:
             return
         # 줄 수가 호가 폭에 따라 달라지므로 글자 크기를 거기에 맞춘다.
-        cell = max(6, int(self.height() / (len(self._rows) + 6)))
+        # 머리글 넉 줄(이름·현재가·시고저·상한)과 꼬리 두 줄(하한·합계),
+        # 현재가 줄이 1.9배인 것, 줄간격 1.25배를 함께 센다. 덜 세면 아래
+        # 두 줄이 창 밖으로 밀려 안 보인다.
+        # 글자 크기를 먼저 정한다. 폭도 함께 본다 — 한 줄이
+        # `1,000 ▮ 18,910 +21.84% ▮ 2,000`로 30자쯤이라 높이만 보면 좁은
+        # 창에서 숫자가 칸을 넘어 세로줄이 깨진다.
+        cell = max(7, min(int(self.width() / 20), int(self.height() / 30)))
         head = max(9, int(cell * 1.9))
-        widest = max((max(a, b) for _p, a, b in self._rows), default=0) or 1
         price = getattr(self, "_price", 0)
+        # 창에 들어갈 줄 수만 그린다. 머리글 넉 줄과 꼬리 두 줄, 현재가 줄이
+        # 1.9배인 것을 뺀 나머지다. 다 그리면 호가가 넓게 벌어진 날 아래
+        # 두 줄(하한가·합계)이 창 밖으로 밀려 안 보인다.
+        room = max(4, int(self.height() / (cell * 1.25)) - 7)
+        rows = self._rows
+        if len(rows) > room:
+            # 현재가를 가운데 둔다. 위아래 어느 쪽이 잘려도 그 자리는 보인다.
+            center = next((i for i, r in enumerate(rows) if r[0] == price),
+                          len(rows) // 2)
+            start = max(0, min(center - room // 2, len(rows) - room))
+            rows = rows[start:start + room]
+        widest = max((max(a, b) for _p, a, b in rows), default=0) or 1
         base = getattr(self, "_base", 0)
         rate = float(self._head.split("|")[1])
         tone = lambda v: ("#e83030" if v > 0 else
@@ -3099,12 +3116,24 @@ class DepthPopup(BidQtyPopup):
             self, "_info", (0, 0, 0, 0, 0))
         vol_rate = (vol - prev_vol) / prev_vol * 100 if prev_vol else 0.0
 
-        def bar(qty, color):
+        def bar(qty, color, right: bool):
+            """폭이 고정된 칸 안에서만 자라는 막대.
+
+            글자로 막대를 그리면(`&nbsp;` 반복) 길이에 따라 옆 칸이 밀려
+            가격·등락률·잔량이 줄마다 어긋난다. 중첩 표로 비율을 주면
+            칸 폭이 고정이라 세로줄이 맞는다.
+            """
             if not qty:
-                return ""
-            width = max(1, int(qty / widest * 14))
-            return (f"<span style='background-color:{color}'>"
-                    f"{'&nbsp;' * width}</span>")
+                return "<td width='12%'></td>"
+            fill = max(2, int(qty / widest * 100))
+            pad = 100 - fill
+            # 빈 칸은 높이가 0이라 배경색이 안 그려진다. 공백을 한 자 넣어
+            # 줄 높이를 만들되 폭은 %가 정한다.
+            solid = f"<td width='{fill}%' bgcolor='{color}'>&nbsp;</td>"
+            empty = f"<td width='{pad}%'>&nbsp;</td>"
+            cells = (empty + solid) if right else (solid + empty)
+            return (f"<td width='12%'><table width='100%' cellspacing='0' "
+                    f"cellpadding='0'><tr>{cells}</tr></table></td>")
 
         lines = [
             f"<div style='font-size:{cell}px; color:#C9A968'>{self._name}</div>"
@@ -3118,26 +3147,36 @@ class DepthPopup(BidQtyPopup):
             lines.append(
                 f"<div style='font-size:{cell}px; color:#e83030'>"
                 f"상한 {self._upper:,}</div>")
+        # 호가 줄은 표로 그린다. 칸 폭을 못 박아야 세로줄이 맞는다.
+        lines.append(
+            f"<table width='100%' cellspacing='0' cellpadding='0' "
+            f"style='font-size:{cell}px'>")
         ask_sum = bid_sum = 0
-        for row_price, ask_qty, bid_qty in self._rows:
+        for row_price, ask_qty, bid_qty in rows:
             ask_sum += ask_qty
             bid_sum += bid_qty
             gap = (row_price - base) / base * 100 if base else 0.0
             # 현재가 줄은 노랑으로 세운다. 영웅문 「호가중앙」과 같은 자리다.
             if row_price == price:
-                style = "color:#1b1b1b; background-color:#ffe066; font-weight:900;"
+                row = " bgcolor='#ffe066'"
+                price_style = "color:#1b1b1b; font-weight:900;"
             else:
-                style = f"color:{tone(gap)};"
+                row = ""
+                price_style = f"color:{tone(gap)};"
             lines.append(
-                f"<div style='font-size:{cell}px; {style}'>"
-                f"{bar(ask_qty, '#2f4f9e')}"
-                f"<span style='color:#6f9be0'>"
-                f"{f'{ask_qty:,}' if ask_qty else ''}</span>"
-                f" {row_price:,} <span style='font-size:{max(5, cell - 1)}px'>"
-                f"{gap:+.2f}%</span> "
-                f"<span style='color:#e07c7c'>"
-                f"{f'{bid_qty:,}' if bid_qty else ''}</span>"
-                f"{bar(bid_qty, '#9e3f3f')}</div>")
+                f"<tr{row}>"
+                f"<td width='19%' align='right' nowrap style='color:#6f9be0'>"
+                f"{f'{ask_qty:,}&nbsp;' if ask_qty else ''}</td>"
+                f"{bar(ask_qty, '#2f4f9e', right=True)}"
+                f"<td width='19%' align='right' nowrap style='{price_style}'>"
+                f"{row_price:,}</td>"
+                f"<td width='19%' align='right' nowrap style='{price_style}'>"
+                f"&nbsp;{gap:+.2f}%</td>"
+                f"{bar(bid_qty, '#9e3f3f', right=False)}"
+                f"<td width='19%' align='left' nowrap style='color:#e07c7c'>"
+                f"{f'&nbsp;{bid_qty:,}' if bid_qty else ''}</td>"
+                f"</tr>")
+        lines.append("</table>")
         if self._lower:
             lines.append(
                 f"<div style='font-size:{cell}px; color:#2050d0'>"
