@@ -3016,10 +3016,8 @@ class DepthPopup(BidQtyPopup):
     KEY_PREFIX = "depth_popup_"
 
     def __init__(self, screen, code: str, name: str):
-        self._asks: dict[int, int] = {}  # 부모 __init__이 _refresh를 부른다
-        self._bids: dict[int, int] = {}
+        self._rows: list[tuple] = []     # 부모 __init__이 _refresh를 부른다
         self._head = ""
-        self._price = 0
         self._base = self._upper = self._lower = 0
         super().__init__(screen, code, name)
         self.setMinimumSize(170, 200)
@@ -3046,18 +3044,22 @@ class DepthPopup(BidQtyPopup):
                 asks[ask_price] = int(stored.get(f"ask_qty{suffix}") or 0)
             if bid_price:
                 bids[bid_price] = int(stored.get(f"bid_qty{suffix}") or 0)
-        if not [p for p in (*asks, *bids, price) if p > 0]:
+        known = [p for p in (*asks, *bids, price) if p > 0]
+        if not known:
             return
-        # **축은 여기서 만들지 않는다.** 호가 폭에 따라 줄 수가 달라지면
-        # 글자 크기가 틱마다 커졌다 작아졌고 현재가 줄도 위아래로 움직였다.
-        # 축은 창 크기로 정하므로 `_refresh_text`가 만든다.
+        # 호가가 실린 구간을 다 덮고 위아래로 한 틱씩만 여유를 둔다. 여유를
+        # 더 주면 그만큼 창을 먹어 10단이 다 안 들어간다 — 2026-09-23
+        # 두산에너빌리티(호가단위 100원)가 8단까지만 보였다.
+        high, low = max(known), min(known)
+        high += krx_tick_size(high)
+        low -= krx_tick_size(max(1, low - 1))
+        rows = [(p, asks.get(p, 0), bids.get(p, 0))
+                for p in krx_quote_axis(max(1, low), high)]
         head = f"{price:,}|{rate:+.2f}"
-        if (head == self._head and asks == self._asks
-                and bids == self._bids):
+        if head == self._head and rows == self._rows:
             return
-        self._head, self._asks, self._bids = head, asks, bids
-        # 현재가가 아직 안 온 첫 틱에는 최우선 매수호가를 기준선으로 쓴다.
-        self._price = price or (max(bids) if bids else min(asks))
+        self._head, self._rows = head, rows
+        self._price = price
         # 오른쪽 정보 박스 몫. 시·고·저는 0B가 체결 틱마다 싣고(FID 16·17·18)
         # 기준가는 편입 조회로 이미 와 있다. 따로 조회할 것이 없다.
         self._info = (int(stored.get("open") or 0),
@@ -3082,43 +3084,27 @@ class DepthPopup(BidQtyPopup):
         self._paint_timer.stop()
         self._refresh_text()
 
-    @staticmethod
-    def _axis(center: int, half: int) -> list[int]:
-        """기준가에서 위아래로 같은 칸수만큼 잡은 가격 축(높은 값부터).
-
-        칸수가 고정이라 기준선이 언제나 가운데 한 자리에 선다. 호가 폭에
-        맞춰 축을 늘였다 줄이면 그 줄이 위아래로 움직여 눈이 따라다녀야 한다.
-        """
-        up, price = [], center
-        for _ in range(half):
-            price += krx_tick_size(price)
-            up.append(price)
-        down, price = [], center
-        for _ in range(half):
-            price -= krx_tick_size(max(1, price - 1))
-            down.append(max(1, price))
-        return list(reversed(up)) + [center] + down
-
     def _refresh_text(self):
-        price = self._price
-        if not price:
+        if not self._rows:
             return
         # **글자 크기는 창 크기만 본다.** 줄 수에 맞춰 정하면 호가가 벌어지고
         # 좁아질 때마다 글자가 커졌다 작아졌다 한다. 폭도 함께 보는 것은 한
         # 줄이 `1,000 ▮ 18,910 +21.84% ▮ 2,000`로 30자쯤이라, 높이만 보면
         # 좁은 창에서 숫자가 칸을 넘어 세로줄이 깨지기 때문이다.
+        rows = self._rows
         cell = max(7, min(int(self.width() / 20), int(self.height() / 38)))
-        head = max(9, int(cell * 1.9))
+        price = getattr(self, "_price", 0)
         # 머리글 넉 줄(이름·현재가·시고저·상한)과 꼬리 두 줄(하한·합계),
-        # 현재가 줄이 1.9배인 것을 합쳐 일곱 줄로 센다.
-        # 줄간격은 글꼴에 따라 1.25~1.35배다. 넉넉히 잡아야 꼬리 두 줄이
-        # 창 밖으로 안 밀린다.
-        room = max(5, int(self.height() / (cell * 1.35)) - 7)
-        half = (room - 1) // 2
-        # **기준선은 언제나 가운데 한 자리다.** 현재가에서 위아래로 같은
-        # 칸수만큼 잡으므로, 값이 오르내려도 그 줄이 움직이지 않는다.
-        rows = [(p, self._asks.get(p, 0), self._bids.get(p, 0))
-                for p in self._axis(price, half)]
+        # 현재가 줄이 1.9배인 것을 합쳐 일곱 줄로 센다. 들어갈 만큼만 그리지
+        # 않으면 아래 두 줄이 창 밖으로 밀려 안 보인다.
+        room = max(4, int(self.height() / (cell * 1.35)) - 7)
+        head = max(9, int(cell * 1.9))
+        if len(rows) > room:
+            # 현재가를 가운데 둔다. 위아래 어느 쪽이 잘려도 그 자리는 보인다.
+            center = next((i for i, r in enumerate(rows) if r[0] == price),
+                          len(rows) // 2)
+            start = max(0, min(center - room // 2, len(rows) - room))
+            rows = rows[start:start + room]
         widest = max((max(a, b) for _p, a, b in rows), default=0) or 1
         base = getattr(self, "_base", 0)
         rate = float(self._head.split("|")[1])
