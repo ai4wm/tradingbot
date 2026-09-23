@@ -2970,6 +2970,34 @@ class BidQtyPopup(QWidget):
         super().closeEvent(event)
 
 
+def krx_tick_size(price: int) -> int:
+    """그 가격대의 호가단위. 2023년 개정으로 코스피·코스닥이 같다.
+
+    ponytail: `main._previous_krx_quote_price`에 같은 표가 있다. 그쪽은 매도
+    가격을 만드는 주문 경로라 표시용과 섞지 않았다. 둘 중 하나를 고칠 일이
+    생기면 그때 합친다.
+    """
+    price = max(1, int(price))
+    for ceiling, tick in ((2_000, 1), (5_000, 5), (20_000, 10),
+                          (50_000, 50), (200_000, 100), (500_000, 500)):
+        if price <= ceiling:
+            return tick
+    return 1_000
+
+
+def krx_quote_axis(low: int, high: int, cap: int = 120) -> list[int]:
+    """low~high를 호가단위로 채운 가격 축(높은 값부터). 빈 가격대를 만든다.
+
+    호가창에 실리는 것은 잔량이 있는 10단뿐이라, 그 사이 빈 가격은 이렇게
+    계산해서 넣어야 영웅문 「호가중앙」처럼 연속된 축이 된다.
+    """
+    price, axis = int(high), []
+    while price >= low and len(axis) < cap:
+        axis.append(price)
+        price -= krx_tick_size(price - 1)   # 경계에서 아래 구간의 단위를 쓴다
+    return axis
+
+
 class DepthPopup(BidQtyPopup):
     """10호가와 등락률을 한 종목만 띄우는 단타용 창. 조회가 없다.
 
@@ -2990,31 +3018,54 @@ class DepthPopup(BidQtyPopup):
     def __init__(self, screen, code: str, name: str):
         self._rows: list[tuple] = []     # 부모 __init__이 _refresh를 부른다
         self._head = ""
+        self._base = self._upper = self._lower = 0
         super().__init__(screen, code, name)
-        self.setMinimumSize(150, 180)    # 20줄 + 머리글
-        if self.width() < 150 or self.height() < 180:
-            self.resize(200, 320)
+        self.setMinimumSize(170, 200)
+        if self.width() < 170 or self.height() < 200:
+            self.resize(260, 420)
 
     def set_book(self, stored: dict):
-        """표에 저장된 값으로 다시 그린다. 값이 그대로면 페인트를 건너뛴다."""
+        """표에 저장된 값으로 다시 그린다. 값이 그대로면 페인트를 건너뛴다.
+
+        호가창에 실리는 것은 잔량이 있는 10단뿐이다. 그 사이 빈 가격은
+        `krx_quote_axis`가 호가단위로 채워 연속된 축을 만든다.
+        """
         price = int(stored.get("price") or 0)
         rate = float(stored.get("rate") or 0.0)
+        self._base = int(stored.get("base") or 0)
+        self._upper = int(stored.get("upper") or 0)
+        self._lower = int(stored.get("lower") or 0)
+        asks, bids = {}, {}
+        for level in range(1, 11):
+            suffix = "" if level == 1 else str(level)
+            ask_price = int(stored.get(f"ask_price{suffix}") or 0)
+            bid_price = int(stored.get(f"bid_price{suffix}") or 0)
+            if ask_price:
+                asks[ask_price] = int(stored.get(f"ask_qty{suffix}") or 0)
+            if bid_price:
+                bids[bid_price] = int(stored.get(f"bid_qty{suffix}") or 0)
+        known = [p for p in (*asks, *bids, price) if p > 0]
+        if not known:
+            return
+        # 호가가 실린 구간을 다 덮고 위아래로 세 틱씩 여유를 둔다.
+        high, low = max(known), min(known)
+        for _ in range(3):
+            high += krx_tick_size(high)
+            low -= krx_tick_size(max(1, low - 1))
+        rows = [(p, asks.get(p, 0), bids.get(p, 0))
+                for p in krx_quote_axis(max(1, low), high)]
         head = f"{price:,}|{rate:+.2f}"
-        rows = []
-        for level in range(10, 0, -1):   # 매도는 위에서 아래로 10 -> 1
-            suffix = "" if level == 1 else str(level)
-            rows.append(("ask",
-                         int(stored.get(f"ask_price{suffix}") or 0),
-                         int(stored.get(f"ask_qty{suffix}") or 0)))
-        for level in range(1, 11):       # 매수는 1 -> 10
-            suffix = "" if level == 1 else str(level)
-            rows.append(("bid",
-                         int(stored.get(f"bid_price{suffix}") or 0),
-                         int(stored.get(f"bid_qty{suffix}") or 0)))
         if head == self._head and rows == self._rows:
             return
         self._head, self._rows = head, rows
         self._price = price
+        # 오른쪽 정보 박스 몫. 시·고·저는 0B가 체결 틱마다 싣고(FID 16·17·18)
+        # 기준가는 편입 조회로 이미 와 있다. 따로 조회할 것이 없다.
+        self._info = (int(stored.get("open") or 0),
+                      int(stored.get("high") or 0),
+                      int(stored.get("low") or 0),
+                      int(stored.get("vol") or 0),
+                      int(stored.get("prev_vol") or 0))
         if not self._paint_timer.isActive():
             self._paint_timer.start()
 
@@ -3035,42 +3086,68 @@ class DepthPopup(BidQtyPopup):
     def _refresh_text(self):
         if not self._rows:
             return
-        # 20줄 + 머리글 + 합계가 창 높이에 들어가도록 잡는다.
-        cell = max(7, int(self.height() * 0.037))
-        head = max(9, int(cell * 1.7))
-        widest = max((qty for _side, _p, qty in self._rows), default=0) or 1
+        # 줄 수가 호가 폭에 따라 달라지므로 글자 크기를 거기에 맞춘다.
+        cell = max(6, int(self.height() / (len(self._rows) + 6)))
+        head = max(9, int(cell * 1.9))
+        widest = max((max(a, b) for _p, a, b in self._rows), default=0) or 1
         price = getattr(self, "_price", 0)
+        base = getattr(self, "_base", 0)
         rate = float(self._head.split("|")[1])
-        head_color = "#e83030" if rate > 0 else "#2050d0" if rate < 0 else "#d8d8d8"
+        tone = lambda v: ("#e83030" if v > 0 else
+                          "#2050d0" if v < 0 else "#d8d8d8")
+        open_p, high_p, low_p, vol, prev_vol = getattr(
+            self, "_info", (0, 0, 0, 0, 0))
+        vol_rate = (vol - prev_vol) / prev_vol * 100 if prev_vol else 0.0
+
+        def bar(qty, color):
+            if not qty:
+                return ""
+            width = max(1, int(qty / widest * 14))
+            return (f"<span style='background-color:{color}'>"
+                    f"{'&nbsp;' * width}</span>")
+
         lines = [
             f"<div style='font-size:{cell}px; color:#C9A968'>{self._name}</div>"
             f"<div style='font-size:{head}px; font-weight:900;"
-            f" color:{head_color}'>{price:,} "
-            f"<span style='font-size:{cell}px'>{rate:+.2f}%</span></div>"
+            f" color:{tone(rate)}'>{price:,}"
+            f"<span style='font-size:{cell}px'> {rate:+.2f}%</span></div>"
+            f"<div style='font-size:{cell}px; color:#9aa4b2'>"
+            f"시 {open_p:,} · 고 {high_p:,} · 저 {low_p:,} · 기준 {base:,}</div>"
         ]
-        ask_sum = bid_sum = 0
-        for side, row_price, qty in self._rows:
-            if side == "ask":
-                ask_sum += qty
-                color, bar = "#2050d0", "#2f4f9e"
-            else:
-                bid_sum += qty
-                color, bar = "#e83030", "#9e3f3f"
-            if not row_price:
-                lines.append(f"<div style='font-size:{cell}px'>&nbsp;</div>")
-                continue
-            width = max(1, int(qty / widest * 100))
-            mark = "font-weight:900;" if row_price == price else ""
+        if self._upper:
             lines.append(
-                f"<div style='font-size:{cell}px; color:{color}; {mark}'>"
-                f"<span style='background-color:{bar}'>"
-                f"{'&nbsp;' * max(1, width // 8)}</span> "
-                f"{row_price:,} · {qty:,}</div>")
+                f"<div style='font-size:{cell}px; color:#e83030'>"
+                f"상한 {self._upper:,}</div>")
+        ask_sum = bid_sum = 0
+        for row_price, ask_qty, bid_qty in self._rows:
+            ask_sum += ask_qty
+            bid_sum += bid_qty
+            gap = (row_price - base) / base * 100 if base else 0.0
+            # 현재가 줄은 노랑으로 세운다. 영웅문 「호가중앙」과 같은 자리다.
+            if row_price == price:
+                style = "color:#1b1b1b; background-color:#ffe066; font-weight:900;"
+            else:
+                style = f"color:{tone(gap)};"
+            lines.append(
+                f"<div style='font-size:{cell}px; {style}'>"
+                f"{bar(ask_qty, '#2f4f9e')}"
+                f"<span style='color:#6f9be0'>"
+                f"{f'{ask_qty:,}' if ask_qty else ''}</span>"
+                f" {row_price:,} <span style='font-size:{max(5, cell - 1)}px'>"
+                f"{gap:+.2f}%</span> "
+                f"<span style='color:#e07c7c'>"
+                f"{f'{bid_qty:,}' if bid_qty else ''}</span>"
+                f"{bar(bid_qty, '#9e3f3f')}</div>")
+        if self._lower:
+            lines.append(
+                f"<div style='font-size:{cell}px; color:#2050d0'>"
+                f"하한 {self._lower:,}</div>")
         total = ask_sum + bid_sum
         share = int(bid_sum / total * 100) if total else 0
         lines.append(
             f"<div style='font-size:{cell}px; color:#6FD3C7'>"
-            f"매수 {share}% · {bid_sum:,} / {ask_sum:,}</div>")
+            f"매수 {share}% · {bid_sum:,}/{ask_sum:,} · "
+            f"거래 {vol:,} ({vol_rate:+.0f}%)</div>")
         self._label.setText("".join(lines))
 
 
