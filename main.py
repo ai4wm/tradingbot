@@ -913,7 +913,9 @@ class View:
         present = [code for code in self.screen.model.codes
                    if code.removesuffix("_AL") in new_today]
         if present:
-            log.info("new listing upper refresh: %s", ",".join(present))
+            # `log.info`는 루트 레벨이 WARNING이라 파일에 안 남는다. 신규주
+            # 상한가가 언제 고쳐졌는지는 나중에 되짚어야 할 값이다.
+            log.warning("new listing upper refresh: %s", ",".join(present))
             self._schedule_refresh()
         self._schedule_new_listing_refresh()
 
@@ -969,10 +971,33 @@ class View:
                 for row in await self.app.rest.watch_info(
                         codes[i:i + 100], suffix=self._real_suffix()):
                     self.screen.on_tick(row["code"], row)
+                    self._log_new_listing_range(row)
             except Exception as e:  # noqa: BLE001
                 log.warning("watch_info failed: %s", e)
         self.app.ensure_prev_vol(self.screen.model)  # 역산 0인 종목 ka10081 백필
         self._fill_entry_times()
+
+    def _log_new_listing_range(self, row: dict):
+        """상장 당일 종목의 가격제한폭을 조회할 때마다 한 줄 남긴다.
+
+        신규주는 전일 종가가 없어 공모가 기준 60~400%가 가격제한폭이다.
+        그 값이 09:00 전에는 아직 확정되지 않아, `NEW_LISTING_REFRESH`가
+        09:00:30에 다시 읽는다. **그전에 편입되면 무엇을 들고 있었는지
+        지금까지 기록이 없었다** — 상한가 판정은 등락률이 아니라 `upper`
+        일치라(`gui.py:584`), 이 값이 틀리면 점상 대기·알림음·3단매도
+        기준선이 함께 어긋난다.
+
+        2026-09-23 와이즈플래닛컴퍼니(0010S0)는 09:00:16에 첫 매수가
+        나갔고 재조회는 09:00:30이었다. 그 14초를 확인할 방법이 없었다.
+        하루 몇 종목이라 로그가 늘지 않고, 조회는 원래 나가던 것이다.
+        """
+        code = str(row.get("code") or "").removesuffix("_AL")
+        if code not in getattr(self.app._market, "new_today", ()):
+            return
+        log.warning(
+            "new listing range code=%s price=%s base=%s upper=%s lower=%s",
+            code, row.get("price"), row.get("base"),
+            row.get("upper"), row.get("lower"))
 
     def fill_entry_time(self, code: str):
         """한 종목의 상한가 진입시각을 필요할 때만 채운다.
