@@ -21,7 +21,7 @@ import qasync
 import config
 from PySide6.QtCore import (
     QAbstractNativeEventFilter, QDate, QPoint, QRect, QSettings, QSize, Qt,
-    QTimer, QUrl, Signal,
+    QTime, QTimer, QUrl, Signal,
 )
 from PySide6.QtGui import (
     QColor, QDesktopServices, QFont, QFontMetrics, QPainter, QPalette,
@@ -608,6 +608,9 @@ class View:
         self._refresh_task = None
         self._entry_cache: dict[str, str] = {}
         self._entry_pending: set[str] = set()
+        # 상한가가 무너진 종목. 다시 붙는 틱이 곧 재진입 시각이라 그 순간을
+        # 여기서 잡으면 ka10079를 다시 안 불러도 된다.
+        self._entry_broken: set[str] = set()
         self._settings = QSettings("layout.ini", QSettings.IniFormat)
         self._auto_timer = QTimer(screen)
         self._auto_timer.timeout.connect(self.on_refresh)
@@ -972,17 +975,29 @@ class View:
         self._fill_entry_times()
 
     def fill_entry_time(self, code: str):
-        """한 종목의 상한가 진입시각을 필요할 때만 채운다. 조회는 종목당 1회다.
+        """한 종목의 상한가 진입시각을 필요할 때만 채운다.
 
-        시세 틱마다 불린다. 상한가가 아니거나 이미 받아 둔 종목은 즉시 빠진다.
+        시세 틱마다 불린다. 이미 받아 둔 종목은 즉시 빠진다.
+
+        **상한가가 풀려도 시각을 지우지 않는다.** 그날 몇 시에 붙었는지가
+        무너진 뒤에도 정보다. 대신 무너진 것을 기억해 두었다가, 다시 붙는
+        틱에서 그 순간을 재진입 시각으로 쓴다 — 조회가 한 번도 안 나간다.
+        전에는 무너질 때 캐시를 지워서 다시 붙을 때마다 `last_limit_entry`
+        (ka10079 틱차트, 활발한 상한이면 3페이지)를 새로 불렀다.
         """
         d = self.screen.model.rows.get(code)
         if d is None:
             return
         if not (d["upper"] > 0 and d["price"] == d["upper"]):
-            if code in self._entry_cache:  # 상한가가 풀리면 시각을 지운다
-                del self._entry_cache[code]
-                self.screen.on_tick(code, {"time": ""})
+            self._entry_broken.add(code)
+            return
+        if code in self._entry_broken:
+            # 무너졌다 다시 붙었다(또는 눈앞에서 처음 붙었다). 이 틱이 곧
+            # 진입 순간이라 조회할 것이 없다.
+            self._entry_broken.discard(code)
+            self._entry_pending.discard(code)  # 돌던 조회 결과는 이미 옛것이다
+            self._set_entry_time(
+                code, QTime.currentTime().toString("HH:mm:ss"))
             return
         if code in self._entry_cache:
             if not d["time"]:
@@ -1003,10 +1018,23 @@ class View:
         """
         self._entry_cache.pop(code, None)
         self._entry_pending.discard(code)
+        self._entry_broken.discard(code)
 
     def _fill_entry_times(self):
         for code in list(self.screen.model.codes):
             self.fill_entry_time(code)
+
+    def _set_entry_time(self, code: str, t: str):
+        """진입시각을 캐시·화면·DB에 함께 남긴다. 조회와 틱 갈래가 같이 쓴다."""
+        self._entry_cache[code] = t
+        self.screen.on_tick(code, {"time": t})
+        if not t:
+            return
+        trade_date = QDate.currentDate().toString("yyyyMMdd")
+        if save_last_entry_time(trade_date, code, t):
+            log.info("live limit entry saved: %s %s %s", trade_date, code, t)
+            if self.app._analysis is not None:
+                self.app._analysis._refresh_limit_up_table()
 
     async def _drain_entries(self, todo):
         for _, code, upper in todo:
@@ -1018,16 +1046,7 @@ class View:
             if code not in self._entry_pending:
                 continue  # 조회 도중 이탈했다. 이 값은 이미 옛것이다.
             self._entry_pending.discard(code)
-            self._entry_cache[code] = t
-            self.screen.on_tick(code, {"time": t})
-            if t:
-                trade_date = QDate.currentDate().toString("yyyyMMdd")
-                if save_last_entry_time(trade_date, code, t):
-                    log.info(
-                        "live limit entry saved: %s %s %s",
-                        trade_date, code, t)
-                    if self.app._analysis is not None:
-                        self.app._analysis._refresh_limit_up_table()
+            self._set_entry_time(code, t)
 
 
 class App:
