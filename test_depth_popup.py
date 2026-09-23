@@ -77,9 +77,10 @@ def demo_draws_continuous_axis():
     popup._refresh_text()
 
     prices = [p for p, _a, _b in popup._rows]
-    # 매도 10단(19,010) ~ 매수 10단(18,810)에 위아래 3틱 여유.
-    assert prices[0] == 19040, prices[:3]
-    assert prices[-1] == 18780, prices[-3:]
+    # 매도 10단(19,010) ~ 매수 10단(18,810)에 위아래 한 틱 여유. 여유를 더
+    # 주면 그만큼 창을 먹어 10단이 다 안 들어간다(2026-09-23 두산에너빌리티).
+    assert prices[0] == 19020, prices[:3]
+    assert prices[-1] == 18800, prices[-3:]
     assert prices == sorted(prices, reverse=True)
     # 축이 호가단위로 연속이어야 한다.
     assert all(a - b == 10 for a, b in zip(prices, prices[1:]))

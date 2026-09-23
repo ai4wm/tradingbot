@@ -3047,11 +3047,12 @@ class DepthPopup(BidQtyPopup):
         known = [p for p in (*asks, *bids, price) if p > 0]
         if not known:
             return
-        # 호가가 실린 구간을 다 덮고 위아래로 세 틱씩 여유를 둔다.
+        # 호가가 실린 구간을 다 덮고 위아래로 한 틱씩만 여유를 둔다. 여유를
+        # 더 주면 그만큼 창을 먹어 10단이 다 안 들어간다 — 2026-09-23
+        # 두산에너빌리티(호가단위 100원)가 8단까지만 보였다.
         high, low = max(known), min(known)
-        for _ in range(3):
-            high += krx_tick_size(high)
-            low -= krx_tick_size(max(1, low - 1))
+        high += krx_tick_size(high)
+        low -= krx_tick_size(max(1, low - 1))
         rows = [(p, asks.get(p, 0), bids.get(p, 0))
                 for p in krx_quote_axis(max(1, low), high)]
         head = f"{price:,}|{rate:+.2f}"
@@ -3093,14 +3094,17 @@ class DepthPopup(BidQtyPopup):
         # 글자 크기를 먼저 정한다. 폭도 함께 본다 — 한 줄이
         # `1,000 ▮ 18,910 +21.84% ▮ 2,000`로 30자쯤이라 높이만 보면 좁은
         # 창에서 숫자가 칸을 넘어 세로줄이 깨진다.
-        cell = max(7, min(int(self.width() / 20), int(self.height() / 30)))
-        head = max(9, int(cell * 1.9))
-        price = getattr(self, "_price", 0)
-        # 창에 들어갈 줄 수만 그린다. 머리글 넉 줄과 꼬리 두 줄, 현재가 줄이
-        # 1.9배인 것을 뺀 나머지다. 다 그리면 호가가 넓게 벌어진 날 아래
-        # 두 줄(하한가·합계)이 창 밖으로 밀려 안 보인다.
-        room = max(4, int(self.height() / (cell * 1.25)) - 7)
+        # **줄 수에 맞춰 글자를 줄이는 것이 먼저다.** 크기를 먼저 못 박고
+        # 자르면 창이 넉넉해도 10단이 잘린다. 머리글 넉 줄과 꼬리 두 줄,
+        # 현재가 줄이 1.9배인 것을 합쳐 일곱 줄로 센다.
         rows = self._rows
+        cell = min(int(self.width() / 20),
+                   int(self.height() / ((len(rows) + 7) * 1.25)))
+        price = getattr(self, "_price", 0)
+        # 7px보다 작아지면 읽을 수 없다. 그때만 들어갈 만큼 잘라 낸다.
+        cell = max(7, cell)
+        room = max(4, int(self.height() / (cell * 1.25)) - 7)
+        head = max(9, int(cell * 1.9))
         if len(rows) > room:
             # 현재가를 가운데 둔다. 위아래 어느 쪽이 잘려도 그 자리는 보인다.
             center = next((i for i, r in enumerate(rows) if r[0] == price),
@@ -3124,7 +3128,7 @@ class DepthPopup(BidQtyPopup):
             칸 폭이 고정이라 세로줄이 맞는다.
             """
             if not qty:
-                return "<td width='12%'></td>"
+                return "<td width='15%'></td>"
             fill = max(2, int(qty / widest * 100))
             pad = 100 - fill
             # 빈 칸은 높이가 0이라 배경색이 안 그려진다. 공백을 한 자 넣어
@@ -3132,7 +3136,7 @@ class DepthPopup(BidQtyPopup):
             solid = f"<td width='{fill}%' bgcolor='{color}'>&nbsp;</td>"
             empty = f"<td width='{pad}%'>&nbsp;</td>"
             cells = (empty + solid) if right else (solid + empty)
-            return (f"<td width='12%'><table width='100%' cellspacing='0' "
+            return (f"<td width='15%'><table width='100%' cellspacing='0' "
                     f"cellpadding='0'><tr>{cells}</tr></table></td>")
 
         lines = [
@@ -3165,15 +3169,15 @@ class DepthPopup(BidQtyPopup):
                 price_style = f"color:{tone(gap)};"
             lines.append(
                 f"<tr{row}>"
-                f"<td width='19%' align='right' nowrap style='color:#6f9be0'>"
+                f"<td width='17.5%' align='right' nowrap style='color:#6f9be0'>"
                 f"{f'{ask_qty:,}&nbsp;' if ask_qty else ''}</td>"
                 f"{bar(ask_qty, '#2f4f9e', right=True)}"
-                f"<td width='19%' align='right' nowrap style='{price_style}'>"
+                f"<td width='17.5%' align='right' nowrap style='{price_style}'>"
                 f"{row_price:,}</td>"
-                f"<td width='19%' align='right' nowrap style='{price_style}'>"
+                f"<td width='17.5%' align='right' nowrap style='{price_style}'>"
                 f"&nbsp;{gap:+.2f}%</td>"
                 f"{bar(bid_qty, '#9e3f3f', right=False)}"
-                f"<td width='19%' align='left' nowrap style='color:#e07c7c'>"
+                f"<td width='17.5%' align='left' nowrap style='color:#e07c7c'>"
                 f"{f'&nbsp;{bid_qty:,}' if bid_qty else ''}</td>"
                 f"</tr>")
         lines.append("</table>")
