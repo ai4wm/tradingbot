@@ -35,6 +35,10 @@ class Stub:
     def _push_pending_orders(self, code):
         self.pushed.append(code)
 
+    def _auto_assign_exit_hotkey_everywhere(self, code):
+        # 보유 0에서 체결이 생기면 청산키가 걸린다. 여기서는 세지 않는다.
+        pass
+
 
 def fill(code="011330", order_no="1", qty=197, fill_id="A1") -> dict:
     return {"code": code, "side": "buy", "status": "체결", "order_qty": qty,

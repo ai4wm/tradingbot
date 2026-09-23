@@ -39,7 +39,9 @@ class Stub:
         self._balance_sell_settings = {}
         self._exit_hotkey_specs = {"F1": {"0010S0"}}
         self.cleared = []
-        for name in ("_clear_after_emergency", "_pending_open_buys"):
+        self.views = []                  # 주문상태 칸을 비울 창은 없다
+        for name in ("_clear_after_emergency", "_pending_open_buys",
+                     "_clear_order_status"):
             setattr(self, name,
                     types.MethodType(getattr(main.App, name), self))
 

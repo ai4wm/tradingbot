@@ -2730,10 +2730,27 @@ class App:
                 code, {"held": 0, "sellable": 0})
         if filled and position is not None:
             # 당일 매수 체결분은 그대로 매도할 수 있다.
+            was_empty = position["held"] <= 0
             position["held"] += filled
             position["sellable"] += filled
+            if was_empty:
+                # 보유가 0에서 생기는 순간이다. 영웅문에서 산 것도 여기로
+                # 온다 — `_auto_assign_exit_hotkey`는 주문 경로에만 붙어
+                # 있어서 앱 밖 매수는 청산키 없이 남았다. 2026-09-23
+                # 0010S0은 청산으로 다 판 뒤 86주를 영웅문에서 다시 샀는데
+                # 32분 동안 F1이 안 걸려 있었다.
+                #
+                # **보유가 0일 때만 건다.** 추가 매수마다 걸면 손으로 푼
+                # 키가 되살아난다. 푸는 쪽이 사용자의 명시적 의사표시다.
+                self._auto_assign_exit_hotkey_everywhere(code)
         # 장부를 다 고친 뒤에 표시한다. 먼저 부르면 보유수량이 한 박자 늦는다.
         self._push_pending_orders(code)
+
+    def _auto_assign_exit_hotkey_everywhere(self, code: str):
+        """그 종목이 떠 있는 창마다 청산키를 건다. 이미 걸린 창은 건너뛴다."""
+        for view in self.views:
+            if code in view.screen.model.rows:
+                self._auto_assign_exit_hotkey(view.screen, code)
 
     def _track_open_sell(self, code: str, order_no: str, event: dict):
         """매도 이벤트: 미체결 매도와 보유·매도가능 수량을 갱신한다."""
@@ -3431,6 +3448,19 @@ class App:
         # 청산키도 같이 내린다. 다 판 종목의 키가 살아 있으면 나중에 눌렀을 때
         # 엉뚱하게 동작한다. 다시 주문하면 자동 배정이 새로 건다.
         self._clear_exit_hotkey(code)
+        self._clear_order_status(code)
+
+    def _clear_order_status(self, code: str):
+        """주문상태 칸을 비운다. 감시를 내릴 때 문구도 같이 지운다.
+
+        3단매도·자동취소·청산키를 다 내리면서 「긴급정리」만 남기면 칸만
+        보고는 아직 걸려 있는 줄 안다. 2026-09-23 0010S0이 그랬다 —
+        10:14:27에 80주를 팔고 청산키가 풀렸는데 칸의 「긴급정리」가 그대로
+        남아, 재매수한 86주를 32분 동안 걸려 있는 것으로 오해했다.
+        """
+        for view in self.views:
+            if code in view.screen.model.rows:
+                view.screen.set_order_state(code, "", "", False)
 
     def _schedule_session_cleanup(self):
         """다음 정리 시각에 한 번 울리도록 건다. 다 지났으면 내일 첫 차례로."""
@@ -3809,6 +3839,7 @@ class App:
         if armed:
             self._set_account_auto_cancel(code, False)
         self._clear_exit_hotkey(code)
+        self._clear_order_status(code)
 
     async def _emergency_exit_async(self, code: str, price: int):
         # 장부가 서 있으면 계좌조회를 기다리지 않는다. 조회 큐는 1초에 1건이라
