@@ -1116,6 +1116,7 @@ class App:
         self._cond_items = []           # CNSRLST 결과 (새 창 콤보 채우기용)
         self._condition_reload_id = 0   # 재조회 타임아웃과 실제 응답의 경합 방지
         self._market = None             # MarketInfo (새 창 모델 주입용)
+        self._bid_split_logged: dict[str, float] = {}
         self._limit_cnt = None          # 어제까지 연속상한 일수 (연상 컬럼, 시작 시 1회, 일봉 계산)
         self._account_summary = None     # 주문 툴바 공통 실계좌 요약
         self._balance_sell_settings: dict[str, dict] = {}
@@ -2586,8 +2587,35 @@ class App:
                     # 진입시각 조회는 편입 때만 돌아서, 편입 뒤에 상한가로 간
                     # 종목은 다음 편입이 있을 때까지 시각이 비어 있었다.
                     v.fill_entry_time(code)
-        if "bid_qty" in fields:
+        # 3단매도는 화면과 같은 출처의 잔량만 본다. `[NXT]등락률순위` 창이
+        # 같은 종목을 `_NX`로 등록하면 NXT 단독 잔량 틱이 섞여 들어와, 통합
+        # 기준선을 먼저 밑돌아 일찍 발동할 수 있었다.
+        if "bid_qty" in fields and (
+                source is None or source == self.ws.real_suffix):
             self._check_balance_sell(code, int(fields.get("bid_qty") or 0))
+            if source == "_AL":
+                self._log_bid_split(code, fields)
+
+    def _log_bid_split(self, code: str, fields: dict):
+        """3단매도가 보는 통합 잔량이 KRX+NXT 합인지 30초마다 한 줄 남긴다.
+
+        3단매도가 걸렸거나 보유 중인 종목만 찍는다. 합이 맞는지 확인되면
+        지워도 된다.
+        """
+        if "bid_qty_krx" not in fields or (
+                code not in self._balance_sell_settings
+                and code not in self._position_book):
+            return
+        now = time.monotonic()
+        if now - self._bid_split_logged.get(code, 0.0) < 30:
+            return
+        self._bid_split_logged[code] = now
+        total = int(fields["bid_qty"])
+        krx = int(fields.get("bid_qty_krx") or 0)
+        nxt = int(fields.get("bid_qty_nxt") or 0)
+        log.warning("bid split code=%s total=%s krx=%s nxt=%s %s",
+                    code, total, krx, nxt,
+                    "sum-ok" if total == krx + nxt else "SUM-DIFF")
 
     def _on_account_order_event(self, event: dict):
         """앱/영웅문 어느 쪽 주문이든 계좌 체결 이벤트를 자동취소에 반영한다."""
