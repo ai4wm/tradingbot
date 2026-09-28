@@ -38,7 +38,7 @@ def demo_limit_follows_switch_market_stays_krx():
 def demo_single_gate_carries_exchange():
     """3단매도·청산 둘 다 `_send_sell_order` 한 곳을 지난다."""
     app = types.SimpleNamespace(rest=_rest(), _sell_accepts={})
-    app._sell_exchange_now = lambda: app._sell_exchange
+    app._sell_exchange_now = lambda _code: app._sell_exchange
     send = types.MethodType(main.App._send_sell_order, app)
     for exchange in ("KRX", "SOR"):
         app._sell_exchange = exchange
@@ -81,12 +81,19 @@ def demo_nxt_premarket_watch():
             "08:50~09:00은 여전히 쉰다"
         assert gate_open("000002", ("정규장", "메인마켓", ""))
 
-        # 프리마켓 매도는 스위치가 KRX여도 SOR이다. KRX는 아직 체결이 없다.
-        app = types.SimpleNamespace(_sell_exchange="KRX")
+        # 프리마켓 매도는 스위치와 상관없이 종목을 본다. NXT 가능은 SOR
+        # (키움이 NXT로 보낸다), KRX 전용은 KRX(SOR이면 NXT로 가서 거부된다).
         main._market_session_states = lambda _now: premarket
-        assert main.App._sell_exchange_now(app) == "SOR"
+        for switch in ("KRX", "SOR"):
+            app = types.SimpleNamespace(
+                _sell_exchange=switch,
+                _market=types.SimpleNamespace(nxt={"000001"}))
+            assert main.App._sell_exchange_now(app, "000001") == "SOR"
+            assert main.App._sell_exchange_now(app, "000002") == "KRX"
         main._market_session_states = lambda _now: ("정규장", "메인마켓", "")
-        assert main.App._sell_exchange_now(app) == "KRX"
+        assert main.App._sell_exchange_now(app, "000002") == "SOR"  # 스위치대로
+        app._sell_exchange = "KRX"
+        assert main.App._sell_exchange_now(app, "000001") == "KRX"
     finally:
         main._market_session_states = real_states
         main._balance_stage_order = real_order

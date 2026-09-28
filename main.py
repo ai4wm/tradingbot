@@ -2834,10 +2834,16 @@ class App:
         # 장부를 다 고친 뒤에 표시한다. 먼저 부르면 보유수량이 한 박자 늦는다.
         self._push_pending_orders(code)
 
-    def _sell_exchange_now(self) -> str:
-        """NXT 프리마켓에는 KRX 체결이 없다. 그때만 스위치를 넘어 SOR로 낸다."""
+    def _sell_exchange_now(self, code: str) -> str:
+        """NXT 프리마켓(08:00~08:50)만 스위치를 넘어 종목을 보고 고른다.
+
+        키움 SOR은 그 시간 주문을 NXT로 보낸다. NXT 가능 종목은 SOR이라야
+        바로 체결된다. **KRX 전용은 KRX다** — SOR로 내면 NXT로 가서 거부되고,
+        KRX로 내면 08:30부터 시가 동시호가에 들어가 09:00에 체결된다.
+        """
         if _market_session_states(datetime.now())[1] == NXT_PREMARKET:
-            return "SOR"
+            nxt = code in getattr(self._market, "nxt", ())
+            return "SOR" if nxt else "KRX"
         return self._sell_exchange
 
     async def _send_sell_order(self, code: str, qty: int, price: int,
@@ -2853,7 +2859,7 @@ class App:
             try:
                 return await self.rest.sell_order(
                     code, qty, int(price), market=market_sell,
-                    exchange=self._sell_exchange_now())
+                    exchange=self._sell_exchange_now(code))
             except OrderSendUnknown as error:
                 accepted = await self._wait_sell_accepted(code, marker, qty)
                 if accepted:
@@ -3812,7 +3818,7 @@ class App:
             "시장가" if market_sell else "지정가",
             "" if market_sell else price, result["order_no"], source,
             self._current_bid_qty(code),
-            "KRX" if market_sell else self._sell_exchange_now())
+            "KRX" if market_sell else self._sell_exchange_now(code))
         return qty
 
     def _emergency_exit(self, code: str, price: int = 0, *_ignored):
@@ -4044,7 +4050,7 @@ class App:
                     "sellable=%s price=%s order_no=%s src=%s ex=%s",
                     code, held_qty, sellable_qty, price, result["order_no"],
                     "book" if booked is not None else "query",
-                    self._sell_exchange_now())
+                    self._sell_exchange_now(code))
         except Exception as error:  # noqa: BLE001
             log.exception(
                 "emergency cancel/sell failed code=%s price=%s "
