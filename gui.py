@@ -3413,6 +3413,13 @@ class ConditionScreen(QWidget):
         account_bar.addWidget(self.order_remaining_value)
         account_bar.addWidget(QLabel("인출가능금액"))
         account_bar.addWidget(self.withdrawable_value)
+        self.sor_sell_check = QCheckBox("매도SOR")
+        self.sor_sell_check.setStyle(self._checkbox_style)
+        self.sor_sell_check.setToolTip(
+            "3단매도·청산 매도를 통합(SOR)으로 냅니다 · 끄면 KRX\n"
+            "키움이 체결에 유리한 시장(KRX·NXT)을 고르고 나눠 보내기도 합니다\n"
+            "NXT 불가 종목은 KRX로 갑니다 · 시장가는 늘 KRX · 전 창 공통")
+        account_bar.addWidget(self.sor_sell_check)
         account_bar.addWidget(self.restore_order_btn)
         account_bar.addStretch(1)
         account_bar.addWidget(self.jumsang_check)

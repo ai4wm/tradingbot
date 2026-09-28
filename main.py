@@ -1075,6 +1075,8 @@ class View:
 
 
 class App:
+    _sell_exchange = "KRX"  # 설정 복원 전·검증 대역의 기본값
+
     def __init__(self, screen: ConditionScreen):
         self.rest = RestClient()
         self.ws = WSClient()
@@ -1241,6 +1243,12 @@ class App:
             self.ws.condition_stex_tp = "A"
             screen.unified_check.setChecked(True)  # toggled 연결 전 = 시각 상태만
         screen.unified_check.toggled.connect(self._on_unified)
+        # 3단매도·청산 매도 거래소. 기본 KRX. 전 창 공통이라 메인창에만 있다.
+        self._sell_exchange = (
+            "SOR" if self._settings.value("order/sell_sor", "false") == "true"
+            else "KRX")
+        screen.sor_sell_check.setChecked(self._sell_exchange == "SOR")
+        screen.sor_sell_check.toggled.connect(self._on_sor_sell)
         self._font_size = _normalize_app_font_size(
             self._settings.value(APP_FONT_SIZE_KEY, DEFAULT_APP_FONT_SIZE))
         font_index = screen.font_size_combo.findData(self._font_size)
@@ -1918,6 +1926,12 @@ class App:
             else:
                 btn.setToolTip(f"조건목록 재조회 완료 — {count}개")
 
+    def _on_sor_sell(self, on: bool):
+        self._sell_exchange = "SOR" if on else "KRX"
+        self._settings.setValue("order/sell_sor", "true" if on else "false")
+        self._settings.sync()
+        log.warning("sell exchange -> %s", self._sell_exchange)
+
     def _on_unified(self, on: bool):
         self._settings.setValue("unified_real", "true" if on else "false")
         self._settings.sync()
@@ -2577,13 +2591,13 @@ class App:
             audit_log.info(
                 "account order event code=%s side=%s status=%s order=%s "
                 "original=%s order_qty=%s fill_qty=%s fill_price=%s "
-                "remaining=%s fill_id=%s exchange=%s",
+                "remaining=%s fill_id=%s exchange=%s sor=%s",
                 code, event.get("side"), event.get("status"),
                 event.get("order_no"), event.get("original_order_no"),
                 event.get("order_qty"), event.get("fill_qty"),
                 event.get("fill_price"),
                 event.get("remaining_qty"), event.get("fill_id"),
-                event.get("exchange"))
+                event.get("exchange"), event.get("sor", ""))
         self.orders.on_order_event(event)
         if not code:
             return
@@ -2799,7 +2813,8 @@ class App:
             marker = len(self._sell_accepts.get(code) or ())
             try:
                 return await self.rest.sell_order(
-                    code, qty, int(price), market=market_sell)
+                    code, qty, int(price), market=market_sell,
+                    exchange=self._sell_exchange)
             except OrderSendUnknown as error:
                 accepted = await self._wait_sell_accepted(code, marker, qty)
                 if accepted:
@@ -3750,11 +3765,12 @@ class App:
         # 되짚기 위한 것이다(2026-09-07 223310: 발동 시점 값밖에 없었다).
         log.warning(
             "%s account sell sent code=%s held=%s sellable=%s qty=%s "
-            "order_type=%s price=%s order_no=%s src=%s bid_qty=%s",
+            "order_type=%s price=%s order_no=%s src=%s bid_qty=%s ex=%s",
             reason, code, held, sellable, qty,
             "시장가" if market_sell else "지정가",
             "" if market_sell else price, result["order_no"], source,
-            self._current_bid_qty(code))
+            self._current_bid_qty(code),
+            "KRX" if market_sell else self._sell_exchange)
         return qty
 
     def _emergency_exit(self, code: str, price: int = 0, *_ignored):
@@ -3983,9 +3999,10 @@ class App:
                 sold_qty = sellable_qty
                 log.warning(
                     "emergency account sell sent code=%s held=%s "
-                    "sellable=%s price=%s order_no=%s src=%s",
+                    "sellable=%s price=%s order_no=%s src=%s ex=%s",
                     code, held_qty, sellable_qty, price, result["order_no"],
-                    "book" if booked is not None else "query")
+                    "book" if booked is not None else "query",
+                    self._sell_exchange)
         except Exception as error:  # noqa: BLE001
             log.exception(
                 "emergency cancel/sell failed code=%s price=%s "
@@ -4274,6 +4291,7 @@ class App:
         screen.rank_btn.setVisible(False)
         screen.news_btn.setVisible(False)
         screen.unified_check.setVisible(False)  # 통합 시세는 전 창 공통 -> 메인창에서만 전환
+        screen.sor_sell_check.setVisible(False)  # 매도 거래소도 전 창 공통
         screen.font_size_combo.setVisible(False)  # 글자 크기는 앱 전체 공통 -> 메인창에서만 전환
         screen.theme_btn.setVisible(False)  # 테마는 앱 전체 공통 -> 메인창에서만 전환
         win = ConditionWindow(prefix, on_close=self._on_window_closed)

@@ -56,7 +56,7 @@ class FakeRest:
         self.calls.append("open_buys_query")
         return list(self.pending)
 
-    async def sell_order(self, code, qty, price, market=False):
+    async def sell_order(self, code, qty, price, market=False, exchange="KRX"):
         self.calls.append("sell")
         self.sells.append(("시장가" if market else price, qty))
         return {"order_no": "0001"}
@@ -446,7 +446,7 @@ async def check_sell_resend_guard():
     app = _app([])
     tries = []
 
-    async def lost_response(code, qty, price, market=False):
+    async def lost_response(code, qty, price, market=False, exchange="KRX"):
         tries.append(qty)
         # 응답은 유실됐지만 거래소는 접수했다 -> 웹소켓으로 접수 이벤트 도착
         app._track_open_sell(code, f"S{len(tries)}", {
@@ -463,7 +463,7 @@ async def check_sell_resend_guard():
     app2 = _app([])
     tries2 = []
 
-    async def never_accepted(code, qty, price, market=False):
+    async def never_accepted(code, qty, price, market=False, exchange="KRX"):
         tries2.append(qty)
         raise api.OrderSendUnknown("timeout")
 
@@ -580,7 +580,7 @@ async def check_sell_uses_book():
     calls = rejected.rest.calls
     first = {"done": False}
 
-    async def flaky_sell(code, qty, price, market=False):
+    async def flaky_sell(code, qty, price, market=False, exchange="KRX"):
         calls.append(f"sell:{qty}")
         if not first["done"]:
             first["done"] = True
@@ -906,7 +906,7 @@ async def check_balance_refill_while_selling():
     app._position_book[code] = {"held": 1408, "sellable": 1408}
 
     # 매도 응답을 늦춰 '아직 도는 중'을 만든다.
-    async def slow_sell(stock_code, qty, price, market=False):
+    async def slow_sell(stock_code, qty, price, market=False, exchange="KRX"):
         app.rest.calls.append(f"sell:{qty}")
         await asyncio.sleep(0.05)
         return {"order_no": "1001"}

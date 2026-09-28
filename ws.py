@@ -189,6 +189,10 @@ def parse_order_item(item: dict) -> dict:
         "fill_price": integer("910"),
         "fill_qty": integer("911"),
         "exchange": exchange,
+        # 2136 = SOR 주문 여부(Y/N). 2026-09-28 424870 SOR 주문에서
+        # 2134='0' · 2135='SOR' · 2136='Y'로 확인했다. 실제 집행 거래소는
+        # 어느 FID에도 안 온다.
+        "sor": str(values.get("2136") or "").strip().upper(),
         "side": (
             "buy" if "매수" in str(values.get("905") or "")
             else "sell" if "매도" in str(values.get("905") or "")

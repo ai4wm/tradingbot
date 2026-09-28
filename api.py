@@ -343,13 +343,17 @@ class RestClient:
 
     async def sell_order(
             self, code: str, qty: int, price: int = 0, *,
-            market: bool = False) -> dict:
-        """KRX 지정가 또는 시장가 매도."""
+            market: bool = False, exchange: str = "KRX") -> dict:
+        """지정가 또는 시장가 매도. `exchange`는 KRX 또는 SOR.
+
+        **시장가는 KRX로만 낸다.** NXT 프리·애프터마켓은 지정가만 받아 SOR이
+        그쪽으로 보내면 거부된다(키움 최선집행기준 설명서 2026-09-14).
+        """
         price = int(price)
         if not market and price <= 0:
             raise ValueError("매도 지정가는 0원보다 커야 합니다")
         data = await self._order_request("kt10001", {
-            "dmst_stex_tp": "KRX",
+            "dmst_stex_tp": "KRX" if market else exchange,
             "stk_cd": code,
             "ord_qty": str(int(qty)),
             "ord_uv": "" if market else str(price),
