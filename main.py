@@ -389,6 +389,11 @@ def _krx_holiday_reason(day: date) -> str:
 # 나가는 구간이라 자기 주문에 반응하고, 뒤는 종가 한 값으로만 거래된다.
 BALANCE_SELL_SESSIONS = ("정규장", "종가 동시호가", "애프터마켓")
 
+# NXT 프리마켓(08:00~08:50)은 NXT 가능 종목만 본다. 전날 점상에서 산 물량이
+# 다음 날 아침 NXT에서 먼저 무너질 수 있다. KRX는 아직 체결이 없으므로 그
+# 시간 매도는 스위치와 상관없이 SOR로 낸다 — 키움 SOR이 NXT로 보낸다.
+NXT_PREMARKET = "프리마켓"
+
 # 3단매도·자동취소를 내리는 시각. 감시가 끝난 뒤여야 한다. 종가는 15:30에
 # 정해지고 애프터마켓은 20:00에 끝나는데, 체결 통보가 몇 초 늦게 오므로
 # 각각 3분과 5분을 둔다.
@@ -2801,6 +2806,12 @@ class App:
         # 장부를 다 고친 뒤에 표시한다. 먼저 부르면 보유수량이 한 박자 늦는다.
         self._push_pending_orders(code)
 
+    def _sell_exchange_now(self) -> str:
+        """NXT 프리마켓에는 KRX 체결이 없다. 그때만 스위치를 넘어 SOR로 낸다."""
+        if _market_session_states(datetime.now())[1] == NXT_PREMARKET:
+            return "SOR"
+        return self._sell_exchange
+
     async def _send_sell_order(self, code: str, qty: int, price: int,
                                market_sell: bool, reason: str,
                                attempts: int = 3) -> dict:
@@ -2814,7 +2825,7 @@ class App:
             try:
                 return await self.rest.sell_order(
                     code, qty, int(price), market=market_sell,
-                    exchange=self._sell_exchange)
+                    exchange=self._sell_exchange_now())
             except OrderSendUnknown as error:
                 accepted = await self._wait_sell_accepted(code, marker, qty)
                 if accepted:
@@ -3558,8 +3569,11 @@ class App:
             audit_log.info(
                 "expired balance sell setting cleared code=%s", code)
             return
-        krx_state, _, reason = _market_session_states(datetime.now())
-        if reason or krx_state not in BALANCE_SELL_SESSIONS:
+        krx_state, nxt_state, reason = _market_session_states(datetime.now())
+        premarket = (nxt_state == NXT_PREMARKET
+                     and code in getattr(self._market, "nxt", ()))
+        if reason or (krx_state not in BALANCE_SELL_SESSIONS
+                      and not premarket):
             return
         # 번호는 이름일 뿐이고 실행 순서는 기준 잔량이 큰 쪽 -> 작은 쪽이다.
         # 여러 기준을 한 번에 밑돌면 기준이 가장 작은 단계 하나만 실행하고
@@ -3770,7 +3784,7 @@ class App:
             "시장가" if market_sell else "지정가",
             "" if market_sell else price, result["order_no"], source,
             self._current_bid_qty(code),
-            "KRX" if market_sell else self._sell_exchange)
+            "KRX" if market_sell else self._sell_exchange_now())
         return qty
 
     def _emergency_exit(self, code: str, price: int = 0, *_ignored):
@@ -4002,7 +4016,7 @@ class App:
                     "sellable=%s price=%s order_no=%s src=%s ex=%s",
                     code, held_qty, sellable_qty, price, result["order_no"],
                     "book" if booked is not None else "query",
-                    self._sell_exchange)
+                    self._sell_exchange_now())
         except Exception as error:  # noqa: BLE001
             log.exception(
                 "emergency cancel/sell failed code=%s price=%s "

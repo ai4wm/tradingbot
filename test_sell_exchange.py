@@ -38,6 +38,7 @@ def demo_limit_follows_switch_market_stays_krx():
 def demo_single_gate_carries_exchange():
     """3단매도·청산 둘 다 `_send_sell_order` 한 곳을 지난다."""
     app = types.SimpleNamespace(rest=_rest(), _sell_accepts={})
+    app._sell_exchange_now = lambda: app._sell_exchange
     send = types.MethodType(main.App._send_sell_order, app)
     for exchange in ("KRX", "SOR"):
         app._sell_exchange = exchange
@@ -47,6 +48,52 @@ def demo_single_gate_carries_exchange():
     print("ok (한 관문에서 거래소를 싣는다 · 기본 KRX)")
 
 
+class _Passed(Exception):
+    pass
+
+
+def demo_nxt_premarket_watch():
+    """08:00~08:50 NXT 프리마켓은 NXT 가능 종목만 감시하고, 매도는 SOR로 낸다."""
+    real_states, real_order = main._market_session_states, main._balance_stage_order
+    today = main.datetime.now().strftime("%Y%m%d")
+
+    def gate_open(code, states):
+        main._market_session_states = lambda _now: states
+        app = types.SimpleNamespace(
+            _balance_sell_settings={code: {"first": 100}},
+            _balance_sell_date={code: today},
+            _market=types.SimpleNamespace(nxt={"000001"}))
+        try:
+            main.App._check_balance_sell(app, code, 0)
+        except _Passed:
+            return True
+        return False
+
+    def passed(_setting):
+        raise _Passed
+
+    try:
+        main._balance_stage_order = passed
+        premarket = ("개장 전", "프리마켓", "")
+        assert gate_open("000001", premarket), "NXT 종목은 프리마켓에 봐야 한다"
+        assert not gate_open("000002", premarket), "KRX 전용은 볼 시장이 없다"
+        assert not gate_open("000001", ("시가 동시호가", "일시휴장", "")), \
+            "08:50~09:00은 여전히 쉰다"
+        assert gate_open("000002", ("정규장", "메인마켓", ""))
+
+        # 프리마켓 매도는 스위치가 KRX여도 SOR이다. KRX는 아직 체결이 없다.
+        app = types.SimpleNamespace(_sell_exchange="KRX")
+        main._market_session_states = lambda _now: premarket
+        assert main.App._sell_exchange_now(app) == "SOR"
+        main._market_session_states = lambda _now: ("정규장", "메인마켓", "")
+        assert main.App._sell_exchange_now(app) == "KRX"
+    finally:
+        main._market_session_states = real_states
+        main._balance_stage_order = real_order
+    print("ok (NXT 프리마켓 감시는 NXT 종목만 · 그때 매도는 SOR)")
+
+
 if __name__ == "__main__":
     demo_limit_follows_switch_market_stays_krx()
     demo_single_gate_carries_exchange()
+    demo_nxt_premarket_watch()
