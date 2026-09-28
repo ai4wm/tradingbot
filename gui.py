@@ -143,6 +143,10 @@ MISU_MARK = QColor("#33C24D")  # 미수가능 우상단 삼각형 (녹색)
 NEW_MARKS = {3: QColor("#FF3DC8"), 2: QColor("#38B8FF"), 1: QColor("#8098B8")}  # 신규: 당일/15일/30일
 WHITE = QColor("white")
 TRACK = QColor("#d8d8d8")
+# 호가창에서 매도·매수 막대가 출발하는 세로 기준선.
+GRID_LINE = "#4a5361"
+# 호가창 현재가 테두리. 영웅문도 가격 칸만 이렇게 감싼다.
+CURRENT_MARK = "#ffd24d"
 CENTER = QColor("#707070")  # L일봉H 0% 중심선
 WATCH_BG = QColor("#FFD54F")  # 실시간 뉴스 감시: 연상 셀 배경
 WATCH_TEXT = QColor("#111111")
@@ -2970,43 +2974,26 @@ class BidQtyPopup(QWidget):
         super().closeEvent(event)
 
 
-def krx_tick_size(price: int) -> int:
-    """그 가격대의 호가단위. 2023년 개정으로 코스피·코스닥이 같다.
-
-    ponytail: `main._previous_krx_quote_price`에 같은 표가 있다. 그쪽은 매도
-    가격을 만드는 주문 경로라 표시용과 섞지 않았다. 둘 중 하나를 고칠 일이
-    생기면 그때 합친다.
-    """
-    price = max(1, int(price))
-    for ceiling, tick in ((2_000, 1), (5_000, 5), (20_000, 10),
-                          (50_000, 50), (200_000, 100), (500_000, 500)):
-        if price <= ceiling:
-            return tick
-    return 1_000
-
-
-def krx_quote_axis(low: int, high: int, cap: int = 120) -> list[int]:
-    """low~high를 호가단위로 채운 가격 축(높은 값부터). 빈 가격대를 만든다.
-
-    호가창에 실리는 것은 잔량이 있는 10단뿐이라, 그 사이 빈 가격은 이렇게
-    계산해서 넣어야 영웅문 「호가중앙」처럼 연속된 축이 된다.
-    """
-    price, axis = int(high), []
-    while price >= low and len(axis) < cap:
-        axis.append(price)
-        price -= krx_tick_size(price - 1)   # 경계에서 아래 구간의 단위를 쓴다
-    return axis
-
-
 class DepthPopup(BidQtyPopup):
-    """10호가와 등락률을 한 종목만 띄우는 단타용 창. 조회가 없다.
+    """10호가를 한 종목만 띄우는 단타용 창. 조회가 없다.
 
     필요한 값이 전부 웹소켓으로 이미 온다 — `0D`가 41~80으로 10단 호가와
-    잔량을, `0B`가 현재가·등락률을 싣는다(`ws.FID`). REST는 한 건도 안
-    나가고, 실시간 등록은 화면에 있는 종목이라 이미 잡혀 있다.
+    잔량을, `0B`가 현재가·등락률·시가·고가·저가를 싣는다(`ws.FID`). 기준가와
+    상·하한가는 편입 조회(`ka10095`)로 `STORED`에 남아 있다. REST는 한 건도
+    안 나가고, 실시간 등록은 화면에 있는 종목이라 이미 잡혀 있다.
 
-    **REST(`ka10095`)는 5단까지만 준다.** 편입 직후 한 틱은 6~10단이 비고
-    다음 호가 틱이 채우므로, 창을 열자마자 아래 다섯 줄이 잠깐 빈다.
+    **줄 구조가 고정이다.** 위 열 줄은 언제나 매도 10~1단, 아래 열 줄은
+    매수 1~10단이고 그 사이에 기준선이 있다. 가격은 그 줄에 실려 바뀌고
+    현재가 표시만 실시간으로 오르내린다. 빈 가격대를 채우지 않으므로 줄이
+    늘었다 줄었다 하지 않는다.
+
+    **현재가는 매도 쪽에 있을 수도, 매수 쪽에 있을 수도, 어느 쪽에도 없을
+    수도 있다.** 최우선 매도호가와 매수호가 사이에 끼면 호가 줄에는 안
+    나오고 머리글에만 남는다(2026-09-23 두산에너빌리티 81,600 · 매도1
+    81,700 · 매수1 81,500).
+
+    **`ka10095`는 5단까지만 준다.** 편입 직후 한 틱은 6~10단이 비고 다음
+    호가 틱이 채운다.
 
     갱신과 조작은 `BidQtyPopup`과 같은 배관이다 — 100ms 묶음 페인트, 휠
     투명도, 드래그 이동, 우하단 크기 조절, 더블클릭 닫기.
@@ -3014,54 +3001,48 @@ class DepthPopup(BidQtyPopup):
 
     POPUPS_ATTR = "_depth_popups"
     KEY_PREFIX = "depth_popup_"
+    LEVELS = 10
 
     def __init__(self, screen, code: str, name: str):
         self._rows: list[tuple] = []     # 부모 __init__이 _refresh를 부른다
         self._head = ""
+        self._price = 0
         self._base = self._upper = self._lower = 0
+        self._info = (0, 0, 0, 0, 0)
         super().__init__(screen, code, name)
-        self.setMinimumSize(170, 200)
-        if self.width() < 170 or self.height() < 200:
+        # 스무 줄 + 머리글 넉 줄 + 꼬리 두 줄이 7px로도 들어가야 한다.
+        self.setMinimumSize(170, 260)
+        if self.width() < 170 or self.height() < 260:
             self.resize(260, 420)
 
     def set_book(self, stored: dict):
         """표에 저장된 값으로 다시 그린다. 값이 그대로면 페인트를 건너뛴다.
 
-        호가창에 실리는 것은 잔량이 있는 10단뿐이다. 그 사이 빈 가격은
-        `krx_quote_axis`가 호가단위로 채워 연속된 축을 만든다.
+        줄 자리는 호가 단수로 고정이다. 가격이 아직 안 온 단은 빈 줄로
+        남겨 아래 줄이 위로 밀려 올라오지 않게 한다.
         """
         price = int(stored.get("price") or 0)
         rate = float(stored.get("rate") or 0.0)
         self._base = int(stored.get("base") or 0)
         self._upper = int(stored.get("upper") or 0)
         self._lower = int(stored.get("lower") or 0)
-        asks, bids = {}, {}
-        for level in range(1, 11):
+        rows = []
+        for level in range(self.LEVELS, 0, -1):      # 매도 10 -> 1 (위)
             suffix = "" if level == 1 else str(level)
-            ask_price = int(stored.get(f"ask_price{suffix}") or 0)
-            bid_price = int(stored.get(f"bid_price{suffix}") or 0)
-            if ask_price:
-                asks[ask_price] = int(stored.get(f"ask_qty{suffix}") or 0)
-            if bid_price:
-                bids[bid_price] = int(stored.get(f"bid_qty{suffix}") or 0)
-        known = [p for p in (*asks, *bids, price) if p > 0]
-        if not known:
-            return
-        # 호가가 실린 구간을 다 덮고 위아래로 한 틱씩만 여유를 둔다. 여유를
-        # 더 주면 그만큼 창을 먹어 10단이 다 안 들어간다 — 2026-09-23
-        # 두산에너빌리티(호가단위 100원)가 8단까지만 보였다.
-        high, low = max(known), min(known)
-        high += krx_tick_size(high)
-        low -= krx_tick_size(max(1, low - 1))
-        rows = [(p, asks.get(p, 0), bids.get(p, 0))
-                for p in krx_quote_axis(max(1, low), high)]
+            rows.append(("ask",
+                         int(stored.get(f"ask_price{suffix}") or 0),
+                         int(stored.get(f"ask_qty{suffix}") or 0)))
+        for level in range(1, self.LEVELS + 1):      # 매수 1 -> 10 (아래)
+            suffix = "" if level == 1 else str(level)
+            rows.append(("bid",
+                         int(stored.get(f"bid_price{suffix}") or 0),
+                         int(stored.get(f"bid_qty{suffix}") or 0)))
         head = f"{price:,}|{rate:+.2f}"
         if head == self._head and rows == self._rows:
             return
-        self._head, self._rows = head, rows
-        self._price = price
-        # 오른쪽 정보 박스 몫. 시·고·저는 0B가 체결 틱마다 싣고(FID 16·17·18)
-        # 기준가는 편입 조회로 이미 와 있다. 따로 조회할 것이 없다.
+        self._head, self._rows, self._price = head, rows, price
+        # 머리글 몫. 시·고·저는 0B가 체결 틱마다 싣고(FID 16·17·18) 기준가는
+        # 편입 조회로 이미 와 있다. 따로 조회할 것이 없다.
         self._info = (int(stored.get("open") or 0),
                       int(stored.get("high") or 0),
                       int(stored.get("low") or 0),
@@ -3087,51 +3068,46 @@ class DepthPopup(BidQtyPopup):
     def _refresh_text(self):
         if not self._rows:
             return
-        # **글자 크기는 창 크기만 본다.** 줄 수에 맞춰 정하면 호가가 벌어지고
-        # 좁아질 때마다 글자가 커졌다 작아졌다 한다. 폭도 함께 보는 것은 한
-        # 줄이 `1,000 ▮ 18,910 +21.84% ▮ 2,000`로 30자쯤이라, 높이만 보면
-        # 좁은 창에서 숫자가 칸을 넘어 세로줄이 깨지기 때문이다.
-        rows = self._rows
-        cell = max(7, min(int(self.width() / 20), int(self.height() / 38)))
-        price = getattr(self, "_price", 0)
-        # 머리글 넉 줄(이름·현재가·시고저·상한)과 꼬리 두 줄(하한·합계),
-        # 현재가 줄이 1.9배인 것을 합쳐 일곱 줄로 센다. 들어갈 만큼만 그리지
-        # 않으면 아래 두 줄이 창 밖으로 밀려 안 보인다.
-        room = max(4, int(self.height() / (cell * 1.35)) - 7)
+        # **글자 크기는 창 크기만 본다.** 줄 수가 고정이라 한 번 정해지면
+        # 창을 건드릴 때까지 그대로다. 폭도 함께 보는 것은 한 줄이
+        # `1,000 ▮ 18,910 +21.84% ▮ 2,000`로 30자쯤이라, 높이만 보면 좁은
+        # 창에서 숫자가 칸을 넘어 세로줄이 깨지기 때문이다.
+        rows_tall = len(self._rows) + 7   # 머리글 넉 줄 · 꼬리 두 줄 · 1.9배 몫
+        cell = max(7, min(int(self.width() / 20),
+                          int(self.height() / (rows_tall * 1.35))))
         head = max(9, int(cell * 1.9))
-        if len(rows) > room:
-            # 현재가를 가운데 둔다. 위아래 어느 쪽이 잘려도 그 자리는 보인다.
-            center = next((i for i, r in enumerate(rows) if r[0] == price),
-                          len(rows) // 2)
-            start = max(0, min(center - room // 2, len(rows) - room))
-            rows = rows[start:start + room]
-        widest = max((max(a, b) for _p, a, b in rows), default=0) or 1
-        base = getattr(self, "_base", 0)
-        rate = float(self._head.split("|")[1])
+        price, base = self._price, self._base
+        widest = max((qty for _s, _p, qty in self._rows), default=0) or 1
         tone = lambda v: ("#e83030" if v > 0 else
                           "#2050d0" if v < 0 else "#d8d8d8")
-        open_p, high_p, low_p, vol, prev_vol = getattr(
-            self, "_info", (0, 0, 0, 0, 0))
+        open_p, high_p, low_p, vol, prev_vol = self._info
         vol_rate = (vol - prev_vol) / prev_vol * 100 if prev_vol else 0.0
+        rate = float(self._head.split("|")[1])
 
-        def bar(qty, color, right: bool):
+        def bar(qty, color, right: bool, split: str = ""):
             """폭이 고정된 칸 안에서만 자라는 막대.
 
             글자로 막대를 그리면(`&nbsp;` 반복) 길이에 따라 옆 칸이 밀려
             가격·등락률·잔량이 줄마다 어긋난다. 중첩 표로 비율을 주면
             칸 폭이 고정이라 세로줄이 맞는다.
+
+            **막대가 출발하는 자리에 기준선을 긋는다.** 선이 없으면 잔량이
+            0인 줄에서 어디가 0점인지 안 보이고, 매도와 매수를 같은 자리에서
+            견줄 수 없다. 칸 폭이 고정이라 이 선도 고정이다.
             """
+            edge = "border-right" if right else "border-left"
+            rule = f"{split}{edge}:1px solid {GRID_LINE};"
             if not qty:
-                return "<td width='15%'></td>"
+                return f"<td width='15%' style='{rule}'>&nbsp;</td>"
             fill = max(2, int(qty / widest * 100))
-            pad = 100 - fill
             # 빈 칸은 높이가 0이라 배경색이 안 그려진다. 공백을 한 자 넣어
             # 줄 높이를 만들되 폭은 %가 정한다.
             solid = f"<td width='{fill}%' bgcolor='{color}'>&nbsp;</td>"
-            empty = f"<td width='{pad}%'>&nbsp;</td>"
+            empty = f"<td width='{100 - fill}%'>&nbsp;</td>"
             cells = (empty + solid) if right else (solid + empty)
-            return (f"<td width='15%'><table width='100%' cellspacing='0' "
-                    f"cellpadding='0'><tr>{cells}</tr></table></td>")
+            return (f"<td width='15%' style='{rule}'>"
+                    f"<table width='100%' cellspacing='0' cellpadding='0'>"
+                    f"<tr>{cells}</tr></table></td>")
 
         lines = [
             f"<div style='font-size:{cell}px; color:#C9A968'>{self._name}</div>"
@@ -3145,34 +3121,46 @@ class DepthPopup(BidQtyPopup):
             lines.append(
                 f"<div style='font-size:{cell}px; color:#e83030'>"
                 f"상한 {self._upper:,}</div>")
-        # 호가 줄은 표로 그린다. 칸 폭을 못 박아야 세로줄이 맞는다.
         lines.append(
             f"<table width='100%' cellspacing='0' cellpadding='0' "
             f"style='font-size:{cell}px'>")
         ask_sum = bid_sum = 0
-        for row_price, ask_qty, bid_qty in rows:
-            ask_sum += ask_qty
-            bid_sum += bid_qty
-            gap = (row_price - base) / base * 100 if base else 0.0
-            # 현재가 줄은 노랑으로 세운다. 영웅문 「호가중앙」과 같은 자리다.
-            if row_price == price:
-                row = " bgcolor='#ffe066'"
-                price_style = "color:#1b1b1b; font-weight:900;"
+        for index, (side, row_price, qty) in enumerate(self._rows):
+            if side == "ask":
+                ask_sum += qty
             else:
-                row = ""
-                price_style = f"color:{tone(gap)};"
+                bid_sum += qty
+            gap = (row_price - base) / base * 100 if base and row_price else 0.0
+            # 매도 1단과 매수 1단 사이에 가로 기준선. 이 자리가 고정이라
+            # 위 열 줄이 매도, 아래 열 줄이 매수임이 한눈에 보인다.
+            split = ("border-top:2px solid %s;" % GRID_LINE
+                     if index == self.LEVELS else "")
+            # 현재가는 **가격 칸만 노란 테두리**로 감싼다. 영웅문과 같은
+            # 표시다. 줄 전체를 칠하면 그 줄 잔량 막대가 안 보인다.
+            # **굵게 하지 않는다.** 그 줄만 글자 폭이 달라지면 현재가가
+            # 오르내릴 때마다 칸이 다시 계산돼 화면이 흔들린다. 영웅문도
+            # 테두리만 친다.
+            row, text, mark = "", f"color:{tone(gap)};", ""
+            if row_price and row_price == price:
+                mark = f"border:1px solid {CURRENT_MARK};"
+            if not row_price:      # 아직 안 온 단. 자리는 남긴다.
+                lines.append(
+                    f"<tr><td colspan='6' style='{split}'>&nbsp;</td></tr>")
+                continue
             lines.append(
                 f"<tr{row}>"
-                f"<td width='17.5%' align='right' nowrap style='color:#6f9be0'>"
-                f"{f'{ask_qty:,}&nbsp;' if ask_qty else ''}</td>"
-                f"{bar(ask_qty, '#2f4f9e', right=True)}"
-                f"<td width='17.5%' align='right' nowrap style='{price_style}'>"
-                f"{row_price:,}</td>"
-                f"<td width='17.5%' align='right' nowrap style='{price_style}'>"
+                f"<td width='17.5%' align='right' nowrap "
+                f"style='{split} color:#6f9be0'>"
+                f"{f'{qty:,}&nbsp;' if side == 'ask' else ''}</td>"
+                f"{bar(qty if side == 'ask' else 0, '#2f4f9e', True, split)}"
+                f"<td width='17.5%' align='right' nowrap "
+                f"style='{split}{text}{mark}'>{row_price:,}</td>"
+                f"<td width='17.5%' align='right' nowrap style='{split}{text}'>"
                 f"&nbsp;{gap:+.2f}%</td>"
-                f"{bar(bid_qty, '#9e3f3f', right=False)}"
-                f"<td width='17.5%' align='left' nowrap style='color:#e07c7c'>"
-                f"{f'&nbsp;{bid_qty:,}' if bid_qty else ''}</td>"
+                f"{bar(qty if side == 'bid' else 0, '#9e3f3f', False, split)}"
+                f"<td width='17.5%' align='left' nowrap "
+                f"style='{split} color:#e07c7c'>"
+                f"{f'&nbsp;{qty:,}' if side == 'bid' else ''}</td>"
                 f"</tr>")
         lines.append("</table>")
         if self._lower:
