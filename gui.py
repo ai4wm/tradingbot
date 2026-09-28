@@ -2487,7 +2487,16 @@ class BalanceSellDialog(QDialog):
                 "화살표: 1만(Shift 10만) · 휠: 10만(Shift 1만) · "
                 "Ctrl: 100만")
             edit.valueChanged.connect(self._mark_manual)
+            edit.valueChanged.connect(self._refresh_amounts)
             edit.lineEdit().returnPressed.connect(self._apply)
+        # 기준은 수량으로 넣고, 옆에 상한가 기준 금액을 보여 준다. 가격대가
+        # 다른 종목끼리 같은 수량이 전혀 다른 크기다(HLB 10만 주 = 40억).
+        self.amount_labels = [QLabel() for _ in range(3)]
+        for label in self.amount_labels:
+            label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            label.setMinimumWidth(64)
+            label.setStyleSheet("color:#8A6D1F")
+        self.current_label = QLabel()
         # 단계별 사용 체크. 해제한 단계는 기준 0으로 적용돼 감시·주문에서 빠진다.
         self.first_check = QCheckBox("1")
         self.second_check = QCheckBox("2")
@@ -2574,20 +2583,25 @@ class BalanceSellDialog(QDialog):
 
         grid = QGridLayout()
         grid.addWidget(QLabel("현재 적용값"), 0, 0)
-        grid.addWidget(self.applied_label, 0, 1, 1, 2)
-        grid.addWidget(self.market_sell_check, 0, 3)
+        grid.addWidget(self.applied_label, 0, 1, 1, 3)
+        grid.addWidget(self.market_sell_check, 0, 4)
         grid.addWidget(self.first_check, 1, 0)
         grid.addWidget(self.first_edit, 1, 1)
-        grid.addWidget(QLabel("이하 → 경고음 +"), 1, 2)
-        grid.addWidget(self.first_sell_combo, 1, 3)
+        grid.addWidget(self.amount_labels[0], 1, 2)
+        grid.addWidget(QLabel("이하 → 경고음 +"), 1, 3)
+        grid.addWidget(self.first_sell_combo, 1, 4)
         grid.addWidget(self.second_check, 2, 0)
         grid.addWidget(self.second_edit, 2, 1)
-        grid.addWidget(QLabel("이하 → 경고음 +"), 2, 2)
-        grid.addWidget(self.second_sell_combo, 2, 3)
+        grid.addWidget(self.amount_labels[1], 2, 2)
+        grid.addWidget(QLabel("이하 → 경고음 +"), 2, 3)
+        grid.addWidget(self.second_sell_combo, 2, 4)
         grid.addWidget(self.third_check, 3, 0)
         grid.addWidget(self.third_edit, 3, 1)
-        grid.addWidget(QLabel("이하 → 완료음 +"), 3, 2)
-        grid.addWidget(self.third_sell_combo, 3, 3)
+        grid.addWidget(self.amount_labels[2], 3, 2)
+        grid.addWidget(QLabel("이하 → 완료음 +"), 3, 3)
+        grid.addWidget(self.third_sell_combo, 3, 4)
+        grid.addWidget(QLabel("현재 잔량"), 4, 0)
+        grid.addWidget(self.current_label, 4, 1, 1, 4)
 
         buttons = QHBoxLayout()
         buttons.addWidget(rebase_btn)
@@ -2736,6 +2750,21 @@ class BalanceSellDialog(QDialog):
     def _refresh_live(self):
         if not self._manual_edit and self.config is None:
             self._refresh_suggestion()
+        self._refresh_amounts()
+
+    def _refresh_amounts(self):
+        """기준 수량과 현재 잔량 옆에 상한가 기준 금액(억)을 붙인다."""
+        row = self.screen.model.rows.get(self.code, {})
+        price = int(row.get("upper") or 0) or int(row.get("bid_price") or 0)
+        eok = (lambda qty: f"{qty * price / 100_000_000:,.1f}억"
+               if price else "")
+        for label, edit in zip(
+                self.amount_labels,
+                (self.first_edit, self.second_edit, self.third_edit)):
+            label.setText(eok(edit.value()))
+        current = self._current_bid()
+        self.current_label.setText(
+            f"{current:,}주" + (f" · {eok(current)}" if price else ""))
 
     def _apply(self):
         row = self.screen.model.rows.get(self.code, {})

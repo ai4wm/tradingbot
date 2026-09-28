@@ -50,9 +50,17 @@ def demo():
     assert (dialog.first_edit.value(), dialog.second_edit.value(),
             dialog.third_edit.value()) == (500_000, 300_000, 200_000), (
         dialog.first_edit.value())
+    # 기준 수량 옆에 상한가(1,000원) 기준 금액이 붙는다.
+    dialog._refresh_amounts()
+    assert [label.text() for label in dialog.amount_labels] == [
+        "5.0억", "3.0억", "2.0억"], [l.text() for l in dialog.amount_labels]
+    assert dialog.current_label.text() == "1,000,000주 · 10.0억", (
+        dialog.current_label.text())
     # 적용 전이라 기존 설정은 그대로다.
     assert screen.model.balance_sell_settings[CODE] == SETTING
     assert dialog.error_label.text()
+    dialog.first_edit.setValue(250_000)          # 손으로 고치면 바로 따라온다
+    assert dialog.amount_labels[0].text() == "2.5억"
 
     # 설정이 없을 때도 같다.
     fresh = Stub(None, 1_000_000)
