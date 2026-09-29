@@ -15,6 +15,7 @@ from collections import Counter, deque
 from ctypes import wintypes
 from datetime import date, datetime, timedelta
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 import holidays
 import qasync
@@ -351,6 +352,19 @@ def _format_flow_million(value) -> str:
 
 
 _KR_HOLIDAY_CACHE = {}
+
+
+# 연상 계산 방식이 바뀌면 올린다. 같은 날 저장분이라도 옛 방식 값은 버린다
+# (2: cur_prc가 애프터마켓 마지막 체결가라 기준가로 세도록 바꿈, 2026-09-29).
+DAILY_CACHE_VERSION = 2
+
+
+def _previous_trading_day(day: date) -> str:
+    """그날 전 마지막 KRX 거래일(yyyymmdd). 주말·공휴일을 건너뛴다."""
+    day -= timedelta(days=1)
+    while _krx_holiday_reason(day):
+        day -= timedelta(days=1)
+    return day.strftime("%Y%m%d")
 
 
 def _krx_holiday_reason(day: date) -> str:
@@ -1117,7 +1131,8 @@ class App:
         self._condition_reload_id = 0   # 재조회 타임아웃과 실제 응답의 경합 방지
         self._market = None             # MarketInfo (새 창 모델 주입용)
         self._bid_split_logged: dict[str, float] = {}
-        self._limit_cnt = None          # 어제까지 연속상한 일수 (연상 컬럼, 시작 시 1회, 일봉 계산)
+        # 어제까지 연속상한 일수·어제 종가 (연상 컬럼). 종목마다 제 일봉으로 센다.
+        self._limit_cnt: dict[str, tuple[int, int]] = {}
         self._account_summary = None     # 주문 툴바 공통 실계좌 요약
         self._balance_sell_settings: dict[str, dict] = {}
         self._balance_sell_stage: dict[str, int] = {}
@@ -1186,9 +1201,13 @@ class App:
         self._reg_task = None
         # 단일가 종목은 WS 무송신(실측 0건) -> REST 3초 폴이 유일한 채널
         self._single_task = None
-        # 전일거래량: 동시호가 역산실패(0) 종목만 ka10081로 1회 백필 (정적값 캐시)
+        # 편입 종목마다 일봉(ka10081)을 하루 한 번 받아 전일거래량과 연상을
+        # 함께 채운다. 받은 값은 그날 날짜로 파일에 남겨, 같은 날 재실행하면
+        # 처음 보는 종목만 조회한다.
         self._prevvol_pending: set[str] = set()
-        self._prevvol_done: set[str] = set()
+        self._daily_cache: dict[str, dict] = self._load_daily_cache()
+        self._daily_retry_at: dict[str, float] = {}
+        self._streak_refresh_total = 0  # 연상 재수집 진행 표시용
         self._prevvol_queue: deque[str] = deque()
         self._prevvol_workers: set[asyncio.Task] = set()
         self._single_timer = QTimer()
@@ -2063,15 +2082,8 @@ class App:
                      len(m.nxt), len(m.misu), len(m.admin))
         except Exception as e:  # noqa: BLE001
             log.warning("market_info failed: %s", e)
-        try:
-            # ponytail: 시작 시 1회. 자정 넘겨 켜두면 옛 목록 -> 날짜 가드는 필요해지면
-            self._limit_cnt = await self.rest.yesterday_limit_counts()
             for v in self.views:
-                self._inject_market(v)
-            log.info("yesterday limit: %s",
-                     ",".join(f"{c}={n}" for c, (n, _) in self._limit_cnt.items()))
-        except Exception as e:  # noqa: BLE001
-            log.warning("limit_counts failed: %s", e)
+                self._inject_market(v)  # 시장 분류가 실패해도 연상 칸은 붙인다
 
     async def start(self):
         for _ in range(int(self._settings.value("cond_windows", 0))):
@@ -4161,14 +4173,56 @@ class App:
             self._single_task = asyncio.ensure_future(self._poll_single(codes))
 
     def ensure_prev_vol(self, model):
-        """전일거래량이 0인 종목을 제한된 저우선순위 백필 큐에 넣는다."""
+        """편입 종목마다 일봉을 하루 한 번 받는 저우선순위 큐에 넣는다.
+
+        전일거래량과 연상을 같은 응답에서 채운다. 오늘 이미 받은 종목은
+        파일 캐시에서 전일거래량만 다시 얹고 조회하지 않는다.
+        """
+        now = time.monotonic()
         for code in list(model.codes):
-            if (model.rows[code].get("prev_vol", 0) == 0
-                    and code not in self._prevvol_pending
-                    and code not in self._prevvol_done):
-                self._prevvol_pending.add(code)
-                self._prevvol_queue.append(code)
+            cached = self._daily_cache.get(code)
+            if cached:
+                if code not in self._limit_cnt:
+                    self._limit_cnt[code] = (cached["streak"], cached["yclose"])
+                    model.refresh_streaks()
+                if cached["prev_vol"] and not model.rows[code].get("prev_vol"):
+                    model.update_stock(code, {"prev_vol": cached["prev_vol"]})
+                continue
+            if (code in self._prevvol_pending
+                    or self._daily_retry_at.get(code, 0.0) > now):
+                continue
+            self._prevvol_pending.add(code)
+            self._prevvol_queue.append(code)
         self._start_prevvol_workers()
+
+    def _daily_cache_path(self) -> Path:
+        return Path(__file__).with_name("data") / "daily_summary.json"
+
+    def _load_daily_cache(self) -> dict[str, dict]:
+        """오늘 날짜로 저장된 일봉 요약만 읽는다. 어제 것은 버린다."""
+        try:
+            saved = json.loads(self._daily_cache_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        if (saved.get("date") != date.today().strftime("%Y%m%d")
+                or saved.get("version") != DAILY_CACHE_VERSION):
+            return {}
+        return {code: info for code, info in (saved.get("rows") or {}).items()
+                if isinstance(info, dict) and "streak" in info}
+
+    def _save_daily_cache(self):
+        path = self._daily_cache_path()
+        try:
+            path.parent.mkdir(exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(
+                {"date": date.today().strftime("%Y%m%d"),
+                 "version": DAILY_CACHE_VERSION,
+                 "rows": self._daily_cache}, ensure_ascii=False),
+                encoding="utf-8")
+            tmp.replace(path)
+        except OSError as error:
+            log.warning("daily summary cache save failed: %s", error)
 
     def _start_prevvol_workers(self):
         """초기 대량 편입 때 ka10081 요청이 동시에 폭주하지 않게 최대 3개만 실행한다."""
@@ -4179,6 +4233,8 @@ class App:
 
     def _on_prevvol_worker_done(self, task: asyncio.Task):
         self._prevvol_workers.discard(task)
+        if not self._prevvol_workers and not self._prevvol_queue:
+            self._show_streak_refresh_status()
         # 마지막 pop 직후 새 종목이 들어오는 경합에서도 큐가 멈추지 않게 한다.
         self._start_prevvol_workers()
 
@@ -4188,16 +4244,39 @@ class App:
 
     async def _fetch_prev_vol(self, code: str):
         try:
-            vol = await self.rest.prev_volume(code)
-            self._prevvol_done.add(code)  # 응답 받았으면(0이라도) 재조회 안 함
-            if vol:
-                for v in self.views:
-                    if code in v.screen.model.rows:
-                        v.screen.on_tick(code, {"prev_vol": vol})
+            # 어제 정규장 종가 = 오늘 기준가. 편입 조회(ka10095)로 이미 행에 있다.
+            today_base = next(
+                (int(v.screen.model.rows[code].get("base") or 0)
+                 for v in self.views if code in v.screen.model.rows), 0)
+            info = await self.rest.daily_summary(code, today_base)
         except Exception as e:  # noqa: BLE001
-            log.warning("prev_vol %s: %s", code, e)  # 실패는 done 안 찍어 다음 refresh 재시도
-        finally:
+            log.warning("daily summary %s: %s", code, e)  # 다음 refresh에 재시도
             self._prevvol_pending.discard(code)
+            return
+        self._prevvol_pending.discard(code)
+        expected = _previous_trading_day(date.today())
+        if (info["last_date"] and info["last_date"] < expected
+                and datetime.now().hour < 9):
+            # 이른 아침엔 일봉이 아직 직전 거래일을 안 담고 있을 수 있다. 그 값을
+            # 저장하면 연상이 하루 종일 틀린다. 5분 뒤 다시 받는다. 09시가
+            # 넘으면 거래정지 종목 등은 그대로 받는다.
+            self._daily_retry_at[code] = time.monotonic() + 300
+            log.warning("daily summary stale code=%s last=%s expected=%s",
+                        code, info["last_date"], expected)
+            return
+        self._daily_cache[code] = info
+        self._save_daily_cache()
+        self._show_streak_refresh_status()
+        self._limit_cnt[code] = (info["streak"], info["yclose"])
+        for v in self.views:
+            if code in v.screen.model.rows:
+                # 비었을 때만 채운다. 일봉 거래량은 KRX분이라, 통합 모드에서
+                # 편입 조회가 준 통합 전일거래량을 덮으면 HLB 09-28이
+                # 86만 주 → 34만 주가 된다(당일/전일 비율이 틀어진다).
+                if (info["prev_vol"]
+                        and not v.screen.model.rows[code].get("prev_vol")):
+                    v.screen.on_tick(code, {"prev_vol": info["prev_vol"]})
+                v.screen.model.refresh_streaks()
 
     async def _poll_single(self, codes: list[str]):
         try:
@@ -4295,23 +4374,40 @@ class App:
         analysis._start_intraday_enrichment(silent=True)
 
     def _manual_limit_count_refresh(self):
-        log.info("manual limit count refresh requested")
-        asyncio.ensure_future(self._refresh_limit_counts_after_close())
+        """연상 재수집: 오늘 받은 일봉을 버리고 화면 종목을 다시 받는다."""
+        log.warning("manual limit count refresh: %d cached dropped",
+                    len(self._daily_cache))
+        self._daily_cache.clear()
+        self._daily_retry_at.clear()
+        self._limit_cnt.clear()
+        self._save_daily_cache()
+        for view in self.views:
+            view.screen.model.refresh_streaks()
+            self.ensure_prev_vol(view.screen.model)
+        # 누른 결과가 보여야 한다. 전에는 20초를 조용히 기다렸다가 목록만
+        # 다시 받아, 목록이 또 비면 아무 변화도 없어 버튼이 죽은 것 같았다.
+        self._streak_refresh_total = len(self._prevvol_pending)
+        self._show_streak_refresh_status()
+
+    def _show_streak_refresh_status(self):
+        total = self._streak_refresh_total
+        if not total or self._analysis is None:
+            return
+        left = len(self._prevvol_pending)
+        text = (f"연상 재수집 완료 · {total:,}종목" if not left
+                else f"연상 재수집 중 · {total - left:,}/{total:,}")
+        self._analysis._collection_status.setText(text)
+        if not left:
+            self._streak_refresh_total = 0
 
     async def _refresh_limit_counts_after_close(self):
-        """장 마감 후 틱차트 기반 연상 보완을 기다린 뒤 다시 조회한다."""
-        log.info("limit count refresh waiting: 20s")
+        """장 마감 후 틱차트 기반 연상 보완을 기다린 뒤 상한가 탭을 다시 그린다.
+
+        조건검색 표 연상은 종목마다 제 일봉으로 세므로 다시 조회할 것이 없다.
+        """
         await asyncio.sleep(20)
-        try:
-            counts = await self.rest.yesterday_limit_counts()
-            self._limit_cnt = counts
-            for view in self.views:
-                self._inject_market(view)
-            if self._analysis is not None:
-                self._analysis._refresh_limit_up_table()
-            log.info("post-close limit counts refreshed: %d", len(counts))
-        except Exception as error:  # noqa: BLE001
-            log.warning("post-close limit count refresh failed: %s", error)
+        if self._analysis is not None:
+            self._analysis._refresh_limit_up_table()
 
     def _on_newwin(self):
         if len(self.views) >= MAX_WINDOWS:
@@ -6208,6 +6304,11 @@ class AnalysisWindow(
             self._show_async_error("KRX 수집", message)
         finally:
             await client.close()
+            if (status == "COMPLETED" and processed and not saved
+                    and datetime.now().hour < 8):
+                # KRX는 전일 데이터를 08시 무렵 올린다. 그전에는 빈 값이 와서
+                # 「상한가 0건」으로 조용히 끝났다(2026-09-29 07:49).
+                message = "KRX 전일 데이터 공개 전 — 08시 이후 다시 수집하세요"
             update_collection(
                 run_id, status, processed, saved, errors,
                 message or f"상한가 {events:,}건")

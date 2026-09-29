@@ -463,56 +463,62 @@ class RestClient:
             })
         return out
 
-    async def yesterday_limit_counts(self) -> dict[str, tuple[int, int]]:
-        """어제 상한 마감 종목 -> (어제까지 연속 상한 일수, 어제 종가).
-        연상 표시 = 일수 + (오늘 상한이면 1). 어제 종가는 휴장일 이중계산 방지용:
-        휴장일엔 ka10095가 마지막 세션 그대로라 현재가==상한가인데 그 상한은 이미 일수에
-        포함됨. 진짜 오늘 상한이면 상한가=전일종가x1.3이라 어제 종가와 절대 같을 수 없음.
-        목록만 ka10017(updown_tp=6)에서 받고, 일수는 일봉으로 직접 계산.
-        (서버 cnt는 장중에 오늘분이 섞여드는 시점이 불규칙 -> 신뢰 불가. 07-10 15:21 실측:
-        마감 전인데 cnt에 오늘 상한 포함. 일봉 과거 행은 하루 종일 불변이라 결정적.)"""
-        d = await self.request("ka10017", {
-            "mrkt_tp": "000", "updown_tp": "6", "sort_tp": "1", "stk_cnd": "0",
-            "trde_qty_tp": "00000", "crd_cnd": "0", "trde_gold_tp": "0", "stex_tp": "1"})
-        out = {}
-        for code in (r["stk_cd"] for r in d.get("updown_pric", []) if r.get("stk_cd")):
-            try:
-                out[code] = await self._yesterday_streak(code)
-            except Exception as e:  # noqa: BLE001 - 개별 실패는 최소값 1 (목록에 있음 = 어제 상한)
-                log.warning("yesterday_streak %s: %s", code, e)
-                out[code] = (1, 0)
-        return out
+    async def daily_summary(self, code: str, today_base: int = 0) -> dict:
+        """일봉(ka10081) 한 번으로 전일거래량과 어제까지 연속 상한 일수를 함께 구한다.
 
-    async def _yesterday_streak(self, code: str) -> tuple[int, int]:
-        """일봉에서 (어제까지 연속 상한 일수, 어제 종가): 종가 대비 +29.5% 이상 연속
-        (gui.py LIMIT과 동일 판정)."""
+        연상은 종목마다 제 일봉으로 센다. 전에는 전일 상한 목록(ka10017)을 받아
+        그 종목만 셌는데, 08시 전에 켜면 빈 목록이 와서 연상이 전부 사라졌다
+        (2026-09-29 07:45 — 그날 상한가 종목만 1로 떴다).
+
+        **정규장 종가 기준이다(사용자 결정).** 그런데 `cur_prc`는 정규장 종가가
+        아니라 애프터마켓(16~20시)까지 포함한 **마지막 체결가**다. 2026-09-29
+        실측 원본(HLB글로벌 003580)이다.
+
+            09-28  cur_prc 2,055  pred_pre +472  → 기준가 1,583
+            09-23  cur_prc 1,608  pred_pre  +29
+
+        09-23 정규장 종가는 1,583원(= 09-28 기준가)인데 `cur_prc`는 1,608원이다.
+        씨싸이트도 09-23 `cur_prc` 11,400원(애프터마켓 상한)인데 정규장은
+        9,900원이었다. 인접 `cur_prc`끼리 나누면 연상이 엉뚱하게 끊겼다.
+
+        그래서 날마다 **그날 기준가 = cur_prc − pred_pre**, **그날 정규장 종가 =
+        다음 날 기준가**로 센다. 어제의 정규장 종가는 오늘 기준가다
+        (`today_base`, 편입 조회 값). 없으면 오늘 행에서, 그것도 없으면
+        어제 `cur_prc`로 물러난다(장 전엔 오늘 행이 없을 수 있다).
+
+        streak: 어제부터 거꾸로, 정규장 종가가 기준가 대비 +29.5% 이상인 날의 수.
+        yclose: 어제 정규장 종가(= 오늘 기준가) — 휴장일 이중계산 방지용.
+        last_date: 일봉의 마지막 거래일 — 부르는 쪽이 직전 거래일과 맞는지 본다.
+        prev_vol: 전일 절대 거래량. 동시호가엔 ka10095 역산이 0이라 이 값으로 채운다.
+        """
         import datetime
         today = datetime.datetime.now().strftime("%Y%m%d")
         d = await self.request("ka10081",
                                {"stk_cd": code, "base_dt": today, "upd_stkpc_tp": "1"},
                                path="/api/dostk/chart")
-        rows = [r for r in d.get("stk_dt_pole_chart_qry", []) if r.get("dt", "") < today]
-        n = 0
-        for a, b in zip(rows, rows[1:]):  # 최신(어제) -> 과거
-            c0, c1 = abs(_to_int(a.get("cur_prc"))), abs(_to_int(b.get("cur_prc")))
-            if not c1 or (c0 - c1) / c1 * 100 < 29.5:
+        rows = [r for r in d.get("stk_dt_pole_chart_qry", []) if r.get("dt")]
+
+        def base(row):                                 # 그날 기준가
+            return abs(_to_int(row.get("cur_prc"))) - _to_int(row.get("pred_pre"))
+
+        past = [r for r in rows if str(r["dt"]) < today]   # 최신(어제) -> 과거
+        today_row = next((r for r in rows if str(r["dt"]) == today), None)
+        close = (int(today_base or 0)
+                 or (base(today_row) if today_row else 0)
+                 or (abs(_to_int(past[0].get("cur_prc"))) if past else 0))
+        yclose = close
+        streak = 0
+        for row in past:
+            start = base(row)
+            if not close or start <= 0 or (close - start) / start * 100 < 29.5:
                 break
-            n += 1
-        return n, abs(_to_int(rows[0].get("cur_prc"))) if rows else 0
-
-    async def prev_volume(self, code: str) -> int:
-        """전일(직전 거래일) 절대 거래량 = ka10081 일봉의 첫 dt<오늘 행.
-        동시호가엔 오늘 체결이 없어 ka10095 역산(오늘거래량÷전일대비율)이 0이 됨.
-        이 절대값으로 채운다. 정적값이라 종목당 1회만 조회하면 됨."""
-        import datetime
-        today = datetime.datetime.now().strftime("%Y%m%d")
-        d = await self.request("ka10081",
-                               {"stk_cd": code, "base_dt": today, "upd_stkpc_tp": "1"},
-                               path="/api/dostk/chart")
-        for r in d.get("stk_dt_pole_chart_qry", []):
-            if r.get("dt", "") < today:            # 오늘 행(부분체결) 건너뛰고 전일
-                return abs(_to_int(r.get("trde_qty")))
-        return 0
+            streak += 1
+            close = start                                  # 하루 더 과거로
+        last = past[0] if past else {}
+        return {"prev_vol": abs(_to_int(last.get("trde_qty"))),
+                "streak": streak,
+                "yclose": yclose,
+                "last_date": str(last.get("dt", ""))}
 
     async def market_info(self) -> "MarketInfo":
         """ka10099 양시장 1회 조회 -> 종목 분류셋 묶음(MarketInfo).

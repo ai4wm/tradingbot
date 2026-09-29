@@ -21,3 +21,5 @@ data/*.session
 data/*.session-journal
 bidqty_probe.csv
 data/vi_raw_*.jsonl
+data/daily_summary.json
+data/daily_summary.tmp
