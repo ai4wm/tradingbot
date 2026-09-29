@@ -28,6 +28,10 @@ FID = {
     "13": "vol",       # 누적거래량
     "14": "acc_value",  # 누적거래대금 (백만원 단위로 옴 -> 원으로 환산)
     "15": "tick_qty",  # 개별 체결량 (+매수체결 / -매도체결, 부호 보존)
+    # 체결 시각(HHMMSS)과 그 체결이 난 거래소. 통합 모드에서 KRX 시가가
+    # 정해졌는지를 NXT 체결과 섞지 않고 본다(09:00 이후 첫 KRX 체결).
+    "20": "trade_time",
+    "9081": "trade_ex",
     # 전일거래량대비(주). 누적거래량에서 빼면 전일거래량이 그대로 나온다.
     # FID 30(비율)은 소수 2자리 반올림이라 역산에 오차가 있고, 동시호가엔
     # 오늘 거래량이 0이라 역산 자체가 0이 된다. 뺄셈은 둘 다 겪지 않는다.
@@ -131,6 +135,9 @@ def parse_real_item(item: dict) -> tuple[str, dict]:
     for fid, raw in values.items():
         field = table.get(fid)
         if not field:
+            continue
+        if field == "trade_ex":            # 'KRX' / 'NXT' 글자 그대로
+            out[field] = str(raw or "").strip().upper()
             continue
         n = _num(raw)
         if field == "acc_value":

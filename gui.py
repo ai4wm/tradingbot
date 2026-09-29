@@ -554,7 +554,8 @@ TIER_NO_ASK = 5        # 거래 중인데 매도호가가 빈 종목 (상한가 
 TIER_PLAIN = 6         # 그 밖의 일반 종목
 
 
-def _limit_tier(d: dict, liquidation: bool = False) -> int:
+def _limit_tier(d: dict, liquidation: bool = False,
+                krx_opened: bool | None = None) -> int:
     """상한가정렬 우선순위.
 
     정리매매 종목은 맨 아래로 보낸다. 가격제한폭이 없어 '상한가'라는 개념
@@ -590,12 +591,17 @@ def _limit_tier(d: dict, liquidation: bool = False) -> int:
     expected_limit = d["exp_price"] > 0 and (
         d["exp_price"] >= d["upper"] if d["upper"] > 0 else d["exp_rate"] >= LIMIT
     )
-    if expected_limit and not d["rate"]:
+    # 「아직 KRX 시가 전」. KRX 모드는 등락률 0이 그 신호다. 통합 모드는 NXT
+    # 체결이 등락률을 먼저 채우므로(2026-09-29 NXT 프리마켓 +25%) 09:00 이후
+    # KRX 체결이 왔는지로 본다(`StockModel.krx_open_state`). 매도·매수잔량은
+    # 통합 그대로 — KRX·NXT 둘 다 매도 0인 종목만 줄 위에 오른다.
+    preopen = not d["rate"] if krx_opened is None else not krx_opened
+    if expected_limit and preopen:
         # 매수잔량까지 있어야 점상 대기다. 양쪽 다 비어 있으면 호가가 아직
         # 안 들어온 것이라 같은 자리에 두면 안 된다.
         return (TIER_WAIT_CLEAN
                 if d["ask_qty"] == 0 and d["bid_qty"] > 0 else TIER_WAIT)
-    if not d["rate"] and d["exp_price"] > 0:
+    if preopen and d["exp_price"] > 0:
         # 예상값까지 있어야 장 시작 전이다. 등락률 0만 보면 시초가가 전일종가와
         # 같은 종목이 하루 종일 대기열에 남는다. 예상값은 체결이 재개되면
         # 모델이 끄므로, 세 대기 묶음이 09:03 이후 함께 사라진다.
@@ -979,8 +985,8 @@ class TieredProxy(QSortFilterProxyModel):
             m = self.sourceModel()
             code_a, code_b = m.codes[left.row()], m.codes[right.row()]
             a, b = m.rows[code_a], m.rows[code_b]
-            ta = _limit_tier(a, code_a in m.liquidation)
-            tb = _limit_tier(b, code_b in m.liquidation)
+            ta = _limit_tier(a, code_a in m.liquidation, m.krx_open_state(code_a))
+            tb = _limit_tier(b, code_b in m.liquidation, m.krx_open_state(code_b))
             desc = self.sortOrder() == Qt.DescendingOrder
             if ta != tb:  # 우선순위 그룹 순서는 현재 정렬방향과 무관하게 고정
                 return ta > tb if desc else ta < tb
@@ -1076,7 +1082,8 @@ class ThemeGroupedTableView(QTableView):
             if not source_index.isValid():
                 break
             code = source.codes[source_index.row()]
-            tier = _limit_tier(source.rows[code], code in source.liquidation)
+            tier = _limit_tier(source.rows[code], code in source.liquidation,
+                               source.krx_open_state(code))
             if waiting and tier == TIER_WAIT_CLEAN:
                 jumsang.add(code)
             if code in proxy.pinned:
@@ -1168,6 +1175,9 @@ class StockModel(QAbstractTableModel):
         self.single: set[str] = set()        # 단일가 매매 종목: 예상값 상시 표시 (main 주입)
         self.short_overheat: set[str] = set()  # 단기과열 30분 단일가: 종목명 주황 배경
         self.liquidation: set[str] = set()   # 정리매매: 가격제한폭 없음 (main 주입)
+        self.unified = False                  # 통합 시세 모드 (main 주입)
+        self.krx_opened: set[str] = set()     # 오늘 09:00 이후 KRX 체결이 온 종목
+        self._krx_opened_day = ""
         self.nxt: set[str] = set()           # 넥스트레이드(NXT) 거래가능: 종목명 제외 배경 (main 주입)
         self.misu: set[str] = set()          # 미수가능(증거금<100%): 우상단 녹색 삼각형 (main 주입)
         self.admin: set[str] = set()         # 관리종목: 종목명 경고색 (코스닥보다 우선, main 주입)
@@ -1362,6 +1372,19 @@ class StockModel(QAbstractTableModel):
             cell = self.index(row, AUTO_CANCEL_ARM_COL)
             self.dataChanged.emit(cell, cell)
 
+    def _touch_krx_day(self):
+        today = time.strftime("%Y%m%d")
+        if self._krx_opened_day != today:
+            self._krx_opened_day = today
+            self.krx_opened.clear()
+
+    def krx_open_state(self, code: str) -> bool | None:
+        """통합 모드에서 오늘 KRX 시가가 정해졌는가. KRX 모드는 None(등락률로 본다)."""
+        if not self.unified:
+            return None
+        self._touch_krx_day()
+        return code in self.krx_opened
+
     def set_vi(self, code: str, active: bool, price: int = 0):
         if active and price:  # 발동가로 즉시 채움, 이후 틱이 덮어씀
             self.update_stock(code, {"exp_price": price, "exp_hot": 1})
@@ -1374,6 +1397,14 @@ class StockModel(QAbstractTableModel):
         row = self.codes.index(code)
         stored = self.rows[code]
         tick_qty = fields.get("tick_qty")  # STORED 필터 전에 보존: +매수체결 / -매도체결
+        # 09:00 이후 KRX 체결 = KRX 시가가 정해졌다. NXT로 표시된 체결만 뺀다
+        # — 거래소 칸이 빠진 틱은 KRX로 본다(예전 동작 쪽으로 기울게).
+        # 09:00 전 KRX 체결은 장전 시간외(전일 종가)라 시가가 아니다.
+        krx_tick = (float(fields.get("trade_time") or 0) >= 90000
+                    and fields.get("trade_ex") != "NXT")
+        if krx_tick:
+            self._touch_krx_day()
+            self.krx_opened.add(code)
         real_type = str(fields.get("_real_type") or "")
         volume_source = (
             str(fields.get("_real_suffix") or "")
@@ -1402,7 +1433,8 @@ class StockModel(QAbstractTableModel):
                 fields.pop("exp_qty", None)
             # 이미 켜진(VI/단일가) 종목의 0D값은 그대로 통과 -> 실시간 갱신
         if (code in self._exp_live and code not in self.single
-                and "exp_price" not in fields and fields.get("vol", 0) > stored["vol"]):
+                and "exp_price" not in fields and fields.get("vol", 0) > stored["vol"]
+                and (krx_tick or not self.unified)):  # 통합은 NXT 체결로 안 끈다
             self._exp_live.discard(code)  # 체결 재개 = 국면 종료 (단일가 종목은 유지)
             fields["exp_price"], fields["exp_qty"] = 0, 0
             log.info("expOFF %s vol", code)
@@ -5115,8 +5147,8 @@ class ConditionScreen(QWidget):
         if self._bidqty_probe_on and "bid_qty" in fields:
             stored = self.model.rows.get(code)
             if stored is not None and _limit_tier(
-                    stored,
-                    code in self.model.liquidation) == TIER_WAIT_CLEAN:
+                    stored, code in self.model.liquidation,
+                    self.model.krx_open_state(code)) == TIER_WAIT_CLEAN:
                 self._bidqty_probe.append(
                     (time.time(), code, stored["bid_qty"], stored["ask_qty"]))
         # 0D는 매도쪽만, 0B는 체결만 바뀌어도 온다. 둘 중 하나가 실린 틱만

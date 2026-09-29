@@ -1963,6 +1963,8 @@ class App:
         self.rest.suffix = "_AL" if on else ""  # watch_info 백필도 같은 소스로
         # WS가 기존 조건을 해제한 뒤 A(통합)/K(KRX)로 즉시 재등록한다.
         asyncio.ensure_future(self.ws.set_real_suffix("_AL" if on else ""))
+        for v in self.views:
+            v.screen.model.unified = on
         for v in self.views:  # 전 종목 시세 강제 재백필: 편입 diff 없어도 KRX<->통합 값 교체
             v._schedule_refresh()
 
@@ -2125,6 +2127,7 @@ class App:
 
     def _inject_market(self, view: View):
         m = view.screen.model
+        m.unified = self.rest.suffix == "_AL"   # 통합 모드 점상 판정(krx_open_state)
         if self._limit_cnt is not None:
             m.limit_cnt = self._limit_cnt
             m.refresh_streaks()
