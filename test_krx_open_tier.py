@@ -78,7 +78,43 @@ def demo_model():
     print("ok (NXT 체결은 무시, 09:00 이후 KRX 체결에 시가)")
 
 
+def demo_krx_vi_marks_open():
+    """재실행·편입 직후 KRX 체결 전에 VI가 걸려도 시가를 가린다(2026-09-29)."""
+    QApplication.instance() or QApplication([])
+    m = gui.StockModel()
+    m.unified = True
+    m.add_stock("047920", {"name": "HLB제약", "base": 9620})
+    m.add_stock("131100", {"name": "티엔엔터테인먼트", "base": 2860})
+
+    m.note_krx_vi("047920", True, "정적", 9620)        # 시가 VI 발동: 시가 전
+    assert m.krx_open_state("047920") is False
+    m.note_krx_vi("047920", False, "정적", 9620)       # 해제 = KRX 시가
+    assert m.krx_open_state("047920") is True
+
+    m.note_krx_vi("131100", True, "정적", 3040)        # 장중 VI: 이미 거래 중
+    assert m.krx_open_state("131100") is True
+
+    m.single.add("131100")                               # 단일가 종목은 등락률로
+    assert m.krx_open_state("131100") is None
+    print("ok (KRX VI: 시가 VI는 그대로, 장중 VI·해제는 시가 정해짐)")
+
+
+def demo_ws_routes_only_krx_vi():
+    client = ws.WSClient()
+    got = []
+    client.on_krx_vi = lambda *a: got.append(a)
+    client._log_vi_raw = lambda *a: None
+    for item in ("047920_NX", "047920_AL", "047920"):
+        client._on_vi({"values": {
+            "9001": item, "1221": "12500", "1223": "090013", "1224": "000000",
+            "1225": "정적", "1236": "9620", "1238": "+29.94"}})
+    assert got == [("047920", True, "정적", 9620)], got
+    print("ok (NXT·통합 사본은 넘기지 않고 KRX VI만)")
+
+
 if __name__ == "__main__":
     demo_tier()
     demo_parse()
     demo_model()
+    demo_krx_vi_marks_open()
+    demo_ws_routes_only_krx_vi()

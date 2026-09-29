@@ -1379,11 +1379,36 @@ class StockModel(QAbstractTableModel):
             self.krx_opened.clear()
 
     def krx_open_state(self, code: str) -> bool | None:
-        """통합 모드에서 오늘 KRX 시가가 정해졌는가. KRX 모드는 None(등락률로 본다)."""
-        if not self.unified:
+        """통합 모드에서 오늘 KRX 시가가 정해졌는가. KRX 모드는 None(등락률로 본다).
+
+        단일가 종목도 None이다. 예상체결가가 늘 켜져 있어, 재실행 뒤 다음
+        단일가 체결(최대 30분)까지 「시가 전」으로 맨 위에 앉는다.
+        """
+        if not self.unified or code in self.single:
             return None
         self._touch_krx_day()
         return code in self.krx_opened
+
+    def note_krx_vi(self, code: str, active: bool, kind: str,
+                    static_base: int):
+        """KRX VI로 KRX 시가가 정해졌는지 가린다(통합 모드 점상 판정).
+
+        체결 틱만 보면 재실행·편입 직후 KRX 체결이 오기 전에 VI가 걸린 종목을
+        「시가 전」으로 읽어 맨 위로 올렸다(2026-09-29 10:49 티엔엔터테인먼트 —
+        장중 정적VI 중 예상체결가가 켜져 상한가 종목들 위에 앉았다).
+
+        - **시가 VI 발동**(정적, 기준가 = 오늘 기준가): 아직 시가 전. 두지 않는다.
+          점상 대기 시간이다(HLB제약 09:00:13, 기준 9,620).
+        - **그 밖의 발동**(동적VI, 장중 정적VI): KRX가 이미 거래 중이다.
+          티엔엔터테인먼트는 정적 기준 3,040 ≠ 오늘 기준가 2,860이었다.
+        - **해제**: 시가가 정해졌거나 체결이 재개됐다.
+        기준가를 아직 모르면 시가 VI로 보고 두지 않는다 — 해제 때 기록된다.
+        """
+        base = int(self.rows.get(code, {}).get("base") or 0)
+        if active and kind == "정적" and (not base or static_base == base):
+            return
+        self._touch_krx_day()
+        self.krx_opened.add(code)
 
     def set_vi(self, code: str, active: bool, price: int = 0):
         if active and price:  # 발동가로 즉시 채움, 이후 틱이 덮어씀
@@ -3250,6 +3275,7 @@ class ConditionScreen(QWidget):
     emergency_exit_requested = Signal(str, int, bool)
     order_status_acknowledged = Signal(str)
     exit_hotkey_changed = Signal(str, object)
+    exit_hotkeys_clear_all_requested = Signal()   # 모든 창의 청산키 해제
     balance_sell_changed = Signal(str, object)
     account_auto_cancel_changed = Signal(str, bool)
     watch_toggled = Signal(str, bool)
@@ -3808,7 +3834,9 @@ class ConditionScreen(QWidget):
         # 컬럼 줄에서 찾는 게 자연스럽다. 표 본문 우클릭도 같은 메뉴를 연다.
         hdr.setContextMenuPolicy(Qt.CustomContextMenu)
         hdr.customContextMenuRequested.connect(
-            lambda pos: self._show_column_menu(hdr.mapToGlobal(pos)))
+            lambda pos: self._show_column_menu(
+                hdr.mapToGlobal(pos),
+                hdr.logicalIndexAt(pos) == EXIT_HOTKEY_COL))
         hdr.sectionResized.connect(lambda *a: self._save_timer.start(400))
         hdr.sectionMoved.connect(lambda *a: self._save_timer.start(400))
 
@@ -4833,9 +4861,11 @@ class ConditionScreen(QWidget):
                 f"https://stock.naver.com/domestic/stock/{code}"
                 f"/discussion?filter=all"))
             return
-        self._show_column_menu(self.table.viewport().mapToGlobal(pos))
+        self._show_column_menu(
+            self.table.viewport().mapToGlobal(pos),
+            index.isValid() and index.column() == EXIT_HOTKEY_COL)
 
-    def _show_column_menu(self, at):
+    def _show_column_menu(self, at, hotkeys: bool = False):
         """보이는 열을 체크로 고른다. 숨긴 열도 목록에 남아 되살릴 수 있다.
 
         헤더가 아니라 표에서 여는 이유는 열을 다 숨겨도 메뉴에 닿기 위해서다.
@@ -4844,6 +4874,15 @@ class ConditionScreen(QWidget):
         columns = [col for col in range(len(FIELDS)) if col not in RANK_COLS]
         shown = [col for col in columns if not self.table.isColumnHidden(col)]
         menu = QMenu(self)
+        if hotkeys:
+            # 청산키 자리에서만 맨 위에 둔다. 우클릭은 원래 열 메뉴라 그대로 두고
+            # 한 줄만 더한다. 안 보이는 창에 걸린 키까지 한 번에 푸는 탈출구다
+            # (2026-09-29 486510 F1이 조건에서 빠진 창에 남아 있었다).
+            count = int(self.exit_hotkey_count())
+            clear_all = menu.addAction(f"청산키 전부 해제 ({count}개)")
+            clear_all.setEnabled(count > 0)
+            clear_all.triggered.connect(self.exit_hotkeys_clear_all_requested.emit)
+            menu.addSeparator()
         for col in columns:
             action = menu.addAction(COLUMNS[col])
             action.setCheckable(True)
@@ -4855,6 +4894,10 @@ class ConditionScreen(QWidget):
                 lambda checked, target=col:
                 self._set_column_visible(target, checked))
         menu.exec(at)
+
+    def exit_hotkey_count(self) -> int:
+        """모든 창에 걸린 청산키 수. main이 모든 창을 세는 함수로 바꿔 끼운다."""
+        return len(self.model.exit_hotkeys)
 
     def _set_column_visible(self, col: int, visible: bool):
         """열을 감추거나 되살리고 현재 배치 프로필에 남긴다."""
@@ -5100,9 +5143,15 @@ class ConditionScreen(QWidget):
         self._remove_excluded(code)
 
     def _holds_excluded_row(self, code: str) -> bool:
-        """조건에서 빠져도 행을 남겨야 하는 종목인지."""
+        """조건에서 빠져도 행을 남겨야 하는 종목인지.
+
+        청산키도 붙잡는다. 행이 지워지면 키는 전역으로 살아 있는데 풀 칸이
+        사라져, 비어 있는 줄 알고 누르면 그 종목이 청산된다(2026-09-29
+        486510: 창 2에서 빠진 채 F1이 남아 있었다).
+        """
         return (code in self.model.order_cancellable
-                or code in self.model.balance_sell_settings)
+                or code in self.model.balance_sell_settings
+                or code in self.model.exit_hotkeys)
 
     def _release_excluded(self, code: str):
         """붙잡아 둔 사유가 사라졌으면 그때 행을 지운다."""

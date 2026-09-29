@@ -47,6 +47,9 @@ class FakeScreen:
 
     refresh_exit_hotkey_cell = _refresh_exit_hotkey_cell
 
+    def _release_excluded(self, code):
+        pass
+
 
 class FakeHotkeys:
     def __init__(self, ok, refuse=()):

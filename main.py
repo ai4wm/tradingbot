@@ -940,6 +940,14 @@ class View:
 
     # --- 편입/이탈 ---------------------------------------------------------
     def on_snapshot(self, codes: list[str]):
+        # 이 창에 청산키가 걸린 종목은 조건에서 빠졌어도 행을 둔다. 재실행하면
+        # 키는 저장분으로 되살아나는데 행이 없어, 풀 칸 없는 키가 됐다
+        # (2026-09-29 486510 F1). 키를 풀면 `_release_excluded`가 지운다.
+        held = [c for c in (self.app._exit_hotkey_specs.get(self.prefix) or {})
+                if c not in codes]
+        if held:
+            self.screen._excluded_with_orders.update(held)
+            codes = list(codes) + held
         cur = set(self.screen.model.codes)
         new = set(codes)
         for code in cur - new:
@@ -960,7 +968,8 @@ class View:
             # 실시간 종목 등록은 현재 모든 창의 모델을 기준으로 한 번만 동기화한다.
             self.app.queue_real("", add=True, suffix=self._real_suffix())
             self._schedule_refresh()
-            self._maybe_beep()
+            if set(added) - set(held):   # 청산키로 붙잡은 행은 편입 알림이 아니다
+                self._maybe_beep()
         log.info("snapshot%s: %d codes (+%d/-%d) %s", self.prefix or " ",
                  len(new), len(added), len(cur - new), ",".join(sorted(new)))
 
@@ -1260,6 +1269,7 @@ class App:
         self.ws.on_condition_snapshot = self._on_condition_snapshot
         self.ws.on_real = self._on_real
         self.ws.on_vi = self._on_vi
+        self.ws.on_krx_vi = self._on_krx_vi
         self.ws.on_order = self._on_account_order_event
         self.ws.on_connected = self._on_ws_connected
         # 통합 시세·조건검색: 전 창 공통 설정. 첫 REG/CNSRREQ 전에 확정한다.
@@ -1333,6 +1343,9 @@ class App:
         screen.exit_hotkey_changed.connect(
             lambda code, spec, source=screen:
             self._set_global_exit_hotkey(source, code, spec))
+        screen.exit_hotkeys_clear_all_requested.connect(
+            self._clear_all_exit_hotkeys)
+        screen.exit_hotkey_count = self._exit_hotkey_count
         screen.emergency_exit_requested.connect(self._emergency_exit)
         screen.order_status_acknowledged.connect(
             self._acknowledge_order_status)
@@ -1367,6 +1380,9 @@ class App:
             self._global_hotkeys.unregister(token)
             self._exit_hotkey_specs.get(screen.prefix, {}).pop(code, None)
             self._clear_hotkey_conflict(code)
+            # 청산키 때문에 붙잡아 둔 행이면 이제 놓는다.
+            screen.model.exit_hotkeys.pop(code, None)
+            screen._release_excluded(code)
             if persist:
                 self._save_order_settings()
             audit_log.info(
@@ -1415,8 +1431,11 @@ class App:
         후보로 넘어갑니다. 다만 **키보드 후킹 방식 매크로는 거부되지
         않습니다** — 그런 키는 `AUTO_EXIT_HOTKEY_LABELS`에서 빼야 합니다.
         """
-        if code in (self._exit_hotkey_specs.get(screen.prefix) or {}):
-            return  # 이미 걸려 있다. 손으로 고른 키를 덮지 않는다.
+        if any(code in specs for specs in self._exit_hotkey_specs.values()):
+            # 이미 걸려 있다(다른 창이어도). 한 종목에 키는 하나다 — 어느 키든
+            # 같은 종목을 청산하는데 창마다 걸면 F1·F5가 한 종목에 붙어 키만
+            # 쓴다(2026-09-29 486510). 손으로 고른 키도 덮지 않는다.
+            return
         taken = {
             str(spec.get("label") or "")
             for specs in self._exit_hotkey_specs.values()
@@ -1437,6 +1456,30 @@ class App:
         log.warning(
             "auto exit hotkey unavailable code=%s candidates=%s",
             code, ",".join(AUTO_EXIT_HOTKEY_LABELS))
+
+    def _exit_hotkey_count(self) -> int:
+        """모든 창에 걸린 청산키 수. 안 보이는 창의 키도 센다."""
+        return sum(len(specs) for specs in self._exit_hotkey_specs.values())
+
+    def _clear_all_exit_hotkeys(self):
+        """모든 창의 청산키를 한 번에 푼다. 청산키 칸 우클릭 메뉴에서 부른다.
+
+        창마다 따로 걸리고, 조건에서 빠진 창에 남은 키는 풀 칸이 안 보일 수
+        있었다(2026-09-29 486510 F1). 저장은 끝에 한 번만 한다.
+        """
+        cleared = 0
+        for view in self.views:
+            screen = view.screen
+            for code in list(self._exit_hotkey_specs.get(screen.prefix) or {}):
+                screen.model.exit_hotkeys.pop(code, None)
+                screen.refresh_exit_hotkey_cell(code)
+                self._set_global_exit_hotkey(screen, code, None, persist=False)
+                cleared += 1
+        # 닫힌 창 몫(등록은 안 됐지만 저장분에 남은 것)도 비운다.
+        cleared += sum(len(specs) for specs in self._exit_hotkey_specs.values())
+        self._exit_hotkey_specs.clear()
+        self._save_order_settings()
+        log.warning("all exit hotkeys cleared: %d", cleared)
 
     def _clear_exit_hotkey(self, code: str):
         """걸려 있던 청산키를 내린다. 창마다 따로 걸리므로 전부 본다."""
@@ -2809,10 +2852,11 @@ class App:
         self._push_pending_orders(code)
 
     def _auto_assign_exit_hotkey_everywhere(self, code: str):
-        """그 종목이 떠 있는 창마다 청산키를 건다. 이미 걸린 창은 건너뛴다."""
+        """그 종목이 떠 있는 첫 창에 청산키를 건다. 한 종목에 키는 하나다."""
         for view in self.views:
             if code in view.screen.model.rows:
                 self._auto_assign_exit_hotkey(view.screen, code)
+                return
 
     def _track_open_sell(self, code: str, order_no: str, event: dict):
         """매도 이벤트: 미체결 매도와 보유·매도가능 수량을 갱신한다."""
@@ -4107,6 +4151,11 @@ class App:
         if active and hit:
             asyncio.ensure_future(self._vi_fetch(code))
 
+    def _on_krx_vi(self, code: str, active: bool, kind: str, static_base: int):
+        for v in self.views:
+            if code in v.screen.model.rows:
+                v.screen.model.note_krx_vi(code, active, kind, static_base)
+
     async def _vi_fetch(self, code: str):
         try:
             for row in await self.rest.watch_info([code], exp=True):
@@ -4482,6 +4531,9 @@ class App:
         screen.exit_hotkey_changed.connect(
             lambda code, spec, source=screen:
             self._set_global_exit_hotkey(source, code, spec))
+        screen.exit_hotkeys_clear_all_requested.connect(
+            self._clear_all_exit_hotkeys)
+        screen.exit_hotkey_count = self._exit_hotkey_count
         screen.emergency_exit_requested.connect(self._emergency_exit)
         screen.order_status_acknowledged.connect(
             self._acknowledge_order_status)

@@ -141,6 +141,9 @@ class _HotkeyScreen:
     def refresh_exit_hotkey_cell(self, code):
         pass
 
+    def _release_excluded(self, code):
+        pass
+
     def set_pending_orders(self, *args, **kwargs):
         pass
 

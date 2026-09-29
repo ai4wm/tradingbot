@@ -23,6 +23,7 @@ class Model:
     def __init__(self):
         self.order_cancellable: set[str] = set()
         self.balance_sell_settings: dict[str, dict] = {}
+        self.exit_hotkeys: dict[str, tuple] = {}   # 청산키도 행을 붙잡는다
         self.removed: list[str] = []
         self.order_status: dict[str, str] = {}
 

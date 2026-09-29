@@ -218,6 +218,7 @@ class WSClient:
         self.on_condition_once = None      # (seq, list[code]) - 일반 1회 조회
         self.on_real = None               # (code, fields)
         self.on_vi = None                 # (code, active, 발동가) - VI 발동/해제
+        self.on_krx_vi = None             # (code, active, 정적/동적, 정적 기준가) - KRX VI만
         self.on_order = None              # type=00 주문접수/체결/취소
         self.on_condition_list = None     # (list[(seq, name)])
         self.on_connected = None          # () - 로그인+주문체결 등록 직후 1회
@@ -553,6 +554,14 @@ class WSClient:
         self._log_vi_raw(code, mine, v)
         if code and self.on_vi and self._vi_first_time(code, v):
             self.on_vi(code, _vi_active(v), int(abs(_num(v.get("1221")))))
+        # 같은 VI가 거래소별로 따로 온다 — 접미사 없는 9001이 KRX, `_NX`가 NXT,
+        # `_AL`은 통합 사본(2026-09-29 047920: 08:02 `_NX`, 09:00:13 KRX+`_AL`).
+        # 위 중복 접기는 먼저 온 한 벌만 넘겨 거래소를 잃으므로 KRX 것은 따로
+        # 알린다. 통합 모드 점상 판정이 KRX 시가가 정해졌는지 여기서 본다.
+        raw = str(v.get("9001") or "")
+        if code and "_" not in raw and self.on_krx_vi:
+            self.on_krx_vi(code, _vi_active(v), str(v.get("1225") or ""),
+                           int(abs(_num(v.get("1236")))))
 
     def _vi_first_time(self, code: str, values: dict) -> bool:
         """같은 이벤트를 두 번째로 받은 것이면 False.
