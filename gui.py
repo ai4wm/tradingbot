@@ -554,6 +554,11 @@ TIER_NO_ASK = 5        # 거래 중인데 매도호가가 빈 종목 (상한가 
 TIER_PLAIN = 6         # 그 밖의 일반 종목
 
 
+class _DaySet(set):
+    """그날 날짜를 함께 들고 다니는 집합. 날짜가 바뀌면 비운다."""
+    day = ""
+
+
 def _limit_tier(d: dict, liquidation: bool = False,
                 krx_opened: bool | None = None) -> int:
     """상한가정렬 우선순위.
@@ -1171,13 +1176,17 @@ class StockModel(QAbstractTableModel):
         # 0D 23/24는 연속매매 중에도 값이 미세하게 변하며 옴 -> ON 신호로 쓰면 오탐(012160 영흥).
         # 켜진 뒤엔 0D값으로 갱신은 허용. 끄기는 exp_price=0 / 체결재개(거래량↑) / VI해제.
         self._exp_live: set[str] = set()     # 예상 컬럼 표시중
+        # 일봉으로 받은 전일거래량(main 주입). 틱·조회로 계산한 값의 기준이다.
+        self.prev_vol_ref: dict[str, int] = {}
+        self._prev_vol_warned: dict[str, float] = {}
         self.kosdaq: set[str] = set()        # 코스닥 코드 집합 (main이 시작 시 주입)
         self.single: set[str] = set()        # 단일가 매매 종목: 예상값 상시 표시 (main 주입)
         self.short_overheat: set[str] = set()  # 단기과열 30분 단일가: 종목명 주황 배경
         self.liquidation: set[str] = set()   # 정리매매: 가격제한폭 없음 (main 주입)
         self.unified = False                  # 통합 시세 모드 (main 주입)
-        self.krx_opened: set[str] = set()     # 오늘 09:00 이후 KRX 체결이 온 종목
-        self._krx_opened_day = ""
+        # 오늘 KRX 시가가 정해진 종목. 모든 창이 하나를 나눠 쓴다(main 주입)
+        # — 날짜도 함께 들고 다녀야 한 창이 남의 기록을 지우지 않는다.
+        self.krx_opened = _DaySet()
         self.nxt: set[str] = set()           # 넥스트레이드(NXT) 거래가능: 종목명 제외 배경 (main 주입)
         self.misu: set[str] = set()          # 미수가능(증거금<100%): 우상단 녹색 삼각형 (main 주입)
         self.admin: set[str] = set()         # 관리종목: 종목명 경고색 (코스닥보다 우선, main 주입)
@@ -1374,8 +1383,8 @@ class StockModel(QAbstractTableModel):
 
     def _touch_krx_day(self):
         today = time.strftime("%Y%m%d")
-        if self._krx_opened_day != today:
-            self._krx_opened_day = today
+        if self.krx_opened.day != today:
+            self.krx_opened.day = today
             self.krx_opened.clear()
 
     def krx_open_state(self, code: str) -> bool | None:
@@ -1389,26 +1398,69 @@ class StockModel(QAbstractTableModel):
         self._touch_krx_day()
         return code in self.krx_opened
 
-    def note_krx_vi(self, code: str, active: bool, kind: str,
-                    static_base: int):
+    def note_krx_vi(self, code: str, active: bool, kind: str, fired_at: str):
         """KRX VI로 KRX 시가가 정해졌는지 가린다(통합 모드 점상 판정).
 
-        체결 틱만 보면 재실행·편입 직후 KRX 체결이 오기 전에 VI가 걸린 종목을
-        「시가 전」으로 읽어 맨 위로 올렸다(2026-09-29 10:49 티엔엔터테인먼트 —
-        장중 정적VI 중 예상체결가가 켜져 상한가 종목들 위에 앉았다).
+        **시장 전체의 KRX VI를 받는다**(main이 화면에 없는 종목도 넘긴다).
+        화면에 있을 때만 반영하던 시절엔 VI가 걸린 채 편입된 종목을 「시가
+        전」으로 읽어 상한가 줄 위에 올렸다(2026-09-30 09:11 금강철강·
+        KBI동양철관 — VI 발동이 편입보다 먼저 지나갔다).
 
-        - **시가 VI 발동**(정적, 기준가 = 오늘 기준가): 아직 시가 전. 두지 않는다.
-          점상 대기 시간이다(HLB제약 09:00:13, 기준 9,620).
-        - **그 밖의 발동**(동적VI, 장중 정적VI): KRX가 이미 거래 중이다.
-          티엔엔터테인먼트는 정적 기준 3,040 ≠ 오늘 기준가 2,860이었다.
-        - **해제**: 시가가 정해졌거나 체결이 재개됐다.
-        기준가를 아직 모르면 시가 VI로 보고 두지 않는다 — 해제 때 기록된다.
+        - **시가 VI 발동**: 아직 시가 전. KRX 시가는 09:00:00~09:00:30
+          (랜덤엔드)에 한 번 정해지므로 발동 시각(`1223`)이 그 안이면 시가
+          VI다(2026-09-29 전부 이 구간). 기준가를 몰라도 가릴 수 있다 —
+          편입 직후엔 기준가가 아직 없을 때가 있다.
+        - **그 밖의 발동**(장중 VI, 동적VI)과 **해제**: 시가가 정해졌다.
         """
-        base = int(self.rows.get(code, {}).get("base") or 0)
-        if active and kind == "정적" and (not base or static_base == base):
+        opening = active and kind == "정적" and "090000" <= fired_at <= "090030"
+        if opening:
             return
         self._touch_krx_day()
         self.krx_opened.add(code)
+
+    PREV_VOL_BAND = 5   # NXT 종목 통합 전일거래량의 상한: 일봉(KRX)값의 5배
+
+    def _guard_prev_vol(self, code: str, fields: dict):
+        """틱·조회로 계산한 전일거래량이 일봉값과 동떨어지면 버린다.
+
+        전일거래량은 하루 동안 바뀌지 않는데 틱(누적거래량 − FID 26)과
+        조회(오늘 거래량 ÷ 전일대비율)로 매번 다시 계산한다. 2026-09-30
+        윈팩(097800, 정답 619,917주)이 처음 600,000주 — 오늘 거래량이 적어
+        비율이 소수 둘째 자리에서 뭉개졌다 — 로 떴다가 60,619,847주로
+        덮였다(오늘 거래량에 어제 거래량을 빼야 할 것을 더한 모양).
+
+        - KRX 전용 종목이거나 KRX 모드: **일봉값만 쓴다.** 계산값은 버린다.
+        - NXT 종목·통합 모드: 통합 전일거래량은 KRX 일봉값보다 크다(2026-09-28
+          HLB 34만 → 86만). **일봉값 이상 5배 이하**만 받는다.
+        """
+        if "prev_vol" not in fields:
+            return
+        ref = int(self.prev_vol_ref.get(code) or 0)
+        value = int(fields.get("prev_vol") or 0)
+        if not ref or not value or self._prev_vol_ok(code, value, ref):
+            return
+        fields.pop("prev_vol")
+        now = time.monotonic()
+        if now - self._prev_vol_warned.get(code, 0.0) >= 60:
+            self._prev_vol_warned[code] = now
+            log.warning(
+                "prev_vol rejected code=%s value=%s ref=%s vol=%s src=%s ex=%s",
+                code, value, ref, fields.get("vol"),
+                fields.get("_real_suffix", "rest"), fields.get("trade_ex", ""))
+
+    def _prev_vol_ok(self, code: str, value: int, ref: int) -> bool:
+        if self.unified and code in self.nxt:
+            return ref <= value <= ref * self.PREV_VOL_BAND
+        return value == ref
+
+    def set_prev_vol_ref(self, code: str, ref: int) -> bool:
+        """일봉 전일거래량을 기준으로 둔다. 화면 값을 일봉값으로 바꿔 끼울지
+        (True)를 돌려준다 — 비었거나 `_prev_vol_ok`를 못 넘으면 바꾼다."""
+        if not ref:
+            return False
+        self.prev_vol_ref[code] = int(ref)
+        current = int(self.rows.get(code, {}).get("prev_vol") or 0)
+        return not current or not self._prev_vol_ok(code, current, int(ref))
 
     def set_vi(self, code: str, active: bool, price: int = 0):
         if active and price:  # 발동가로 즉시 채움, 이후 틱이 덮어씀
@@ -1440,6 +1492,7 @@ class StockModel(QAbstractTableModel):
             self._ingest_program(
                 code, fields["program_buy_qty"], fields["program_sell_qty"],
                 fields.get("_program_source", ""), time.monotonic())
+        self._guard_prev_vol(code, fields)
         hot = fields.get("exp_hot", 0) or code in self.single  # 0H발/단일가종목 = 국면 확정
         fields = {f: v for f, v in fields.items() if f in STORED}  # 모르는 키 무시
         if fields.get("prev_vol") == 0 and stored.get("prev_vol"):

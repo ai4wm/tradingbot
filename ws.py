@@ -218,7 +218,7 @@ class WSClient:
         self.on_condition_once = None      # (seq, list[code]) - 일반 1회 조회
         self.on_real = None               # (code, fields)
         self.on_vi = None                 # (code, active, 발동가) - VI 발동/해제
-        self.on_krx_vi = None             # (code, active, 정적/동적, 정적 기준가) - KRX VI만
+        self.on_krx_vi = None             # (code, active, 정적/동적, 발동시각 HHMMSS) - KRX VI만
         self.on_order = None              # type=00 주문접수/체결/취소
         self.on_condition_list = None     # (list[(seq, name)])
         self.on_connected = None          # () - 로그인+주문체결 등록 직후 1회
@@ -561,7 +561,7 @@ class WSClient:
         raw = str(v.get("9001") or "")
         if code and "_" not in raw and self.on_krx_vi:
             self.on_krx_vi(code, _vi_active(v), str(v.get("1225") or ""),
-                           int(abs(_num(v.get("1236")))))
+                           str(v.get("1223") or ""))
 
     def _vi_first_time(self, code: str, values: dict) -> bool:
         """같은 이벤트를 두 번째로 받은 것이면 False.

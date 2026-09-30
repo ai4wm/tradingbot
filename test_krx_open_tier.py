@@ -79,24 +79,39 @@ def demo_model():
 
 
 def demo_krx_vi_marks_open():
-    """재실행·편입 직후 KRX 체결 전에 VI가 걸려도 시가를 가린다(2026-09-29)."""
+    """KRX VI로 시가를 가린다. 발동 시각이 09:00:00~09:00:30이면 시가 VI."""
     QApplication.instance() or QApplication([])
     m = gui.StockModel()
     m.unified = True
     m.add_stock("047920", {"name": "HLB제약", "base": 9620})
-    m.add_stock("131100", {"name": "티엔엔터테인먼트", "base": 2860})
 
-    m.note_krx_vi("047920", True, "정적", 9620)        # 시가 VI 발동: 시가 전
+    m.note_krx_vi("047920", True, "정적", "090013")     # 시가 VI 발동: 시가 전
     assert m.krx_open_state("047920") is False
-    m.note_krx_vi("047920", False, "정적", 9620)       # 해제 = KRX 시가
+    m.note_krx_vi("047920", False, "정적", "090013")    # 해제 = KRX 시가
     assert m.krx_open_state("047920") is True
 
-    m.note_krx_vi("131100", True, "정적", 3040)        # 장중 VI: 이미 거래 중
-    assert m.krx_open_state("131100") is True
+    # 2026-09-30 09:11 금강철강: 장중 VI가 편입보다 먼저 지나갔다. 화면에
+    # 없을 때 받은 VI도 기록해 두었다가 편입되면 그대로 본다.
+    m.note_krx_vi("014285", True, "정적", "091002")      # 아직 행 없음
+    m.add_stock("014285", {"name": "금강철강"})
+    assert m.krx_open_state("014285") is True
+    m.note_krx_vi("000001", True, "동적", "090010")     # 동적VI = 장중
+    assert m.krx_open_state("000001") is True
 
-    m.single.add("131100")                               # 단일가 종목은 등락률로
-    assert m.krx_open_state("131100") is None
-    print("ok (KRX VI: 시가 VI는 그대로, 장중 VI·해제는 시가 정해짐)")
+    m.single.add("014285")                               # 단일가 종목은 등락률로
+    assert m.krx_open_state("014285") is None
+    print("ok (KRX VI: 시가 VI만 시가 전, 장중 VI·해제는 시가 정해짐)")
+
+
+def demo_shared_across_windows():
+    """모든 창이 기록 하나를 나눠 쓰고, 날짜 기준도 같이 간다."""
+    QApplication.instance() or QApplication([])
+    main_m, other = gui.StockModel(), gui.StockModel()
+    main_m.unified = other.unified = True
+    other.krx_opened = main_m.krx_opened                 # main._inject_market
+    main_m.note_krx_vi("014285", True, "정적", "091002")
+    assert other.krx_open_state("014285") is True        # 다른 창이 지우지 않음
+    print("ok (창 사이 공유)")
 
 
 def demo_ws_routes_only_krx_vi():
@@ -108,7 +123,7 @@ def demo_ws_routes_only_krx_vi():
         client._on_vi({"values": {
             "9001": item, "1221": "12500", "1223": "090013", "1224": "000000",
             "1225": "정적", "1236": "9620", "1238": "+29.94"}})
-    assert got == [("047920", True, "정적", 9620)], got
+    assert got == [("047920", True, "정적", "090013")], got
     print("ok (NXT·통합 사본은 넘기지 않고 KRX VI만)")
 
 
@@ -117,4 +132,5 @@ if __name__ == "__main__":
     demo_parse()
     demo_model()
     demo_krx_vi_marks_open()
+    demo_shared_across_windows()
     demo_ws_routes_only_krx_vi()

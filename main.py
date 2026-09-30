@@ -356,7 +356,8 @@ _KR_HOLIDAY_CACHE = {}
 
 # 연상 계산 방식이 바뀌면 올린다. 같은 날 저장분이라도 옛 방식 값은 버린다
 # (2: cur_prc가 애프터마켓 마지막 체결가라 기준가로 세도록 바꿈, 2026-09-29).
-DAILY_CACHE_VERSION = 2
+# (3: 상장 첫날 +45%를 상한으로 세던 것, +29.5~+30.1%만 세도록, 2026-09-30).
+DAILY_CACHE_VERSION = 3
 
 
 def _previous_trading_day(day: date) -> str:
@@ -2171,6 +2172,11 @@ class App:
     def _inject_market(self, view: View):
         m = view.screen.model
         m.unified = self.rest.suffix == "_AL"   # 통합 모드 점상 판정(krx_open_state)
+        # 「KRX 시가 정해짐」 기록은 모든 창이 하나를 나눠 쓴다. 한 창이 받은
+        # 체결·VI가 다른 창과 나중에 편입된 종목에도 그대로 통한다.
+        if self.views and view is not self.views[0]:
+            main_model = self.views[0].screen.model
+            m.krx_opened = main_model.krx_opened
         if self._limit_cnt is not None:
             m.limit_cnt = self._limit_cnt
             m.refresh_streaks()
@@ -4151,10 +4157,11 @@ class App:
         if active and hit:
             asyncio.ensure_future(self._vi_fetch(code))
 
-    def _on_krx_vi(self, code: str, active: bool, kind: str, static_base: int):
-        for v in self.views:
-            if code in v.screen.model.rows:
-                v.screen.model.note_krx_vi(code, active, kind, static_base)
+    def _on_krx_vi(self, code: str, active: bool, kind: str, fired_at: str):
+        # 화면에 없는 종목도 넘긴다. 모든 창이 같은 기록(`krx_opened`)을
+        # 나눠 쓰므로(`_inject_market`) 나중에 편입돼도 그 기록을 본다.
+        if self.views:
+            self.views[0].screen.model.note_krx_vi(code, active, kind, fired_at)
 
     async def _vi_fetch(self, code: str):
         try:
@@ -4237,7 +4244,7 @@ class App:
                 if code not in self._limit_cnt:
                     self._limit_cnt[code] = (cached["streak"], cached["yclose"])
                     model.refresh_streaks()
-                if cached["prev_vol"] and not model.rows[code].get("prev_vol"):
+                if model.set_prev_vol_ref(code, cached["prev_vol"]):
                     model.update_stock(code, {"prev_vol": cached["prev_vol"]})
                 continue
             if (code in self._prevvol_pending
@@ -4322,11 +4329,10 @@ class App:
         self._limit_cnt[code] = (info["streak"], info["yclose"])
         for v in self.views:
             if code in v.screen.model.rows:
-                # 비었을 때만 채운다. 일봉 거래량은 KRX분이라, 통합 모드에서
-                # 편입 조회가 준 통합 전일거래량을 덮으면 HLB 09-28이
-                # 86만 주 → 34만 주가 된다(당일/전일 비율이 틀어진다).
-                if (info["prev_vol"]
-                        and not v.screen.model.rows[code].get("prev_vol")):
+                # 비었거나 깨졌을 때만 채운다(`set_prev_vol_ref`). 일봉 거래량은
+                # KRX분이라, 통합 모드에서 정상인 통합 전일거래량을 덮으면 HLB
+                # 09-28이 86만 주 → 34만 주가 된다(당일/전일 비율이 틀어진다).
+                if v.screen.model.set_prev_vol_ref(code, info["prev_vol"]):
                     v.screen.on_tick(code, {"prev_vol": info["prev_vol"]})
                 v.screen.model.refresh_streaks()
 

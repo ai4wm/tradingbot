@@ -171,6 +171,20 @@ def _parse_expires(dt: str) -> float:
         return 0.0
 
 
+def _closed_at_limit(close: int, base: int) -> bool:
+    """그날 정규장 종가가 상한가였는가. 기준가 대비 +29.5~+30.1%만 센다.
+
+    「+29.5% 이상」으로 세면 상장 첫날을 잘못 셌다. 첫날 기준가는 공모가고
+    가격제한폭이 60~400%라, 2026-09-29 상장한 486510이 +45%로 끝났는데
+    연상 1이 떴다. 일반 상한가는 호가 단위 내림 때문에 +29.5~+30.0%에
+    떨어진다 — DB 상한 마감 3,660건 중 30% 이하가 전부 이 구간이었고, 넘는
+    125건은 ETN·수정주가·상장 초기 종목이었다. 상장 첫날의 진짜 상한가
+    (공모가 × 4, +300%)는 따로 센다.
+    """
+    rate = (close - base) / base * 100
+    return 29.5 <= rate <= 30.1 or 299.5 <= rate <= 300.1
+
+
 class TokenManager:
     def __init__(self, client: httpx.AsyncClient):
         self._client = client
@@ -510,7 +524,7 @@ class RestClient:
         streak = 0
         for row in past:
             start = base(row)
-            if not close or start <= 0 or (close - start) / start * 100 < 29.5:
+            if not close or start <= 0 or not _closed_at_limit(close, start):
                 break
             streak += 1
             close = start                                  # 하루 더 과거로

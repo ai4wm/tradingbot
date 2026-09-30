@@ -70,6 +70,53 @@ def demo_regular_close_streak():
     print("ok (정규장 종가 = 다음 날 기준가 · 씨싸이트 2연상)")
 
 
+def demo_listing_day_is_not_limit():
+    """2026-09-29 상장한 486510: 첫날 +45%는 상한가가 아니다(연상 1이 떴다).
+
+    첫날 기준가는 공모가고 가격제한폭이 60~400%다. 공모가 × 4로 끝난
+    날만 상한가다.
+    """
+    listing = [_bar("20260929", 18220, +5655)]          # 공모가 12,565 → +45%
+    assert _summary(listing, today_base=18220)["streak"] == 0
+    capped = [_bar("20260929", 48000, +36000)]           # 공모가 12,000 × 4
+    assert _summary(capped, today_base=48000)["streak"] == 1
+    print("ok (상장 첫날 +45%는 상한 아님, ×4만 상한)")
+
+
+def _needs_ref(rows, code, ref):
+    """StockModel.set_prev_vol_ref와 같은 판정(대역용)."""
+    current = int(rows[code].get("prev_vol") or 0)
+    return bool(ref) and (not current or not (ref / 5 <= current <= ref * 5))
+
+
+def demo_broken_prev_vol_is_rejected():
+    """2026-09-30 윈팩(정답 619,917): 처음 600,000, 그다음 60,619,847로 떴다."""
+    from PySide6.QtWidgets import QApplication
+    import gui
+    QApplication.instance() or QApplication([])
+    m = gui.StockModel()
+    m.unified = True
+    m.add_stock("097800", {"name": "윈팩"})               # KRX 전용
+    m.update_stock("097800", {"prev_vol": 600_000})        # 기준 전: 들어감
+    assert m.set_prev_vol_ref("097800", 619_917)           # 틀린 값은 바꿈
+    m.update_stock("097800", {"prev_vol": 619_917})
+    for broken in (600_000, 60_619_847, 620_000):          # 계산값은 전부 버림
+        m.update_stock("097800", {"prev_vol": broken, "_real_suffix": "_AL"})
+        assert m.rows["097800"]["prev_vol"] == 619_917, broken
+
+    # NXT 종목·통합 모드: 통합 전일거래량은 KRX 일봉값 이상 5배 이하만.
+    m.nxt.add("028300")
+    m.add_stock("028300", {"name": "HLB"})
+    m.set_prev_vol_ref("028300", 344_213)
+    m.update_stock("028300", {"prev_vol": 867_169})        # 통합 2.5배: 받음
+    assert m.rows["028300"]["prev_vol"] == 867_169
+    for broken in (300_000, 60_000_000):                   # 일봉보다 작거나 튐
+        m.update_stock("028300", {"prev_vol": broken})
+        assert m.rows["028300"]["prev_vol"] == 867_169, broken
+    assert not m.set_prev_vol_ref("028300", 344_213)       # 정상 통합값은 둠
+    print("ok (KRX 전용은 일봉값만, NXT 통합은 일봉 이상 5배 이하)")
+
+
 def _app(tmp):
     app = types.SimpleNamespace(
         views=[], _prevvol_pending=set(), _prevvol_queue=[],
@@ -103,6 +150,7 @@ def demo_cache_survives_restart():
         pushed = []
         model = types.SimpleNamespace(
             codes=list(rows), rows=rows, refresh_streaks=lambda: None,
+            set_prev_vol_ref=lambda c, ref: _needs_ref(rows, c, ref),
             update_stock=lambda c, f: pushed.append((c, f)))
         main.App.ensure_prev_vol(again, model)
         assert again._prevvol_queue == ["000002"], again._prevvol_queue
@@ -121,7 +169,9 @@ def demo_unified_prev_vol_is_kept():
         rows = {"028300": {"prev_vol": 867_169, "base": 39700},
                 "003580": {"prev_vol": 0, "base": 2055}}
         screen = types.SimpleNamespace(
-            model=types.SimpleNamespace(rows=rows, refresh_streaks=lambda: None),
+            model=types.SimpleNamespace(
+                rows=rows, refresh_streaks=lambda: None,
+                set_prev_vol_ref=lambda c, ref: _needs_ref(rows, c, ref)),
             on_tick=lambda c, f: ticks.append((c, f)))
         app.views = [types.SimpleNamespace(screen=screen)]
         expected = main._previous_trading_day(date.today())
@@ -203,6 +253,8 @@ if __name__ == "__main__":
     demo_refresh_shows_progress()
     demo_cur_prc_is_last_trade()
     demo_regular_close_streak()
+    demo_listing_day_is_not_limit()
+    demo_broken_prev_vol_is_rejected()
     demo_cache_survives_restart()
     demo_unified_prev_vol_is_kept()
     demo_stale_morning_chart_is_not_kept()
