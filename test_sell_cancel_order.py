@@ -94,6 +94,7 @@ def _app(pending):
     app.orders = types.SimpleNamespace(
         stop_local_submissions=lambda code: None, batches={})
     app._balance_sell_stage = {}
+    app._bid_split_last = {}
     app._balance_sell_tasks = {}
     app._balance_sell_recheck = set()
     app._emergency_status_dismissed = set()

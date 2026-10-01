@@ -17,7 +17,7 @@ def _app(suffix="_AL"):
     app = types.SimpleNamespace(
         views=[], ws=types.SimpleNamespace(real_suffix=suffix),
         checked=[], split=[], _balance_sell_settings={"028300": {}},
-        _position_book={}, _bid_split_logged={})
+        _position_book={}, _bid_split_logged={}, _bid_split_last={})
     app._check_balance_sell = lambda code, qty: app.checked.append(qty)
     real_split = main.App._log_bid_split
     app._log_bid_split = lambda code, fields: (
@@ -53,6 +53,7 @@ def demo_split_fields_and_log():
     main.App._on_real(app, code, fields)
     main.App._on_real(app, code, fields)     # 30초 안 두 번째는 안 찍는다
     assert app.split == [code, code] and len(app._bid_split_logged) == 1
+    assert app._bid_split_last[code] == (600_000, 1_198_266)  # 발동 줄에 실린다
     print("ok (거래소별 잔량 매핑 · 30초 표본)")
 
 

@@ -99,10 +99,13 @@ file_log.setLevel(logging.INFO)
 file_log.addFilter(_ProductionFileLogFilter())
 console_log = logging.StreamHandler()
 console_log.setLevel(logging.ERROR)
+# 검증(test_*.py)이 main을 import하면 운영 bot.log에 가짜 거래 기록이 섞였다
+# (2026-10-01 09:06 `stage skipped code=084010 bid_qty=100`, `session cleanup`).
+_UNDER_TEST = os.path.basename(sys.argv[0]).startswith("test_")
 logging.basicConfig(
     level=logging.WARNING,
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
-    handlers=[file_log, console_log],
+    handlers=[console_log] if _UNDER_TEST else [file_log, console_log],
 )
 log = logging.getLogger("main")
 audit_log = logging.getLogger("trade.audit")
@@ -1141,6 +1144,7 @@ class App:
         self._condition_reload_id = 0   # 재조회 타임아웃과 실제 응답의 경합 방지
         self._market = None             # MarketInfo (새 창 모델 주입용)
         self._bid_split_logged: dict[str, float] = {}
+        self._bid_split_last: dict[str, tuple[int, int]] = {}
         # 어제까지 연속상한 일수·어제 종가 (연상 컬럼). 종목마다 제 일봉으로 센다.
         self._limit_cnt: dict[str, tuple[int, int]] = {}
         self._account_summary = None     # 주문 툴바 공통 실계좌 요약
@@ -2656,6 +2660,11 @@ class App:
         # 기준선을 먼저 밑돌아 일찍 발동할 수 있었다.
         if "bid_qty" in fields and (
                 source is None or source == self.ws.real_suffix):
+            if source == "_AL" and "bid_qty_krx" in fields:
+                # 발동 순간의 거래소별 잔량을 발동 줄에 남기려고 덮어써 둔다.
+                self._bid_split_last[code] = (
+                    int(fields["bid_qty_krx"] or 0),
+                    int(fields.get("bid_qty_nxt") or 0))
             self._check_balance_sell(code, int(fields.get("bid_qty") or 0))
             if source == "_AL":
                 self._log_bid_split(code, fields)
@@ -3751,9 +3760,11 @@ class App:
             return
         audit_log.info(
             "balance sell stage triggered code=%s slot=%s depth=%s "
-            "bid_qty=%s threshold=%s ratio=%s order_type=%s price=%s refill=%s",
+            "bid_qty=%s threshold=%s ratio=%s order_type=%s price=%s refill=%s "
+            "krx/nxt=%s",
             code, number, depth, bid_qty, threshold,
-            ratio, "low" if market_sell else "limit", price, refill)
+            ratio, "low" if market_sell else "limit", price, refill,
+            "%s/%s" % self._bid_split_last.get(code, ("-", "-")))
         task = asyncio.ensure_future(
             self._execute_balance_stage(
                 code, depth, number, ratio, price, bid_qty, market_sell))

@@ -34,6 +34,7 @@ class Stub:
         self._balance_sell_settings = {code: dict(setting or SETTING)}
         self._balance_sell_date = {code: datetime.now().strftime("%Y%m%d")}
         self._balance_sell_stage = {code: stage}  # 1 = 1단계가 소진된 뒤
+        self._bid_split_last = {}
         self._balance_sell_tasks = {}
         self._position_book = book if book is not None else {}
         self._position_book_primed = primed
