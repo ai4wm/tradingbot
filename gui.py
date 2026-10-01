@@ -6,6 +6,7 @@
 """
 import logging
 import math
+import re
 import sys
 import time
 from collections import deque
@@ -3341,6 +3342,7 @@ class ConditionScreen(QWidget):
     balance_sell_changed = Signal(str, object)
     account_auto_cancel_changed = Signal(str, bool)
     watch_toggled = Signal(str, bool)
+    code_add_requested = Signal(str)  # Ctrl+V: 조건에 없는 종목을 이 창에 추가
     analysis_stock_requested = Signal(str)
     market_overview_requested = Signal()
     realtime_news_requested = Signal()
@@ -4764,6 +4766,10 @@ class ConditionScreen(QWidget):
                 self.emergency_exit_requested.emit(
                     code, price, self.order_enable_check.isChecked())
                 return True
+            # 청산키로 배정된 조합이 아니면 Ctrl+V는 종목 붙잡기다.
+            if event.matches(QKeySequence.StandardKey.Paste):
+                self._paste_code()
+                return True
         return super().eventFilter(watched, event)
 
     def _on_cell_clicked(self, index):
@@ -4986,12 +4992,14 @@ class ConditionScreen(QWidget):
     def _toggle_pin(self, row: int):
         """순위 칸을 누르면 그 종목을 맨 위에 고정하거나 해제한다."""
         code = self.proxy.row_code(row)
-        if not code:
-            return
-        if code in self.proxy.pinned:
-            self.proxy.pinned.discard(code)
-        else:
+        if code:
+            self._set_pinned(code, code not in self.proxy.pinned)
+
+    def _set_pinned(self, code: str, on: bool):
+        if on:
             self.proxy.pinned.add(code)
+        else:
+            self.proxy.pinned.discard(code)
         self._settings.setValue(
             self.prefix + "pinned", ",".join(sorted(self.proxy.pinned)))
         self._settings.sync()
@@ -5000,6 +5008,34 @@ class ConditionScreen(QWidget):
         if self.proxy.rowCount():  # 번호 <-> 표식 교체를 즉시 반영
             self.proxy.headerDataChanged.emit(
                 Qt.Vertical, 0, self.proxy.rowCount() - 1)
+
+    def _paste_code(self, text: str | None = None):
+        """Ctrl+V: 복사해 둔 종목코드를 이 창에 붙잡아 둔다(고정).
+
+        창에 없으면 행을 추가하고 고정, 있으면 고정만, 이미 고정이면 그 행만
+        고른다. 조건에 없는 종목도 고정이라 이탈·재조회로 지워지지 않고,
+        고정을 풀면 그때 사라진다.
+        """
+        if text is None:
+            text = QApplication.clipboard().text()
+        text = text.strip().upper()
+        match = re.fullmatch(r"A?([0-9][0-9A-Z]{5})", text)
+        if not match:
+            QToolTip.showText(QCursor.pos(), "종목코드 아님")
+            return
+        code = match.group(1)
+        if code in self.proxy.pinned and code in self.model.rows:
+            name = self.model.rows[code].get("name") or code
+            QToolTip.showText(QCursor.pos(), f"이미 고정: {name}")
+        else:
+            self._set_pinned(code, True)
+            if code not in self.model.rows:
+                self.code_add_requested.emit(code)
+        if code in self.model.rows:
+            index = self.proxy.mapFromSource(
+                self.model.index(self.model.codes.index(code), 0))
+            self.table.scrollTo(index)
+            self.table.setCurrentIndex(index)  # 선택은 꺼 두었다(NoSelection)
 
     def _resort_proxy(self):
         """스로틀 시간이 끝나면 현재 열과 방향으로 정렬을 확실히 다시 적용한다."""

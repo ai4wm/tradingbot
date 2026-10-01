@@ -647,6 +647,7 @@ class View:
         screen.condition_combo.activated.connect(self._on_condition_selected)
         screen.rank_period.activated.connect(self.on_refresh)  # 기준시간 변경 -> 즉시 재폴
         screen.refresh_btn.clicked.connect(self.on_refresh)
+        screen.code_add_requested.connect(self.add_manual)
         screen.refresh_interval.setValue(int(self._settings.value(self.prefix + "refresh_interval", 3)))
         screen.auto_refresh.setChecked(self._settings.value(self.prefix + "auto_refresh", "false") == "true")
         if screen.auto_refresh.isChecked():
@@ -947,8 +948,12 @@ class View:
         # 이 창에 청산키가 걸린 종목은 조건에서 빠졌어도 행을 둔다. 재실행하면
         # 키는 저장분으로 되살아나는데 행이 없어, 풀 칸 없는 키가 됐다
         # (2026-09-29 486510 F1). 키를 풀면 `_release_excluded`가 지운다.
-        held = [c for c in (self.app._exit_hotkey_specs.get(self.prefix) or {})
-                if c not in codes]
+        # 고정한 종목(Ctrl+V로 넣은 것 포함)도 같다. 조건에 실제로 든 종목은
+        # 더는 「빠졌는데 붙잡은」 행이 아니다.
+        self.screen._excluded_with_orders.difference_update(codes)
+        keep = list(self.app._exit_hotkey_specs.get(self.prefix) or {})
+        keep += sorted(self.screen.proxy.pinned)
+        held = [c for c in dict.fromkeys(keep) if c not in codes]
         if held:
             self.screen._excluded_with_orders.update(held)
             codes = list(codes) + held
@@ -977,8 +982,20 @@ class View:
         log.info("snapshot%s: %d codes (+%d/-%d) %s", self.prefix or " ",
                  len(new), len(added), len(cur - new), ",".join(sorted(new)))
 
+    def add_manual(self, code: str):
+        """Ctrl+V로 넣은 조건 밖 종목. 편입과 같은 길이되 알림음은 없다.
+
+        고정이 행을 붙잡고, 고정을 풀면 `_release_excluded`가 지운다.
+        """
+        self.screen._excluded_with_orders.add(code)
+        self.screen.on_included(code, {"name": code})
+        self.app._restore_stock_order_settings(self.screen, code)
+        self.app.queue_real(code, add=True, suffix=self._real_suffix())
+        self._schedule_refresh()
+
     def on_event(self, code: str, is_insert: bool):
         if is_insert:
+            self.screen._excluded_with_orders.discard(code)  # 진짜 편입
             self.screen.on_included(code, {"name": code})
             self.app._restore_stock_order_settings(self.screen, code)
             self.app.queue_real(code, add=True, suffix=self._real_suffix())

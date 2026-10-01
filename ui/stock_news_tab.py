@@ -187,6 +187,10 @@ class StockNewsTabMixin:
         if not self._news_watch_header_restored:
             for column, width in enumerate((42, 115, 150, 38, 72, 145, 145)):
                 self._news_watch_table.setColumnWidth(column, width)
+        # 감시 칸을 화면 맨 왼쪽에 둔다. 보이는 자리만 옮기고 칸 번호(3)는
+        # 그대로라 item(row, 3)을 쓰는 코드는 손대지 않는다.
+        if watch_header.visualIndex(3) != 0:
+            watch_header.moveSection(watch_header.visualIndex(3), 0)
         # 기본은 등록 순서(번호 오름차순)이며, 이후 모든 열 제목으로 정렬 가능하다.
         self._news_watch_table.sortItems(0, Qt.SortOrder.AscendingOrder)
         self._news_watch_header_initialized = False
@@ -222,6 +226,9 @@ class StockNewsTabMixin:
             self._realtime_news_table_clicked)
 
         watch_pane = QWidget()
+        # 머리글 글자 폭(약 150px)이 최소 폭이 되어, 그보다 좁히면 칸이 통째로
+        # 접혀 사라졌다. 최소 폭을 직접 낮추고 아래에서 접힘을 끈다.
+        watch_pane.setMinimumWidth(40)
         watch_layout = QVBoxLayout(watch_pane)
         watch_layout.setContentsMargins(0, 0, 0, 0)
         watch_layout.addWidget(QLabel("직접 등록한 감시 종목"))
@@ -400,6 +407,7 @@ class StockNewsTabMixin:
         self._news_main_splitter = QSplitter(Qt.Orientation.Horizontal)
         self._news_main_splitter.addWidget(watch_pane)
         self._news_main_splitter.addWidget(self._news_right_splitter)
+        self._news_main_splitter.setCollapsible(0, False)
         self._news_main_splitter.setStretchFactor(0, 1)
         self._news_main_splitter.setStretchFactor(1, 3)
         layout.addWidget(self._news_main_splitter, 1)

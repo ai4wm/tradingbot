@@ -54,6 +54,7 @@ def demo_restored_key_gets_a_row():
     added, beeps = [], []
     screen = types.SimpleNamespace(
         model=types.SimpleNamespace(codes=[], rows={}),
+        proxy=types.SimpleNamespace(pinned=set()),
         _excluded_with_orders=set(),
         on_included_many=lambda codes: added.extend(codes))
     view = types.SimpleNamespace(
