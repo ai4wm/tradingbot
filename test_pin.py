@@ -14,6 +14,8 @@ from PySide6.QtWidgets import QApplication
 
 import gui
 
+gui._opening_over = lambda: False  # 동시호가 시각으로 고정
+
 
 def build():
     """등락률 내림차순으로 세운 4종목. 하나만 점상 대기다."""

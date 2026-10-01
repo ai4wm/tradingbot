@@ -49,6 +49,7 @@ def screen(model):
         order_status_value=types.SimpleNamespace(setText=lambda _t: None),
         _order_target_code="",
         _excluded_with_orders=set(),
+        proxy=types.SimpleNamespace(pinned=set()),
         _refresh_order_target_display=lambda: None,
         _refresh_order_actions=lambda: None,
     )
@@ -101,6 +102,16 @@ def demo():
     held.on_excluded(CODE)
     held.set_order_state(CODE, "접수", "", True)
     assert model.removed == [], model.removed
+
+    # 고정(순위 칸)한 종목도 붙잡고, 고정을 풀면 그때 지운다.
+    model = Model()
+    pinned = screen(model)
+    pinned.proxy.pinned.add(CODE)
+    pinned.on_excluded(CODE)
+    assert model.removed == [], model.removed
+    pinned.proxy.pinned.discard(CODE)
+    pinned._release_excluded(CODE)
+    assert model.removed == [CODE], model.removed
     del app
     print("ok")
 

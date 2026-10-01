@@ -16,6 +16,8 @@ from PySide6.QtWidgets import QApplication
 import gui
 from gui import _limit_tier
 
+gui._opening_over = lambda: False  # 동시호가 시각으로 고정
+
 
 def row(**changes) -> dict:
     """상한가 1204원 종목의 기본 상태. 필요한 값만 바꿔 쓴다."""

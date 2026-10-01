@@ -23,7 +23,7 @@ logging.disable(logging.CRITICAL)  # 운영 bot.log에 쓰지 않는다
 TODAY = datetime.now().strftime("%Y%m%d")
 
 
-def _bar(dt, close, pred_pre=0, qty=0):
+def _bar(dt, close, pred_pre=0, qty=1):
     return {"dt": dt, "cur_prc": str(close), "pred_pre": f"{pred_pre:+d}",
             "trde_qty": str(qty)}
 
@@ -68,6 +68,18 @@ def demo_regular_close_streak():
              _bar("20260922", 13000, +3000), _bar("20260921", 10000, 0)]
     assert _summary(clean, today_base=21970)["streak"] == 3
     print("ok (정규장 종가 = 다음 날 기준가 · 씨싸이트 2연상)")
+
+
+def demo_halt_day_is_skipped():
+    """씨싸이트 10-01: 09-29 상한 뒤 09-30 매매거래정지(거래량 0). 정지일은
+    가격이 그대로라 0%로 끊겼다. 건너뛰고 그 앞을 이어 센다."""
+    rows = [_bar("20260930", 16730, 0, 0),
+            _bar("20260929", 16730, +3860, 500_000),
+            _bar("20260928", 12870, +2970, 37_055),
+            _bar("20260923", 11400, +2630, 898_662)]
+    info = _summary(rows, today_base=16730)
+    assert info["streak"] == 2 and info["prev_vol"] == 0, info
+    print("ok (거래정지일은 건너뛰고 센다)")
 
 
 def demo_listing_day_is_not_limit():
@@ -253,6 +265,7 @@ if __name__ == "__main__":
     demo_refresh_shows_progress()
     demo_cur_prc_is_last_trade()
     demo_regular_close_streak()
+    demo_halt_day_is_skipped()
     demo_listing_day_is_not_limit()
     demo_broken_prev_vol_is_rejected()
     demo_cache_survives_restart()

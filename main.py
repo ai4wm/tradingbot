@@ -357,7 +357,7 @@ _KR_HOLIDAY_CACHE = {}
 # 연상 계산 방식이 바뀌면 올린다. 같은 날 저장분이라도 옛 방식 값은 버린다
 # (2: cur_prc가 애프터마켓 마지막 체결가라 기준가로 세도록 바꿈, 2026-09-29).
 # (3: 상장 첫날 +45%를 상한으로 세던 것, +29.5~+30.1%만 세도록, 2026-09-30).
-DAILY_CACHE_VERSION = 3
+DAILY_CACHE_VERSION = 4
 
 
 def _previous_trading_day(day: date) -> str:

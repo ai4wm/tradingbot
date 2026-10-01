@@ -523,6 +523,10 @@ class RestClient:
         yclose = close
         streak = 0
         for row in past:
+            if not _to_int(row.get("trde_qty")):
+                # 매매거래정지일은 건너뛴다. 가격이 그대로라 0%로 연상이 끊겼다
+                # (2026-10-01 씨싸이트: 09-29 상한 뒤 09-30 정지, 거래량 0).
+                continue
             start = base(row)
             if not close or start <= 0 or not _closed_at_limit(close, start):
                 break

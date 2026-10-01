@@ -39,6 +39,7 @@ def screen():
         model=Model(),
         _order_target_code=CODE,
         _excluded_with_orders=set(),
+        proxy=types.SimpleNamespace(pinned=set()),
         order_status_value=types.SimpleNamespace(setText=lambda _t: None),
         order_status_acknowledged=types.SimpleNamespace(
             emit=lambda _c: stub.acked.append(_c)),

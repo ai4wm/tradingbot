@@ -559,6 +559,10 @@ class _DaySet(set):
     day = ""
 
 
+def _opening_over() -> bool:
+    return time.strftime("%H%M") >= "0903"
+
+
 def _limit_tier(d: dict, liquidation: bool = False,
                 krx_opened: bool | None = None) -> int:
     """상한가정렬 우선순위.
@@ -601,6 +605,11 @@ def _limit_tier(d: dict, liquidation: bool = False,
     # KRX 체결이 왔는지로 본다(`StockModel.krx_open_state`). 매도·매수잔량은
     # 통합 그대로 — KRX·NXT 둘 다 매도 0인 종목만 줄 위에 오른다.
     preopen = not d["rate"] if krx_opened is None else not krx_opened
+    # 09:03 이후엔 「시가 전」이 없다. 시가 VI 연장(2분 + 랜덤엔드)도 끝난
+    # 시각이다. 체결이 하나도 없는 종목은 예상값이 안 꺼져, 30분 단일가
+    # 예상 상한으로 실제 상한가 위에 하루 종일 앉았다(2026-09-30 09:52
+    # 성문전자우, 거래량 0).
+    preopen = preopen and not _opening_over()
     if expected_limit and preopen:
         # 매수잔량까지 있어야 점상 대기다. 양쪽 다 비어 있으면 호가가 아직
         # 안 들어온 것이라 같은 자리에 두면 안 된다.
@@ -4986,6 +4995,7 @@ class ConditionScreen(QWidget):
         self._settings.setValue(
             self.prefix + "pinned", ",".join(sorted(self.proxy.pinned)))
         self._settings.sync()
+        self._release_excluded(code)  # 조건에서 빠진 채 고정만 붙잡고 있었으면 지운다
         self._resort_proxy()
         if self.proxy.rowCount():  # 번호 <-> 표식 교체를 즉시 반영
             self.proxy.headerDataChanged.emit(
@@ -5204,7 +5214,8 @@ class ConditionScreen(QWidget):
         """
         return (code in self.model.order_cancellable
                 or code in self.model.balance_sell_settings
-                or code in self.model.exit_hotkeys)
+                or code in self.model.exit_hotkeys
+                or code in self.proxy.pinned)
 
     def _release_excluded(self, code: str):
         """붙잡아 둔 사유가 사라졌으면 그때 행을 지운다."""

@@ -16,6 +16,8 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 import gui  # noqa: E402
 import ws  # noqa: E402
+
+gui._opening_over = lambda: False  # 동시호가 시각으로 고정
 from gui import TIER_LIMIT_CLEAN, TIER_WAIT, TIER_WAIT_CLEAN, _limit_tier  # noqa: E402
 
 
@@ -103,6 +105,23 @@ def demo_krx_vi_marks_open():
     print("ok (KRX VI: 시가 VI만 시가 전, 장중 VI·해제는 시가 정해짐)")
 
 
+def demo_no_preopen_after_0903():
+    """2026-09-30 09:52 성문전자우: 거래량 0, 등락률 0, 다음 단일가 예상 상한."""
+    d = row(upper=6300, base=4850, price=4850, rate=0.0, exp_price=6300,
+            exp_rate=29.90, ask_qty=6500, bid_qty=1, vol=0)
+    assert _limit_tier(d, krx_opened=False) == TIER_WAIT
+    gui._opening_over = lambda: True
+    try:
+        for opened in (None, False):
+            assert _limit_tier(d, krx_opened=opened) not in (
+                TIER_WAIT, TIER_WAIT_CLEAN, gui.TIER_PREOPEN)
+        # 실제 상한가 판정은 그대로다.
+        assert _limit_tier(row(), krx_opened=False) == TIER_LIMIT_CLEAN
+    finally:
+        gui._opening_over = lambda: False
+    print("ok (09:03 이후엔 시가 전 묶음이 없다)")
+
+
 def demo_shared_across_windows():
     """모든 창이 기록 하나를 나눠 쓰고, 날짜 기준도 같이 간다."""
     QApplication.instance() or QApplication([])
@@ -132,5 +151,6 @@ if __name__ == "__main__":
     demo_parse()
     demo_model()
     demo_krx_vi_marks_open()
+    demo_no_preopen_after_0903()
     demo_shared_across_windows()
     demo_ws_routes_only_krx_vi()

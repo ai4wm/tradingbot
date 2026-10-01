@@ -17,6 +17,8 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 import gui  # noqa: E402
 
+gui._opening_over = lambda: False  # 동시호가 시각으로 고정
+
 BLANK = {"upper": 0, "price": 0, "rate": 0.0, "exp_price": 0, "exp_rate": 0.0,
          "ask_qty": 0, "bid_qty": 0, "ask_price": 0, "bid_price": 0}
 
