@@ -3633,8 +3633,9 @@ class App:
         감시는 종가 동시호가까지 돈다(`BALANCE_SELL_SESSIONS`). 그래서 그것이
         끝나고 체결 통보까지 온 뒤에 내린다.
 
-        미체결 매수는 건드리지 않는다. 종가 동시호가에 그대로 들어가고,
-        무너지면 3단매도가 끊고, 안 되면 15:30에 거래소가 지운다.
+        설정을 내린 종목은 계좌 미체결 매수도 다시 조회해 남은 주문의 취소를
+        요청한다. 정규장 주문은 종가 뒤 애프터마켓으로 이어지지 않지만,
+        거래소 마감 처리와 앱 장부가 어긋난 경우를 대비해 확인한다.
 
         청산키는 내리지 않는다. 2026-09-14부터 애프터마켓(16~20시)이 열려
         16시 이후 손쓸 수 있는 수단이 그것뿐이다.
@@ -3652,6 +3653,8 @@ class App:
                 self._set_balance_sell(code, None)
             if code in self._account_auto_cancel_armed:
                 self._set_account_auto_cancel(code, False)
+            asyncio.ensure_future(
+                self._sweep_open_buys(code, "session cleanup"))
         self._schedule_session_cleanup()
 
     def _resell_late_buy_fill(self, code: str):
@@ -3986,6 +3989,9 @@ class App:
         setting = code in self._balance_sell_settings
         hotkey = any(code in specs
                      for specs in self._exit_hotkey_specs.values())
+        # 매도 체결이 상태 문구를 쓰기 전에 도착할 수 있다. 호출 시점에 이미
+        # 모든 감시 설정이 내려가 있어도, 청산 완료 문구는 반드시 지운다.
+        self._clear_order_status(code)
         if not (armed or setting or hotkey):
             return
         audit_log.info(
@@ -3996,7 +4002,6 @@ class App:
         if armed:
             self._set_account_auto_cancel(code, False)
         self._clear_exit_hotkey(code)
-        self._clear_order_status(code)
 
     async def _emergency_exit_async(self, code: str, price: int):
         # 장부가 서 있으면 계좌조회를 기다리지 않는다. 조회 큐는 1초에 1건이라
@@ -4175,6 +4180,10 @@ class App:
             "cancelled_orders=%s cancelled_qty=%s",
             code, price, pending_qty, held_qty, sellable_qty, tracked_filled,
             local_pending_qty, cancelled_count, cancelled_qty)
+        # 체결 웹소켓이 매도 전송 응답보다 먼저 도착하면 위에서 상태를 지운
+        # 뒤 이 함수가 다시 「긴급정리」를 쓸 수 있다. 마지막에 잔고와 매수
+        # 잔량을 재확인해 이미 끝난 청산 문구를 걷는다.
+        self._clear_after_emergency(code)
 
     def _on_vi(self, code: str, active: bool, price: int):
         hit = False
