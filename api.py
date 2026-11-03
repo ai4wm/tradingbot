@@ -151,6 +151,7 @@ class MarketInfo:
     kosdaq: set[str] = field(default_factory=set)  # 코스닥 (종목명 보라)
     single: set[str] = field(default_factory=set)  # 단일가 매매 (예상값 상시 표시)
     short_overheat: set[str] = field(default_factory=set)  # 단기과열 (30분 단일가)
+    low_liquidity: set[str] = field(default_factory=set)  # 저유동성/소규모 우선주 단일가
     liquidation: set[str] = field(default_factory=set)  # 정리매매 (가격제한폭 없음)
     nxt: set[str] = field(default_factory=set)     # 넥스트레이드 거래가능 (좌상단 노랑)
     misu: set[str] = field(default_factory=set)    # 미수가능 (우상단 녹색)
@@ -590,6 +591,7 @@ class RestClient:
                 elif (r.get("marketCode") in ("0", "10") and not code.endswith("0")
                         and 0 < shares < 500_000):
                     m.single.add(code)  # 저유동성 우선주
+                    m.low_liquidity.add(code)
         return m
 
     async def stock_universe(self) -> list[dict]:

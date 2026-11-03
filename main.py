@@ -60,6 +60,7 @@ from api import (
     is_nothing_to_cancel,
 )
 from classification_api import ClassificationClient
+from liquidity_info import fetch_low_liquidity
 from dart_api import DartClient
 from krx_api import KrxClient
 from global_market_api import GlobalMarketClient
@@ -2147,10 +2148,26 @@ class App:
                      "nxt %d, misu %d, admin %d",
                      len(m.kosdaq), len(m.single), len(m.short_overheat), len(m.liquidation),
                      len(m.nxt), len(m.misu), len(m.admin))
+            asyncio.ensure_future(self._load_low_liquidity())
         except Exception as e:  # noqa: BLE001
             log.warning("market_info failed: %s", e)
             for v in self.views:
                 self._inject_market(v)  # 시장 분류가 실패해도 연상 칸은 붙인다
+
+    async def _load_low_liquidity(self):
+        """키움에 없는 저유동성 지정 정보는 공개 종목마스터로 보완한다."""
+        try:
+            codes = await fetch_low_liquidity()
+        except Exception as error:  # noqa: BLE001
+            log.warning("low-liquidity master load failed: %s", error)
+            return
+        if self._market is None:
+            return
+        self._market.low_liquidity.update(codes)
+        for view in self.views:
+            self._inject_market(view)
+        if self._rank is not None:
+            self._rank.set_market(self._market)
 
     async def start(self):
         for _ in range(int(self._settings.value("cond_windows", 0))):
@@ -2209,6 +2226,7 @@ class App:
             self._market.admin)
         m.new_today, m.new15, m.new30 = (
             self._market.new_today, self._market.new15, self._market.new30)
+        m.low_liquidity = self._market.low_liquidity
         m.shares = self._market.shares
         m.refresh_market_markers()
 

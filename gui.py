@@ -111,6 +111,7 @@ NXT_ROLE = Qt.UserRole + 2  # NameDelegate에 NXT 종목 여부 전달
 MISU_ROLE = Qt.UserRole + 3  # NameDelegate에 미수가능 여부 전달
 NEW_ROLE = Qt.UserRole + 4  # NameDelegate에 신규상장 단계 전달 (3=당일 2=15일이내 1=30일이내 0=아님)
 SHORT_OVERHEAT_ROLE = Qt.UserRole + 5  # NameDelegate에 단기과열(30분 단일가) 여부 전달
+LOW_LIQUIDITY_ROLE = Qt.UserRole + 7  # 저유동성/소규모 우선주 종목명 배경
 BUY_TREND_ROLE = Qt.UserRole + 6  # 매수% 추세: 최근 20초 비중 vs 이전 40초 (-1/0/+1)
 ORDER_CANCEL_ROLE = Qt.UserRole + 13  # 주문 셀 오른쪽 즉시 잔량취소 영역
 THEME_LEADER_ROLE = Qt.UserRole + 14  # 테마정렬에서 각 묶음의 첫 대장 종목
@@ -138,12 +139,52 @@ PURPLE = QColor("#C080F0")  # 코스닥 종목명
 ADMIN = QColor("#FF6A3D")   # 관리종목 종목명 (경고 주황빨강, 코스닥보다 우선)
 NXT_EXCLUDE_BG_DARK = QColor("#6B2B2B")   # 다크 테마: NXT 매매 제외 확인용 종목명 배경
 NXT_EXCLUDE_BG_LIGHT = QColor("#FFD6D6")  # 라이트 테마: NXT 매매 제외 확인용 종목명 배경
-SHORT_OVERHEAT_BG_DARK = QColor("#704800")   # 다크 테마: 단기과열 30분 단일가
+SHORT_OVERHEAT_BG_DARK = QColor("#573A00")   # 다크 테마: 단기과열 30분 단일가
 SHORT_OVERHEAT_BG_LIGHT = QColor("#FFE0A6")  # 라이트 테마: 단기과열 30분 단일가
+LOW_LIQUIDITY_BG_DARK = QColor("#17394F")   # 저유동성 단일가: 짙은 청색
+LOW_LIQUIDITY_BG_LIGHT = QColor("#D9EDF7")  # 저유동성 단일가: 옅은 하늘색
 MISU_MARK = QColor("#33C24D")  # 미수가능 우상단 삼각형 (녹색)
 NEW_MARKS = {3: QColor("#FF3DC8"), 2: QColor("#38B8FF"), 1: QColor("#8098B8")}  # 신규: 당일/15일/30일
 WHITE = QColor("white")
 TRACK = QColor("#d8d8d8")
+
+
+def name_marker_colors(palette, foreground, short_overheat=False,
+                       low_liquidity=False, nxt=False):
+    """배경과 글씨를 함께 정해 다크/라이트 양쪽에서 경고색을 읽게 한다."""
+    dark = palette.base().color().lightness() < 128
+    background = None
+    if short_overheat:
+        background = SHORT_OVERHEAT_BG_DARK if dark else SHORT_OVERHEAT_BG_LIGHT
+    elif low_liquidity:
+        background = LOW_LIQUIDITY_BG_DARK if dark else LOW_LIQUIDITY_BG_LIGHT
+    elif nxt:
+        background = NXT_EXCLUDE_BG_DARK if dark else NXT_EXCLUDE_BG_LIGHT
+    if foreground == ADMIN:
+        foreground = QColor("#FF9B70" if dark else "#9B3100")
+    elif foreground == PURPLE:
+        foreground = QColor("#D5AEFF" if dark else "#642A8A")
+    elif background is not None:
+        foreground = QColor("#F4F7FA" if dark else "#17202A")
+    return background, foreground
+
+
+def market_status_tip(model, code: str) -> str:
+    parts = []
+    if code in model.admin:
+        parts.append("관리종목: 종목명 주황빨간 글씨")
+    if code in model.liquidation:
+        parts.append("정리매매")
+    else:
+        if code in model.short_overheat:
+            parts.append("단기과열: 30분 단일가 매매 (종목명 주황색 배경)")
+        if code in model.low_liquidity:
+            text = ("저유동성: 30분 단일가 매매" if code in model.single
+                    else "저유동성 지정 (공개 종목마스터 기준)")
+            text += (" (단기과열 배경 우선)" if code in model.short_overheat
+                     else " (종목명 청색 배경)")
+            parts.append(text)
+    return "\n".join(parts)
 # 호가창에서 매도·매수 막대가 출발하는 세로 기준선.
 GRID_LINE = "#4a5361"
 # 호가창 현재가 테두리. 영웅문도 가격 칸만 이렇게 감싼다.
@@ -453,7 +494,7 @@ class BarDelegate(QStyledItemDelegate):
 
 
 class NameDelegate(QStyledItemDelegate):
-    """종목명 셀: 단기과열은 주황색, NXT는 제외 확인용 적갈색 배경.
+    """종목명 셀: 단기과열 주황색 > 저유동성 청색 > NXT 적갈색 배경.
     우상단 녹색=미수가능(증거금100%는 무표시),
     좌하단=신규상장(마젠타=당일, 하늘=15일이내, 청회=30일이내)."""
 
@@ -466,26 +507,15 @@ class NameDelegate(QStyledItemDelegate):
         self.initStyleOption(opt, index)
         nxt = bool(index.data(NXT_ROLE))
         short_overheat = bool(index.data(SHORT_OVERHEAT_ROLE))
+        low_liquidity = bool(index.data(LOW_LIQUIDITY_ROLE))
         text = opt.text
         opt.text = ""
         style = opt.widget.style() if opt.widget else QApplication.style()
         style.drawControl(QStyle.CE_ItemViewItem, opt, painter, opt.widget)
-        if short_overheat:
-            # 단기과열과 NXT가 동시에 잡히면 주문 주의도가 높은 단기과열을 우선한다.
-            background = (
-                SHORT_OVERHEAT_BG_DARK
-                if opt.palette.base().color().lightness() < 128
-                else SHORT_OVERHEAT_BG_LIGHT
-            )
-            painter.fillRect(option.rect, background)
-        elif nxt:
-            # NXT 가능 종목은 실제 필터가 아니라 사용자가 주문 전 제외 대상을
-            # 즉시 알아보도록 종목명 셀 전체를 테마 밝기에 맞춰 표시한다.
-            background = (
-                NXT_EXCLUDE_BG_DARK
-                if opt.palette.base().color().lightness() < 128
-                else NXT_EXCLUDE_BG_LIGHT
-            )
+        background, foreground = name_marker_colors(
+            opt.palette, opt.palette.text().color(),
+            short_overheat, low_liquidity, nxt)
+        if background is not None:
             painter.fillRect(option.rect, background)
         leader = bool(index.data(THEME_LEADER_ROLE))
         theme_color = index.data(THEME_COLOR_ROLE)
@@ -509,7 +539,7 @@ class NameDelegate(QStyledItemDelegate):
             text_rect.adjust(15, 0, 0, 0)
         else:
             painter.setFont(opt.font)
-        painter.setPen(opt.palette.text().color())
+        painter.setPen(foreground)
         painter.drawText(text_rect, Qt.AlignLeft | Qt.AlignVCenter | Qt.TextSingleLine, text)
         painter.restore()
         misu = index.data(MISU_ROLE)
@@ -1192,6 +1222,7 @@ class StockModel(QAbstractTableModel):
         self.kosdaq: set[str] = set()        # 코스닥 코드 집합 (main이 시작 시 주입)
         self.single: set[str] = set()        # 단일가 매매 종목: 예상값 상시 표시 (main 주입)
         self.short_overheat: set[str] = set()  # 단기과열 30분 단일가: 종목명 주황 배경
+        self.low_liquidity: set[str] = set()  # 저유동성/소규모 우선주 단일가
         self.liquidation: set[str] = set()   # 정리매매: 가격제한폭 없음 (main 주입)
         self.unified = False                  # 통합 시세 모드 (main 주입)
         # 오늘 KRX 시가가 정해진 종목. 모든 창이 하나를 나눠 쓴다(main 주입)
@@ -1338,7 +1369,7 @@ class StockModel(QAbstractTableModel):
             self.index(0, NAME_COL),
             self.index(len(self.codes) - 1, NAME_COL),
             [Qt.ItemDataRole.ForegroundRole, Qt.ItemDataRole.ToolTipRole,
-             NXT_ROLE, SHORT_OVERHEAT_ROLE, MISU_ROLE, NEW_ROLE])
+             NXT_ROLE, SHORT_OVERHEAT_ROLE, LOW_LIQUIDITY_ROLE, MISU_ROLE, NEW_ROLE])
 
     def set_order_status(self, code: str, text: str, cancellable: bool = False):
         if code not in self.rows:
@@ -2367,6 +2398,8 @@ class StockModel(QAbstractTableModel):
             return self.codes[index.row()] in self.nxt
         if role == SHORT_OVERHEAT_ROLE:
             return self.codes[index.row()] in self.short_overheat
+        if role == LOW_LIQUIDITY_ROLE:
+            return self.codes[index.row()] in self.low_liquidity
         if role == MISU_ROLE:
             return self.codes[index.row()] in self.misu
         if role == NEW_ROLE:
@@ -2380,6 +2413,9 @@ class StockModel(QAbstractTableModel):
         if role == Qt.ToolTipRole and field == "name":  # 모서리 삼각형 설명
             code = self.codes[index.row()]
             parts = []
+            status = market_status_tip(self, code)
+            if status:
+                parts.append(status)
             themes = self.theme_labels.get(code.removesuffix("_AL"), ())
             if themes:
                 parts.append("테마: " + " · ".join(themes))
@@ -2393,10 +2429,10 @@ class StockModel(QAbstractTableModel):
                 parts.append("★ 현재 테마 대장")
             elif code in self.theme_singletons:
                 parts.append("◇ 현재 조건검색의 단독 테마 종목")
-            if code in self.short_overheat:
-                parts.append("종목명 주황색 배경 = 단기과열(30분 단일가)")
             if code in self.nxt and code in self.short_overheat:
                 parts.append("NXT 거래가능(단기과열 배경 우선)")
+            elif code in self.nxt and code in self.low_liquidity:
+                parts.append("NXT 거래가능(저유동성 배경 우선)")
             elif code in self.nxt:
                 parts.append("종목명 적갈색 배경 = NXT 거래가능(매매 제외 확인용)")
             if code in self.misu:

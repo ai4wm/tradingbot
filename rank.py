@@ -20,8 +20,9 @@ from PySide6.QtWidgets import (
 )
 
 from api import MarketInfo
-from gui import (ADMIN, MISU_ROLE, NEW_ROLE, NXT_ROLE, PURPLE, NameDelegate,
-                 PreserveTextColorDelegate, VisibleCheckStyle)
+from gui import (ADMIN, LOW_LIQUIDITY_ROLE, MISU_ROLE, NEW_ROLE, NXT_ROLE, PURPLE,
+                 SHORT_OVERHEAT_ROLE, NameDelegate, PreserveTextColorDelegate,
+                 VisibleCheckStyle, market_status_tip)
 
 log = logging.getLogger("rank")
 
@@ -356,6 +357,9 @@ class RankModel(QAbstractTableModel):
         self.misu: set[str] = set()
         self.admin: set[str] = set()
         self.liquidation: set[str] = set()
+        self.short_overheat: set[str] = set()
+        self.low_liquidity: set[str] = set()
+        self.single: set[str] = set()
         self.new_today: set[str] = set()
         self.new15: set[str] = set()
         self.new30: set[str] = set()
@@ -383,6 +387,10 @@ class RankModel(QAbstractTableModel):
         code = r["code"]
         if role == NXT_ROLE:
             return code in self.nxt
+        if role == SHORT_OVERHEAT_ROLE:
+            return code in self.short_overheat
+        if role == LOW_LIQUIDITY_ROLE:
+            return code in self.low_liquidity
         if role == MISU_ROLE:
             return code in self.misu
         if role == NEW_ROLE:
@@ -390,8 +398,15 @@ class RankModel(QAbstractTableModel):
                     else 1 if code in self.new30 else 0)
         if role == Qt.ToolTipRole and f == "name":
             parts = []
+            status = market_status_tip(self, code)
+            if status:
+                parts.append(status)
             if code in self.nxt:
-                parts.append("좌상단 노랑 = NXT 거래가능")
+                parts.append("NXT 거래가능(단기과열 배경 우선)"
+                             if code in self.short_overheat else
+                             "NXT 거래가능(저유동성 배경 우선)"
+                             if code in self.low_liquidity else
+                             "종목명 적갈색 배경 = NXT 거래가능")
             if code in self.misu:
                 parts.append("우상단 녹색 = 미수가능")
             new = self.data(index, NEW_ROLE)
@@ -573,6 +588,9 @@ class RankScreen(QWidget):
         self.model.kosdaq, self.model.nxt, self.model.misu, self.model.admin = (
             market.kosdaq, market.nxt, market.misu, market.admin)
         self.model.liquidation = market.liquidation
+        self.model.short_overheat = market.short_overheat
+        self.model.low_liquidity = market.low_liquidity
+        self.model.single = market.single
         self.model.new_today, self.model.new15, self.model.new30 = (
             market.new_today, market.new15, market.new30)
         if self.model.rows:
@@ -580,7 +598,7 @@ class RankScreen(QWidget):
                 self.model.index(0, FIELDS.index("name")),
                 self.model.index(len(self.model.rows) - 1, FIELDS.index("rate")),
                 [Qt.BackgroundRole, Qt.ForegroundRole, Qt.ToolTipRole,
-                 NXT_ROLE, MISU_ROLE, NEW_ROLE])
+                 NXT_ROLE, SHORT_OVERHEAT_ROLE, LOW_LIQUIDITY_ROLE, MISU_ROLE, NEW_ROLE])
 
     def _save_opt(self, key: str, v):
         self._settings.setValue(key, "true" if v is True else "false" if v is False else v)
