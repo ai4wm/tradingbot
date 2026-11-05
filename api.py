@@ -465,10 +465,9 @@ class RestClient:
                    for n in range(2, 6)},
                 **{f"bid_price{n}": abs(_to_int(r.get(f"buy_{n}th_bid")))
                    for n in range(2, 6)},
-                **{f"ask_qty{n}": _to_int(r.get(f"pri_sel_req{n}"))
-                   for n in range(2, 6)},
-                **{f"bid_qty{n}": _to_int(r.get(f"pri_buy_req{n}"))
-                   for n in range(2, 6)},
+                # 2~5단 잔량은 ka10095에 없다(2026-10-20 실응답: 단별은 가격
+                # `*_2th_bid`뿐, 잔량은 1단 `pri_*_req`와 총잔량 `tot_*_req`).
+                # 없는 키를 0으로 넣으면 웹소켓이 채운 잔량을 조회마다 지운다.
                 "open": abs(_to_int(r.get("open_pric"))),  # 시가 (L일봉H 몸통)
                 "low": abs(_to_int(r.get("low_pric"))),    # 당일 저가 (심지)
                 "high": abs(_to_int(r.get("high_pric"))),  # 당일 고가 (심지)

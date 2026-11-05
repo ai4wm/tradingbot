@@ -30,6 +30,7 @@ def demo():
     app = QApplication.instance() or QApplication([])
     screen = FakeScreen()
     popup = gui.BidQtyPopup(screen, "223310", "사토시홀딩스")
+    assert popup.parent() is None  # 화면에 묶이면 창 최소화 때 같이 숨는다
     popup.resize(240, 96)
 
     # 1) 두 값이 다 나오고, 거래량은 매수잔량의 48% 크기다.

@@ -489,7 +489,7 @@ class BarDelegate(QStyledItemDelegate):
         painter.drawLine(x(low), yc, x(high), yc)  # 심지: 저가~고가
         lo, hi = (op, close) if op else (close, close)  # 시가 없으면 종가 마커
         x0, x1 = sorted((x(lo), x(hi)))
-        painter.fillRect(QRect(x0, r.top() + 2, max(2, x1 - x0 + 1), r.height() - 4), color)
+        painter.fillRect(QRect(x0, r.top() + 2, x1 - x0 + 1, r.height() - 4), color)
         painter.restore()
 
 
@@ -2977,8 +2977,11 @@ class BidQtyPopup(QWidget):
     KEY_PREFIX = "bidqty_popup_"
 
     def __init__(self, screen: "ConditionScreen", code: str, name: str):
+        # 부모를 두지 않는다. 화면을 부모로 두면 윈도우가 소유 창으로 묶어
+        # 조건검색 창을 최소화할 때 같이 숨긴다. 창을 닫을 때는 앱이 정리한다
+        # (메인 종료는 최상위 창을 전부 닫고, 추가 창은 `_on_window_closed`).
         super().__init__(
-            screen,
+            None,
             Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint,
         )
@@ -3326,6 +3329,9 @@ class DepthPopup(BidQtyPopup):
             # 오르내릴 때마다 칸이 다시 계산돼 화면이 흔들린다. 영웅문도
             # 테두리만 친다.
             row, text, mark = "", f"color:{tone(gap)};", ""
+            # 가격만 있고 잔량이 0이면 아직 모르는 것이다. 웹소켓은 주문이 없는
+            # 단에 가격을 싣지 않고, 조회(ka10095)는 2~5단 가격만 준다.
+            shown = f"{qty:,}" if qty else ""
             if row_price and row_price == price:
                 mark = f"border:1px solid {CURRENT_MARK};"
             if not row_price:      # 아직 안 온 단. 자리는 남긴다.
@@ -3336,7 +3342,7 @@ class DepthPopup(BidQtyPopup):
                 f"<tr{row}>"
                 f"<td width='17.5%' align='right' nowrap "
                 f"style='{split} color:#6f9be0'>"
-                f"{f'{qty:,}&nbsp;' if side == 'ask' else ''}</td>"
+                f"{f'{shown}&nbsp;' if side == 'ask' else ''}</td>"
                 f"{bar(qty if side == 'ask' else 0, '#2f4f9e', True, split)}"
                 f"<td width='17.5%' align='right' nowrap "
                 f"style='{split}{text}{mark}'>{row_price:,}</td>"
@@ -3345,7 +3351,7 @@ class DepthPopup(BidQtyPopup):
                 f"{bar(qty if side == 'bid' else 0, '#9e3f3f', False, split)}"
                 f"<td width='17.5%' align='left' nowrap "
                 f"style='{split} color:#e07c7c'>"
-                f"{f'&nbsp;{qty:,}' if side == 'bid' else ''}</td>"
+                f"{f'&nbsp;{shown}' if side == 'bid' else ''}</td>"
                 f"</tr>")
         lines.append("</table>")
         if self._lower:
@@ -3464,6 +3470,10 @@ class ConditionScreen(QWidget):
             "분석창을 열고 LS증권 실시간 뉴스 탭으로 이동")
         self.news_btn.setFixedWidth(44)
         self.news_btn.clicked.connect(self.realtime_news_requested.emit)
+        self.clock_btn = QPushButton("🕒")  # 분리 시계 켜기/끄기 (메인창만 배선)
+        self.clock_btn.setCheckable(True)
+        self.clock_btn.setFixedWidth(32)
+        self.clock_btn.setToolTip("시계 — 항상 위 작은 시계 창 켜기/끄기")
         self.newwin_btn = QPushButton("창+")
         self.newwin_btn.setToolTip("조건검색 창 하나 더 열기 (다른 조건식 동시 감시)")
         self.newwin_btn.setFixedWidth(44)
@@ -3500,6 +3510,7 @@ class ConditionScreen(QWidget):
         top.addWidget(self.unified_check)
         top.addWidget(self.rank_btn)
         top.addWidget(self.news_btn)
+        top.addWidget(self.clock_btn)
         top.addWidget(self.newwin_btn)
         top.addStretch(1)  # 남는 공간은 오른쪽으로
         top.addWidget(self.count_label)

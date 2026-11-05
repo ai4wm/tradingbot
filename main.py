@@ -21,8 +21,8 @@ import holidays
 import qasync
 import config
 from PySide6.QtCore import (
-    QAbstractNativeEventFilter, QDate, QPoint, QRect, QSettings, QSize, Qt,
-    QTime, QTimer, QUrl, Signal,
+    QAbstractNativeEventFilter, QDate, QObject, QPoint, QRect, QSettings,
+    QSize, Qt, QTime, QTimer, QUrl, Signal,
 )
 from PySide6.QtGui import (
     QColor, QDesktopServices, QFont, QFontMetrics, QPainter, QPalette,
@@ -1315,6 +1315,14 @@ class App:
             self._on_font_size_selected)
         screen.theme_btn.clicked.connect(self._cycle_theme)
         self._sync_theme_button()
+        # 분리 시계는 앱이 갖는다. 분석창에 두면 분석창을 닫을 때 같이 사라지고
+        # 한 번도 안 열면 뜨지도 않는다.
+        self._clock = ClockController(self._settings)
+        self._clock.changed.connect(
+            lambda on: _set_checked_quietly(screen.clock_btn, on))
+        if self._settings.value("clock_detached", "false") == "true":
+            self._clock.set_on(True)
+        screen.clock_btn.toggled.connect(self._clock.set_on)
         self._wire_common(screen)
         self._sync_realtime_watch_models()
 
@@ -4551,6 +4559,7 @@ class App:
         screen.sor_sell_check.setVisible(False)  # 매도 거래소도 전 창 공통
         screen.font_size_combo.setVisible(False)  # 글자 크기는 앱 전체 공통 -> 메인창에서만 전환
         screen.theme_btn.setVisible(False)  # 테마는 앱 전체 공통 -> 메인창에서만 전환
+        screen.clock_btn.setVisible(False)  # 분리 시계도 앱에 하나
         win = ConditionWindow(prefix, on_close=self._on_window_closed)
         _start_title_clock(win, f"[0156-{n}] 조건검색실시간")
         win.setCentralWidget(screen)
@@ -4612,6 +4621,10 @@ class App:
             return
         for v in list(self.views[1:]):
             if v.screen.window() is win:
+                # 확대 창은 부모가 없어 창과 함께 숨지 않는다. 시세도 끊기므로 닫는다.
+                for popup in (*v.screen._bid_popups.values(),
+                              *v.screen._depth_popups.values()):
+                    popup.close()
                 for code in tuple(v.screen.model.exit_hotkeys):
                     self._global_hotkeys.unregister((id(v.screen), code))
                 task = self._orderable_tasks.pop(v.screen, None)
@@ -4814,12 +4827,125 @@ class RotationCycleWidget(QWidget):
 QWIDGETSIZE_MAX = 16777215  # Qt 위젯 크기 상한. 고정 폭 해제에 쓴다.
 
 
+class ClockRenderMixin:
+    """시계 라벨(`_analysis_clock_label`)을 그린다. 분석창과 분리 시계가 함께 쓴다."""
+
+    def _clock_px(self, size: int) -> int:
+        """분리 시계 배율을 반영한 글자 크기(px)."""
+        return max(7, int(round(size * getattr(self, "_clock_scale", 1.0))))
+
+    def _clock_time_px(self) -> int:
+        """시각 줄 글자 크기. 분리 창에서는 폭을 채우도록 따로 잡는다.
+
+        창 너비는 더 긴 날짜 줄이 정한다. 시각 줄을 같은 배율로 그리면 그
+        차이만큼 양옆이 빈다(13px 기준 날짜 234px / 26px 기준 시각 208px).
+        """
+        return getattr(self, "_clock_time_px_value", 0) or self._clock_px(26)
+
+    def _update_analysis_clock(self):
+        now = datetime.now().astimezone()
+        weekdays = (
+            "월요일", "화요일", "수요일", "목요일",
+            "금요일", "토요일", "일요일",
+        )
+        weekday = weekdays[now.weekday()]
+        krx_state, nxt_state, holiday_reason = _market_session_states(now)
+        active_states = {
+            "정규장", "시간외", "프리마켓", "메인마켓", "애프터마켓",
+        }
+        auction_states = {"시가 동시호가", "종가 동시호가"}
+
+        def badge(market: str, state: str) -> str:
+            if state in active_states:
+                background, foreground = "#18733C", "#E2FFE9"
+            elif state in auction_states:
+                background, foreground = "#9A6500", "#FFF4C2"
+            elif state in {"휴장", "일시휴장"}:
+                background, foreground = "#8B2635", "#FFE1E5"
+            else:
+                background, foreground = "#424A55", "#E2E7ED"
+            return (
+                f"<span style='background-color:{background};"
+                f" color:{foreground};"
+                f" font-size:{self._clock_px(12)}px; font-weight:800;'>"
+                f"&nbsp;{market} {state}&nbsp;</span>"
+            )
+
+        if holiday_reason:
+            border, background = "#E05252", "#351D22"
+            day_color = "#FF8C98"
+            day_state = f"·{holiday_reason}"
+        elif krx_state in active_states or nxt_state in active_states:
+            border, background = "#3FC56B", "#16291D"
+            day_color = "#F7FF8A"
+            day_state = "·거래일"
+        elif krx_state in auction_states:
+            border, background = "#E3A522", "#332A16"
+            day_color = "#FFD66B"
+            day_state = "·개장 준비"
+        else:
+            border, background = "#718096", "#202832"
+            day_color = "#D7E3F2"
+            day_state = "·거래 종료"
+
+        # 개장 직후 체결이 활발한 구간과 09:30 이후의 속도 저하 구간을
+        # 시계만 보아도 구분할 수 있게 한다. 거래 자체를 막지는 않고,
+        # 느린 시간의 신규 매매를 다시 생각하게 하는 시각 경고다.
+        seconds = now.hour * 3600 + now.minute * 60 + now.second
+        if not holiday_reason and 9 * 3600 <= seconds < 9 * 3600 + 10 * 60:
+            phase_text = "개장 급변 구간 · 추격 주의"
+        elif (
+            not holiday_reason
+            and 9 * 3600 + 10 * 60 <= seconds < 9 * 3600 + 30 * 60
+        ):
+            phase_text = "핵심 매매시간 · 체결 활발"
+            border = "#35D6A2"
+        elif (
+            not holiday_reason
+            and 9 * 3600 + 30 * 60 <= seconds < 15 * 3600 + 30 * 60
+        ):
+            phase_text = "09:30 경과 · 체결속도 저하 · 신규매매 경고"
+            border, background = "#FF5868", "#351D22"
+        else:
+            phase_text = "매매 집중시간 아님"
+
+        self._clock_date_text = f"{now:%Y-%m-%d} {weekday}{day_state}"
+        self._clock_phase_text = phase_text
+        alpha = int(getattr(self, "_clock_alpha", 255))
+        if alpha < 255:
+            fill = QColor(background)
+            fill.setAlpha(alpha)
+            background = (f"rgba({fill.red()},{fill.green()},"
+                          f"{fill.blue()},{alpha})")
+        self._analysis_clock_label.setStyleSheet(
+            "QLabel {"
+            " color: #F4F7FA;"
+            f" background-color: {background};"
+            f" border: 2px solid {border};"
+            " border-radius: 7px;"
+            f" padding: {getattr(self, '_clock_pad_y', 4)}px"
+            f" {getattr(self, '_clock_pad_x', 7)}px;"
+            "}")
+        self._analysis_clock_label.setText(
+            f"<div style='font-size:{self._clock_px(13)}px;"
+            " font-weight:800;'>"
+            f"{now:%Y-%m-%d} "
+            f"<span style='color:{day_color};'>{weekday}{day_state}</span>"
+            "</div>"
+            f"<div style='font-size:{self._clock_time_px()}px;"
+            " font-weight:900; letter-spacing:1px;'>"
+            f"{now:%H:%M:%S}</div>"
+            f"<div>{badge('KRX', krx_state)}&nbsp;"
+            f"{badge('NXT', nxt_state)}</div>"
+        )
+
+
 class DetachedClockWindow(QWidget):
     """떼어낸 시계 창: 타이틀바 없이 아무 데나 끌어 옮기고 우하단으로 크기 조절."""
 
     GRIP = 14  # 우하단 크기 조절 영역(px)
 
-    def __init__(self, owner: "AnalysisWindow"):
+    def __init__(self, owner: "ClockController"):
         super().__init__(
             None,
             Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint,
@@ -4828,7 +4954,7 @@ class DetachedClockWindow(QWidget):
         self.setWindowTitle("시계")
         self.setToolTip(
             "끌어서 이동 · 우하단 모서리로 크기 조절(가로·세로 따로)\n"
-            "더블클릭하면 분석창으로 되돌립니다.")
+            "더블클릭하거나 닫으면 시계를 끕니다.")
         self._owner = owner
         self._drag_offset = None
         self._resize_from = None
@@ -4968,11 +5094,11 @@ class DetachedClockWindow(QWidget):
         self.setToolTip(
             f"배경 불투명도 {alpha * 100 // 255}% (휠로 조절)\n"
             "끌어서 이동 · 우하단 모서리로 크기 조절(가로·세로 따로)\n"
-            "더블클릭하면 분석창으로 되돌립니다.")
+            "더블클릭하거나 닫으면 시계를 끕니다.")
 
     def mouseDoubleClickEvent(self, _event):
         if self._owner._clock_window is self:
-            self._owner._attach_clock()  # 더블클릭 = 합치기
+            self._owner.set_on(False)  # 더블클릭 = 끄기
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
@@ -5046,19 +5172,70 @@ class DetachedClockWindow(QWidget):
     def closeEvent(self, e):
         self._geo_timer.stop()
         self._save_geo()  # 아직 보이는 지금 저장해야 좌표가 온전하다
-        if self._owner._shutting_down:
-            # 앱 종료 중 Qt가 닫는 것은 합치기가 아니다. 분리 상태를 남겨
-            # 다음 실행에서 시계 창을 그대로 복원한다.
-            self._owner._settings.setValue("clock_detached", "true")
-            self._owner._settings.sync()
-        elif self._owner._clock_window is self:
-            self._owner._attach_clock()  # 닫기 = 합치기
+        # 앱 종료 중 메인창이 함께 닫는 것은 끄기가 아니다. 켜짐 상태를 남겨
+        # 다음 실행에서 시계 창을 그대로 복원한다.
+        if not _SHUTDOWN[0] and self._owner._clock_window is self:
+            self._owner.set_on(False)  # 닫기 = 끄기
         super().closeEvent(e)
+
+
+class ClockController(ClockRenderMixin, QObject):
+    """분리 시계. 앱이 하나 갖고 있어 분석창을 열든 닫든 떠 있다.
+
+    켜짐 상태·위치·크기·투명도는 분석창 시절 `layout.ini` 키를 그대로 쓴다.
+    """
+
+    changed = Signal(bool)
+
+    def __init__(self, settings: QSettings):
+        super().__init__()
+        self._settings = settings
+        self._clock_window: DetachedClockWindow | None = None
+        self._analysis_clock_label: QLabel | None = None
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._update_analysis_clock)
+
+    def is_on(self) -> bool:
+        return self._clock_window is not None
+
+    def set_on(self, on: bool):
+        if on == self.is_on():
+            return
+        if on:
+            label = QLabel()
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._analysis_clock_label = label
+            window = DetachedClockWindow(self)
+            window.adopt(label)
+            self._clock_window = window
+            pos = self._settings.value("clock_window_pos")
+            if isinstance(pos, QPoint):
+                window.move(pos)
+            window.show()
+            self._timer.start(1000)
+        else:
+            window = self._clock_window
+            self._clock_window = None  # 먼저 비워야 closeEvent가 다시 부르지 않는다
+            self._timer.stop()
+            window.close()
+            window.deleteLater()
+            self._analysis_clock_label = None
+        self._settings.setValue("clock_detached", "true" if on else "false")
+        self._settings.sync()
+        self.changed.emit(on)
+
+
+def _set_checked_quietly(button, on: bool):
+    """버튼 표시만 맞춘다. toggled를 다시 쏘면 켜기/끄기가 되돌아 돈다."""
+    if button.isChecked() != on:
+        button.blockSignals(True)
+        button.setChecked(on)
+        button.blockSignals(False)
 
 
 class AnalysisWindow(
         LimitUpTabMixin, RealtimeNewsTabMixin, StockNewsTabMixin,
-        TelegramNewsTabMixin, ThemeTabMixin, QMainWindow):
+        TelegramNewsTabMixin, ThemeTabMixin, ClockRenderMixin, QMainWindow):
     """실시간 뉴스·상한가·테마 전용 경량 분석창."""
 
     watchlist_changed = Signal()
@@ -5147,11 +5324,6 @@ class AnalysisWindow(
         self._update_analysis_clock()
         principle_bar.addWidget(self._analysis_clock_label)
         self._principle_bar = principle_bar
-        self._clock_window: DetachedClockWindow | None = None
-        self._shutting_down = False
-        application = QApplication.instance()
-        if application is not None:
-            application.aboutToQuit.connect(self._mark_shutting_down)
 
         self._latest_ls_news_context: dict | None = None
         self._latest_ls_news_label = LatestLSNewsLabel()
@@ -5170,8 +5342,15 @@ class AnalysisWindow(
         self._clock_detach_btn.setCheckable(True)
         self._clock_detach_btn.setFixedSize(32, 32)
         self._clock_detach_btn.setToolTip(
-            "시계 분리 — 시계만 항상 위 작은 창으로 띄우기")
-        self._clock_detach_btn.toggled.connect(self._clock_detach_toggle)
+            "시계 분리 — 시계만 항상 위 작은 창으로 띄우기\n"
+            "메인창 🕒과 같은 시계입니다. 분석창을 닫아도 남습니다.")
+        clock = getattr(app, "_clock", None)
+        if clock is None:
+            self._clock_detach_btn.setEnabled(False)  # 앱 없이 연 분석창
+        else:
+            self._clock_detach_btn.toggled.connect(clock.set_on)
+            clock.changed.connect(self._on_clock_detached)
+            self._on_clock_detached(clock.is_on())
 
         self._analysis_on_top_btn = QPushButton("📌")
         self._analysis_on_top_btn.setCheckable(True)
@@ -5245,8 +5424,6 @@ class AnalysisWindow(
         QTimer.singleShot(0, self._ensure_titlebar_visible)
         if self._settings.value("analysis_on_top", "false") == "true":
             self._analysis_on_top_btn.setChecked(True)
-        if self._settings.value("clock_detached", "false") == "true":
-            self._clock_detach_btn.setChecked(True)
         self.watchlist_changed.connect(self._sync_ls_news_watched_codes)
         self._refresh_realtime_watch_table()
         self._refresh_realtime_news_table()
@@ -5304,166 +5481,10 @@ class AnalysisWindow(
             "analysis geometry moved on-screen: x=%s y=%s size=%sx%s",
             x, y, width, height)
 
-    def _clock_px(self, size: int) -> int:
-        """분리 시계 배율을 반영한 글자 크기(px)."""
-        return max(7, int(round(size * getattr(self, "_clock_scale", 1.0))))
-
-    def _clock_time_px(self) -> int:
-        """시각 줄 글자 크기. 분리 창에서는 폭을 채우도록 따로 잡는다.
-
-        창 너비는 더 긴 날짜 줄이 정한다. 시각 줄을 같은 배율로 그리면 그
-        차이만큼 양옆이 빈다(13px 기준 날짜 234px / 26px 기준 시각 208px).
-        """
-        return getattr(self, "_clock_time_px_value", 0) or self._clock_px(26)
-
-    def _update_analysis_clock(self):
-        now = datetime.now().astimezone()
-        weekdays = (
-            "월요일", "화요일", "수요일", "목요일",
-            "금요일", "토요일", "일요일",
-        )
-        weekday = weekdays[now.weekday()]
-        krx_state, nxt_state, holiday_reason = _market_session_states(now)
-        active_states = {
-            "정규장", "시간외", "프리마켓", "메인마켓", "애프터마켓",
-        }
-        auction_states = {"시가 동시호가", "종가 동시호가"}
-
-        def badge(market: str, state: str) -> str:
-            if state in active_states:
-                background, foreground = "#18733C", "#E2FFE9"
-            elif state in auction_states:
-                background, foreground = "#9A6500", "#FFF4C2"
-            elif state in {"휴장", "일시휴장"}:
-                background, foreground = "#8B2635", "#FFE1E5"
-            else:
-                background, foreground = "#424A55", "#E2E7ED"
-            return (
-                f"<span style='background-color:{background};"
-                f" color:{foreground};"
-                f" font-size:{self._clock_px(12)}px; font-weight:800;'>"
-                f"&nbsp;{market} {state}&nbsp;</span>"
-            )
-
-        if holiday_reason:
-            border, background = "#E05252", "#351D22"
-            day_color = "#FF8C98"
-            day_state = f"·{holiday_reason}"
-        elif krx_state in active_states or nxt_state in active_states:
-            border, background = "#3FC56B", "#16291D"
-            day_color = "#F7FF8A"
-            day_state = "·거래일"
-        elif krx_state in auction_states:
-            border, background = "#E3A522", "#332A16"
-            day_color = "#FFD66B"
-            day_state = "·개장 준비"
-        else:
-            border, background = "#718096", "#202832"
-            day_color = "#D7E3F2"
-            day_state = "·거래 종료"
-
-        # 개장 직후 체결이 활발한 구간과 09:30 이후의 속도 저하 구간을
-        # 시계만 보아도 구분할 수 있게 한다. 거래 자체를 막지는 않고,
-        # 느린 시간의 신규 매매를 다시 생각하게 하는 시각 경고다.
-        seconds = now.hour * 3600 + now.minute * 60 + now.second
-        if not holiday_reason and 9 * 3600 <= seconds < 9 * 3600 + 10 * 60:
-            phase_text = "개장 급변 구간 · 추격 주의"
-        elif (
-            not holiday_reason
-            and 9 * 3600 + 10 * 60 <= seconds < 9 * 3600 + 30 * 60
-        ):
-            phase_text = "핵심 매매시간 · 체결 활발"
-            border = "#35D6A2"
-        elif (
-            not holiday_reason
-            and 9 * 3600 + 30 * 60 <= seconds < 15 * 3600 + 30 * 60
-        ):
-            phase_text = "09:30 경과 · 체결속도 저하 · 신규매매 경고"
-            border, background = "#FF5868", "#351D22"
-        else:
-            phase_text = "매매 집중시간 아님"
-
-        self._clock_date_text = f"{now:%Y-%m-%d} {weekday}{day_state}"
-        self._clock_phase_text = phase_text
-        alpha = int(getattr(self, "_clock_alpha", 255))
-        if alpha < 255:
-            fill = QColor(background)
-            fill.setAlpha(alpha)
-            background = (f"rgba({fill.red()},{fill.green()},"
-                          f"{fill.blue()},{alpha})")
-        self._analysis_clock_label.setStyleSheet(
-            "QLabel {"
-            " color: #F4F7FA;"
-            f" background-color: {background};"
-            f" border: 2px solid {border};"
-            " border-radius: 7px;"
-            f" padding: {getattr(self, '_clock_pad_y', 4)}px"
-            f" {getattr(self, '_clock_pad_x', 7)}px;"
-            "}")
-        self._analysis_clock_label.setText(
-            f"<div style='font-size:{self._clock_px(13)}px;"
-            " font-weight:800;'>"
-            f"{now:%Y-%m-%d} "
-            f"<span style='color:{day_color};'>{weekday}{day_state}</span>"
-            "</div>"
-            f"<div style='font-size:{self._clock_time_px()}px;"
-            " font-weight:900; letter-spacing:1px;'>"
-            f"{now:%H:%M:%S}</div>"
-            f"<div>{badge('KRX', krx_state)}&nbsp;"
-            f"{badge('NXT', nxt_state)}</div>"
-        )
-
-    def _mark_shutting_down(self):
-        self._shutting_down = True
-
-    def _clock_detach_toggle(self, on: bool):
-        if on:
-            self._detach_clock()
-        else:
-            self._attach_clock()
-
-    def _detach_clock(self):
-        if self._clock_window is not None:
-            return
-        window = DetachedClockWindow(self)
-        self._principle_bar.removeWidget(self._analysis_clock_label)
-        window.adopt(self._analysis_clock_label)
-        self._clock_window = window
-        pos = self._settings.value("clock_window_pos")
-        if isinstance(pos, QPoint):
-            window.move(pos)
-        window.show()
-        self._settings.setValue("clock_detached", "true")
-        self._settings.sync()
-
-    def _attach_clock(self):
-        window = self._clock_window
-        if window is None:
-            return
-        self._clock_window = None
-        window.layout().removeWidget(self._analysis_clock_label)
-        label = self._analysis_clock_label
-        label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
-        label.setFixedWidth(275)
-        label.setMinimumHeight(86)
-        label.setWordWrap(False)
-        self._clock_scale = 1.0
-        self._clock_pad_x = 7
-        self._clock_pad_y = 4
-        self._clock_phase_px = 0
-        self._clock_time_px_value = 0
-        self._clock_alpha = 255
-        self._update_analysis_clock()
-        self._principle_bar.insertWidget(0, self._analysis_clock_label)
-        self._analysis_clock_label.show()
-        window.close()
-        window.deleteLater()
-        self._settings.setValue("clock_detached", "false")
-        self._settings.sync()
-        if self._clock_detach_btn.isChecked():
-            self._clock_detach_btn.blockSignals(True)
-            self._clock_detach_btn.setChecked(False)
-            self._clock_detach_btn.blockSignals(False)
+    def _on_clock_detached(self, on: bool):
+        """시계가 떠 있으면 분석창 칸은 비워 전광판이 그 자리까지 넓어진다."""
+        self._analysis_clock_label.setVisible(not on)
+        _set_checked_quietly(self._clock_detach_btn, on)
 
     def _analysis_on_top_toggle(self, on: bool):
         geo = self.geometry()
@@ -6763,14 +6784,6 @@ class AnalysisWindow(
             self._settings.setValue("analysis_pos", self.pos())
         self._settings.sync()
 
-    def showEvent(self, event):
-        super().showEvent(event)
-        # 창을 닫을 때 시계를 합쳐 두므로, 다시 열 때 분리 상태를 되살린다.
-        # 같은 창 객체를 재사용해 __init__이 다시 돌지 않기 때문이다.
-        if (self._clock_window is None
-                and self._settings.value("clock_detached", "false") == "true"):
-            self._clock_detach_btn.setChecked(True)
-
     def closeEvent(self, event):
         self._save_market_splitters()
         self._save_news_splitters()
@@ -6778,12 +6791,6 @@ class AnalysisWindow(
         self._save_news_watch_header()
         self._save_limit_header()
         self._save_geo()
-        if self._clock_window is not None:
-            # 시계 위젯을 되돌려 고아 창을 남기지 않되, 분리 상태 설정은
-            # 남겨 다음 실행에서 분리된 시계 창을 그대로 복원한다.
-            self._attach_clock()
-            self._settings.setValue("clock_detached", "true")
-            self._settings.sync()
         super().closeEvent(event)
 
 

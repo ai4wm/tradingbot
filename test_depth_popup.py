@@ -187,6 +187,29 @@ def demo_partial_depth_keeps_places():
     print("ok (5단만 와도 자리 유지)")
 
 
+def demo_unknown_qty_is_blank():
+    """조회(ka10095)는 2~5단 가격만 준다. 그 단 잔량은 0이 아니라 빈칸이다.
+
+    2026-10-20 형지엘리트: 영웅문 1,923원 329주인데 확대 창은 0이었다.
+    """
+    QApplication.instance() or QApplication([])
+    screen = ConditionScreen()
+    popup = DepthPopup(screen, "093240", "형지엘리트")
+    popup.resize(300, 560)
+    book = {"name": "형지엘리트", "price": 1924, "base": 1480,
+            "rate": 30.0, "upper": 1924, "lower": 1036,
+            "bid_price": 1924, "bid_qty": 285933}
+    for n, p in zip(range(2, 6), (1923, 1922, 1921, 1920)):
+        book[f"bid_price{n}"], book[f"bid_qty{n}"] = p, 0
+    popup.set_book(book)
+    popup._refresh_text()
+    html = popup._label.text()
+    assert "&nbsp;285,933" in html
+    assert "&nbsp;0<" not in html, "모르는 잔량이 0으로 보인다"
+    popup.close()
+    print("ok (모르는 잔량은 빈칸)")
+
+
 def demo_same_book_skips_paint():
     """값이 그대로면 다시 그리지 않는다. 붕괴 때 틱이 몰아친다."""
     QApplication.instance() or QApplication([])
@@ -244,6 +267,7 @@ if __name__ == "__main__":
     demo_fits_in_window()
     demo_columns_are_fixed()
     demo_partial_depth_keeps_places()
+    demo_unknown_qty_is_blank()
     demo_same_book_skips_paint()
     demo_opens_and_closes_with_row()
     demo_tick_updates_without_query()
