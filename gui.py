@@ -17,13 +17,15 @@ from PySide6.QtCore import (
     QSortFilterProxyModel, Qt, QTimer, QUrl, Signal,
 )
 from PySide6.QtGui import (
-    QColor, QCursor, QDesktopServices, QFont, QFontMetrics, QIcon,
-    QKeySequence, QPainter, QPen, QPixmap, QPolygon,
+    QAbstractTextDocumentLayout, QColor, QCursor, QDesktopServices, QFont,
+    QFontMetrics, QIcon, QKeySequence, QPainter, QPalette, QPen, QPixmap,
+    QPolygon, QTextCharFormat, QTextCursor, QTextDocument, QTextOption,
 )
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QHBoxLayout, QHeaderView, QLabel,
     QDialog, QGridLayout, QLineEdit, QMainWindow, QMenu, QProxyStyle, QPushButton,
-    QSizePolicy, QSpinBox, QStyle, QStyledItemDelegate, QStyleOptionViewItem,
+    QSizePolicy, QSpinBox, QStyle, QStyledItemDelegate, QStyleOption,
+    QStyleOptionViewItem,
     QTableView, QTableWidgetItem, QToolTip, QVBoxLayout, QWidget,
 )
 
@@ -2964,6 +2966,72 @@ class BalanceSellDialog(QDialog):
         self.accept()
 
 
+class OutlinedLabel(QLabel):
+    """글자 둘레에 검은 테를 둘러 그린다. 배경이 투명해도 어떤 바탕 위에서든 읽힌다.
+
+    같은 문서를 검게 칠해 사방으로 HALO px씩 비켜 찍고 그 위에 원래 글자를
+    그린다. Qt 글자 외곽선(-qt-stroke)은 굵게 하면 배치가 달라져 테가
+    아래·왼쪽으로 밀린다. 같은 배치를 비켜 찍는 쪽은 어긋날 수 없다.
+    """
+
+    HALO = 2
+    # 순검정은 밝은 글자 둘레에 딱딱한 선이 생긴다. 어두운 남회색 80%가 더 부드럽다.
+    # 겹쳐 찍어도 80%가 쌓이지 않도록 글자 한 벌은 불투명으로 칠하고 통째로 반투명하게 합성한다.
+    HALO_COLOR = QColor("#10151C")
+    HALO_OPACITY = 0.8
+
+    def _document(self, width: float) -> QTextDocument:
+        doc = QTextDocument()
+        doc.setDefaultFont(self.font())
+        doc.setDefaultTextOption(QTextOption(Qt.AlignmentFlag.AlignHCenter))
+        doc.setDocumentMargin(0)
+        doc.setTextWidth(width)
+        doc.setHtml(re.sub(r"-qt-stroke-[a-z-]+:[^;']*;", "", self.text()))
+        return doc
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        option = QStyleOption()
+        option.initFrom(self)
+        self.style().drawPrimitive(  # 스타일시트의 배경·테두리
+            QStyle.PrimitiveElement.PE_Widget, option, painter, self)
+        rect = self.contentsRect()
+        doc = self._document(rect.width())
+        painter.translate(rect.left(), rect.top() + max(
+            0, (rect.height() - doc.size().height()) / 2))
+        context = QAbstractTextDocumentLayout.PaintContext()
+        context.palette.setColor(QPalette.ColorRole.Text,
+                                 self.palette().color(QPalette.ColorRole.WindowText))
+        halo = self._document(rect.width())
+        tint = QTextCharFormat()
+        tint.setForeground(self.HALO_COLOR)
+        tint.setBackground(QColor(0, 0, 0, 0))
+        cursor = QTextCursor(halo)
+        cursor.select(QTextCursor.SelectionType.Document)
+        cursor.mergeCharFormat(tint)
+        r = self.HALO
+        # 테를 따로 그려 한 번에 반투명 합성한다. 비켜 찍은 점이 겹쳐도 진해지지 않는다.
+        layer = QPixmap(self.size() * self.devicePixelRatioF())
+        layer.setDevicePixelRatio(self.devicePixelRatioF())
+        layer.fill(Qt.GlobalColor.transparent)
+        lp = QPainter(layer)
+        lp.translate(rect.left(), rect.top() + max(
+            0, (rect.height() - doc.size().height()) / 2))
+        for dx in range(-r, r + 1):
+            for dy in range(-r, r + 1):
+                if (dx or dy) and dx * dx + dy * dy <= r * r + 1:
+                    lp.translate(dx, dy)
+                    halo.documentLayout().draw(lp, context)
+                    lp.translate(-dx, -dy)
+        lp.end()
+        painter.save()
+        painter.resetTransform()
+        painter.setOpacity(self.HALO_OPACITY)
+        painter.drawPixmap(0, 0, layer)
+        painter.restore()
+        doc.documentLayout().draw(painter, context)
+
+
 class BidQtyPopup(QWidget):
     """매수잔량 한 종목만 크게 띄우는 타이틀바 없는 항상 위 창.
 
@@ -3014,21 +3082,10 @@ class BidQtyPopup(QWidget):
         self._resize_from = None
         # 레이아웃 없이 라벨을 직접 채운다. 레이아웃을 쓰면 글자가 커질수록
         # 창 최소 크기가 따라 커져 다시 줄일 수 없다.
-        self._label = QLabel(self)
+        self._label = (OutlinedLabel if self.OUTLINED_TEXT else QLabel)(self)
         self._label.setAlignment(Qt.AlignCenter)
         self._label.setAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self._fill_label = None
-        if self.OUTLINED_TEXT:
-            # 외곽선은 글자 안쪽에도 걸친다. 같은 자리의 불투명한 글자를
-            # 위에 한 번 더 그려 검은 선이 원래 색을 덮지 못하게 한다.
-            self._fill_label = QLabel(self)
-            self._fill_label.setAlignment(Qt.AlignCenter)
-            self._fill_label.setAttribute(
-                Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-            self._fill_label.setStyleSheet(
-                "QLabel { background-color: transparent; border: 2px solid transparent;"
-                " border-radius: 10px; }")
         try:
             self._alpha = int(screen._settings.value(self._key + "_alpha", 235))
         except (TypeError, ValueError):
@@ -3111,10 +3168,7 @@ class BidQtyPopup(QWidget):
             big -= 1
         small = max(8, int(big * 0.34))
         volume = max(8, int(big * 0.48))
-        # QLabel의 rich text가 지원하는 글자 외곽선. 창 전체의 opacity는
-        # 내리지 않아 배경이 투명해져도 숫자와 외곽선은 선명하게 남는다.
-        outline = ("-qt-stroke-color:#000000; -qt-stroke-width:1px; "
-                   "-qt-stroke-linejoin:roundjoin;")
+        outline = ""  # 검은 테는 OutlinedLabel이 그린다.
         # 예상수량이 있으면 두 칸, 없으면 거래량 한 칸을 가운데 쓴다.
         labels = (self._vol_text, self._exp_text) if self._exp_text else (self._vol_text,)
         cell_width = available / 2 - 4 if self._exp_text else available
@@ -3128,25 +3182,24 @@ class BidQtyPopup(QWidget):
                 f"<table width='100%' cellspacing='0' cellpadding='0' "
                 f"style='font-size:{volume}px'><tr>"
                 f"<td width='50%' align='center' "
-                f"style='color:#6FD3C7; font-weight:600; {outline} "
+                f"style='color:#6FD3C7; font-weight:700; {outline} "
                 f"border-right:1px solid #596371'>"
                 f"{self._vol_text}</td>"
                 f"<td width='50%' align='center' "
-                f"style='color:#FF8FC7; font-weight:600; {outline}'>"
+                f"style='color:#FF8FC7; font-weight:700; {outline}'>"
                 f"{self._exp_text}</td></tr></table>")
         else:
             footer = (
                 f"<div align='center' style='font-size:{volume}px; color:#6FD3C7; "
-                f"font-weight:600; {outline}'>"
+                f"font-weight:700; {outline}'>"
                 f"{self._vol_text}</div>")
         html = (
             f"<div style='font-size:{small}px; font-weight:700; color:#C9A968; "
             f"{outline}'>{self._name}</div>"
             f"<div style='font-size:{big}px; font-weight:900; color:#FFC24D; "
-            f"{outline} -qt-stroke-width:2px;'>"
+            f"{outline}'>"
             f"{self._text}</div>" + footer)
         self._label.setText(html)
-        self._fill_label.setText(re.sub(r"-qt-stroke-[a-z-]+:[^;']*;", "", html))
 
     def wheelEvent(self, event):
         """휠로 배경 불투명도를 조절하고 바로 저장한다."""
@@ -3173,8 +3226,6 @@ class BidQtyPopup(QWidget):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._label.setGeometry(self.rect())
-        if self._fill_label is not None:
-            self._fill_label.setGeometry(self.rect())
         self._refresh()
 
     def _in_grip(self, pos) -> bool:

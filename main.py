@@ -25,13 +25,11 @@ from PySide6.QtCore import (
     QSize, Qt, QTime, QTimer, QUrl, Signal,
 )
 from PySide6.QtGui import (
-    QAbstractTextDocumentLayout, QColor, QDesktopServices, QFont, QFontMetrics,
-    QPainter, QPalette, QPen, QTextCharFormat, QTextCursor, QTextDocument,
-    QTextOption,
+    QColor, QDesktopServices, QFont, QFontMetrics, QPainter, QPalette,
+    QPen,
 )
 from PySide6.QtWidgets import (
     QApplication, QDialog, QHBoxLayout, QLabel, QLayout, QMainWindow,
-    QStyle, QStyleOption,
     QMessageBox, QProgressBar, QPushButton, QTableWidget, QTableWidgetItem,
     QTabWidget, QVBoxLayout, QWidget,
 )
@@ -67,6 +65,7 @@ from dart_api import DartClient
 from krx_api import KrxClient
 from global_market_api import GlobalMarketClient
 from gui import (
+    OutlinedLabel,
     BALANCE_SELL_COL, ORDER_TRIM_KEEP, ConditionScreen, NumericTableWidgetItem,
 )
 from ls_news_server_sync import LSNewsServerSync
@@ -4948,49 +4947,6 @@ class ClockRenderMixin:
         )
 
 
-class OutlinedClockLabel(QLabel):
-    """글자에 검은 외곽선을 둘러 그린다. 배경을 투명하게 해도 어떤 바탕 위에서든 읽힌다."""
-
-    OUTLINE = 4  # 펜 폭. 글자 밖으로 절반(2px)이 나온다.
-
-    def paintEvent(self, _event):
-        painter = QPainter(self)
-        option = QStyleOption()
-        option.initFrom(self)
-        self.style().drawPrimitive(  # 스타일시트의 배경·테두리
-            QStyle.PrimitiveElement.PE_Widget, option, painter, self)
-        rect = self.contentsRect()
-        doc = QTextDocument()
-        doc.setDefaultFont(self.font())
-        doc.setDefaultTextOption(QTextOption(Qt.AlignmentFlag.AlignHCenter))
-        doc.setDocumentMargin(0)
-        doc.setTextWidth(rect.width())
-        doc.setHtml(self.text())
-        painter.translate(rect.left(),
-                          rect.top() + max(0, (rect.height() - doc.size().height()) / 2))
-        context = QAbstractTextDocumentLayout.PaintContext()
-        context.palette.setColor(QPalette.ColorRole.Text,
-                                 self.palette().color(QPalette.ColorRole.WindowText))
-        # 외곽선 판을 먼저 깔고 그 위에 원래 글자를 다시 그린다.
-        outline = QTextDocument()
-        outline.setDefaultFont(self.font())
-        outline.setDefaultTextOption(doc.defaultTextOption())
-        outline.setDocumentMargin(0)
-        outline.setTextWidth(rect.width())
-        outline.setHtml(self.text())
-        fmt = QTextCharFormat()
-        fmt.setTextOutline(QPen(QColor("black"), self.OUTLINE,
-                                Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
-                                Qt.PenJoinStyle.RoundJoin))
-        fmt.setForeground(QColor("black"))
-        fmt.setBackground(QColor(0, 0, 0, 0))
-        cursor = QTextCursor(outline)
-        cursor.select(QTextCursor.SelectionType.Document)
-        cursor.mergeCharFormat(fmt)
-        outline.documentLayout().draw(painter, context)
-        doc.documentLayout().draw(painter, context)
-
-
 class DetachedClockWindow(QWidget):
     """떼어낸 시계 창: 타이틀바 없이 아무 데나 끌어 옮기고 우하단으로 크기 조절."""
 
@@ -5253,7 +5209,7 @@ class ClockController(ClockRenderMixin, QObject):
         if on == self.is_on():
             return
         if on:
-            label = OutlinedClockLabel()
+            label = OutlinedLabel()
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self._analysis_clock_label = label
             window = DetachedClockWindow(self)
