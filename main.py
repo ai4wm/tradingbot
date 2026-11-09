@@ -25,11 +25,13 @@ from PySide6.QtCore import (
     QSize, Qt, QTime, QTimer, QUrl, Signal,
 )
 from PySide6.QtGui import (
-    QColor, QDesktopServices, QFont, QFontMetrics, QPainter, QPalette,
-    QPen,
+    QAbstractTextDocumentLayout, QColor, QDesktopServices, QFont, QFontMetrics,
+    QPainter, QPalette, QPen, QTextCharFormat, QTextCursor, QTextDocument,
+    QTextOption,
 )
 from PySide6.QtWidgets import (
     QApplication, QDialog, QHBoxLayout, QLabel, QLayout, QMainWindow,
+    QStyle, QStyleOption,
     QMessageBox, QProgressBar, QPushButton, QTableWidget, QTableWidgetItem,
     QTabWidget, QVBoxLayout, QWidget,
 )
@@ -4855,6 +4857,17 @@ class ClockRenderMixin:
         }
         auction_states = {"시가 동시호가", "종가 동시호가"}
 
+        alpha = int(getattr(self, "_clock_alpha", 255))
+
+        def fade(color: str) -> str:
+            if alpha >= 255:
+                return color
+            # 0이어도 1/255는 남긴다. 완전 투명 픽셀은 윈도우가 클릭을 뒤 창으로 넘긴다.
+            # 알파는 소수로 쓴다. Qt CSS는 정수 1을 1.0(불투명)으로 읽는다.
+            fill = QColor(color)
+            return (f"rgba({fill.red()},{fill.green()},{fill.blue()},"
+                    f"{max(1, alpha) / 255:.3f})")
+
         def badge(market: str, state: str) -> str:
             if state in active_states:
                 background, foreground = "#18733C", "#E2FFE9"
@@ -4865,7 +4878,7 @@ class ClockRenderMixin:
             else:
                 background, foreground = "#424A55", "#E2E7ED"
             return (
-                f"<span style='background-color:{background};"
+                f"<span style='background-color:{fade(background)};"
                 f" color:{foreground};"
                 f" font-size:{self._clock_px(12)}px; font-weight:800;'>"
                 f"&nbsp;{market} {state}&nbsp;</span>"
@@ -4911,12 +4924,7 @@ class ClockRenderMixin:
 
         self._clock_date_text = f"{now:%Y-%m-%d} {weekday}{day_state}"
         self._clock_phase_text = phase_text
-        alpha = int(getattr(self, "_clock_alpha", 255))
-        if alpha < 255:
-            fill = QColor(background)
-            fill.setAlpha(alpha)
-            background = (f"rgba({fill.red()},{fill.green()},"
-                          f"{fill.blue()},{alpha})")
+        background = fade(background)
         self._analysis_clock_label.setStyleSheet(
             "QLabel {"
             " color: #F4F7FA;"
@@ -4938,6 +4946,49 @@ class ClockRenderMixin:
             f"<div>{badge('KRX', krx_state)}&nbsp;"
             f"{badge('NXT', nxt_state)}</div>"
         )
+
+
+class OutlinedClockLabel(QLabel):
+    """글자에 검은 외곽선을 둘러 그린다. 배경을 투명하게 해도 어떤 바탕 위에서든 읽힌다."""
+
+    OUTLINE = 4  # 펜 폭. 글자 밖으로 절반(2px)이 나온다.
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        option = QStyleOption()
+        option.initFrom(self)
+        self.style().drawPrimitive(  # 스타일시트의 배경·테두리
+            QStyle.PrimitiveElement.PE_Widget, option, painter, self)
+        rect = self.contentsRect()
+        doc = QTextDocument()
+        doc.setDefaultFont(self.font())
+        doc.setDefaultTextOption(QTextOption(Qt.AlignmentFlag.AlignHCenter))
+        doc.setDocumentMargin(0)
+        doc.setTextWidth(rect.width())
+        doc.setHtml(self.text())
+        painter.translate(rect.left(),
+                          rect.top() + max(0, (rect.height() - doc.size().height()) / 2))
+        context = QAbstractTextDocumentLayout.PaintContext()
+        context.palette.setColor(QPalette.ColorRole.Text,
+                                 self.palette().color(QPalette.ColorRole.WindowText))
+        # 외곽선 판을 먼저 깔고 그 위에 원래 글자를 다시 그린다.
+        outline = QTextDocument()
+        outline.setDefaultFont(self.font())
+        outline.setDefaultTextOption(doc.defaultTextOption())
+        outline.setDocumentMargin(0)
+        outline.setTextWidth(rect.width())
+        outline.setHtml(self.text())
+        fmt = QTextCharFormat()
+        fmt.setTextOutline(QPen(QColor("black"), self.OUTLINE,
+                                Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                                Qt.PenJoinStyle.RoundJoin))
+        fmt.setForeground(QColor("black"))
+        fmt.setBackground(QColor(0, 0, 0, 0))
+        cursor = QTextCursor(outline)
+        cursor.select(QTextCursor.SelectionType.Document)
+        cursor.mergeCharFormat(fmt)
+        outline.documentLayout().draw(painter, context)
+        doc.documentLayout().draw(painter, context)
 
 
 class DetachedClockWindow(QWidget):
@@ -5086,7 +5137,7 @@ class DetachedClockWindow(QWidget):
     def wheelEvent(self, event):
         """휠로 배경 불투명도를 조절하고 바로 저장한다."""
         step = 15 if event.angleDelta().y() > 0 else -15
-        alpha = min(255, max(60, int(self._owner._clock_alpha) + step))
+        alpha = min(255, max(0, int(self._owner._clock_alpha) + step))
         self._owner._clock_alpha = alpha
         self._owner._settings.setValue("clock_window_alpha", alpha)
         self._owner._settings.sync()
@@ -5202,7 +5253,7 @@ class ClockController(ClockRenderMixin, QObject):
         if on == self.is_on():
             return
         if on:
-            label = QLabel()
+            label = OutlinedClockLabel()
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self._analysis_clock_label = label
             window = DetachedClockWindow(self)

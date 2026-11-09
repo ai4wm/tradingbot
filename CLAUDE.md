@@ -96,6 +96,11 @@ class AnalysisWindow(
   - 그리는 코드는 `ClockRenderMixin` 하나를 분석창과 함께 씁니다. 저장 키는
     전과 같습니다(`clock_detached`·`clock_window_*`).
   - `test_clock_controller.py`가 임시 ini로 켜기·끄기·종료 복원을 봅니다.
+- **투명도는 0~100%입니다**(2026-11-09). KRX·NXT 배지 배경도 같이 옅어집니다.
+  글자는 `OutlinedClockLabel`이 검은 외곽선(4px 펜)을 둘러 그려 어떤 바탕
+  위에서도 읽힙니다. 0%여도 배경은 1/255로 남깁니다(완전 투명 픽셀은 클릭이
+  뒤 창으로 빠짐). **CSS 알파는 소수로 씁니다** — Qt는 `rgba(...,1)`의 정수
+  1을 1.0(불투명)으로 읽습니다.
 
 ### 7. 뉴스 전광판·알림음·매수잔량 확대 창 — 완료
 

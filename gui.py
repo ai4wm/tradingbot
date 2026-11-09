@@ -137,6 +137,7 @@ RED  = QColor("#e83030")
 BLUE = QColor("#2050d0")
 PURPLE = QColor("#C080F0")  # 코스닥 종목명
 ADMIN = QColor("#FF6A3D")   # 관리종목 종목명 (경고 주황빨강, 코스닥보다 우선)
+ADMIN_KOSDAQ = QColor("#FF4FB0")  # 코스닥 관리종목: 분홍 (주황빨강이면 거래소와 구분 불가)
 NXT_EXCLUDE_BG_DARK = QColor("#6B2B2B")   # 다크 테마: NXT 매매 제외 확인용 종목명 배경
 NXT_EXCLUDE_BG_LIGHT = QColor("#FFD6D6")  # 라이트 테마: NXT 매매 제외 확인용 종목명 배경
 SHORT_OVERHEAT_BG_DARK = QColor("#573A00")   # 다크 테마: 단기과열 30분 단일가
@@ -172,7 +173,8 @@ def name_marker_colors(palette, foreground, short_overheat=False,
 def market_status_tip(model, code: str) -> str:
     parts = []
     if code in model.admin:
-        parts.append("관리종목: 종목명 주황빨간 글씨")
+        parts.append("관리종목(코스닥): 종목명 분홍 글씨" if code in model.kosdaq
+                     else "관리종목(거래소): 종목명 주황빨간 글씨")
     if code in model.liquidation:
         parts.append("정리매매")
     else:
@@ -2485,7 +2487,7 @@ class StockModel(QAbstractTableModel):
         if role == Qt.ForegroundRole:
             if field == "name":
                 if code in self.admin:       # 관리종목 = 경고색 (코스닥보다 우선)
-                    return ADMIN
+                    return ADMIN_KOSDAQ if code in self.kosdaq else ADMIN
                 return PURPLE if code in self.kosdaq else None
             if field == "rate":
                 if is_limit:
