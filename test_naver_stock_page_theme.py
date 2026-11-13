@@ -21,6 +21,10 @@ from pathlib import Path
 from analysis_db import (
     active_theme_labels, backfill_news_themes, initialize, save_news_items)
 from naver_news_api import title_key
+import analysis_db
+
+# 표본 날짜(2026-09)가 7일 컷오프 밖으로 밀려 검사가 늘 비었다. 기간을 넓힌다.
+analysis_db.NEWS_THEME_MAX_AGE_DAYS = 10_000
 
 # 제목에 종목명이 없다. 지금까지 버려지던 모양 그대로다.
 SECTOR = {
@@ -81,6 +85,11 @@ def demo_own_theme_mark():
             [{"code": "1", "name": "전력설비", "members": ["007610"]},
              {"code": "2", "name": "철도", "members": ["007610"]}],
             "20260917", "NAVER", 0.95, db_path=db_path)
+        # 지난 뉴스로 붙은 NEWS 테마. 요약에만 이름이 스친 기사가 이것을
+        # 오늘 날짜로 되살리면 안 된다(2026-11-12 깨끗한나라 인수합병, 지금은 경영권분쟁).
+        from analysis_db import apply_news_themes
+        apply_news_themes(["007610"], "선도전기 경영권 분쟁", "20260911",
+                          db_path=db_path)
 
         base = dict(SECTOR)
         # 제목에 종목명이 없고, 종목이 이미 가진 테마가 제목에 걸린다.
@@ -113,8 +122,17 @@ def demo_own_theme_mark():
             "duplicate_key": title_key(
                 "코스피, 6900선 회복…2차전지·전력설비 강세"),
         }
+        renew = {
+            **base, "source_item_key": "k4",
+            "canonical_url": "https://example.test/4",
+            "title": "연일 상한가…한진칼 등 '경영권 분쟁' 우선주 급등",
+            "summary": "선도전기도 올랐다.",
+            "current_hash": "h4",
+            "duplicate_key": title_key(
+                "연일 상한가…한진칼 등 '경영권 분쟁' 우선주 급등"),
+        }
         save_news_items(
-            "007610", "선도전기", [hit, miss, wrap], db_path=db_path)
+            "007610", "선도전기", [hit, miss, wrap, renew], db_path=db_path)
 
         fresh = news_theme_labels(db_path, first_seen_on="20260918")
         marked = set(fresh.get("007610") or ())
@@ -122,7 +140,14 @@ def demo_own_theme_mark():
 
         # 종목이 가진 테마 자체는 늘지 않았다. 표식만 붙었다.
         labels = set(active_theme_labels(db_path).get("007610") or ())
-        assert labels == {"전력설비", "철도"}, labels
+        assert labels == {"전력설비", "철도", "경영권분쟁"}, labels
+        # 지난 NEWS 테마는 9/11에 머문다. 9/18로 연장되면 7일 컷오프가 안 온다.
+        with sqlite3.connect(db_path) as connection:
+            renewed = connection.execute(
+                """SELECT st.valid_from FROM stock_themes st
+                     JOIN themes t ON t.theme_id=st.theme_id
+                    WHERE t.theme_name='경영권분쟁'""").fetchall()
+        assert renewed == [("20260911",)], renewed
         assert "로봇" not in labels and "데이터센터" not in labels, labels
 
         # 소급이 그 표식을 지우면 안 된다.

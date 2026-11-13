@@ -34,7 +34,7 @@ def _screen():
     QApplication.instance() or QApplication([])
     screen = gui.ConditionScreen(prefix="paste_test_")
     screen._settings = FakeSettings()
-    screen.proxy.pinned = set()
+    screen.proxy.pinned = gui.PinOrder()
     screen.auto_remove.setChecked(True)
     screen.code_add_requested.connect(
         lambda code: (screen._excluded_with_orders.add(code),

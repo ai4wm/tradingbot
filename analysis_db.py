@@ -984,6 +984,25 @@ def save_condition_snapshot_quotes(snapshot_id: int, quotes: list[dict],
     return len(rows)
 
 
+def _previous_streak(connection: sqlite3.Connection, code: str,
+                     trade_date: str) -> int:
+    """직전 거래일까지의 연상. 거래량 0(매매거래정지)인 날은 건너뛴다.
+
+    앱 화면 연상(`api.daily_summary`)과 같은 규칙이다. 정지일 행이
+    daily_prices에 있어 그날을 직전 거래일로 잡으면 연상이 1로 끊겼다
+    (2026-03-25 우리로 5연상 → 03-26 정지 → 03-27 1).
+    """
+    row = connection.execute(
+        """SELECT consecutive_days FROM limit_up_events
+            WHERE stock_code=? AND trade_date=(
+                SELECT MAX(trade_date) FROM daily_prices
+                 WHERE stock_code=? AND trade_date<?
+                   AND COALESCE(volume, 0)>0)""",
+        (code, code, trade_date),
+    ).fetchone()
+    return int(row[0] or 0) if row else 0
+
+
 def save_condition_limit_ups(snapshot_id: int,
                              entry_times: dict[str, str] | None = None,
                              db_path: Path = DB_PATH) -> int:
@@ -1080,18 +1099,8 @@ def save_condition_limit_ups(snapshot_id: int,
         entry_times = entry_times or {}
         event_rows = []
         for row in quotes:
-            previous = connection.execute(
-                """SELECT e.consecutive_days
-                     FROM limit_up_events e
-                    WHERE e.stock_code=?
-                      AND e.trade_date=(
-                          SELECT MAX(p.trade_date)
-                            FROM daily_prices p
-                           WHERE p.stock_code=? AND p.trade_date<?
-                      )""",
-                (row["stock_code"], row["stock_code"], trade_date),
-            ).fetchone()
-            streak = int(previous["consecutive_days"] or 0) + 1 if previous else 1
+            streak = _previous_streak(
+                connection, row["stock_code"], trade_date) + 1
             event_rows.append((
                 trade_date, row["stock_code"], streak,
                 str(entry_times.get(row["stock_code"]) or ""),
@@ -1947,41 +1956,21 @@ def save_stock_history(
             price_rows,
         )
         # 저장 직전 이전 거래일 이벤트와 연결해 연속 상한가 일수를 계산한다.
-        corrected_events = []
+        # 앞 날짜부터 하나씩 넣어야 다음 날이 방금 넣은 연상을 읽는다.
         for trade_date, code, closed, touched, _streak, collected in event_rows:
-            previous_date = connection.execute(
-                """SELECT MAX(trade_date) FROM daily_prices
-                   WHERE stock_code=? AND trade_date<?""",
-                (code, trade_date),
-            ).fetchone()[0]
-            previous_streak = 0
-            if previous_date:
-                previous_streak = int(connection.execute(
-                    """SELECT consecutive_days FROM limit_up_events
-                       WHERE stock_code=? AND trade_date=?""",
-                    (code, previous_date),
-                ).fetchone()[0] or 0) if connection.execute(
-                    """SELECT 1 FROM limit_up_events
-                       WHERE stock_code=? AND trade_date=?""",
-                    (code, previous_date),
-                ).fetchone() else 0
-            corrected_events.append((
-                trade_date, code, closed, touched,
-                previous_streak + 1 if previous_streak else 1, collected,
-            ))
-        event_rows = corrected_events
-        connection.executemany(
-            """INSERT INTO limit_up_events(
-                   trade_date, stock_code, closed_at_limit, touched_limit,
-                   consecutive_days, collected_at)
-               VALUES (?, ?, ?, ?, ?, ?)
-               ON CONFLICT(trade_date, stock_code) DO UPDATE SET
-                   closed_at_limit=excluded.closed_at_limit,
-                   touched_limit=excluded.touched_limit,
-                   consecutive_days=excluded.consecutive_days,
-                   collected_at=excluded.collected_at""",
-            event_rows,
-        )
+            streak = _previous_streak(connection, code, trade_date) + 1
+            connection.execute(
+                """INSERT INTO limit_up_events(
+                       trade_date, stock_code, closed_at_limit, touched_limit,
+                       consecutive_days, collected_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(trade_date, stock_code) DO UPDATE SET
+                       closed_at_limit=excluded.closed_at_limit,
+                       touched_limit=excluded.touched_limit,
+                       consecutive_days=excluded.consecutive_days,
+                       collected_at=excluded.collected_at""",
+                (trade_date, code, closed, touched, streak, collected),
+            )
     return len(price_rows), len(event_rows)
 
 
@@ -2104,6 +2093,13 @@ def save_krx_market_day(rows: list[dict], db_path: Path = DB_PATH
                         WHERE trade_date=? AND stock_code IN ({placeholders})""",
                     (trade_date, *non_limit_codes),
                 )
+        # 전엔 늘 1로 넣고 덮지 않아 KRX로만 들어온 날은 연상이 끊겼다.
+        # ponytail: 호출부가 하루치씩 넣는다. 여러 날을 한 번에 넣으면 앞날을 먼저 저장해야 한다.
+        event_rows = [
+            (date, code, closed, touched,
+             _previous_streak(connection, code, date) + 1, collected)
+            for date, code, closed, touched, _streak, collected in event_rows
+        ]
         connection.executemany(
             """INSERT INTO limit_up_events(
                    trade_date, stock_code, closed_at_limit, touched_limit,
@@ -2112,6 +2108,7 @@ def save_krx_market_day(rows: list[dict], db_path: Path = DB_PATH
                ON CONFLICT(trade_date, stock_code) DO UPDATE SET
                    closed_at_limit=excluded.closed_at_limit,
                    touched_limit=excluded.touched_limit,
+                   consecutive_days=excluded.consecutive_days,
                    collected_at=excluded.collected_at""",
             event_rows,
         )
@@ -4125,13 +4122,19 @@ _MARKET_WRAP_RE = re.compile(
 
 
 def _own_theme_names(connection, stock_code: str) -> set[str]:
-    """그 종목에 지금 붙어 있는 테마 이름. 출처를 가리지 않는다."""
+    """그 종목에 지금 붙어 있는 분류 테마 이름. NEWS 출처는 뺀다.
+
+    NEWS를 넣으면 뉴스 테마가 스스로를 갱신한다 — 요약에 이름만 스친 시황이
+    날마다 오늘 날짜를 찍어 7일 컷오프가 영영 안 온다(2026-11-12 깨끗한나라:
+    11/6 경영권 기사 하나로 붙은 인수합병을 한진칼 경영권 기사들이 매일 연장).
+    """
     return {
         str(row[0] or "").strip()
         for row in connection.execute(
             """SELECT t.theme_name FROM stock_themes st
                  JOIN themes t ON t.theme_id=st.theme_id
-                WHERE st.stock_code=? AND st.valid_to IS NULL""",
+                WHERE st.stock_code=? AND st.valid_to IS NULL
+                  AND st.source<>'NEWS'""",
             (str(stock_code).removesuffix("_AL"),)).fetchall()
         if str(row[0] or "").strip()
     }

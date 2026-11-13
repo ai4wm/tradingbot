@@ -165,6 +165,8 @@ def name_marker_colors(palette, foreground, short_overheat=False,
         background = NXT_EXCLUDE_BG_DARK if dark else NXT_EXCLUDE_BG_LIGHT
     if foreground == ADMIN:
         foreground = QColor("#FF9B70" if dark else "#9B3100")
+    elif foreground == ADMIN_KOSDAQ:
+        foreground = QColor("#FF85C8" if dark else "#A3005C")
     elif foreground == PURPLE:
         foreground = QColor("#D5AEFF" if dark else "#642A8A")
     elif background is not None:
@@ -678,6 +680,19 @@ def _row_blank(d: dict) -> bool:
                 or d["ask_price"] or d["rate"])
 
 
+class PinOrder(dict):
+    """고정 종목 → 고정한 차례. 먼저 고정한 종목이 위에 온다.
+
+    set처럼 add/discard로 쓴다. 순서를 바꾸려면 풀었다 다시 고정해 맨 아래로 보낸다.
+    """
+
+    def add(self, code: str):
+        self.setdefault(code, max(self.values(), default=-1) + 1)
+
+    def discard(self, code: str):
+        self.pop(code, None)
+
+
 class TieredProxy(QSortFilterProxyModel):
     """상한가정렬 모드(limit_mode):
     장 시작 전 예상상한 대기, 실제 상한, 장중 예상상한을 각각
@@ -690,7 +705,7 @@ class TieredProxy(QSortFilterProxyModel):
         self.limit_mode = False
         self.theme_mode = False
         # 세로 헤더를 눌러 맨 위에 붙인 종목. 어떤 정렬에서도 위에 남는다.
-        self.pinned: set[str] = set()
+        self.pinned = PinOrder()
         self.theme_labels: dict[str, tuple[str, ...]] = {}
         self.relation_groups: dict[str, tuple[str, ...]] = {}
         self._theme_sort_keys: dict[str, tuple] = {}
@@ -1000,6 +1015,11 @@ class TieredProxy(QSortFilterProxyModel):
                 # lessThan 결과를 뒤집으므로 반대로 돌려준다.
                 return (right_pinned if self.sortOrder() == Qt.DescendingOrder
                         else left_pinned)
+            if left_pinned:
+                # 고정끼리는 정렬 열·방향과 무관하게 고정한 차례대로.
+                a = self.pinned[model.codes[left.row()]]
+                b = self.pinned[model.codes[right.row()]]
+                return a > b if self.sortOrder() == Qt.DescendingOrder else a < b
         left_blank = _row_blank(model.rows[model.codes[left.row()]])
         right_blank = _row_blank(model.rows[model.codes[right.row()]])
         if left_blank != right_blank:
@@ -3048,7 +3068,8 @@ class BidQtyPopup(QWidget):
     POPUPS_ATTR = "_bid_popups"
     KEY_PREFIX = "bidqty_popup_"
 
-    def __init__(self, screen: "ConditionScreen", code: str, name: str):
+    def __init__(self, screen: "ConditionScreen", code: str, name: str,
+                 restore: bool = False):
         # 부모를 두지 않는다. 화면을 부모로 두면 윈도우가 소유 창으로 묶어
         # 조건검색 창을 최소화할 때 같이 숨긴다. 창을 닫을 때는 앱이 정리한다
         # (메인 종료는 최상위 창을 전부 닫고, 추가 창은 `_on_window_closed`).
@@ -3091,7 +3112,8 @@ class BidQtyPopup(QWidget):
         except (TypeError, ValueError):
             self._alpha = 235
         self._alpha = min(255, max(self.MIN_ALPHA, self._alpha))
-        if not self._place_beside_last():
+        # 재시작 복원은 옆에 붙이지 않고 그 종목 자리로 간다.
+        if restore or not self._place_beside_last():
             geometry = screen._settings.value(self._key)
             if geometry is None or not self.restoreGeometry(geometry):
                 geometry = screen._settings.value(self._last_key)
@@ -3262,6 +3284,24 @@ class BidQtyPopup(QWidget):
 
     def mouseDoubleClickEvent(self, _event):
         self.close()  # 타이틀바가 없으니 더블클릭이 닫기다
+        self.remember_open(self._screen)
+
+    @classmethod
+    def remember_open(cls, screen):
+        """떠 있는 종목을 남긴다. 다음 실행에 그 종목 행이 생기면 다시 띄운다.
+
+        열기·더블클릭 닫기·조건 이탈 닫기에서만 부른다. closeEvent에서 부르면
+        앱 종료가 창을 전부 닫으면서 목록을 비운다.
+        """
+        screen._settings.setValue(
+            screen.prefix + cls.KEY_PREFIX + "open",
+            ",".join(getattr(screen, cls.POPUPS_ATTR)))
+
+    @classmethod
+    def saved_open(cls, screen) -> set[str]:
+        value = screen._settings.value(screen.prefix + cls.KEY_PREFIX + "open", "")
+        codes = value if isinstance(value, list) else str(value or "").split(",")
+        return {code for code in codes if code}
 
     def _save_geo(self):
         geometry = self.saveGeometry()
@@ -3307,13 +3347,13 @@ class DepthPopup(BidQtyPopup):
     OUTLINED_TEXT = False
     LEVELS = 10
 
-    def __init__(self, screen, code: str, name: str):
+    def __init__(self, screen, code: str, name: str, restore: bool = False):
         self._rows: list[tuple] = []     # 부모 __init__이 _refresh를 부른다
         self._head = ""
         self._price = 0
         self._base = self._upper = self._lower = 0
         self._info = (0, 0, 0, 0, 0)
-        super().__init__(screen, code, name)
+        super().__init__(screen, code, name, restore)
         # 스무 줄 + 머리글 넉 줄 + 꼬리 두 줄이 7px로도 들어가야 한다.
         self.setMinimumSize(170, 260)
         if self.width() < 170 or self.height() < 260:
@@ -3935,6 +3975,11 @@ class ConditionScreen(QWidget):
         self.model.rowsRemoved.connect(self._on_data_changed)
         self.model.rowsRemoved.connect(self._close_orphan_bid_popups)
         self.model.rowsRemoved.connect(self._close_orphan_depth_popups)
+        self._popup_restore = {cls: cls.saved_open(self)
+                               for cls in (BidQtyPopup, DepthPopup)}
+        # 행이 들어온 뒤 이름·시세가 채워지므로 한 박자 늦게 띄운다.
+        self.model.rowsInserted.connect(
+            lambda *_: QTimer.singleShot(0, self._restore_popups))
         self._balance_blink_timer = QTimer(self)
         self._balance_blink_timer.timeout.connect(
             self._refresh_balance_alert_blink)
@@ -3956,11 +4001,10 @@ class ConditionScreen(QWidget):
         self.table.verticalHeader().setToolTip(
             "클릭하면 그 종목을 맨 위에 고정합니다. 다시 누르면 해제")
         self.table.verticalHeader().sectionClicked.connect(self._toggle_pin)
-        self.proxy.pinned = {
-            code for code in str(
-                self._settings.value(self.prefix + "pinned", "") or ""
-            ).split(",") if code
-        }
+        for code in str(
+                self._settings.value(self.prefix + "pinned", "") or "").split(","):
+            if code:
+                self.proxy.pinned.add(code)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         # StretchLastSection 금지: 마지막 컬럼 경계선이 사라지고 폭 조절이 잠김
         # 헤더 글자 왼쪽 정렬: 가운데면 칸 좁힐 때 앞자리부터 잘림 (시가총액->총액)
@@ -5037,7 +5081,7 @@ class ConditionScreen(QWidget):
             QApplication.clipboard().setText(code)
             QToolTip.showText(QCursor.pos(), f"{code} 복사됨")
 
-    def _open_bid_popup(self, code: str):
+    def _open_bid_popup(self, code: str, restore: bool = False):
         """매수잔량 셀 클릭 -> 종목별 확대 창. 이미 떠 있으면 앞으로 올린다.
 
         갱신은 호가·체결·예상체결 푸시(on_tick)가 직접 한다. 조회는 하지 않는다.
@@ -5048,7 +5092,7 @@ class ConditionScreen(QWidget):
             return
         stored = self.model.rows.get(code, {})
         popup = BidQtyPopup(
-            self, code, str(stored.get("name") or code))
+            self, code, str(stored.get("name") or code), restore)
         popup.set_value(int(stored.get("bid_qty") or 0),
                         int(stored.get("vol") or 0),
                         int(stored.get("exp_qty") or 0)
@@ -5056,14 +5100,16 @@ class ConditionScreen(QWidget):
                         else None)
         self._bid_popups[code] = popup
         popup.show()
+        BidQtyPopup.remember_open(self)
 
     def _close_orphan_bid_popups(self, *_):
         """조건 이탈로 행이 사라진 종목은 확대 창도 닫는다."""
         for code, popup in list(self._bid_popups.items()):
             if code not in self.model.rows:
                 popup.close()
+        BidQtyPopup.remember_open(self)
 
-    def _open_depth_popup(self, code: str):
+    def _open_depth_popup(self, code: str, restore: bool = False):
         """매도잔량 셀 클릭 -> 종목별 10호가 창. 떠 있으면 앞으로 올린다.
 
         갱신은 0D 호가·0B 체결 푸시(on_tick)가 직접 한다. 조회는 하지 않는다.
@@ -5073,16 +5119,31 @@ class ConditionScreen(QWidget):
             popup.raise_()
             return
         stored = self.model.rows.get(code, {})
-        popup = DepthPopup(self, code, str(stored.get("name") or code))
+        popup = DepthPopup(self, code, str(stored.get("name") or code), restore)
         popup.set_book(stored)
         self._depth_popups[code] = popup
         popup.show()
+        DepthPopup.remember_open(self)
 
     def _close_orphan_depth_popups(self, *_):
         """조건 이탈로 행이 사라진 종목은 10호가 창도 닫는다."""
         for code, popup in list(self._depth_popups.items()):
             if code not in self.model.rows:
                 popup.close()
+        DepthPopup.remember_open(self)
+
+    def _restore_popups(self):
+        """지난 실행에 떠 있던 확대 창을 그 종목 행이 생기면 다시 띄운다.
+
+        편입이든 고정이든 행이 있어야 시세가 온다. 행이 아직 없는 종목은
+        기다렸다가 편입되는 순간 띄운다.
+        """
+        for cls, opener in ((BidQtyPopup, self._open_bid_popup),
+                            (DepthPopup, self._open_depth_popup)):
+            pending = self._popup_restore[cls]
+            for code in [c for c in pending if c in self.model.rows]:
+                pending.discard(code)
+                opener(code, restore=True)
 
     def _on_context_menu(self, pos):
         """종목명은 네이버 종목토론실, 그 밖의 자리는 컬럼 표시 메뉴."""
@@ -5167,7 +5228,7 @@ class ConditionScreen(QWidget):
         else:
             self.proxy.pinned.discard(code)
         self._settings.setValue(
-            self.prefix + "pinned", ",".join(sorted(self.proxy.pinned)))
+            self.prefix + "pinned", ",".join(self.proxy.pinned))
         self._settings.sync()
         self._release_excluded(code)  # 조건에서 빠진 채 고정만 붙잡고 있었으면 지운다
         self._resort_proxy()

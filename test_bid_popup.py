@@ -131,6 +131,46 @@ def demo_expected_only_ticks():
     print("ok (단일가 장중 예상체결량 단독 갱신·해제)")
 
 
+def demo_restore_after_restart():
+    """떠 있던 확대 창은 재시작 뒤 그 종목 행이 생기면 같은 자리·크기로 다시 뜬다."""
+    app = QApplication.instance() or QApplication([])
+    row = {"name": "깨끗한나라우", "bid_qty": 1, "price": 1, "base": 1, "upper": 1}
+    with tempfile.TemporaryDirectory(prefix="bid-popup-") as tmp:
+        settings = QSettings(os.path.join(tmp, "layout.ini"), QSettings.IniFormat)
+        with patch.object(gui, "QSettings", return_value=settings):
+            screen = gui.ConditionScreen()
+        for code in ("004545", "001527", "003495"):
+            screen.model.add_stock(code, dict(row))
+        app.processEvents()
+        for code in ("004545", "001527", "003495"):
+            screen._open_bid_popup(code)
+        screen._bid_popups["001527"].setGeometry(300, 200, 280, 120)
+        screen._bid_popups["001527"]._save_geo()
+        screen._bid_popups["003495"].mouseDoubleClickEvent(None)  # 손으로 닫음
+        for popup in list(screen._bid_popups.values()):
+            popup.close()                                     # 앱 종료
+        screen.deleteLater()
+        app.processEvents()
+
+        with patch.object(gui, "QSettings", return_value=settings):
+            screen = gui.ConditionScreen()
+        screen.model.add_stock("001527", dict(row))           # 편입
+        app.processEvents()
+        assert set(screen._bid_popups) == {"001527"}, screen._bid_popups
+        geo = screen._bid_popups["001527"].geometry()
+        assert (geo.x(), geo.y(), geo.width(), geo.height()) == (300, 200, 280, 120), geo
+        screen.model.add_stock("003495", dict(row))           # 닫은 종목은 안 뜸
+        screen.model.add_stock("004545", dict(row))           # 늦게 편입돼도 뜸
+        app.processEvents()
+        assert set(screen._bid_popups) == {"001527", "004545"}, screen._bid_popups
+        for popup in list(screen._bid_popups.values()):
+            popup.close()
+        screen.deleteLater()
+        app.processEvents()
+    print("ok (재시작 뒤 확대 창 복원)")
+
+
 if __name__ == "__main__":
     demo()
     demo_expected_only_ticks()
+    demo_restore_after_restart()

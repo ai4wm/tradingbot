@@ -167,12 +167,13 @@ class MarketStatusTests(unittest.TestCase):
                     gui.LOW_LIQUIDITY_BG_DARK if dark else gui.LOW_LIQUIDITY_BG_LIGHT
                 ) if kind == "low" else (
                     gui.NXT_EXCLUDE_BG_DARK if dark else gui.NXT_EXCLUDE_BG_LIGHT)
-                for foreground in (palette.text().color(), gui.ADMIN, gui.PURPLE):
+                for foreground in (palette.text().color(), gui.ADMIN, gui.ADMIN_KOSDAQ,
+                                   gui.PURPLE):
                     model = gui.StockModel()
                     model.add_stocks([("004545", {"name": "깨끗한나라우"})])
-                    if foreground == gui.ADMIN:
+                    if foreground in (gui.ADMIN, gui.ADMIN_KOSDAQ):
                         model.admin.add("004545")
-                    elif foreground == gui.PURPLE:
+                    if foreground in (gui.ADMIN_KOSDAQ, gui.PURPLE):
                         model.kosdaq.add("004545")
                     if kind in ("short", "both"):
                         model.short_overheat.add("004545")
@@ -194,6 +195,10 @@ class MarketStatusTests(unittest.TestCase):
                     low, high = sorted((luminance(bg), luminance(fg)))
                     self.assertGreaterEqual((high + .05) / (low + .05), 4.5,
                                             (dark, kind, fg.name()))
+                    if foreground != palette.text().color():
+                        # 경고색이 배경 위에서 흰/검 글씨로 바뀌면 안 된다
+                        # (2026-11-11 대호특수강우: 코스닥 관리종목 분홍이 흰색).
+                        self.assertGreater(fg.saturation(), 60, (dark, kind, fg.name()))
         self.assertEqual(len(gui.COLUMNS), 23)
         self.assertEqual(len(rank.COLUMNS), 6)
         self.assertNotIn("market_status", gui.FIELDS)

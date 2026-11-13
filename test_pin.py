@@ -57,6 +57,22 @@ def demo():
     proxy.sort(gui.RATE_COL, Qt.AscendingOrder)
     assert order(proxy)[0] == "000004", f"오름차순 고정: {order(proxy)}"
 
+    # 고정끼리는 고정한 차례대로, 정렬 열·방향과 무관. 풀었다 다시 걸면 맨 아래.
+    proxy.pinned.add("000003")
+    for col in (gui.RATE_COL, 0):
+        for direction in (Qt.DescendingOrder, Qt.AscendingOrder):
+            proxy.invalidate()
+            proxy.sort(col, direction)
+            assert order(proxy)[:2] == ["000004", "000003"], f"고정 차례: {order(proxy)}"
+    proxy.pinned.discard("000004")
+    proxy.pinned.add("000004")
+    proxy.invalidate()
+    proxy.sort(gui.RATE_COL, Qt.DescendingOrder)
+    assert order(proxy)[:2] == ["000003", "000004"], f"다시 고정: {order(proxy)}"
+    proxy.pinned.discard("000003")
+    proxy.invalidate()
+    proxy.sort(gui.RATE_COL, Qt.DescendingOrder)
+
     # 세로 헤더는 번호 대신 표식을, 나머지 행은 그대로 번호를 보여 준다.
     assert proxy.headerData(0, Qt.Vertical, Qt.DisplayRole) == "📌"
     assert proxy.headerData(1, Qt.Vertical, Qt.DisplayRole) == 2

@@ -6307,6 +6307,10 @@ class AnalysisWindow(
             button.setEnabled(True)
         self._collection_status.setText(f"뉴스 테마 소급 · {linked:,}건 연결")
         self._refresh_theme_table()
+        # 조건검색 창은 5분마다 다시 읽는다. 그 사이엔 옛 테마가 남아
+        # 재시작해야 바뀌는 것처럼 보였다.
+        for view in getattr(self._app, "views", ()):
+            view.screen._load_theme_classification()
 
     def _start_naver_theme_collection(self):
         if self._collection_task and not self._collection_task.done():
