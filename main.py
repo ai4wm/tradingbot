@@ -25,13 +25,13 @@ from PySide6.QtCore import (
     QSize, Qt, QTime, QTimer, QUrl, Signal,
 )
 from PySide6.QtGui import (
-    QColor, QDesktopServices, QFont, QFontMetrics, QPainter, QPalette,
+    QColor, QCursor, QDesktopServices, QFont, QFontMetrics, QPainter, QPalette,
     QPen,
 )
 from PySide6.QtWidgets import (
     QApplication, QDialog, QHBoxLayout, QLabel, QLayout, QMainWindow,
     QMessageBox, QProgressBar, QPushButton, QTableWidget, QTableWidgetItem,
-    QTabWidget, QVBoxLayout, QWidget,
+    QTabWidget, QToolTip, QVBoxLayout, QWidget,
 )
 
 from analysis_db import (
@@ -220,8 +220,18 @@ HOTKEY_CONFLICT_STATUS = "키충돌"
 
 # 주문과 함께 자동으로 거는 청산키 후보. 앞에서부터 빈 키를 집는다. 쓰던 키가
 # 풀리면 다음 주문은 다시 앞쪽을 집는다. 보통 세 개를 넘지 않는다.
-# F12는 윈도우가 디버거용으로 영구 예약해 어떤 경우에도 등록되지 않으므로 뺐다.
-AUTO_EXIT_HOTKEY_LABELS = ("F1", "F5", "F9", "F2", "F6", "F10")
+# 청산은 홀수 키, 짝 취소키는 바로 옆 짝수 키다(F1·F2, F3·F4 …, 2026-11-18).
+# 초단타에서 떨어져 있으면 불편하다(사용자). F12는 윈도우 예약이라 못 쓴다.
+AUTO_EXIT_HOTKEY_LABELS = ("F1", "F3", "F5", "F7")
+
+
+def _cancel_key_label(exit_spec: dict | None) -> str:
+    """청산키의 짝 취소키 이름. F1·F3·F5·F7 → 바로 옆 키, 그 밖의 키는 짝이 없다."""
+    label = str((exit_spec or {}).get("label") or "")
+    if int((exit_spec or {}).get("modifiers") or 0) or label not in (
+            AUTO_EXIT_HOTKEY_LABELS):
+        return ""
+    return f"F{int(label[1:]) + 1}"
 
 
 def _function_key_spec(label: str) -> dict:
@@ -413,6 +423,9 @@ BALANCE_SELL_SESSIONS = ("정규장", "종가 동시호가", "애프터마켓")
 # 다음 날 아침 NXT에서 먼저 무너질 수 있다. KRX는 아직 체결이 없으므로 그
 # 시간 매도는 스위치와 상관없이 SOR로 낸다 — 키움 SOR이 NXT로 보낸다.
 NXT_PREMARKET = "프리마켓"
+# `시간외` 체크가 저절로 꺼지는 시각. 켜진 채 정규장·애프터마켓이 오면 청산이
+# 시간외 주문으로 나가 전부 거부된다. 장전 시간외는 08:40, 장후는 16:00에 끝난다.
+AFTER_HOURS_OFF_TIMES = ((8, 40), (16, 0))
 
 # 3단매도·자동취소를 내리는 시각. 감시가 끝난 뒤여야 한다. 종가는 15:30에
 # 정해지고 애프터마켓은 20:00에 끝나는데, 체결 통보가 몇 초 늦게 오므로
@@ -426,13 +439,17 @@ def _market_session_states(now: datetime) -> tuple[str, str, str]:
     if reason:
         return "휴장", "휴장", reason
     seconds = now.hour * 3600 + now.minute * 60 + now.second
+    day = now.date()
 
     def at(hour, minute=0, second=0):
-        return hour * 3600 + minute * 60 + second
+        return config.market_at(hour, minute, second, day=day)
+
+    def at_open(hour, minute=0, second=0):
+        return config.market_at(hour, minute, second, opening=True, day=day)
 
     if seconds < at(8, 30):
         krx = "개장 전"
-    elif seconds < at(9):
+    elif seconds < at_open(9):
         krx = "시가 동시호가"
     elif seconds < at(15, 20):
         krx = "정규장"
@@ -442,14 +459,16 @@ def _market_session_states(now: datetime) -> tuple[str, str, str]:
         krx = "정규장 종료"
     elif seconds < at(16):
         krx = "시간외종가"
-    elif seconds < at(20):
+    elif seconds < 20 * 3600:
         # 2026-09-14 시간외단일가(16~18시, 10분 단일가) 폐지. 같은 자리에
-        # 접속매매 애프터마켓이 20시까지 선다.
+        # 접속매매 애프터마켓이 20시까지 선다. 개장이 늦은 날도 20시에 끝난다.
         krx = "애프터마켓"
     else:
         krx = "종료"
 
-    if seconds < at(8):
+    if config.market_delay(day)[0] and seconds < at_open(9, 0, 30):
+        nxt = "개장 전"  # 개장이 늦은 날은 프리마켓이 없다(2026-11-19 수능)
+    elif seconds < at(8):
         nxt = "개장 전"
     elif seconds < at(8, 50):
         nxt = "프리마켓"
@@ -462,7 +481,7 @@ def _market_session_states(now: datetime) -> tuple[str, str, str]:
     elif seconds < at(15, 40):
         # NXT 애프터마켓은 15:30~15:40 호가만 받고 15:40부터 체결한다.
         nxt = "호가접수"
-    elif seconds < at(20):
+    elif seconds < 20 * 3600:
         nxt = "애프터마켓"
     else:
         nxt = "종료"
@@ -475,7 +494,21 @@ def _is_krx_market_open(now: datetime | None = None) -> bool:
     if _krx_holiday_reason(now.date()):
         return False
     seconds = now.hour * 3600 + now.minute * 60 + now.second
-    return 9 * 3600 <= seconds < 15 * 3600 + 30 * 60
+    return (config.market_at(9, opening=True, day=now.date()) <= seconds
+            < config.market_at(15, 30, day=now.date()))
+
+
+def _market_dt(now: datetime, hour: int, minute: int = 0, second: int = 0,
+               *, opening: bool = False, shift: bool = True) -> datetime:
+    """오늘 그 국면 시각. 이미 지났으면 다음 날 것. 개장이 늦은 날은 밀린다."""
+    for add in (0, 1):
+        day = now.date() + timedelta(days=add)
+        seconds = (config.market_at(hour, minute, second, opening=opening, day=day)
+                   if shift else hour * 3600 + minute * 60 + second)
+        at = datetime.combine(day, datetime.min.time(), now.tzinfo) + timedelta(seconds=seconds)
+        if at > now:
+            return at
+    return at
 
 
 def _previous_krx_quote_price(price: int) -> int:
@@ -901,12 +934,11 @@ class View:
         if self.prefix or self._auto_refresh_cutoff_timer is None:
             return
         now = datetime.now(KST)
-        cutoff = now.replace(
-            hour=9, minute=2, second=20, microsecond=0)
-        if clear_stale and now >= cutoff:
+        today = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(
+            seconds=config.market_at(9, 2, 20, opening=True, day=now.date()))
+        if clear_stale and now >= today:
             self.screen.auto_refresh.setChecked(False)
-        if now >= cutoff:
-            cutoff += timedelta(days=1)
+        cutoff = _market_dt(now, 9, 2, 20, opening=True)
         delay_ms = max(
             1, int((cutoff - now).total_seconds() * 1000))
         self._auto_refresh_cutoff_timer.start(delay_ms)
@@ -924,12 +956,8 @@ class View:
 
     def _schedule_new_listing_refresh(self):
         """상장 당일 종목의 상한가를 매일 09:00:30에 한 번 다시 읽도록 예약한다."""
-        hour, minute, second = self.NEW_LISTING_REFRESH
         now = datetime.now(KST)
-        target = now.replace(
-            hour=hour, minute=minute, second=second, microsecond=0)
-        if now >= target:
-            target += timedelta(days=1)
+        target = _market_dt(now, *self.NEW_LISTING_REFRESH, opening=True)
         self._new_listing_timer.start(
             max(1, int((target - now).total_seconds() * 1000)))
 
@@ -1064,7 +1092,12 @@ class View:
         d = self.screen.model.rows.get(code)
         if d is None:
             return
-        if not (d["upper"] > 0 and d["price"] == d["upper"]):
+        if not (d["upper"] > 0 and d["price"] > 0):
+            # 편입 조회 전이라 상한가를 아직 모른다. 무너졌다고 적으면 재시작
+            # 직후 첫 체결 틱이 진입시각이 된다(2026-11-19 노랑풍선: 10:03 진입이
+            # 10:09:38 재시작 7초 뒤 10:09:45로 찍혔다).
+            return
+        if d["price"] != d["upper"]:
             self._entry_broken.add(code)
             return
         if code in self._entry_broken:
@@ -1127,6 +1160,7 @@ class View:
 
 class App:
     _sell_exchange = "KRX"  # 설정 복원 전·검증 대역의 기본값
+    _sell_after_hours = False  # `시간외` 체크. 저장하지 않는다
 
     def __init__(self, screen: ConditionScreen):
         self.rest = RestClient()
@@ -1308,6 +1342,11 @@ class App:
             else "KRX")
         screen.sor_sell_check.setChecked(self._sell_exchange == "SOR")
         screen.sor_sell_check.toggled.connect(self._on_sor_sell)
+        self._after_hours_timer = QTimer()
+        self._after_hours_timer.setSingleShot(True)
+        self._after_hours_timer.timeout.connect(
+            lambda: screen.after_hours_check.setChecked(False))
+        screen.after_hours_check.toggled.connect(self._on_after_hours_sell)
         self._font_size = _normalize_app_font_size(
             self._settings.value(APP_FONT_SIZE_KEY, DEFAULT_APP_FONT_SIZE))
         font_index = screen.font_size_combo.findData(self._font_size)
@@ -1375,9 +1414,15 @@ class App:
         screen.exit_hotkey_changed.connect(
             lambda code, spec, source=screen:
             self._set_global_exit_hotkey(source, code, spec))
+        screen.cancel_hotkey_changed.connect(
+            lambda code, spec, source=screen:
+            self._set_custom_cancel_hotkey(source, code, spec))
         screen.exit_hotkeys_clear_all_requested.connect(
             self._clear_all_exit_hotkeys)
         screen.exit_hotkey_count = self._exit_hotkey_count
+        screen.cancel_hotkeys_clear_all_requested.connect(
+            self._clear_all_cancel_hotkeys)
+        screen.cancel_hotkey_count = self._cancel_hotkey_count
         screen.emergency_exit_requested.connect(self._emergency_exit)
         screen.order_status_acknowledged.connect(
             self._acknowledge_order_status)
@@ -1410,6 +1455,7 @@ class App:
         token = (id(screen), code)
         if spec is None:
             self._global_hotkeys.unregister(token)
+            self._set_cancel_hotkey(screen, code, None)
             self._exit_hotkey_specs.get(screen.prefix, {}).pop(code, None)
             self._clear_hotkey_conflict(code)
             # 청산키 때문에 붙잡아 둔 행이면 이제 놓는다.
@@ -1433,6 +1479,7 @@ class App:
                     specs.pop(other, None)
             specs[code] = dict(spec)
             self._clear_hotkey_conflict(code)
+            self._set_cancel_hotkey(screen, code, spec)
             if persist:
                 self._save_order_settings()
             log.warning(
@@ -1441,6 +1488,7 @@ class App:
                 code, spec.get("label"), screen.prefix,
                 _is_process_admin(), os.getpid())
             return
+        self._set_cancel_hotkey(screen, code, None)
         screen.model.set_order_status(code, HOTKEY_CONFLICT_STATUS)
         # 칸에 키가 남으면 앱이 뒤에 있을 때 안 먹는 줄 모른다. 청산키는
         # 앱이 뒤에 있을 때 쓰는 물건이라 그대로 두면 안 된다. F12는 윈도우가
@@ -1450,6 +1498,68 @@ class App:
         log.error(
             "global exit hotkey registration failed code=%s key=%s screen=%s",
             code, spec.get("label"), screen.prefix)
+
+    def _set_cancel_hotkey(self, screen: ConditionScreen, code: str, exit_spec):
+        """청산키를 따라 짝 취소키(F1→F2 … F7→F8)를 걸고 푼다.
+
+        취소키 칸에서 손으로 고른 키가 있으면 그것을 쓴다(청산키 설정의
+        `cancel`, `{}`는 손으로 푼 것). 그래서 따로 저장하지 않는다.
+        다른 프로그램(또는 손으로 건 청산키)이 그 키를 잡고 있으면 취소키만
+        `충돌`로 비우고 청산키는 그대로 둔다.
+        """
+        token = (id(screen), code, "cancel")
+        self._global_hotkeys.unregister(token)
+        had = screen.model.cancel_hotkeys.pop(code, None)
+        custom = (exit_spec or {}).get("cancel")
+        if custom is not None:
+            cancel_spec = dict(custom) if custom else None
+        else:
+            pair = _cancel_key_label(exit_spec)
+            cancel_spec = _function_key_spec(pair) if pair else None
+        label = str((cancel_spec or {}).get("label") or "")
+        if cancel_spec:
+            ok = self._global_hotkeys.register(
+                token, cancel_spec, (screen, code, label, "cancel"))
+            screen.model.cancel_hotkeys[code] = label if ok else "충돌"
+            (log.warning if ok else log.error)(
+                "cancel hotkey %s code=%s key=%s screen=%s",
+                "registered" if ok else "registration failed",
+                code, label, screen.prefix)
+        if had or label:
+            screen.refresh_exit_hotkey_cell(code)
+
+    def _set_custom_cancel_hotkey(self, screen: ConditionScreen, code: str, spec):
+        """취소키 칸에서 손으로 고른 키. 청산키 설정에 붙여 저장한다."""
+        exit_spec = (self._exit_hotkey_specs.get(screen.prefix) or {}).get(code)
+        if exit_spec is None:
+            return
+        exit_spec["cancel"] = dict(spec) if spec else {}
+        self._set_cancel_hotkey(screen, code, exit_spec)
+        self._save_order_settings()
+        audit_log.info("cancel hotkey set by hand code=%s key=%s",
+                       code, (spec or {}).get("label") or "-")
+
+    def _cancel_key_pressed(self, code: str, label: str):
+        """취소키: 미체결 매수를 전부 취소한다. 보유는 팔지 않는다.
+
+        청산과 같은 장부(웹소켓)로 바로 쏜다. 장부에 없으면 주문 셀 취소
+        버튼과 같은 길(앱 분할 주문 → 계좌 조회)로 거둔다.
+        """
+        orders = [o for o in self._pending_open_buys(code) if o[1] > 0]
+        audit_log.info(
+            "cancel hotkey triggered code=%s key=%s orders=%s qty=%s",
+            code, label, len(orders), sum(qty for _, qty, _ex in orders))
+        if not orders:
+            self._cancel_order(code)
+            return
+        self._cancel_open_buys_now(code, orders, "취소키", cap=None)
+        for view in self.views:
+            if code in view.screen.model.rows:
+                view.screen.set_order_state(
+                    code, "취소전송",
+                    f"상태 취소키 {label} · 미체결 매수 {len(orders):,}건 "
+                    f"{sum(qty for _, qty, _ex in orders):,}주 취소전송",
+                    False)
 
     def _auto_assign_exit_hotkey(self, screen: ConditionScreen, code: str):
         """주문과 함께 청산키를 자동으로 건다. 후보 앞에서부터 빈 키를 집는다.
@@ -1513,6 +1623,36 @@ class App:
         self._save_order_settings()
         log.warning("all exit hotkeys cleared: %d", cleared)
 
+    def _cancel_hotkey_count(self) -> int:
+        """모든 창에 걸린 취소키 수(`충돌` 제외).
+
+        화면의 `cancel_hotkey_count`는 이 함수로 바꿔 끼워져 있다. 그것을
+        부르면 자기 자신을 부른다 — 모델을 직접 센다.
+        """
+        return sum(1 for view in self.views
+                   for label in view.screen.model.cancel_hotkeys.values()
+                   if label != "충돌")
+
+    def _clear_all_cancel_hotkeys(self):
+        """모든 창의 취소키를 한 번에 푼다. 청산키는 그대로 둔다.
+
+        칸을 눌러 하나씩 푼 것과 같다(`cancel` = `{}`) — 재시작해도 안 살아난다.
+        새로 걸리는 청산키에는 다시 짝이 붙는다. 저장은 끝에 한 번만 한다.
+        """
+        for specs in self._exit_hotkey_specs.values():
+            for spec in specs.values():
+                spec["cancel"] = {}
+        cleared = 0
+        for view in self.views:
+            screen = view.screen
+            specs = self._exit_hotkey_specs.get(screen.prefix) or {}
+            for code in list(screen.model.cancel_hotkeys):
+                self._set_cancel_hotkey(
+                    screen, code, specs.get(code) or {"cancel": {}})
+                cleared += 1
+        self._save_order_settings()
+        log.warning("all cancel hotkeys cleared: %d", cleared)
+
     def _clear_exit_hotkey(self, code: str):
         """걸려 있던 청산키를 내린다. 창마다 따로 걸리므로 전부 본다."""
         for view in self.views:
@@ -1535,6 +1675,22 @@ class App:
                 model.set_order_status(code, "")
 
     def _on_global_exit_hotkey(self, payload: tuple):
+        # 칸을 눌러 새 키를 받는 중이면(최대 5초) 전역키를 쏘지 않는다. 이미
+        # 다른 종목에 걸린 키를 고르려다 그 종목이 청산되면 안 된다. 전역으로
+        # 잡힌 키는 창에 키 입력으로 오지 않고 여기로만 온다.
+        capturing = next((view.screen for view in self.views
+                          if view.screen._hotkey_capture_code), None)
+        if capturing is not None:
+            capturing._hotkey_capture_code = ""
+            capturing._hotkey_capture_cancel = False
+            log.warning("global hotkey ignored during key capture key=%s code=%s",
+                        payload[2], payload[1])
+            QToolTip.showText(QCursor.pos(),
+                              f"{payload[2]} 키는 이미 쓰는 중입니다 · 다른 키를 고르세요")
+            return
+        if len(payload) == 4:  # (screen, code, label, "cancel") — 짝 취소키
+            self._cancel_key_pressed(payload[1], payload[2])
+            return
         screen, code, label = payload
         row = screen.model.rows.get(code, {})
         price = _emergency_exit_price(row)
@@ -2436,10 +2592,11 @@ class App:
         if _krx_holiday_reason(now.date()):
             return ""
         minute = now.hour * 60 + now.minute
+        day = now.date()
         # 30초 타이머가 한 번 놓쳐도 2분 창 안에서 한 번만 실행한다.
-        for label, target in (("0930", 9 * 60 + 30),
+        for label, target in (("0930", config.market_at(9, 30, opening=True, day=day) // 60),
                               ("1100", 11 * 60),
-                              ("1520", 15 * 60 + 20)):
+                              ("1520", config.market_at(15, 20, day=day) // 60)):
             if target <= minute <= target + 1:
                 return label
         return ""
@@ -2881,7 +3038,9 @@ class App:
 
     def _track_open_buy(self, code: str, order_no: str, event: dict):
         """매수 이벤트: 미체결 장부와 보유수량을 함께 갱신한다."""
+        had_open = bool(self._open_buy_orders.get(code))
         self._track_order_book(self._open_buy_orders, code, order_no, event)
+        has_open = bool(self._open_buy_orders.get(code))
         filled = self._new_fill_qty(order_no, event)
         position = self._position_book.get(code)
         if filled and position is None and self._position_book_primed:
@@ -2897,6 +3056,8 @@ class App:
             was_empty = position["held"] <= 0
             position["held"] += filled
             position["sellable"] += filled
+            position["amount"] = position.get("amount", 0) + filled * max(
+                0, int(event.get("fill_price") or 0))
             if was_empty:
                 # 보유가 0에서 생기는 순간이다. 영웅문에서 산 것도 여기로
                 # 온다 — `_auto_assign_exit_hotkey`는 주문 경로에만 붙어
@@ -2907,6 +3068,19 @@ class App:
                 # **보유가 0일 때만 건다.** 추가 매수마다 걸면 손으로 푼
                 # 키가 되살아난다. 푸는 쪽이 사용자의 명시적 의사표시다.
                 self._auto_assign_exit_hotkey_everywhere(code)
+        held = int((self._position_book.get(code) or {}).get("held") or 0)
+        if not had_open and has_open and held <= 0:
+            # 영웅문 주문도 **접수 순간** 건다. 체결 때만 걸면 동시호가에
+            # 넣은 9분할이 09:00 체결 전까지 청산키(미체결 취소) 없이 남는다.
+            # 첫 주문일 때만이라 손으로 푼 키가 다음 주문에 되살아나지 않는다.
+            self._auto_assign_exit_hotkey_everywhere(code)
+        elif (had_open and not has_open and held <= 0
+              and self._position_book_primed
+              and not self._open_sell_orders.get(code)
+              and code not in self._emergency_locked):
+            # 한 주도 못 사고 미체결이 다 취소됐다. 빈 키는 풀어 둔다.
+            # 청산 중인 종목은 `_clear_after_emergency`가 따로 정리한다.
+            self._clear_exit_hotkey(code)
         # 장부를 다 고친 뒤에 표시한다. 먼저 부르면 보유수량이 한 박자 늦는다.
         self._push_pending_orders(code)
 
@@ -2943,7 +3117,12 @@ class App:
                 position["sellable"] = max(0, position["sellable"] - after)
             filled = self._new_fill_qty(order_no, event)
             if filled:
-                position["held"] = max(0, position["held"] - filled)
+                before_held = position["held"]
+                position["held"] = max(0, before_held - filled)
+                if before_held and "amount" in position:
+                    # 판 만큼 매입금액도 비율로 줄인다(평균단가 유지).
+                    position["amount"] = (
+                        position["amount"] * position["held"] // before_held)
                 if position["held"] <= 0:
                     self._clear_spent_balance_sell(code)
         if code in self._emergency_locked:
@@ -2964,6 +3143,28 @@ class App:
             return "SOR" if nxt else "KRX"
         return self._sell_exchange
 
+    def _after_hours_type(self, code: str) -> str:
+        """`시간외` 체크가 켜졌을 때 KRX 전용 종목 매도 유형. 아니면 빈 문자열.
+
+        오전은 장전 시간외(61, 08:30~08:40 전일 종가), 오후는 장후 시간외종가
+        (81, 15:40~16:00 종가). 둘 다 미리 받는다. 시각으로 자동 전환하지 않는
+        것은 동시호가가 랜덤엔드라 종목마다 끝나는 시각이 달라서다(사용자).
+        NXT 가능 종목은 `매도SOR`을 따른다.
+        """
+        if not self._sell_after_hours or code in getattr(self._market, "nxt", ()):
+            return ""
+        return "61" if datetime.now().hour < 12 else "81"
+
+    def _on_after_hours_sell(self, on: bool):
+        self._sell_after_hours = bool(on)
+        log.warning("sell after-hours -> %s", self._sell_after_hours)
+        if not on:
+            self._after_hours_timer.stop()
+            return
+        now = datetime.now()
+        end = min(_market_dt(now, h, m) for h, m in AFTER_HOURS_OFF_TIMES)
+        self._after_hours_timer.start(int((end - now).total_seconds() * 1000))
+
     async def _send_sell_order(self, code: str, qty: int, price: int,
                                market_sell: bool, reason: str,
                                attempts: int = 3) -> dict:
@@ -2972,12 +3173,17 @@ class App:
         타임아웃이라고 그냥 다시 보내면 중복 매도가 된다. 거래소가 보내주는
         매도 접수 이벤트를 근거로 미접수를 확인한 경우에만 재전송한다.
         """
+        exchange = self._sell_exchange_now(code)
+        after_hours = self._after_hours_type(code)
+        if after_hours:
+            log.warning("%s sell after-hours(%s) code=%s qty=%s",
+                        reason, after_hours, code, qty)
         for attempt in range(1, attempts + 1):
             marker = len(self._sell_accepts.get(code) or ())
             try:
                 return await self.rest.sell_order(
                     code, qty, int(price), market=market_sell,
-                    exchange=self._sell_exchange_now(code))
+                    exchange=exchange, after_hours=after_hours)
             except OrderSendUnknown as error:
                 accepted = await self._wait_sell_accepted(code, marker, qty)
                 if accepted:
@@ -3068,6 +3274,7 @@ class App:
             str(row["code"]): {
                 "held": max(0, int(row.get("held_qty") or 0)),
                 "sellable": max(0, int(row.get("sellable_qty") or 0)),
+                "amount": max(0, int(row.get("buy_amount") or 0)),
             }
             for row in rows
         }
@@ -3126,8 +3333,10 @@ class App:
         booked = self._position_book.get(code) or {}
         position = (max(0, int(booked.get("held") or 0)),
                     max(0, int(booked.get("sellable") or 0)))
+        amount = max(0, int(booked.get("amount") or 0))
         for view in self.views:
-            view.screen.set_pending_orders(code, buy, sell, position, trim)
+            view.screen.set_pending_orders(
+                code, buy, sell, position, trim, amount=amount)
 
     def _current_bid_qty(self, code: str) -> int:
         """지금 화면에 들어와 있는 최우선 매수잔량. 기록용이라 없으면 0이다."""
@@ -3643,10 +3852,9 @@ class App:
     def _schedule_session_cleanup(self):
         """다음 정리 시각에 한 번 울리도록 건다. 다 지났으면 내일 첫 차례로."""
         now = datetime.now()
-        times = [now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-                 for hour, minute in SESSION_CLEANUP_TIMES]
-        cutoff = next((t for t in sorted(times) if t > now),
-                      min(times) + timedelta(days=1))
+        # 애프터마켓은 개장이 늦은 날도 20시에 끝나므로 20:05는 밀지 않는다.
+        cutoff = min(_market_dt(now, hour, minute, shift=hour < 20)
+                     for hour, minute in SESSION_CLEANUP_TIMES)
         self._session_cleanup_timer.start(
             max(1, int((cutoff - now).total_seconds() * 1000)))
 
@@ -4191,15 +4399,28 @@ class App:
             # 그다음에 조회로 확인한다.
             self._cancel_open_buys_now(code, deferred, "긴급정리", cap=None)
             asyncio.ensure_future(self._sweep_open_buys(code, "긴급정리"))
+        state = "긴급정리" if sold_qty else "매수취소"
+        detail = (f"상태 계좌 미체결 {cancelled_count:,}건 "
+                  f"{cancelled_qty:,}주 취소 · 계좌 {sold_qty:,}주 매도 추적 중")
+        after_hours = self._after_hours_type(code) if sold_qty else ""
+        if after_hours:
+            # 시간외 주문은 접수만 되고 그 시간이 와야 체결된다. 칸이 그대로
+            # 「긴급정리」면 팔리는 중인지 기다리는 중인지 모른다.
+            start, session, price_text = (
+                (config.market_at(8, 30), "장전 시간외", "전일 종가") if after_hours == "61"
+                else (config.market_at(15, 40), "장후 시간외", "종가"))
+            start = f"{start // 3600:02d}:{start % 3600 // 60:02d}"
+            if datetime.now().strftime("%H:%M") < start:
+                state = "시간외대기"
+                detail = (f"상태 아직 {session} 시작 전 · {start}부터 "
+                          f"{price_text} 체결 · {sold_qty:,}주")
+            else:
+                state = "시간외매도"
+                detail = (f"상태 {session} 매도 접수 · {price_text} 체결 대기 · "
+                          f"{sold_qty:,}주")
         for view in self.views:
             if code in view.screen.model.rows:
-                view.screen.set_order_state(
-                    code,
-                    "긴급정리" if sold_qty else "매수취소",
-                    (f"상태 계좌 미체결 {cancelled_count:,}건 "
-                     f"{cancelled_qty:,}주 취소 · "
-                     f"계좌 {sold_qty:,}주 매도 추적 중"),
-                    False)
+                view.screen.set_order_state(code, state, detail, False)
         log.warning(
             "emergency cancel+sell requested code=%s price=%s "
             "pending=%s held=%s sellable=%s tracked_filled=%s "
@@ -4481,7 +4702,8 @@ class App:
         """시작 시 최근 거래일을 보완하고 평일 15:40 이후 하루 한 번 실행한다."""
         now = time.localtime()
         today = time.strftime("%Y%m%d", now)
-        after_close = now.tm_wday < 5 and (now.tm_hour, now.tm_min) >= (15, 40)
+        after_close = now.tm_wday < 5 and (
+            now.tm_hour * 3600 + now.tm_min * 60 >= config.market_at(15, 40))
         if not catch_up and not after_close:
             return
         key = "auto_limit_entry_attempt_date"
@@ -4558,6 +4780,7 @@ class App:
         screen.news_btn.setVisible(False)
         screen.unified_check.setVisible(False)  # 통합 시세는 전 창 공통 -> 메인창에서만 전환
         screen.sor_sell_check.setVisible(False)  # 매도 거래소도 전 창 공통
+        screen.after_hours_check.setVisible(False)
         screen.font_size_combo.setVisible(False)  # 글자 크기는 앱 전체 공통 -> 메인창에서만 전환
         screen.theme_btn.setVisible(False)  # 테마는 앱 전체 공통 -> 메인창에서만 전환
         screen.clock_btn.setVisible(False)  # 분리 시계도 앱에 하나
@@ -4602,9 +4825,15 @@ class App:
         screen.exit_hotkey_changed.connect(
             lambda code, spec, source=screen:
             self._set_global_exit_hotkey(source, code, spec))
+        screen.cancel_hotkey_changed.connect(
+            lambda code, spec, source=screen:
+            self._set_custom_cancel_hotkey(source, code, spec))
         screen.exit_hotkeys_clear_all_requested.connect(
             self._clear_all_exit_hotkeys)
         screen.exit_hotkey_count = self._exit_hotkey_count
+        screen.cancel_hotkeys_clear_all_requested.connect(
+            self._clear_all_cancel_hotkeys)
+        screen.cancel_hotkey_count = self._cancel_hotkey_count
         screen.emergency_exit_requested.connect(self._emergency_exit)
         screen.order_status_acknowledged.connect(
             self._acknowledge_order_status)
@@ -4628,6 +4857,8 @@ class App:
                     popup.close()
                 for code in tuple(v.screen.model.exit_hotkeys):
                     self._global_hotkeys.unregister((id(v.screen), code))
+                    self._global_hotkeys.unregister(
+                        (id(v.screen), code, "cancel"))
                 task = self._orderable_tasks.pop(v.screen, None)
                 if task and not task.done():
                     task.cancel()

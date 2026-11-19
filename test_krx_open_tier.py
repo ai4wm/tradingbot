@@ -12,6 +12,10 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import config  # noqa: E402
+config.market_delay = lambda day=None: (0, 0)  # 평일 시각으로 고정(수능일에 돌려도 같게)
+
+from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 import gui  # noqa: E402
@@ -100,8 +104,8 @@ def demo_krx_vi_marks_open():
     m.note_krx_vi("000001", True, "동적", "090010")     # 동적VI = 장중
     assert m.krx_open_state("000001") is True
 
-    m.single.add("014285")                               # 단일가 종목은 등락률로
-    assert m.krx_open_state("014285") is None
+    m.single.add("014285")                               # 단일가도 확인된 시가는 유지
+    assert m.krx_open_state("014285") is True
     print("ok (KRX VI: 시가 VI만 시가 전, 장중 VI·해제는 시가 정해짐)")
 
 
@@ -120,6 +124,58 @@ def demo_no_preopen_after_0903():
     finally:
         gui._opening_over = lambda: False
     print("ok (09:03 이후엔 시가 전 묶음이 없다)")
+
+
+def demo_flat_open_never_returns_to_waiting():
+    """첫 체결 후 보합인 종목이 다음 예상 상한가로 점상 대기에 재진입하지 않는다."""
+    QApplication.instance() or QApplication([])
+    for unified in (False, True):
+        for single in (False, True):
+            m = gui.StockModel()
+            m.unified = unified
+            code = "002995"
+            if single:
+                m.single.add(code)
+            m.add_stock(code, row(
+                base=23350, upper=30350, price=23350, rate=0.0,
+                exp_price=30350, bid_price=30350, vol=0, exp_hot=1))
+            # 장전 KRX 종가 체결과 NXT 체결만으로 KRX 개장을 확정하지 않는다.
+            m.update_stock(code, {"vol": 100, "trade_time": 83500,
+                                  "trade_ex": "KRX"})
+            m.update_stock(code, {"vol": 200, "trade_time": 90001,
+                                  "trade_ex": "NXT"})
+            assert m.krx_open_state(code) is (False if unified and not single else None)
+            m.update_stock(code, {"exp_price": 30350, "exp_hot": 1})
+            assert gui._limit_tier(
+                m.rows[code], krx_opened=m.krx_open_state(code)) == TIER_WAIT_CLEAN
+            # 첫 KRX 체결은 보합. 다음 단일가/VI 예상값은 그대로 표시한다.
+            m.update_stock(code, {"price": 23350, "rate": 0.0, "vol": 13064,
+                                  "trade_time": 90004, "trade_ex": "KRX"})
+            m.update_stock(code, {"exp_price": 30350, "exp_hot": 1})
+            assert m.rows[code]["exp_price"] == 30350
+            assert m.krx_open_state(code) is True
+            assert gui._limit_tier(
+                m.rows[code], krx_opened=m.krx_open_state(code)) not in (
+                    TIER_WAIT_CLEAN, TIER_WAIT, gui.TIER_PREOPEN)
+            # 첫 체결을 기다리는 진짜 점상 대기 종목은 구분선 위에 남는다.
+            waiting_code = "301300"
+            m.add_stock(waiting_code, row(
+                base=2365, upper=3070, price=2365, rate=0.0,
+                exp_price=3070, bid_price=3070, vol=0, exp_hot=1))
+            proxy = gui.TieredProxy()
+            proxy.setSourceModel(m)
+            proxy.setSortRole(Qt.UserRole)
+            proxy.limit_mode = True
+            for column in (gui.RATE_COL, gui.BID_QTY_COL):
+                for order in (Qt.AscendingOrder, Qt.DescendingOrder):
+                    proxy.sort(column, order)
+                    assert proxy.row_code(0) == waiting_code
+                    table = gui.ThemeGroupedTableView()
+                    table.setModel(proxy)
+                    last, waiting, _ = table.waiting_group()
+                    assert last == 0 and waiting == {waiting_code}
+                    table.close()
+    print("ok (KRX/통합·일반/단일가: 보합 첫 체결 후 대기열 재진입 금지)")
 
 
 def demo_shared_across_windows():
@@ -152,5 +208,6 @@ if __name__ == "__main__":
     demo_model()
     demo_krx_vi_marks_open()
     demo_no_preopen_after_0903()
+    demo_flat_open_never_returns_to_waiting()
     demo_shared_across_windows()
     demo_ws_routes_only_krx_vi()

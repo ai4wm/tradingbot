@@ -51,11 +51,16 @@ def event(order_qty, fill_qty, remaining, fill_id, code="049630") -> dict:
             "fill_qty": fill_qty, "fill_id": fill_id}
 
 
+def _hs(position: dict) -> dict:
+    """체결 금액(amount)은 따로 본다. 여기서는 수량만."""
+    return {k: position[k] for k in ("held", "sellable")}
+
+
 def demo():
     # 장부를 세운 뒤 처음 보는 종목 -> 0에서 시작해 체결량만큼 잡힌다.
     app = Stub(primed=True)
     app._track_open_buy("011330", "1", fill())
-    assert app._position_book["011330"] == {"held": 197, "sellable": 197}, (
+    assert _hs(app._position_book["011330"]) == {"held": 197, "sellable": 197}, (
         app._position_book)
 
     # 같은 체결번호가 두 번 와도 한 번만 센다.
@@ -66,7 +71,7 @@ def demo():
     part = Stub(primed=True)
     part._track_open_buy("011330", "1", event(297, 197, 100, "A1", "011330"))
     part._track_open_buy("011330", "1", event(297, 100, 0, "A2", "011330"))
-    assert part._position_book["011330"] == {"held": 297, "sellable": 297}, (
+    assert _hs(part._position_book["011330"]) == {"held": 297, "sellable": 297}, (
         part._position_book)
 
     # 체결량이 누적으로 실려 와도 부풀지 않는다. 2026-08-14 049630 실제
@@ -75,7 +80,7 @@ def demo():
     dup = Stub(primed=True)
     dup._track_open_buy("049630", "7850", event(109, 34, 75, "3551"))
     dup._track_open_buy("049630", "7850", event(109, 100, 9, "3552"))
-    assert dup._position_book["049630"] == {"held": 100, "sellable": 100}, (
+    assert _hs(dup._position_book["049630"]) == {"held": 100, "sellable": 100}, (
         dup._position_book)
 
     # 잔량 9주 자동취소 확인은 체결량이 0이라 장부를 건드리지 않는다.
@@ -106,7 +111,7 @@ def demo():
     # 이미 들고 있던 종목은 전과 같이 그대로 더한다.
     held = Stub(primed=True, book={"005930": {"held": 10, "sellable": 4}})
     held._track_open_buy("005930", "1", fill(code="005930", qty=5))
-    assert held._position_book["005930"] == {"held": 15, "sellable": 9}
+    assert _hs(held._position_book["005930"]) == {"held": 15, "sellable": 9}
 
     print("ok")
 

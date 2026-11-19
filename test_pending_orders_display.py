@@ -13,8 +13,9 @@ class _Screen:
     def __init__(self):
         self.shown = []
 
-    def set_pending_orders(self, code, buy, sell, position, trim=0):
+    def set_pending_orders(self, code, buy, sell, position, trim=0, amount=0):
         self.shown.append((code, buy, sell, position, trim))
+        self.amount = amount
 
 
 class _View:
@@ -74,6 +75,29 @@ def demo():
     real.set_pending_orders("005930", (0, 0), (0, 0), (500, 500))
     assert real.pending_order_value.text() == "체결 <b>500주</b>", (
         real.pending_order_value.text())
+    # 체결 금액은 수량 옆에 붙는다.
+    real.set_pending_orders("005930", (0, 0), (0, 0), (632, 632),
+                            amount=3_229_520)
+    assert real.pending_order_value.text() == (
+        "체결 <b>632주</b> · <b>3,229,520원</b>"), real.pending_order_value.text()
+
+    # 매수 체결은 체결가 × 수량을 더하고, 매도 체결은 남은 비율만큼 줄인다.
+    probe = _App(_Screen())
+    probe._position_book = {"005930": {"held": 0, "sellable": 0, "amount": 0}}
+    probe._position_book_primed = True
+    probe._open_buy_orders, probe._open_sell_orders = {}, {}
+    probe._track_order_book = lambda *a, **k: 0
+    probe._auto_assign_exit_hotkey_everywhere = lambda code: None
+    probe._clear_spent_balance_sell = lambda code: None
+    probe._emergency_locked = set()
+    probe._sell_accepts = {}
+    fills = iter((632, 316))
+    probe._new_fill_qty = lambda order_no, event: next(fills)
+    main.App._track_open_buy(probe, "005930", "A9", {"fill_price": 5110})
+    assert probe._position_book["005930"]["amount"] == 3_229_520, probe._position_book
+    assert probe.views[0].screen.amount == 3_229_520
+    main.App._track_open_sell(probe, "005930", "S9", {})
+    assert probe._position_book["005930"]["amount"] == 1_614_760, probe._position_book
 
     # 3단매도 셀 — 켜 둔 단계를 다 지나면 더 나갈 매도가 없다. 소리는 그때만
     # 들리므로 자리를 비운 뒤에도 알 수 있게 배경색으로 남아야 한다.

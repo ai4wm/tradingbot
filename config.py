@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """도메인/상수. 모의<->실전은 IS_MOCK 하나로 전환."""
 import os
+from datetime import date, timedelta
 
 from dotenv import load_dotenv
 
@@ -19,6 +20,36 @@ DART_API_KEY = os.getenv("DART_API_KEY", "")
 KRX_API_KEY = os.getenv("KRX_API_KEY", "")
 NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID", "")
 NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET", "")
+
+# 개장이 늦춰지는 날. 수능일은 하루가 통째로 1시간 밀리고(정규장 10:00~16:30,
+# 장전 시간외 09:30~09:40, 장후 시간외 16:40~17:00, 애프터마켓 끝 20:00은 그대로,
+# NXT 프리마켓 없음) 연초 첫 거래일은 개장만 10시다. 수능일은 해마다 거래소
+# 공지를 보고 여기에 더한다.
+SUNEUNG_DAYS = {date(2026, 11, 19)}
+
+
+def market_delay(day: date | None = None) -> tuple[int, int]:
+    """(개장 지연, 하루 전체 지연) 초."""
+    day = day or date.today()
+    if day in SUNEUNG_DAYS:
+        return 3600, 3600
+    first = date(day.year, 1, 2)
+    while first.weekday() >= 5:
+        first += timedelta(days=1)
+    return (3600, 0) if day == first else (0, 0)
+
+
+def market_at(hour: int, minute: int = 0, second: int = 0, *,
+              opening: bool = False, day: date | None = None) -> int:
+    """평소 시각을 그날 실제 시각(자정부터 초)으로. opening은 개장 쪽 지연을 쓴다."""
+    open_delay, day_delay = market_delay(day)
+    return (hour * 3600 + minute * 60 + second
+            + (open_delay if opening else day_delay))
+
+
+def hms(seconds: int) -> str:
+    return f"{seconds // 3600:02d}{seconds % 3600 // 60:02d}{seconds % 60:02d}"
+
 
 # 키움 공지 점검 시간(KST). 이 구간에는 토큰/REST/웹소켓 요청을 보내지 않고
 # 종료 시각에 한 번만 연결을 시작한다. 다음 공지가 나오면 이 목록에 추가한다.

@@ -358,21 +358,26 @@ class RestClient:
 
     async def sell_order(
             self, code: str, qty: int, price: int = 0, *,
-            market: bool = False, exchange: str = "KRX") -> dict:
+            market: bool = False, exchange: str = "KRX",
+            after_hours: str = "") -> dict:
         """지정가 또는 시장가 매도. `exchange`는 KRX 또는 SOR.
 
         **시장가는 KRX로만 낸다.** NXT 프리·애프터마켓은 지정가만 받아 SOR이
         그쪽으로 보내면 거부된다(키움 최선집행기준 설명서 2026-09-14).
+
+        `after_hours`는 KRX 시간외 유형이다 — `61` 장전(전일 종가), `81` 장후
+        (당일 종가). 가격 없이 그 종가로 체결된다.
         """
         price = int(price)
-        if not market and price <= 0:
+        no_price = market or bool(after_hours)
+        if not no_price and price <= 0:
             raise ValueError("매도 지정가는 0원보다 커야 합니다")
         data = await self._order_request("kt10001", {
-            "dmst_stex_tp": "KRX" if market else exchange,
+            "dmst_stex_tp": "KRX" if no_price else exchange,
             "stk_cd": code,
             "ord_qty": str(int(qty)),
-            "ord_uv": "" if market else str(price),
-            "trde_tp": "3" if market else "0",
+            "ord_uv": "" if no_price else str(price),
+            "trde_tp": after_hours or ("3" if market else "0"),
             "cond_uv": "",
         })
         order_no = str(data.get("ord_no") or data.get("order_no") or "")
@@ -963,6 +968,9 @@ class RestClient:
                         "name": _stock_name(code, item.get("stk_nm", "")),
                         "held_qty": held,
                         "sellable_qty": sellable,
+                        # 주문줄 「체결 N주 · 금액」 표시용. 없으면 0(표시 생략).
+                        "buy_amount": max(0, _to_int(item.get("pur_amt"))
+                                          or held * _to_int(item.get("pur_pric"))),
                     })
             if r.headers.get("cont-yn", "N").upper() != "Y":
                 break
@@ -1340,6 +1348,10 @@ class RestClient:
             if t[:8] != today or abs(_to_int(b.get("cur_prc"))) != upper:
                 break
             entry = t
+            if abs(_to_int(b.get("low_pric"))) != upper:
+                # 이 1분 안에서 풀렸다 다시 붙었다. 종가만 보면 그 분을 지나쳐
+                # 더 이른 진입을 돌려줬다(2026-11-19 스튜디오드래곤).
+                break
         return _hms(entry)
 
     async def close(self):
@@ -1349,8 +1361,10 @@ class RestClient:
 def _in_auction() -> bool:
     """개장/마감 동시호가 시간대(로컬=KST) 여부."""
     import time
-    hm = time.strftime("%H%M")
-    return "0830" <= hm < "0900" or "1520" <= hm < "1530"
+    now = time.strftime("%H%M%S")
+    at = lambda h, m, opening=False: config.hms(config.market_at(h, m, opening=opening))  # noqa: E731
+    return (at(8, 30) <= now < at(9, 0, True)
+            or at(15, 20) <= now < at(15, 30))
 
 
 def _hms(tm: str) -> str:

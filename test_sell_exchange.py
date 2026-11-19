@@ -39,6 +39,7 @@ def demo_single_gate_carries_exchange():
     """3단매도·청산 둘 다 `_send_sell_order` 한 곳을 지난다."""
     app = types.SimpleNamespace(rest=_rest(), _sell_accepts={})
     app._sell_exchange_now = lambda _code: app._sell_exchange
+    app._after_hours_type = lambda _code: ""
     send = types.MethodType(main.App._send_sell_order, app)
     for exchange in ("KRX", "SOR"):
         app._sell_exchange = exchange
@@ -100,7 +101,58 @@ def demo_nxt_premarket_watch():
     print("ok (NXT 프리마켓 감시는 NXT 종목만 · 그때 매도는 SOR)")
 
 
+def demo_after_hours_check():
+    """`시간외` 체크: KRX 전용만 오전 61·오후 81(가격 없음), NXT 가능은 매도SOR대로.
+
+    시각으로 자동 전환하지 않는다. 체크가 꺼져 있으면 15:35여도 보통 지정가다.
+    체크는 08:40·16:00에 저절로 꺼진다.
+    """
+    real_dt = main.datetime
+    bodies, started = [], []
+    rest = RestClient.__new__(RestClient)
+
+    async def fake(api_id, body):
+        bodies.append((body["dmst_stex_tp"], body["trde_tp"], body["ord_uv"]))
+        return {"ord_no": "1"}
+
+    rest._order_request = fake
+    app = types.SimpleNamespace(
+        rest=rest, _sell_accepts={}, _sell_exchange="SOR",
+        _sell_after_hours=False, _market=types.SimpleNamespace(nxt={"000001"}),
+        _after_hours_timer=types.SimpleNamespace(
+            start=started.append, stop=lambda: started.append("stop")))
+    app._sell_exchange_now = lambda _code: app._sell_exchange
+    app._after_hours_type = types.MethodType(main.App._after_hours_type, app)
+    send = types.MethodType(main.App._send_sell_order, app)
+
+    def at(hour, minute):
+        class Fixed(real_dt):
+            @classmethod
+            def now(cls, tz=None):
+                return real_dt(2026, 11, 18, hour, minute)
+        main.datetime = Fixed
+
+    try:
+        at(15, 35)
+        asyncio.run(send("000002", 1, 7000, False, "test"))   # 체크 꺼짐
+        main.App._on_after_hours_sell(app, True)
+        asyncio.run(send("000002", 1, 7000, False, "test"))   # KRX 전용 → 81
+        asyncio.run(send("000001", 1, 7000, False, "test"))   # NXT 가능 → SOR
+        at(8, 20)
+        asyncio.run(send("000002", 1, 7000, False, "test"))   # 오전 → 61
+        main.App._on_after_hours_sell(app, True)
+        main.App._on_after_hours_sell(app, False)
+    finally:
+        main.datetime = real_dt
+    assert bodies == [("SOR", "0", "7000"), ("KRX", "81", ""),
+                      ("SOR", "0", "7000"), ("KRX", "61", "")], bodies
+    # 15:35에 켜면 16:00(25분), 08:20에 켜면 08:40(20분)에 꺼진다.
+    assert started == [25 * 60_000, 20 * 60_000, "stop"], started
+    print("ok (시간외 체크: KRX 전용 오전 61·오후 81, NXT는 SOR, 08:40·16:00 꺼짐)")
+
+
 if __name__ == "__main__":
     demo_limit_follows_switch_market_stays_krx()
     demo_single_gate_carries_exchange()
     demo_nxt_premarket_watch()
+    demo_after_hours_check()

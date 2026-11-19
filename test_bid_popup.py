@@ -160,9 +160,12 @@ def demo_restore_after_restart():
         geo = screen._bid_popups["001527"].geometry()
         assert (geo.x(), geo.y(), geo.width(), geo.height()) == (300, 200, 280, 120), geo
         screen.model.add_stock("003495", dict(row))           # 닫은 종목은 안 뜸
-        screen.model.add_stock("004545", dict(row))           # 늦게 편입돼도 뜸
+        screen.model.add_stocks([("004545", {})])             # 늦게 편입, 코드만
         app.processEvents()
         assert set(screen._bid_popups) == {"001527", "004545"}, screen._bid_popups
+        assert screen._bid_popups["004545"]._name == "004545"
+        screen.on_tick("004545", dict(row))                   # 편입 조회가 이름을 싣는다
+        assert screen._bid_popups["004545"]._name == "깨끗한나라우", "이름이 코드로 남음"
         for popup in list(screen._bid_popups.values()):
             popup.close()
         screen.deleteLater()

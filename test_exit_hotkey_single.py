@@ -43,6 +43,7 @@ def demo_keyed_row_is_held():
         _exit_hotkey_specs={screen.prefix: {"486510": {"label": "F1"}}},
         _global_hotkeys=types.SimpleNamespace(unregister=lambda token: None),
         _clear_hotkey_conflict=lambda code: None,
+        _set_cancel_hotkey=lambda screen, code, spec: None,
         _save_order_settings=lambda: None)
     main.App._set_global_exit_hotkey(app, screen, "486510", None)  # 풀면
     assert "486510" not in screen.model.rows, "키를 풀었는데 행이 남았다"
@@ -90,6 +91,7 @@ def demo_clear_all():
                             "w9_": {"000001": {"label": "F9"}}},   # 닫힌 창
         _global_hotkeys=types.SimpleNamespace(unregister=lambda token: None),
         _clear_hotkey_conflict=lambda code: None,
+        _set_cancel_hotkey=lambda screen, code, spec: None,
         _save_order_settings=lambda: saved.append(1))
     app._set_global_exit_hotkey = (
         lambda *a, **k: main.App._set_global_exit_hotkey(app, *a, **k))

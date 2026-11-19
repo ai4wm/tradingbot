@@ -42,19 +42,19 @@ class Stub:
 def demo():
     app = QApplication.instance() or QApplication([])
 
-    # 잔량 100만주 -> 표에서 50만/30만/20만. 입력칸만 바뀌고 저장은 없다.
-    screen = Stub(dict(SETTING), 1_000_000)
+    # 잔량 300만주도 50만/20만/10만. 입력칸만 바뀌고 저장은 없다.
+    screen = Stub(dict(SETTING), 3_000_000)
     dialog = gui.BalanceSellDialog(screen, CODE)
     dialog._rebase_now()
     assert screen.saved == [], screen.saved
     assert (dialog.first_edit.value(), dialog.second_edit.value(),
-            dialog.third_edit.value()) == (500_000, 300_000, 200_000), (
+            dialog.third_edit.value()) == (500_000, 200_000, 100_000), (
         dialog.first_edit.value())
     # 기준 수량 옆에 상한가(1,000원) 기준 금액이 붙는다.
     dialog._refresh_amounts()
     assert [label.text() for label in dialog.amount_labels] == [
-        "5.0억", "3.0억", "2.0억"], [l.text() for l in dialog.amount_labels]
-    assert dialog.current_label.text() == "1,000,000주 · 10.0억", (
+        "5.0억", "2.0억", "1.0억"], [l.text() for l in dialog.amount_labels]
+    assert dialog.current_label.text() == "3,000,000주 · 30.0억", (
         dialog.current_label.text())
     # 적용 전이라 기존 설정은 그대로다.
     assert screen.model.balance_sell_settings[CODE] == SETTING

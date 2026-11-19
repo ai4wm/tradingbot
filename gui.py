@@ -29,7 +29,8 @@ from PySide6.QtWidgets import (
     QTableView, QTableWidgetItem, QToolTip, QVBoxLayout, QWidget,
 )
 
-from order import fixed_quantities
+from config import hms, market_at
+from order import fixed_quantities, split_quantity
 from theme_keywords import STRONG_EVENT_THEMES
 
 log = logging.getLogger("gui")
@@ -39,8 +40,8 @@ audit_log = logging.getLogger("trade.audit")
 # 새 컬럼은 반드시 맨 뒤에 붙인다. 저장된 폭·순서가 논리 인덱스 기준이라
 # 중간에 끼우면 사용자 layout.ini의 폭이 엉뚱한 컬럼에 붙는다. 원하는 자리는
 # 사용자가 헤더를 끌어 옮긴다(setSectionsMovable).
-COLUMNS = ["순위",  "변동",      "등락률", "연상", "종목명", "테마",   "현재가", "예상체결가", "주문",  "L일봉H", "예상등락률", "전일거래량", "거래량", "매도잔량", "매수잔량", "예상체결량", "대금/분",       "시총(억)", "상한가진입시간", "3단매도(만)", "자동취소",       "청산키",     "거래대금"]
-FIELDS  = ["qrank", "qrank_chg", "rate",   "streak", "name", "theme", "price", "exp_price", "order", "bar",    "exp_rate",   "prev_vol", "vol",   "ask_qty",  "bid_qty",  "exp_qty",  "minute_value", "mcap",   "time",             "balance_sell", "auto_cancel_arm", "exit_hotkey", "acc_value"]
+COLUMNS = ["순위",  "변동",      "등락률", "연상", "종목명", "테마",   "현재가", "예상체결가", "주문",  "L일봉H", "예상등락률", "전일거래량", "거래량", "매도잔량", "매수잔량", "예상체결량", "대금/분",       "시총(억)", "상한가진입시간", "3단매도(만)", "자동취소",       "청산키",     "거래대금", "취소키"]
+FIELDS  = ["qrank", "qrank_chg", "rate",   "streak", "name", "theme", "price", "exp_price", "order", "bar",    "exp_rate",   "prev_vol", "vol",   "ask_qty",  "bid_qty",  "exp_qty",  "minute_value", "mcap",   "time",             "balance_sell", "auto_cancel_arm", "exit_hotkey", "acc_value", "cancel_hotkey"]
 # 컬럼은 아니지만 L일봉H 그리기에 필요한 저장 필드 (시/저/고/전일종가/상한/하한)
 # streak(연상)/mcap(시가총액)은 저장 안 함: 매번 계산
 BOOK_FIELDS = {f"{side}_{kind}{level if level > 1 else ''}"
@@ -48,7 +49,7 @@ BOOK_FIELDS = {f"{side}_{kind}{level if level > 1 else ''}"
                for level in range(1, 11)}
 STORED = (set(FIELDS) - {
     "streak", "theme", "mcap", "order", "balance_sell",
-    "auto_cancel_arm", "exit_hotkey"}) | {
+    "auto_cancel_arm", "exit_hotkey", "cancel_hotkey"}) | {
     "open", "low", "high", "base", "upper", "lower"} | BOOK_FIELDS
 BAR_COL = FIELDS.index("bar")
 RATE_COL = FIELDS.index("rate")
@@ -74,6 +75,7 @@ ORDER_COL = FIELDS.index("order")
 BALANCE_SELL_COL = FIELDS.index("balance_sell")
 AUTO_CANCEL_ARM_COL = FIELDS.index("auto_cancel_arm")
 EXIT_HOTKEY_COL = FIELDS.index("exit_hotkey")
+CANCEL_HOTKEY_COL = FIELDS.index("cancel_hotkey")  # 청산키 짝, 미체결 매수 전부 취소
 BALANCE_SELL_MARKET_LAST_KEY = "balance_sell_market_last"
 BALANCE_SELL_STAGE_KEYS = ("first", "second", "third")
 BALANCE_SELL_STAGE_LAST_KEYS = tuple(
@@ -596,8 +598,13 @@ class _DaySet(set):
     day = ""
 
 
+def _opening_at(hour: int, minute: int = 0, second: int = 0) -> str:
+    """개장 쪽 평소 시각을 그날 실제 'HHMMSS'로. 수능일·연초 첫 거래일은 10시 개장."""
+    return hms(market_at(hour, minute, second, opening=True))
+
+
 def _opening_over() -> bool:
-    return time.strftime("%H%M") >= "0903"
+    return time.strftime("%H%M%S") >= _opening_at(9, 3)
 
 
 def _limit_tier(d: dict, liquidation: bool = False,
@@ -715,6 +722,7 @@ class TieredProxy(QSortFilterProxyModel):
         # 상한가진입시간 정렬 중 비상한 그룹이 유지할 마지막 일반 정렬 기준.
         self._non_limit_sort_col = FIELDS.index("rate")
         self._non_limit_sort_order = Qt.DescendingOrder
+        self._sorted_tiers: dict[str, tuple[bool, int]] = {}
 
     def set_theme_labels(self, labels: dict[str, tuple[str, ...]]):
         """실시간 조건검색용 종목별 테마 연결표를 갱신한다."""
@@ -910,6 +918,13 @@ class TieredProxy(QSortFilterProxyModel):
             self._non_limit_sort_col = column
             self._non_limit_sort_order = order
         super().sort(column, order)
+        model = self.sourceModel()
+        self._sorted_tiers = {
+            code: (_row_blank(model.rows[code]),
+                   _limit_tier(model.rows[code], code in model.liquidation,
+                               model.krx_open_state(code)))
+            for code in model.codes
+        } if self.limit_mode and model is not None else {}
 
     def invalidate(self):
         self._refresh_theme_sort_keys()
@@ -1299,6 +1314,8 @@ class StockModel(QAbstractTableModel):
         self.account_auto_cancel_armed: set[str] = set()
         # 종목별 당일 수동 청산키. 창을 닫거나 앱을 재시작하면 사라진다.
         self.exit_hotkeys: dict[str, tuple[int, str]] = {}
+        # 청산키를 따라 main이 거는 짝 취소키 이름(F5~F8). 등록 실패면 "충돌".
+        self.cancel_hotkeys: dict[str, str] = {}
 
     # --- 웹소켓/전략 계층이 부르는 API ---------------------------------
     def add_stock(self, code: str, data: dict):
@@ -1453,15 +1470,18 @@ class StockModel(QAbstractTableModel):
             self.krx_opened.clear()
 
     def krx_open_state(self, code: str) -> bool | None:
-        """통합 모드에서 오늘 KRX 시가가 정해졌는가. KRX 모드는 None(등락률로 본다).
+        """확인된 KRX 시가 기록을 우선하고, 미확인 종목만 기존 판정을 따른다.
 
-        단일가 종목도 None이다. 예상체결가가 늘 켜져 있어, 재실행 뒤 다음
-        단일가 체결(최대 30분)까지 「시가 전」으로 맨 위에 앉는다.
+        KRX 모드·단일가 종목은 기록이 없으면 None(등락률 등으로 판정)이다.
+        기록이 있는데도 None을 주면, 보합으로 첫 체결된 단일가 종목이 다음
+        예상 상한가를 받을 때 다시 점상 대기열로 올라간다.
         """
+        self._touch_krx_day()
+        if code in self.krx_opened:
+            return True
         if not self.unified or code in self.single:
             return None
-        self._touch_krx_day()
-        return code in self.krx_opened
+        return False
 
     def note_krx_vi(self, code: str, active: bool, kind: str, fired_at: str):
         """KRX VI로 KRX 시가가 정해졌는지 가린다(통합 모드 점상 판정).
@@ -1477,7 +1497,8 @@ class StockModel(QAbstractTableModel):
           편입 직후엔 기준가가 아직 없을 때가 있다.
         - **그 밖의 발동**(장중 VI, 동적VI)과 **해제**: 시가가 정해졌다.
         """
-        opening = active and kind == "정적" and "090000" <= fired_at <= "090030"
+        opening = (active and kind == "정적"
+                   and _opening_at(9) <= fired_at <= _opening_at(9, 0, 30))
         if opening:
             return
         self._touch_krx_day()
@@ -1542,10 +1563,12 @@ class StockModel(QAbstractTableModel):
         # 09:00 이후 KRX 체결 = KRX 시가가 정해졌다. NXT로 표시된 체결만 뺀다
         # — 거래소 칸이 빠진 틱은 KRX로 본다(예전 동작 쪽으로 기울게).
         # 09:00 전 KRX 체결은 장전 시간외(전일 종가)라 시가가 아니다.
-        krx_tick = (float(fields.get("trade_time") or 0) >= 90000
+        krx_tick = (float(fields.get("trade_time") or 0) >= int(_opening_at(9))
                     and fields.get("trade_ex") != "NXT")
+        krx_open_changed = False
         if krx_tick:
             self._touch_krx_day()
+            krx_open_changed = code not in self.krx_opened
             self.krx_opened.add(code)
         real_type = str(fields.get("_real_type") or "")
         volume_source = (
@@ -1689,7 +1712,8 @@ class StockModel(QAbstractTableModel):
                 bucket.traded_qty += max(0, int(value_qty))
             while history and history[0].sec <= sec - 300:
                 history.popleft()
-        cols = set()
+        # REST가 이미 같은 가격·누적량을 채웠어도 첫 KRX 체결은 묶음을 바꾼다.
+        cols = {RATE_COL} if krx_open_changed else set()
         for f, v in fields.items():
             if stored.get(f) == v:
                 continue
@@ -2204,6 +2228,25 @@ class StockModel(QAbstractTableModel):
                     "현재 잔량의 50%부터 3단 기준을 자동 제안합니다.\n"
                     "클릭하여 잔량매도 기준 설정")
             return None
+        if field == "cancel_hotkey":
+            label = self.cancel_hotkeys.get(code, "")
+            if role in (Qt.DisplayRole, Qt.UserRole):
+                return label
+            if role == Qt.TextAlignmentRole:
+                return Qt.AlignCenter
+            if role == Qt.ToolTipRole:
+                return ("미체결 매수 전부 취소 · 보유는 팔지 않음\n"
+                        "청산키 F1·F3·F5·F7을 걸면 바로 옆 F2·F4·F6·F8이 같이 걸립니다\n"
+                        "좌클릭: 걸려 있으면 해제, 비어 있으면 새 키 지정")
+            if role == Qt.BackgroundRole and label:
+                return QColor("#FFCDD2" if label == "충돌" else "#C8E6C9")
+            if role == Qt.ForegroundRole and label:
+                return QColor("#111111")
+            if role == Qt.FontRole and label:
+                font = QFont()
+                font.setBold(True)
+                return font
+            return None
         if field == "exit_hotkey":
             hotkey = self.exit_hotkeys.get(code)
             if role == Qt.DisplayRole:
@@ -2582,11 +2625,9 @@ def _balance_sell_suggestion(current: int) -> tuple[int, int, int]:
     """장초 대량취소를 감안한 잔량 규모별 3단 절대수량 제안."""
     current = max(0, int(current or 0))
     tiers = (
-        # 500만주 위로는 더 올리지 않는다. 200만/100만/50만이 상한이다.
-        (5_000_000, (2_000_000, 1_000_000, 500_000)),
-        (2_000_000, (1_000_000, 500_000, 300_000)),
-        (1_000_000, (500_000, 300_000, 200_000)),
-        (500_000, (300_000, 150_000, 50_000)),
+        # 100만주 이상은 잔량이 더 커져도 50만/20만/10만을 쓴다.
+        (1_000_000, (500_000, 200_000, 100_000)),
+        (500_000, (300_000, 100_000, 50_000)),
         (200_000, (100_000, 50_000, 20_000)),
     )
     for minimum, values in tiers:
@@ -3536,7 +3577,9 @@ class ConditionScreen(QWidget):
     emergency_exit_requested = Signal(str, int, bool)
     order_status_acknowledged = Signal(str)
     exit_hotkey_changed = Signal(str, object)
+    cancel_hotkey_changed = Signal(str, object)   # 취소키 손 지정(None = 해제)
     exit_hotkeys_clear_all_requested = Signal()   # 모든 창의 청산키 해제
+    cancel_hotkeys_clear_all_requested = Signal()  # 모든 창의 취소키 해제
     balance_sell_changed = Signal(str, object)
     account_auto_cancel_changed = Signal(str, bool)
     watch_toggled = Signal(str, bool)
@@ -3774,6 +3817,18 @@ class ConditionScreen(QWidget):
             "키움이 체결에 유리한 시장(KRX·NXT)을 고르고 나눠 보내기도 합니다\n"
             "NXT 불가 종목은 KRX로 갑니다 · 시장가는 늘 KRX · 전 창 공통")
         account_bar.addWidget(self.sor_sell_check)
+        self.after_hours_check = QCheckBox("시간외")
+        self.after_hours_check.setStyle(self._checkbox_style)
+        self.after_hours_check.setToolTip(
+            "켜면 KRX 전용 종목의 청산·3단매도 매도를 시간외로 냅니다\n"
+            "오전: 장전 시간외(08:30~08:40, 전일 종가) · 오후: 장후 시간외(15:40~16:00, 종가)\n"
+            "둘 다 미리 접수되고 그 시간에 체결 · NXT 가능 종목은 매도SOR을 따름\n"
+            "저장하지 않고 08:40·16:00에 저절로 꺼집니다")
+        # 켜 둔 걸 잊고 정규장에 청산하면 전부 거부된다. 눈에 띄게 칠한다.
+        self.after_hours_check.toggled.connect(
+            lambda on: self.after_hours_check.setStyleSheet(
+                "QCheckBox { background: #FF9800; color: #111111; }" if on else ""))
+        account_bar.addWidget(self.after_hours_check)
         account_bar.addWidget(self.restore_order_btn)
         account_bar.addStretch(1)
         account_bar.addWidget(self.jumsang_check)
@@ -3954,6 +4009,7 @@ class ConditionScreen(QWidget):
         # 활성 조건검색창 전체에서 받아야 한다. 여러 창 중 활성 창만 처리한다.
         QApplication.instance().installEventFilter(self)
         self._hotkey_capture_code = ""
+        self._hotkey_capture_cancel = False   # True면 청산키가 아니라 취소키를 받는다
         self.global_hotkeys = False
         # 정렬 수동 제어: 첫 클릭을 내림차순(큰 값 위)부터. Qt 기본은 오름차순이라 직접 처리.
         self.table.setSortingEnabled(False)
@@ -4016,6 +4072,7 @@ class ConditionScreen(QWidget):
         self.table.setColumnWidth(BALANCE_SELL_COL, 125)
         self.table.setColumnWidth(AUTO_CANCEL_ARM_COL, 62)
         self.table.setColumnWidth(EXIT_HOTKEY_COL, 56)
+        self.table.setColumnWidth(CANCEL_HOTKEY_COL, 48)
         self.table.setColumnWidth(BAR_COL, 70)
         self.table.setColumnWidth(MINUTE_VALUE_COL, 72)
         self.table.setColumnWidth(ACC_VALUE_COL, 72)
@@ -4054,9 +4111,12 @@ class ConditionScreen(QWidget):
         if self.table.columnWidth(BALANCE_SELL_COL) > 170:
             self.table.setColumnWidth(BALANCE_SELL_COL, 125)
         # 저장된 구버전 헤더 순서와 무관하게
-        # 3단매도 -> 자동취소 -> 청산키를 우측 끝에 둔다.
+        # 3단매도 -> 자동취소 -> 청산키 -> 취소키를 우측 끝에 둔다.
         header = self.table.horizontalHeader()
-        last_visual = self.table.horizontalHeader().count() - 1
+        cancel_visual = header.visualIndex(CANCEL_HOTKEY_COL)
+        if cancel_visual != header.count() - 1:
+            header.moveSection(cancel_visual, header.count() - 1)
+        last_visual = self.table.horizontalHeader().count() - 2
         hotkey_visual = header.visualIndex(EXIT_HOTKEY_COL)
         if hotkey_visual != last_visual:
             header.moveSection(hotkey_visual, last_visual)
@@ -4106,8 +4166,7 @@ class ConditionScreen(QWidget):
         hdr.setContextMenuPolicy(Qt.CustomContextMenu)
         hdr.customContextMenuRequested.connect(
             lambda pos: self._show_column_menu(
-                hdr.mapToGlobal(pos),
-                hdr.logicalIndexAt(pos) == EXIT_HOTKEY_COL))
+                hdr.mapToGlobal(pos), hdr.logicalIndexAt(pos)))
         hdr.sectionResized.connect(lambda *a: self._save_timer.start(400))
         hdr.sectionMoved.connect(lambda *a: self._save_timer.start(400))
 
@@ -4144,11 +4203,12 @@ class ConditionScreen(QWidget):
 
     def set_pending_orders(self, code: str, buy: tuple[int, int],
                            sell: tuple[int, int], position: tuple[int, int],
-                           trim: int = 0):
+                           trim: int = 0, amount: int = 0):
         """선택 종목의 체결(보유)·미체결 요약을 예상주문 줄 오른쪽에 표시한다.
 
         buy/sell은 (건수, 수량), position은 (보유, 매도가능)이다.
-        trim은 미체결 매수에서 100주씩 남기고 취소할 수 있는 수량 합계다."""
+        trim은 미체결 매수에서 100주씩 남기고 취소할 수 있는 수량 합계다.
+        amount는 보유분의 체결(매입)금액이다. 0이면 생략한다."""
         # 취소 영역은 선택 종목이 아니어도 그려야 하므로 먼저 반영한다.
         self.model.set_cancellable(code, buy[0] > 0)
         if not buy[0] and self.model.order_status.get(code) == "취소전송":
@@ -4165,6 +4225,7 @@ class ConditionScreen(QWidget):
             locked = max(0, held - sellable)
             parts.append(
                 f"체결 <b>{held:,}주</b>"
+                + (f" · <b>{amount:,}원</b>" if amount else "")
                 + (f" (묶임 {locked:,})" if locked else ""))
         # 색을 빼고 상자의 기본 글자색(#222)으로 통일한다. 주황·파랑은 밝은
         # 상자 위에서 대비가 안 나와 건수·수량이 안 읽혔다.
@@ -4348,16 +4409,6 @@ class ConditionScreen(QWidget):
         self._refresh_order_preview(
             available_qty, selected_count, fixed_total, remaining_count)
 
-    @staticmethod
-    def _order_slots(actual_count: int, selected_count: int) -> str:
-        filled = (
-            '<span style="color:#18A558;font-weight:bold">■</span>'
-            * actual_count)
-        empty = (
-            '<span style="color:#B8B8B8">□</span>'
-            * max(0, selected_count - actual_count))
-        return filled + empty
-
     def _refresh_order_preview(
             self, available_qty: int, selected_count: int,
             fixed_total: int, remaining_count: int):
@@ -4372,42 +4423,37 @@ class ConditionScreen(QWidget):
         fixed_plan = fixed_quantities(fixed_total)
         fixed_count = len(fixed_plan)
         excluded = max(0, available_qty - fixed_total)
-        fixed_slots = self._order_slots(fixed_count, selected_count)
         if fixed_count:
             odd_lot = fixed_plan[-1] if fixed_plan[-1] < 100 else 0
             unit_text = (
                 f"100주씩+{odd_lot:,}주" if odd_lot else "100주씩")
             fixed_text = (
-                f"{fixed_slots}&nbsp;설정 {selected_count}회 → "
+                f"설정 {selected_count}회 → "
                 f"<b>실제 {fixed_count}회</b> · {unit_text}"
-                f" · 총 {fixed_total:,}주")
+                f" · 총 {fixed_total:,}주 · <b>{fixed_total * upper:,}원</b>")
             if excluded:
                 fixed_text += f" · <b>미주문 {excluded:,}주</b>"
         else:
-            fixed_text = (
-                f"{self._order_slots(0, selected_count)}&nbsp;"
-                "<b>최소 100주 필요</b>")
+            fixed_text = "<b>최소 100주 필요</b>"
 
         if remaining_count:
             base, extra = divmod(available_qty, remaining_count)
             per_order = (
                 f"{base + 1:,}/{base:,}주씩" if extra else f"{base:,}주씩")
+            # 점상 1회차 배분은 건당 100주다. 106주 6건이면 600주만 들어온다.
+            filled = sum(
+                min(q, 100) for q in split_quantity(available_qty, remaining_count))
             split_text = (
-                f"{self._order_slots(remaining_count, selected_count)}&nbsp;"
-                f"<b>{remaining_count}회</b> · {per_order}")
+                f"<b>{remaining_count}회</b> · {per_order}"
+                f" · 배분 {filled:,}주 · <b>{filled * upper:,}원</b>")
         else:
             split_text = "주문가능수량 없음"
 
-        # 100주가 안 되면 100주씩은 0회라 금액이 0원으로 나왔다. 그래도
-        # 분할매수는 가능수량 전부를 주문하므로 그 금액을 대신 보여 준다.
-        amount_qty = fixed_total or available_qty
         self.order_preview_value.setText(
             f"<b>상한가</b>&nbsp;100주씩 {fixed_text}"
-            f"&nbsp;│&nbsp;분할매수 {split_text}"
-            f"&nbsp;·&nbsp;"
-            f"<b>{amount_qty * upper:,}원</b>")
+            f"&nbsp;│&nbsp;분할매수 {split_text}")
         self.order_preview_value.setToolTip(
-            "■ 실제 전송되는 주문 · □ 설정했지만 수량 부족으로 전송되지 않는 주문")
+            "금액은 상한가 × 1회차 배분 수량(건당 최대 100주) · 100주씩과 분할매수 각각")
 
     def _request_order(self, mode: str):
         code = self._order_target_code
@@ -4698,10 +4744,27 @@ class ConditionScreen(QWidget):
             "QPushButton{background:#FFDD00;color:black;font-weight:bold}" if on else "")
 
     def _on_data_changed(self, *a):
+        if getattr(self, "_resorting", False):
+            return
         first = last = None
         if (len(a) >= 2 and isinstance(a[0], QModelIndex)
                 and isinstance(a[1], QModelIndex)):
             first, last = a[0].column(), a[1].column()
+
+        if self.limit_sort.isChecked() and first is not None:
+            for row in range(a[0].row(), a[1].row() + 1):
+                code = self.model.codes[row]
+                stored = self.model.rows[code]
+                state = (_row_blank(stored), _limit_tier(
+                    stored, code in self.model.liquidation,
+                    self.model.krx_open_state(code)))
+                if self.proxy._sorted_tiers.get(code) != state:
+                    # 묶음이 바뀌면 200ms를 기다리지 않는다. 새 상태로 선을
+                    # 그리면서 행은 옛 순서에 남으면 실제 상한가 위에 선이 생기고
+                    # 아직 시가 전인 종목이 그 아래에 밀린 것처럼 보인다.
+                    self._resort_timer.stop()
+                    self._resort_proxy()
+                    return
 
         # 대금/분은 체결마다 바뀌므로 Qt 자동정렬에 맡기면 한 틱마다 행 전체가
         # 재배치되어 화면이 버벅인다. 값은 즉시 갱신하되 순서만 200ms 단위로 묶는다.
@@ -4855,12 +4918,32 @@ class ConditionScreen(QWidget):
         if code not in self.model.rows:
             return
         row = self.model.codes.index(code)
-        cell = self.model.index(row, EXIT_HOTKEY_COL)
-        self.model.dataChanged.emit(cell, cell)
+        for col in (EXIT_HOTKEY_COL, CANCEL_HOTKEY_COL):
+            cell = self.model.index(row, col)
+            self.model.dataChanged.emit(cell, cell)
 
     # 저장된 청산키를 복원할 때 main이 호출한다. 종목이 아직 편입 전이면
     # 셀이 없으므로 조용히 넘어가고, 편입될 때 모델 값으로 그려진다.
     refresh_exit_hotkey_cell = _refresh_exit_hotkey_cell
+
+    def _start_hotkey_capture(self, code: str, cancel: bool):
+        """청산키·취소키 칸 클릭 뒤 다음 키 입력을 그 종목 키로 받는다.
+
+        5초 안에 안 누르면 접는다. 받는 중에는 main이 전역키를 무시하므로
+        (이미 쓰는 키를 눌러 다른 종목이 청산되지 않게) 오래 남으면 안 된다.
+        """
+        self._hotkey_capture_code, self._hotkey_capture_cancel = code, cancel
+        self._hotkey_capture_seq = getattr(self, "_hotkey_capture_seq", 0) + 1
+        seq = self._hotkey_capture_seq
+        self.table.setFocus(Qt.FocusReason.MouseFocusReason)
+        QToolTip.showText(
+            QCursor.pos(),
+            f"{code}: 새 {'취소키' if cancel else '청산키'}를 누르세요\nEsc: 취소")
+
+        def expire():
+            if seq == self._hotkey_capture_seq and self._hotkey_capture_code:
+                self._hotkey_capture_code, self._hotkey_capture_cancel = "", False
+        QTimer.singleShot(5000, expire)
 
     def eventFilter(self, watched, event):
         try:
@@ -4886,6 +4969,27 @@ class ConditionScreen(QWidget):
         )
         if in_this_screen and event.type() == QEvent.Type.KeyPress:
             key = int(event.key())
+            if self._hotkey_capture_code and self._hotkey_capture_cancel:
+                code = self._hotkey_capture_code
+                self._hotkey_capture_code = ""
+                self._hotkey_capture_cancel = False
+                if key == int(Qt.Key.Key_Escape):
+                    QToolTip.showText(QCursor.pos(), "취소키 설정 취소")
+                    return True
+                combined, label = self._exit_hotkey(event)
+                if not combined:
+                    QToolTip.showText(
+                        QCursor.pos(), "Ctrl·Alt·Shift 같은 수정키는 다른 키와 함께 누르세요")
+                    return True
+                self.cancel_hotkey_changed.emit(code, {
+                    "key": key, "modifiers": int(event.modifiers().value),
+                    "text": event.text(), "label": label})
+                ok = self.model.cancel_hotkeys.get(code) == label
+                QToolTip.showText(
+                    QCursor.pos(),
+                    f"{code} 취소키 {label} 등록" if ok else
+                    f"{code} 취소키 {label} 등록 실패 — 다른 키를 쓰세요")
+                return True
             if self._hotkey_capture_code:
                 code = self._hotkey_capture_code
                 if key == int(Qt.Key.Key_Escape):
@@ -5068,11 +5172,20 @@ class ConditionScreen(QWidget):
                     code, current[1])
                 QToolTip.showText(QCursor.pos(), f"{code} 청산키 {current[1]} 해제")
                 return
-            self._hotkey_capture_code = code
-            self.table.setFocus(Qt.FocusReason.MouseFocusReason)
-            QToolTip.showText(
-                QCursor.pos(),
-                f"{code}: 새 청산키를 누르세요\nEsc: 취소")
+            self._start_hotkey_capture(code, False)
+        elif index.column() == CANCEL_HOTKEY_COL:
+            # 취소키는 청산키 설정에 붙어 저장된다. 청산키가 없으면 둘 데가 없다.
+            if code not in self.model.exit_hotkeys:
+                QToolTip.showText(QCursor.pos(), f"{code}: 청산키를 먼저 거세요")
+                return
+            current = self.model.cancel_hotkeys.get(code)
+            if current and current != "충돌":
+                self.cancel_hotkey_changed.emit(code, None)
+                audit_log.info("cancel hotkey cleared by click code=%s key=%s",
+                               code, current)
+                QToolTip.showText(QCursor.pos(), f"{code} 취소키 {current} 해제")
+                return
+            self._start_hotkey_capture(code, True)
         elif index.column() == BID_QTY_COL:
             self._open_bid_popup(code)
         elif index.column() == ASK_QTY_COL:
@@ -5158,9 +5271,9 @@ class ConditionScreen(QWidget):
             return
         self._show_column_menu(
             self.table.viewport().mapToGlobal(pos),
-            index.isValid() and index.column() == EXIT_HOTKEY_COL)
+            index.column() if index.isValid() else -1)
 
-    def _show_column_menu(self, at, hotkeys: bool = False):
+    def _show_column_menu(self, at, col: int = -1):
         """보이는 열을 체크로 고른다. 숨긴 열도 목록에 남아 되살릴 수 있다.
 
         헤더가 아니라 표에서 여는 이유는 열을 다 숨겨도 메뉴에 닿기 위해서다.
@@ -5169,14 +5282,21 @@ class ConditionScreen(QWidget):
         columns = [col for col in range(len(FIELDS)) if col not in RANK_COLS]
         shown = [col for col in columns if not self.table.isColumnHidden(col)]
         menu = QMenu(self)
-        if hotkeys:
-            # 청산키 자리에서만 맨 위에 둔다. 우클릭은 원래 열 메뉴라 그대로 두고
-            # 한 줄만 더한다. 안 보이는 창에 걸린 키까지 한 번에 푸는 탈출구다
-            # (2026-09-29 486510 F1이 조건에서 빠진 창에 남아 있었다).
-            count = int(self.exit_hotkey_count())
-            clear_all = menu.addAction(f"청산키 전부 해제 ({count}개)")
+        # 청산키·취소키 자리에서만 맨 위에 둔다. 우클릭은 원래 열 메뉴라 그대로
+        # 두고 한 줄만 더한다. 안 보이는 창에 걸린 키까지 한 번에 푸는 탈출구다
+        # (2026-09-29 486510 F1이 조건에서 빠진 창에 남아 있었다).
+        clear = {
+            EXIT_HOTKEY_COL: ("청산키", self.exit_hotkey_count,
+                              self.exit_hotkeys_clear_all_requested),
+            CANCEL_HOTKEY_COL: ("취소키", self.cancel_hotkey_count,
+                                self.cancel_hotkeys_clear_all_requested),
+        }.get(col)
+        if clear:
+            name, count_of, signal = clear
+            count = int(count_of())
+            clear_all = menu.addAction(f"{name} 전부 해제 ({count}개)")
             clear_all.setEnabled(count > 0)
-            clear_all.triggered.connect(self.exit_hotkeys_clear_all_requested.emit)
+            clear_all.triggered.connect(signal.emit)
             menu.addSeparator()
         for col in columns:
             action = menu.addAction(COLUMNS[col])
@@ -5193,6 +5313,11 @@ class ConditionScreen(QWidget):
     def exit_hotkey_count(self) -> int:
         """모든 창에 걸린 청산키 수. main이 모든 창을 세는 함수로 바꿔 끼운다."""
         return len(self.model.exit_hotkeys)
+
+    def cancel_hotkey_count(self) -> int:
+        """걸린 취소키 수(`충돌` 제외). main이 모든 창을 세는 함수로 바꿔 끼운다."""
+        return sum(1 for label in self.model.cancel_hotkeys.values()
+                   if label != "충돌")
 
     def _set_column_visible(self, col: int, visible: bool):
         """열을 감추거나 되살리고 현재 배치 프로필에 남긴다."""
@@ -5266,12 +5391,18 @@ class ConditionScreen(QWidget):
 
     def _resort_proxy(self):
         """스로틀 시간이 끝나면 현재 열과 방향으로 정렬을 확실히 다시 적용한다."""
-        self.proxy.invalidate()
-        self._apply_sort()
-        # 점상알림은 여기서 판정한다. paintEvent에 두면 창이 가려지거나
-        # 최소화됐을 때 리페인트가 안 와서 정작 필요한 순간에 안 울린다.
-        self._jumsang_alert(
-            self.table.waiting_group()[1] if self.limit_sort.isChecked() else None)
+        if getattr(self, "_resorting", False):
+            return
+        self._resorting = True
+        try:
+            self.proxy.invalidate()
+            self._apply_sort()
+            # 점상알림은 여기서 판정한다. paintEvent에 두면 창이 가려지거나
+            # 최소화됐을 때 리페인트가 안 와서 정작 필요한 순간에 안 울린다.
+            self._jumsang_alert(
+                self.table.waiting_group()[1] if self.limit_sort.isChecked() else None)
+        finally:
+            self._resorting = False
 
     def _apply_sort(self):
         self._sync_dynamic_sort_mode()
@@ -5280,7 +5411,8 @@ class ConditionScreen(QWidget):
 
     def _on_header_clicked(self, col: int):
         # 상한가정렬 중에도 헤더 클릭 허용: 그룹 내 정렬 기준이 바뀐다
-        if col in (ORDER_COL, BALANCE_SELL_COL, EXIT_HOTKEY_COL):
+        if col in (ORDER_COL, BALANCE_SELL_COL, EXIT_HOTKEY_COL,
+                   CANCEL_HOTKEY_COL):
             return
         # 테마정렬은 테마 강도 순서를 고정하므로 대금/분 전체 순위와 양립하지
         # 않는다. 대금/분 헤더를 누르면 사용자가 요청한 전체 종목 순위를 우선한다.
@@ -5497,7 +5629,7 @@ class ConditionScreen(QWidget):
     def _refresh_bidqty_probe(self):
         """ponytail: 계측 구간(09:00~09:03)을 켜고 끄고, 끝나면 파일로 내린다."""
         on = (self.limit_sort.isChecked()
-              and "0900" <= time.strftime("%H%M") < "0903")
+              and _opening_at(9) <= time.strftime("%H%M%S") < _opening_at(9, 3))
         if on == self._bidqty_probe_on:
             return
         self._bidqty_probe_on = on
@@ -5527,6 +5659,15 @@ class ConditionScreen(QWidget):
                     self.model.krx_open_state(code)) == TIER_WAIT_CLEAN:
                 self._bidqty_probe.append(
                     (time.time(), code, stored["bid_qty"], stored["ask_qty"]))
+        # 재시작 복원 창은 행이 생기는 순간(이름 전, 코드만) 뜬다. 이름은
+        # 편입 조회 틱으로 나중에 오므로 그때 바꿔 단다.
+        if "name" in fields:
+            name = str(self.model.rows.get(code, {}).get("name") or "")
+            for popups in (self._bid_popups, self._depth_popups):
+                popup = popups.get(code)
+                if popup is not None and name and popup._name != name:
+                    popup._name = name
+                    popup._refresh()
         # 호가·체결·예상체결 중 하나만 바뀐 틱도 확대 창에 반영한다.
         # 값은 역행 틱을 걸러 낸 뒤인 표 기준으로 읽어야 표와 안 어긋난다.
         if self._bid_popups and any(
@@ -5567,7 +5708,7 @@ class ConditionScreen(QWidget):
         before, self._jumsang_group = self._jumsang_group, waiting
         fresh = waiting - before if before is not None else set()
         if (fresh and self.jumsang_check.isChecked()
-                and "0901" <= time.strftime("%H%M") < "0903"):
+                and _opening_at(9, 1) <= time.strftime("%H%M%S") < _opening_at(9, 3)):
             self.table.blink_rows(fresh)
             self.jumsang_entered.emit(", ".join(sorted(fresh)))
 

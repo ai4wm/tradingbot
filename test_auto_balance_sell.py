@@ -50,12 +50,12 @@ def row(bid_qty, bid_price=UPPER, upper=UPPER):
 
 def demo():
     # 상한가에 붙어 있고 설정이 없으면 현재 잔량 기준으로 건다.
-    # 잔량 100만 -> 구간표 50만/30만/20만, 비율은 새 설정창 기본값.
-    screen = Screen(row(1_000_000))
+    # 잔량 300만이어도 상한 50만/20만/10만, 비율은 새 설정창 기본값.
+    screen = Screen(row(3_000_000))
     assert screen.auto_balance_sell_on_order(CODE) is True
     _, setting = screen.applied[0]
     assert (setting["first"], setting["second"], setting["third"]) == (
-        500_000, 300_000, 200_000), setting
+        500_000, 200_000, 100_000), setting
     assert (setting["first_ratio"], setting["second_ratio"],
             setting["third_ratio"]) == (0.0, 1.0, 1.0), setting
     assert setting["market_sell"] is False, setting

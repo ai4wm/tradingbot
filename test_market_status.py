@@ -199,7 +199,7 @@ class MarketStatusTests(unittest.TestCase):
                         # 경고색이 배경 위에서 흰/검 글씨로 바뀌면 안 된다
                         # (2026-11-11 대호특수강우: 코스닥 관리종목 분홍이 흰색).
                         self.assertGreater(fg.saturation(), 60, (dark, kind, fg.name()))
-        self.assertEqual(len(gui.COLUMNS), 23)
+        self.assertEqual(len(gui.COLUMNS), 24)
         self.assertEqual(len(rank.COLUMNS), 6)
         self.assertNotIn("market_status", gui.FIELDS)
         self.assertNotIn("market_status", rank.FIELDS)

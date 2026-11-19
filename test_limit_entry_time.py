@@ -174,8 +174,66 @@ def demo_reentry_costs_no_query():
     print(f"ok (재진입 조회 0건, 시각 {new_time})")
 
 
+def demo_restart_tick_before_upper():
+    """재시작 직후 상한가를 받기 전에 체결 틱이 와도 무너짐으로 보지 않는다.
+
+    2026-11-19 노랑풍선: 10:03부터 상한가였는데 10:09:38 재시작 7초 뒤
+    10:09:45가 진입시각으로 찍혔다. 점상이라 체결이 없던 에이스토리는 조회로
+    10:02:20이 맞게 나왔다.
+    """
+    app = QApplication.instance() or QApplication([])
+    screen = ConditionScreen()
+    view = _view(screen)
+    started = []
+    original = main.asyncio.ensure_future
+
+    def fake(coro):
+        coro.close()
+        started.append(1)
+
+    main.asyncio.ensure_future = fake
+    original_save = main.save_last_entry_time
+    main.save_last_entry_time = lambda *a: False   # 회귀해도 운영 DB에 쓰지 않는다
+    try:
+        code = "104620"
+        screen.model.add_stock(code, {"name": "노랑풍선"})
+        screen.on_tick(code, {"price": 4140, "vol": 700000})   # upper 아직 0
+        view.fill_entry_time(code)
+        assert code not in view._entry_broken
+        _at_limit(screen, code, 4140)                           # 편입 조회 도착
+        view.fill_entry_time(code)
+    finally:
+        main.asyncio.ensure_future = original
+        main.save_last_entry_time = original_save
+    assert started == [1], "진입시각은 조회(ka10079)로 받아야 한다"
+    assert screen.model.rows[code]["time"] == "", screen.model.rows[code]
+    del app
+    print("ok (재시작 직후 첫 틱을 진입으로 안 봄)")
+
+
+def demo_minute_fallback_sees_dip():
+    """분봉 폴백은 저가로 분 안의 풀림을 본다. 종가만 보면 더 이른 시각이 나온다."""
+    from api import RestClient
+    rest = RestClient.__new__(RestClient)
+    bar = lambda t, close, low: {"cntr_tm": f"20261119{t}", "cur_prc": f"+{close}",  # noqa: E731
+                                 "low_pric": f"+{low}"}
+    bars = [bar("100500", 1000, 1000), bar("100400", 1000, 1000),
+            bar("100300", 1000, 960),             # 10:03 안에서 풀렸다 다시 붙음
+            bar("100200", 1000, 1000), bar("100100", 900, 880)]
+
+    async def fake(*_a, **_k):
+        return {"stk_min_pole_chart_qry": bars}
+
+    rest.request = fake
+    got = asyncio.run(rest._limit_entry_minute("253450", 1000))
+    assert got == "10:03:00", got
+    print("ok (분봉 폴백이 분 안의 풀림을 봄)")
+
+
 if __name__ == "__main__":
+    demo_minute_fallback_sees_dip()
     demo()
     demo_pending_query_dropped_on_exclude()
     demo_entry_survives_break()
     demo_reentry_costs_no_query()
+    demo_restart_tick_before_upper()

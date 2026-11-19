@@ -19,6 +19,9 @@ from datetime import datetime, timedelta
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import config  # noqa: E402
+config.market_delay = lambda day=None: (0, 0)  # 평일 시각으로 고정(수능일에 돌려도 같게)
+
 import main
 from api import RestClient
 
