@@ -271,8 +271,14 @@ class OrderEngine:
                 return
             child.seen_fills.add(fill_id)
         if fill_qty:
-            child.filled_qty = min(
-                child.requested_qty, child.filled_qty + fill_qty)
+            # 체결량(FID 911)은 그 체결분이 아니라 **그 주문의 누적 체결량**으로 온다
+            # (2026-11-20 매수 체결 이벤트 25건 전부 주문수량-잔량과 같았다). 더하면
+            # 한 주문이 나뉘어 체결될 때 겹쳐 센다 — 노랑풍선 0001926은 9→100이 와서
+            # 109로, 0030292는 99→299→310→584가 와서 1,292로 세졌다(상한으로 잘렸을 뿐).
+            # 겹치면 주문상태 `체결 N/M주`와 쓴 금액이 부푼다. 같은 이벤트가 두 번
+            # 와도 큰 값을 취하므로 그대로다. 보유 장부(main._new_fill_qty)는 이미 이 기준이다.
+            child.filled_qty = max(
+                child.filled_qty, min(child.requested_qty, fill_qty))
         if event.get("remaining_qty") is not None:
             child.remaining_qty = max(0, int(event["remaining_qty"]))
         else:
