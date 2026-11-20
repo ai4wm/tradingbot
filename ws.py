@@ -17,6 +17,7 @@ import time
 import websockets
 
 import config
+from tick_recorder import TickRecorder
 
 log = logging.getLogger("ws")
 
@@ -240,6 +241,8 @@ class WSClient:
         self._last_reg_limit_log = 0.0
         self._vi_raw_failed = False        # VI 원본 기록 실패는 한 번만 알린다
         self._vi_seen: dict[tuple, None] = {}  # 중복 수신 접기(최근 것만)
+        self.tick_recorder = TickRecorder()
+        self.tick_recorder.enabled = config.TICK_RECORD  # 메인창 `틱기록` 체크가 덮어쓴다
 
     # --- 외부 API -------------------------------------------------------
     async def run(self, token_fn):
@@ -470,6 +473,8 @@ class WSClient:
             self._handle_condition(msg)
         elif trnm == "REAL":
             for item in msg.get("data", []):
+                if self.tick_recorder is not None:
+                    self.tick_recorder.put(item)  # 대기열에 넣기만 한다. 막지 않는다
                 if log.isEnabledFor(logging.WARNING):
                     self._discover_fids(item)  # 처음 본 FID 로그 (FID 발굴용)
                     self._count_real(item)

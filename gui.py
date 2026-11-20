@@ -6,6 +6,7 @@
 """
 import logging
 import math
+import os
 import re
 import sys
 import time
@@ -3829,6 +3830,20 @@ class ConditionScreen(QWidget):
             lambda on: self.after_hours_check.setStyleSheet(
                 "QCheckBox { background: #FF9800; color: #111111; }" if on else ""))
         account_bar.addWidget(self.after_hours_check)
+        self.tick_record_check = QCheckBox("틱기록")
+        self.tick_record_check.setStyle(self._checkbox_style)
+        self.tick_record_check.setToolTip(
+            "웹소켓 체결·호가 틱을 data/ticks/에 저장합니다 · 전 창 공통\n"
+            "끄면 파일 쓰기만 멈춥니다 · 화면·3단매도·주문에는 영향이 없습니다\n"
+            "우클릭: 저장 폴더 열기")
+        self.tick_record_check.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tick_record_check.customContextMenuRequested.connect(
+            lambda pos: self._tick_menu().exec(self.tick_record_check.mapToGlobal(pos)))
+        # 꺼진 쪽이 예외 상태다. 껐다는 걸 잊지 않게 칠한다.
+        self.tick_record_check.toggled.connect(
+            lambda on: self.tick_record_check.setStyleSheet(
+                "" if on else "QCheckBox { background: #FF9800; color: #111111; }"))
+        account_bar.addWidget(self.tick_record_check)
         account_bar.addWidget(self.restore_order_btn)
         account_bar.addStretch(1)
         account_bar.addWidget(self.jumsang_check)
@@ -5193,6 +5208,26 @@ class ConditionScreen(QWidget):
         elif index.column() == NAME_COL:
             QApplication.clipboard().setText(code)
             QToolTip.showText(QCursor.pos(), f"{code} 복사됨")
+
+    # --- 틱 기록 저장 폴더 --------------------------------------------
+    def _tick_menu(self) -> QMenu:
+        from tick_recorder import TICK_DIR
+        menu = QMenu(self)
+        menu.addAction("오늘 폴더 열기", lambda: self._open_tick_folder(True))
+        menu.addAction("틱 폴더 열기", lambda: self._open_tick_folder(False))
+        menu.addAction("경로 복사", lambda: (
+            QApplication.clipboard().setText(TICK_DIR),
+            QToolTip.showText(QCursor.pos(), f"{TICK_DIR} 복사됨")))
+        return menu
+
+    def _open_tick_folder(self, today: bool):
+        """오늘 폴더가 아직 없으면(장 시작 전) 틱 폴더를 연다."""
+        from tick_recorder import TICK_DIR
+        folder = os.path.join(TICK_DIR, time.strftime("%Y%m%d"))
+        if not (today and os.path.isdir(folder)):
+            folder = TICK_DIR
+        os.makedirs(folder, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
 
     def _open_bid_popup(self, code: str, restore: bool = False):
         """매수잔량 셀 클릭 -> 종목별 확대 창. 이미 떠 있으면 앞으로 올린다.

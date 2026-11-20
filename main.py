@@ -75,6 +75,7 @@ from ui.realtime_news_tab import (
 from ui.stock_news_tab import StockNewsTabMixin
 from ui.telegram_news_tab import TelegramNewsTabMixin
 from ui.theme_tab import ThemeTabMixin
+from ui.ai_assistant_tab import AiAssistantTabMixin
 from order import OrderEngine, fixed_quantities, split_quantity
 from rank import RankScreen, _beep
 from ws import WSClient
@@ -1347,6 +1348,16 @@ class App:
         self._after_hours_timer.timeout.connect(
             lambda: screen.after_hours_check.setChecked(False))
         screen.after_hours_check.toggled.connect(self._on_after_hours_sell)
+        recorder = self.ws.tick_recorder
+        saved = self._settings.value("order/tick_record", "")
+        recorder.enabled = (saved == "true") if saved in ("true", "false") else recorder.enabled
+        screen.tick_record_check.setChecked(recorder.enabled)
+        screen.tick_record_check.setStyleSheet(
+            "" if recorder.enabled else "QCheckBox { background: #FF9800; color: #111111; }")
+        screen.tick_record_check.toggled.connect(self._on_tick_record)
+        self._tick_stats_timer = QTimer()
+        self._tick_stats_timer.timeout.connect(self._refresh_tick_stats)
+        self._tick_stats_timer.start(5000)
         self._font_size = _normalize_app_font_size(
             self._settings.value(APP_FONT_SIZE_KEY, DEFAULT_APP_FONT_SIZE))
         font_index = screen.font_size_combo.findData(self._font_size)
@@ -2187,6 +2198,21 @@ class App:
         self._settings.setValue("order/sell_sor", "true" if on else "false")
         self._settings.sync()
         log.warning("sell exchange -> %s", self._sell_exchange)
+
+    def _on_tick_record(self, on: bool):
+        self.ws.tick_recorder.enabled = bool(on)
+        self._settings.setValue("order/tick_record", "true" if on else "false")
+        self._settings.sync()
+        log.warning("tick record -> %s", bool(on))
+        self._refresh_tick_stats()
+
+    def _refresh_tick_stats(self):
+        recorder = self.ws.tick_recorder
+        base = ("웹소켓 체결·호가 틱을 data/ticks/에 저장합니다 · 전 창 공통\n"
+                "끄면 파일 쓰기만 멈춥니다 · 화면·3단매도·주문에는 영향이 없습니다\n"
+                "우클릭: 저장 폴더 열기")
+        self.screen.tick_record_check.setToolTip(
+            f"{base}\n지금까지 {recorder.written:,}건 저장 · {recorder.dropped:,}건 버림")
 
     def _on_unified(self, on: bool):
         self._settings.setValue("unified_real", "true" if on else "false")
@@ -4781,6 +4807,7 @@ class App:
         screen.unified_check.setVisible(False)  # 통합 시세는 전 창 공통 -> 메인창에서만 전환
         screen.sor_sell_check.setVisible(False)  # 매도 거래소도 전 창 공통
         screen.after_hours_check.setVisible(False)
+        screen.tick_record_check.setVisible(False)
         screen.font_size_combo.setVisible(False)  # 글자 크기는 앱 전체 공통 -> 메인창에서만 전환
         screen.theme_btn.setVisible(False)  # 테마는 앱 전체 공통 -> 메인창에서만 전환
         screen.clock_btn.setVisible(False)  # 분리 시계도 앱에 하나
@@ -5473,7 +5500,8 @@ def _set_checked_quietly(button, on: bool):
 
 class AnalysisWindow(
         LimitUpTabMixin, RealtimeNewsTabMixin, StockNewsTabMixin,
-        TelegramNewsTabMixin, ThemeTabMixin, ClockRenderMixin, QMainWindow):
+        TelegramNewsTabMixin, ThemeTabMixin, AiAssistantTabMixin,
+        ClockRenderMixin, QMainWindow):
     """실시간 뉴스·상한가·테마 전용 경량 분석창."""
 
     watchlist_changed = Signal()
@@ -5489,6 +5517,7 @@ class AnalysisWindow(
         ("텔레그램 뉴스", "구독 중인 텔레그램 채널의 종목 글을 확인합니다."),
         ("상한가", "상한가 종목 수집·조회·성과 분석 화면입니다."),
         ("테마", "테마 강도와 종목 확산 흐름을 분석합니다."),
+        ("AI 분석", "Codex·Claude와 선택 종목 자료를 분석합니다."),
     )
 
     def __init__(self, rest=None, app: "App | None" = None):
@@ -5635,11 +5664,16 @@ class AnalysisWindow(
                 self._build_limit_up_page(layout)
             elif title == "테마":
                 self._build_theme_page(layout)
+            elif title == "AI 분석":
+                self._build_ai_page(layout)
             else:
                 label = QLabel(description)
                 label.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 layout.addWidget(label)
             tabs.addTab(page, title)
+        self._ai_entry_btn = QPushButton("선택 종목 AI 분석")
+        self._ai_entry_btn.clicked.connect(self._open_ai_analysis)
+        tabs.setCornerWidget(self._ai_entry_btn)
         tabs.currentChanged.connect(self._analysis_tab_changed)
         central_layout.addWidget(tabs, 1)
         self.setCentralWidget(central)
@@ -5762,6 +5796,13 @@ class AnalysisWindow(
     def _analysis_tab_changed(self, index: int):
         title = self._tabs.tabText(index)
         self._settings.setValue("analysis_tab", title)
+        if title != "AI 분석":
+            self._ai_source_tab = title
+        elif (hasattr(self, "_ai_source_tab")
+              or not self._ai_page.targets.text().strip()):
+            codes = self._ai_selected_codes()
+            if codes:
+                self._ai_page.set_targets(codes)
         if title == "종목뉴스·종토방":
             self._refresh_realtime_watch_table()
             self._refresh_realtime_news_table()
@@ -7027,6 +7068,8 @@ class AnalysisWindow(
         self._settings.sync()
 
     def closeEvent(self, event):
+        if hasattr(self, "_ai_page"):
+            self._ai_page.shutdown()
         self._save_market_splitters()
         self._save_news_splitters()
         self._save_ls_news_header()

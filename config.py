@@ -90,4 +90,7 @@ TG_BACKFILL_LIMIT = 500
 
 REAL_REG_LIMIT = 95  # 실시간 등록 종목 수 상한
 REST_RATE_LIMIT = 1.0  # 초당 REST 호출 수 (TR당 1req/s)
+# 웹소켓 체결·호가·예상체결 틱을 data/ticks/에 남긴다(tick_recorder.py). 시작 기본값이고,
+# 메인창 `틱기록` 체크가 저장한 선택이 있으면 그것을 따른다.
+TICK_RECORD = True
 TICK_MAX_PAGES = 6  # 상한가 진입 틱조회 최대 페이지 (초과 시 분봉 분단위 폴백). 6페이지=최악 ~6초
