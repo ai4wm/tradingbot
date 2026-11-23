@@ -981,77 +981,6 @@ class TieredProxy(QSortFilterProxyModel):
             return section + 1
         return super().headerData(section, orientation, role)
 
-    def data(self, index, role=Qt.DisplayRole):
-        if (role == Qt.DisplayRole and index.isValid()
-                and FIELDS[index.column()] == "theme" and not self.theme_mode):
-            # 정렬을 안 켜도 그날 강한 테마를 앞에 적는다. 순서만 바꾸고
-            # 색·대장 표시는 건드리지 않는다.
-            model = self.sourceModel()
-            source_index = self.mapToSource(index)
-            if model is not None and source_index.isValid() and hasattr(
-                    model, "codes"):
-                code = model.codes[source_index.row()]
-                plain = code.removesuffix("_AL")
-                labels = model.theme_labels.get(plain, ())
-                group = self._theme_group_keys.get(code)
-                if labels and group is not None and group[1] in labels:
-                    return _theme_cell_text(
-                        [group[1], *(t for t in labels if t != group[1])],
-                        model.news_themes.get(plain), plain in model.news_codes,
-                        fresh_themes=model.news_fresh_themes.get(plain),
-                        reason=model.news_reasons.get(plain))
-        if index.isValid() and FIELDS[index.column()] == "theme" and self.theme_mode:
-            model = self.sourceModel()
-            source_index = self.mapToSource(index)
-            if model is not None and source_index.isValid() and hasattr(model, "codes"):
-                code = model.codes[source_index.row()]
-                group = self._theme_group_keys.get(code, ("none", "미분류"))
-                name = group[1] if group[0] != "none" else "미분류"
-                if role == Qt.DisplayRole:
-                    # 묶음 이름을 앞에 두고 나머지 테마를 뒤에 잇는다.
-                    # 같은 묶음끼리 앞부분이 같아 정렬 결과를 읽기 쉽다.
-                    labels = [
-                        theme for theme
-                        in model.theme_labels.get(code.removesuffix("_AL"), ())
-                        if theme != name
-                    ]
-                    plain = code.removesuffix("_AL")
-                    return _theme_cell_text(
-                        [name, *labels], model.news_themes.get(plain),
-                        plain in model.news_codes,
-                        fresh_themes=model.news_fresh_themes.get(plain),
-                        reason=model.news_reasons.get(plain))
-                if role == Qt.UserRole:
-                    return name
-                if role == Qt.ForegroundRole:
-                    return (THEME_SINGLETON if code in getattr(model, "theme_singletons", set())
-                            else self._theme_group_colors.get(
-                                group, _theme_group_color(group)))
-                if role == Qt.FontRole and code in getattr(model, "theme_leaders", set()):
-                    font = QFont()
-                    font.setBold(True)
-                    return font
-                if role == Qt.ToolTipRole:
-                    return model.data(
-                        model.index(source_index.row(), THEME_COL),
-                        Qt.ToolTipRole)
-                if role == Qt.TextAlignmentRole:
-                    return Qt.AlignLeft | Qt.AlignVCenter
-        if role == THEME_COLOR_ROLE:
-            if not self.theme_mode or not index.isValid():
-                return None
-            model = self.sourceModel()
-            source_index = self.mapToSource(index)
-            if model is None or not source_index.isValid() or not hasattr(model, "codes"):
-                return None
-            code = model.codes[source_index.row()]
-            # 단독 테마는 ◇ 표식만 사용하고 세로바는 표시하지 않는다.
-            if code in getattr(model, "theme_singletons", set()):
-                return None
-            group = self._theme_group_keys.get(code, ("none", "미분류"))
-            return self._theme_group_colors.get(group, _theme_group_color(group))
-        return super().data(index, role)
-
     def lessThan(self, left, right):
         model = self.sourceModel()
         if self.pinned:
@@ -1290,6 +1219,10 @@ class StockModel(QAbstractTableModel):
         # 0이면 예전처럼 바로 보낸다(화면 없는 검증용).
         self.coalesce_ms = 0
         self._dirty: dict[str, set[int]] = {}
+        # 테마 묶음 상태를 가진 프록시. 프록시에 파이썬 data()를 두면 모든 칸의 값 요청이
+        # C++ -> 파이썬 -> C++ -> 파이썬으로 네 번 건너뛰어 그리기 CPU의 큰 몫이 됐다
+        # (2026-11-23 py-spy). 테마 칸 처리를 이쪽으로 옮겨 프록시는 C++ 기본 동작만 쓴다.
+        self.theme_proxy = None
         self._flush_timer = QTimer(self)
         self._flush_timer.setSingleShot(True)
         self._flush_timer.timeout.connect(self.flush_changes)
@@ -2228,10 +2161,71 @@ class StockModel(QAbstractTableModel):
             return COLUMNS[section]
         return None
 
+    def _theme_override(self, code: str, field: str, role):
+        """테마 정렬 상태(프록시가 가짐)에 따라 달라지는 테마 칸 값. (처리함, 값)을 돌려준다.
+
+        예전에는 `TieredProxy.data`가 했다. 처리하지 않는 경우(`False`)는 아래의 기본
+        테마 분기가 이어받는다.
+        """
+        proxy = self.theme_proxy
+        keys = proxy._theme_group_keys
+        if role == THEME_COLOR_ROLE:
+            if not proxy.theme_mode:
+                return True, None
+            # 단독 테마는 ◇ 표식만 사용하고 세로바는 표시하지 않는다.
+            if code in self.theme_singletons:
+                return True, None
+            group = keys.get(code, ("none", "미분류"))
+            return True, proxy._theme_group_colors.get(group, _theme_group_color(group))
+        plain = code.removesuffix("_AL")
+        if not proxy.theme_mode:
+            # 정렬을 안 켜도 그날 강한 테마를 앞에 적는다. 순서만 바꾸고
+            # 색·대장 표시는 건드리지 않는다.
+            if role == Qt.DisplayRole:
+                labels = self.theme_labels.get(plain, ())
+                group = keys.get(code)
+                if labels and group is not None and group[1] in labels:
+                    return True, _theme_cell_text(
+                        [group[1], *(t for t in labels if t != group[1])],
+                        self.news_themes.get(plain), plain in self.news_codes,
+                        fresh_themes=self.news_fresh_themes.get(plain),
+                        reason=self.news_reasons.get(plain))
+            return False, None
+        group = keys.get(code, ("none", "미분류"))
+        name = group[1] if group[0] != "none" else "미분류"
+        if role == Qt.DisplayRole:
+            # 묶음 이름을 앞에 두고 나머지 테마를 뒤에 잇는다.
+            # 같은 묶음끼리 앞부분이 같아 정렬 결과를 읽기 쉽다.
+            labels = [theme for theme in self.theme_labels.get(plain, ())
+                      if theme != name]
+            return True, _theme_cell_text(
+                [name, *labels], self.news_themes.get(plain),
+                plain in self.news_codes,
+                fresh_themes=self.news_fresh_themes.get(plain),
+                reason=self.news_reasons.get(plain))
+        if role == Qt.UserRole:
+            return True, name
+        if role == Qt.ForegroundRole:
+            return True, (THEME_SINGLETON if code in self.theme_singletons
+                          else proxy._theme_group_colors.get(
+                              group, _theme_group_color(group)))
+        if role == Qt.FontRole and code in self.theme_leaders:
+            font = QFont()
+            font.setBold(True)
+            return True, font
+        if role == Qt.TextAlignmentRole:
+            return True, Qt.AlignLeft | Qt.AlignVCenter
+        return False, None  # 툴팁 등은 기본 테마 분기가 만든다
+
     def data(self, index, role=Qt.DisplayRole):
         field = FIELDS[index.column()]
         code = self.codes[index.row()]
         stored = self.rows[code]
+        if self.theme_proxy is not None and (
+                field == "theme" or role == THEME_COLOR_ROLE):
+            handled, value = self._theme_override(code, field, role)
+            if handled:
+                return value
         if field == "theme":
             themes = self.theme_labels.get(code.removesuffix("_AL"), ())
             primary = themes[0] if themes else ""
@@ -2665,6 +2659,17 @@ class StockModel(QAbstractTableModel):
             if field in ("name", "time"):
                 return Qt.AlignLeft | Qt.AlignVCenter
             return Qt.AlignRight | Qt.AlignVCenter
+        # 아래는 배경·글자색만 만든다. 글꼴 같은 나머지 역할이나 색을 안 쓰는 칸은 상·하한
+        # 판정을 계산하기 전에 돌려보낸다 — 칸 하나를 그릴 때 Qt가 역할을 여러 번 묻고
+        # 그때마다 판정을 돌리던 것이 그리기 CPU의 큰 몫이었다(2026-11-23 py-spy).
+        if role == Qt.BackgroundRole:
+            if field != "rate" and field != "exp_rate":
+                return None
+        elif role == Qt.ForegroundRole:
+            if field not in ("name", "rate", "price", "exp_rate", "exp_price"):
+                return None
+        else:
+            return None
         rate = stored["rate"]
         er = stored["exp_rate"]
         up, lo, pr, ep = stored["upper"], stored["lower"], stored["price"], stored["exp_price"]
@@ -4291,6 +4296,7 @@ class ConditionScreen(QWidget):
 
         # 그리드
         self.proxy = TieredProxy()
+        self.model.theme_proxy = self.proxy
         self.proxy.setSourceModel(self.model)
         self.proxy.setSortRole(Qt.UserRole)
         self.table = ThemeGroupedTableView()
