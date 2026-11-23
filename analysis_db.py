@@ -5851,17 +5851,21 @@ def reconcile_news_search_results(
         ).fetchone()
         if source_row is None:
             return {"active": 0, "missing": 0}
+        # 종목 색인에서 시작하도록 순서를 못 박는다(CROSS JOIN). 쓰지 않으면 SQLite가
+        # 이 출처의 기사 4만 건을 전부 훑고 건마다 두 번씩 찾아 한 종목에 166ms가 걸렸다.
+        # 이 함수는 화면 이벤트 루프에서 종목마다 돌아 창이 끊기고 CPU를 먹었다
+        # (2026-11-23 py-spy: 활성 샘플의 9.5%). 결과는 같고 종목당 1ms 안팎이다.
         candidates = connection.execute(
             """SELECT DISTINCT n.news_id, n.source_item_key
-                 FROM news_items n
-                 JOIN news_stock_maps m ON m.news_id=n.news_id
-                WHERE n.source_id=? AND m.stock_code=?
+                 FROM news_stock_maps m
+                CROSS JOIN news_items n ON n.news_id=m.news_id
+                WHERE m.stock_code=? AND n.source_id=?
                   AND n.published_at_source>=?
                   AND (
                       SELECT COUNT(*) FROM news_stock_maps all_maps
                       WHERE all_maps.news_id=n.news_id
                   )=1""",
-            (int(source_row["source_id"]), str(stock_code), oldest_published),
+            (str(stock_code), int(source_row["source_id"]), oldest_published),
         ).fetchall()
         active_ids = [
             int(row["news_id"]) for row in candidates
