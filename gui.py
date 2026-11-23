@@ -1279,9 +1279,20 @@ class ThemeGroupedTableView(QTableView):
         painter.end()
 
 
+GRID_COALESCE_MS = 250  # 시세 틱의 화면 갱신 신호를 행별로 이 간격에 한 번만 낸다
+
+
 class StockModel(QAbstractTableModel):
     def __init__(self):
         super().__init__()
+        # 틱마다 바뀐 칸을 바로 알리면 표가 틱 수만큼 다시 그려진다(2026-11-23 실측:
+        # 그리기가 CPU의 85%). 값은 틱마다 바로 쓰고, 알림만 행별로 모아 보낸다.
+        # 0이면 예전처럼 바로 보낸다(화면 없는 검증용).
+        self.coalesce_ms = 0
+        self._dirty: dict[str, set[int]] = {}
+        self._flush_timer = QTimer(self)
+        self._flush_timer.setSingleShot(True)
+        self._flush_timer.timeout.connect(self.flush_changes)
         self.codes: list[str] = []          # 행 순서
         self.rows: dict[str, dict] = {}     # code -> {field: value}
         # 예상값 표시 ON은 국면 확정 신호(hot)로만: 0H수신 / 단일가마킹 / VI발동 / 동시호가·VI REST.
@@ -1388,6 +1399,7 @@ class StockModel(QAbstractTableModel):
         self.beginRemoveRows(QModelIndex(), row, row)
         self.codes.remove(code)
         del self.rows[code]
+        self._dirty.pop(code, None)
         self._exp_live.discard(code)
         self.ticks.pop(code, None)
         self.minute_value_ticks.pop(code, None)
@@ -1811,8 +1823,22 @@ class StockModel(QAbstractTableModel):
             if stored.get("exp_rate") != er:
                 stored["exp_rate"] = er
                 cols.add(FIELDS.index("exp_rate"))
-        if cols:  # 바뀐 셀만 갱신
+        if cols and self.coalesce_ms > 0:  # 바뀐 셀만 알리되 행별로 모은다
+            self._dirty.setdefault(code, set()).update(cols)
+            if not self._flush_timer.isActive():
+                self._flush_timer.start(self.coalesce_ms)
+        elif cols:  # 바뀐 셀만 갱신
             self.dataChanged.emit(self.index(row, min(cols)), self.index(row, max(cols)))
+
+    def flush_changes(self):
+        """모아 둔 칸 변경을 행별로 한 번씩 알린다. 그 사이 지워진 행은 건너뛴다."""
+        self._flush_timer.stop()
+        dirty, self._dirty = self._dirty, {}
+        for code, cols in dirty.items():
+            if code in self.rows:
+                row = self.codes.index(code)
+                self.dataChanged.emit(
+                    self.index(row, min(cols)), self.index(row, max(cols)))
 
     def refresh_minute_values(self):
         """거래가 끊겨도 최근 60초 창에서 빠진 체결대금을 1초마다 반영한다."""
@@ -3843,6 +3869,7 @@ class ConditionScreen(QWidget):
         self.prefix = prefix  # 다중창: 창별 설정 키 접두사 ("", "w2_", ...)
         self._settings = QSettings("layout.ini", QSettings.IniFormat)
         self.model = StockModel()
+        self.model.coalesce_ms = GRID_COALESCE_MS
         self._bid_popups: dict[str, BidQtyPopup] = {}
         self._depth_popups: dict[str, DepthPopup] = {}
         self._pnl_popups: dict[str, PnlPopup] = {}
