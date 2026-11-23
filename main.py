@@ -1551,25 +1551,41 @@ class App:
                        code, (spec or {}).get("label") or "-")
 
     def _cancel_key_pressed(self, code: str, label: str):
-        """취소키: 미체결 매수를 전부 취소한다. 보유는 팔지 않는다.
+        """취소키: 미체결 매수와 매도를 전부 취소한다. 보유는 팔지 않는다.
 
-        청산과 같은 장부(웹소켓)로 바로 쏜다. 장부에 없으면 주문 셀 취소
-        버튼과 같은 길(앱 분할 주문 → 계좌 조회)로 거둔다.
+        청산과 같은 장부(웹소켓)로 바로 쏜다. 매수가 장부에 없으면 주문 셀
+        취소 버튼과 같은 길(앱 분할 주문 → 계좌 조회)로 거둔다.
+        매도도 함께 거둔다(2026-11-23 사용자): 매도 297주가 걸린 채 F2를 다섯
+        번 눌렀는데 매수가 없어 `orders=0`으로 아무것도 안 나갔다.
         """
         orders = [o for o in self._pending_open_buys(code) if o[1] > 0]
         audit_log.info(
             "cancel hotkey triggered code=%s key=%s orders=%s qty=%s",
             code, label, len(orders), sum(qty for _, qty, _ex in orders))
+        sells, sell_qty = self._cancel_open_sells(code, "취소키")
         if not orders:
-            self._cancel_order(code)
+            if sells:
+                self._show_cancel_sent(code, label, 0, 0, sells, sell_qty)
+            else:
+                self._cancel_order(code)
             return
         self._cancel_open_buys_now(code, orders, "취소키", cap=None)
+        self._show_cancel_sent(
+            code, label, len(orders), sum(qty for _, qty, _ex in orders),
+            sells, sell_qty)
+
+    def _show_cancel_sent(self, code: str, label: str, buys: int,
+                          buy_qty: int, sells: int, sell_qty: int):
+        parts = []
+        if buys:
+            parts.append(f"미체결 매수 {buys:,}건 {buy_qty:,}주")
+        if sells:
+            parts.append(f"미체결 매도 {sells:,}건 {sell_qty:,}주")
         for view in self.views:
             if code in view.screen.model.rows:
                 view.screen.set_order_state(
                     code, "취소전송",
-                    f"상태 취소키 {label} · 미체결 매수 {len(orders):,}건 "
-                    f"{sum(qty for _, qty, _ex in orders):,}주 취소전송",
+                    f"상태 취소키 {label} · " + " · ".join(parts) + " 취소전송",
                     False)
 
     def _auto_assign_exit_hotkey(self, screen: ConditionScreen, code: str):
@@ -2091,15 +2107,17 @@ class App:
         # 미체결 조회가 일부만 돌아와도, 이 앱이 받은 모든 주문번호를 직접
         # 취소해야 9분할 주문이 빠짐없이 취소된다.
         audit_log.info("manual cancel requested code=%s", code)
+        sells = self._cancel_open_sells(code, "수동취소")
         count, qty = self.orders.cancel_submitted_children(code)
         if count:
             log.warning(
                 "local split cancel queued code=%s orders=%s qty=%s",
                 code, count, qty)
             return
-        asyncio.ensure_future(self._cancel_account_orders(code))
+        asyncio.ensure_future(self._cancel_account_orders(code, sells))
 
-    async def _cancel_account_orders(self, code: str):
+    async def _cancel_account_orders(self, code: str,
+                                     sells: tuple[int, int] = (0, 0)):
         try:
             count, qty = await self.rest.cancel_open_buy_orders(code)
         except Exception as e:  # noqa: BLE001
@@ -2109,15 +2127,14 @@ class App:
                     view.screen.set_order_state(
                         code, "오류", f"상태 취소오류 · {e}", False)
             return
-        status = "취소전송" if count else "취소없음"
+        status = "취소전송" if count or sells[0] else "취소없음"
+        detail = (f"상태 계좌 미체결 매수 {count:,}건 {qty:,}주 취소전송"
+                  if count else "상태 계좌 미체결 매수주문 없음")
+        if sells[0]:
+            detail += f" · 미체결 매도 {sells[0]:,}건 {sells[1]:,}주 취소전송"
         for view in self.views:
             if code in view.screen.model.rows:
-                view.screen.set_order_state(
-                    code, status,
-                    (f"상태 계좌 미체결 매수 {count:,}건 "
-                     f"{qty:,}주 취소전송"
-                     if count else "상태 계좌 미체결 매수주문 없음"),
-                    False)
+                view.screen.set_order_state(code, status, detail, False)
         log.warning(
             "account open buys cancel code=%s orders=%s qty=%s",
             code, count, qty)
@@ -3318,6 +3335,8 @@ class App:
         # 누적체결량이 통째로 다시 더해진다.
         self._position_book_primed = True
         log.warning("position book primed codes=%s", len(self._position_book))
+        for code in list(self._position_book):  # 손익 칸이 시작하자마자 차게 한다
+            self._push_pending_orders(code)
 
     async def _prime_open_buy_book(self):
         """앱 시작·재접속 구간에 놓친 미체결 매수를 계좌 조회로 채운다.
@@ -3456,9 +3475,33 @@ class App:
             reason, code, len(orders), recovered)
         return recovered
 
+    def _cancel_open_sells(self, code: str, reason: str) -> tuple[int, int]:
+        """미체결 매도를 장부로 바로 취소 전송한다. (건수, 수량)을 돌려준다.
+
+        청산의 `_cancel_open_sells_now`와 달리 응답을 기다리지 않는다. 취소키는
+        풀린 수량으로 곧바로 팔 일이 없다. 취소확인 이벤트가 오면
+        `_track_open_sell`이 매도가능 수량을 되돌린다. 장부는 웹소켓 이벤트로
+        서므로 앱을 켜기 전에 걸려 있던 매도는 모른다.
+        """
+        orders = [
+            (order_no, qty, exchange)
+            for order_no, (qty, exchange)
+            in (self._open_sell_orders.get(code) or {}).items()
+            if qty > 0 and order_no not in self._cancel_sent_orders
+        ]
+        for order_no, qty, exchange in orders:
+            self._cancel_sent_orders.add(order_no)
+            asyncio.ensure_future(self._cancel_one_open_buy(
+                code, order_no, qty, exchange, reason, side="sell"))
+        if orders:
+            log.warning(
+                "%s open-sell cancel dispatched code=%s orders=%s qty=%s",
+                reason, code, len(orders), sum(q for _, q, _ex in orders))
+        return len(orders), sum(q for _, q, _ex in orders)
+
     async def _cancel_one_open_buy(
             self, code: str, order_no: str, qty: int, exchange: str,
-            reason: str):
+            reason: str, side: str = "buy"):
         try:
             await self.rest.cancel_order(code, order_no, 0, exchange)
         except Exception as error:  # noqa: BLE001
@@ -3467,12 +3510,12 @@ class App:
             self._cancel_sent_orders.discard(order_no)
             if is_nothing_to_cancel(error):
                 audit_log.info(
-                    "%s open-buy cancel already gone code=%s order=%s qty=%s",
-                    reason, code, order_no, qty)
+                    "%s open-%s cancel already gone code=%s order=%s qty=%s",
+                    reason, side, code, order_no, qty)
                 return
             log.exception(
-                "%s open-buy cancel failed code=%s order=%s qty=%s",
-                reason, code, order_no, qty)
+                "%s open-%s cancel failed code=%s order=%s qty=%s",
+                reason, side, code, order_no, qty)
 
     def _trim_open_buys(self, code: str):
         """미체결 매수 각 건에서 100주만 남기고 나머지를 부분취소한다.
@@ -4888,7 +4931,8 @@ class App:
             if v.screen.window() is win:
                 # 확대 창은 부모가 없어 창과 함께 숨지 않는다. 시세도 끊기므로 닫는다.
                 for popup in (*v.screen._bid_popups.values(),
-                              *v.screen._depth_popups.values()):
+                              *v.screen._depth_popups.values(),
+                              *v.screen._pnl_popups.values()):
                     popup.close()
                 for code in tuple(v.screen.model.exit_hotkeys):
                     self._global_hotkeys.unregister((id(v.screen), code))

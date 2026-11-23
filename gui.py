@@ -41,8 +41,8 @@ audit_log = logging.getLogger("trade.audit")
 # 새 컬럼은 반드시 맨 뒤에 붙인다. 저장된 폭·순서가 논리 인덱스 기준이라
 # 중간에 끼우면 사용자 layout.ini의 폭이 엉뚱한 컬럼에 붙는다. 원하는 자리는
 # 사용자가 헤더를 끌어 옮긴다(setSectionsMovable).
-COLUMNS = ["순위",  "변동",      "등락률", "연상", "종목명", "테마",   "현재가", "예상체결가", "주문",  "L일봉H", "예상등락률", "전일거래량", "거래량", "매도잔량", "매수잔량", "예상체결량", "대금/분",       "시총(억)", "상한가진입시간", "3단매도(만)", "자동취소",       "청산키",     "거래대금", "취소키"]
-FIELDS  = ["qrank", "qrank_chg", "rate",   "streak", "name", "theme", "price", "exp_price", "order", "bar",    "exp_rate",   "prev_vol", "vol",   "ask_qty",  "bid_qty",  "exp_qty",  "minute_value", "mcap",   "time",             "balance_sell", "auto_cancel_arm", "exit_hotkey", "acc_value", "cancel_hotkey"]
+COLUMNS = ["순위",  "변동",      "등락률", "연상", "종목명", "테마",   "현재가", "예상체결가", "주문",  "L일봉H", "예상등락률", "전일거래량", "거래량", "매도잔량", "매수잔량", "예상체결량", "대금/분",       "시총(억)", "상한가진입시간", "3단매도(만)", "자동취소",       "청산키",     "거래대금", "취소키", "손익"]
+FIELDS  = ["qrank", "qrank_chg", "rate",   "streak", "name", "theme", "price", "exp_price", "order", "bar",    "exp_rate",   "prev_vol", "vol",   "ask_qty",  "bid_qty",  "exp_qty",  "minute_value", "mcap",   "time",             "balance_sell", "auto_cancel_arm", "exit_hotkey", "acc_value", "cancel_hotkey", "pnl"]
 # 컬럼은 아니지만 L일봉H 그리기에 필요한 저장 필드 (시/저/고/전일종가/상한/하한)
 # streak(연상)/mcap(시가총액)은 저장 안 함: 매번 계산
 BOOK_FIELDS = {f"{side}_{kind}{level if level > 1 else ''}"
@@ -50,7 +50,7 @@ BOOK_FIELDS = {f"{side}_{kind}{level if level > 1 else ''}"
                for level in range(1, 11)}
 STORED = (set(FIELDS) - {
     "streak", "theme", "mcap", "order", "balance_sell",
-    "auto_cancel_arm", "exit_hotkey", "cancel_hotkey"}) | {
+    "auto_cancel_arm", "exit_hotkey", "cancel_hotkey", "pnl"}) | {
     "open", "low", "high", "base", "upper", "lower"} | BOOK_FIELDS
 BAR_COL = FIELDS.index("bar")
 RATE_COL = FIELDS.index("rate")
@@ -76,7 +76,23 @@ ORDER_COL = FIELDS.index("order")
 BALANCE_SELL_COL = FIELDS.index("balance_sell")
 AUTO_CANCEL_ARM_COL = FIELDS.index("auto_cancel_arm")
 EXIT_HOTKEY_COL = FIELDS.index("exit_hotkey")
-CANCEL_HOTKEY_COL = FIELDS.index("cancel_hotkey")  # 청산키 짝, 미체결 매수 전부 취소
+CANCEL_HOTKEY_COL = FIELDS.index("cancel_hotkey")  # 청산키 짝, 미체결 매수·매도 전부 취소
+PNL_COL = FIELDS.index("pnl")  # 보유 종목 실시간 평가손익(장부 평균단가 × 현재가)
+# 영웅문 실시간잔고 총손익 역산(2026-11-23): 수수료 0.015%(10원 미만 버림),
+# 매도 세금 0.20%(1원 미만 버림). 매수 증거금용 BUY_FEE_RATE와 다른 값이다.
+# 부동소수점 오차로 60.0이 59.99…가 돼 한 칸 덜 나오므로 백만분율 정수로 센다.
+PNL_FEE_PPM = 150     # 0.015%
+PNL_TAX_PPM = 2000    # 0.20%
+
+
+def pnl_detail_text(result: dict) -> str:
+    """손익 칸 툴팁·확대 창 툴팁에 쓰는 분해 내역."""
+    return (f"보유 {result['held']:,}주 · 평균단가 {result['average']:,.1f}원 · "
+            f"현재가 {result['price']:,}원\n"
+            f"평가손익 {result['gross']:+,}원 − 수수료 "
+            f"{result['buy_fee'] + result['sell_fee']:,}원 − 세금 {result['tax']:,}원\n"
+            f"= 순손익 {result['net']:+,}원 ({result['rate']:+.2f}%)\n"
+            "지금 팔았을 때 기준 · 앱 장부(체결 이벤트) 기준")
 BALANCE_SELL_MARKET_LAST_KEY = "balance_sell_market_last"
 BALANCE_SELL_STAGE_KEYS = ("first", "second", "third")
 BALANCE_SELL_STAGE_LAST_KEYS = tuple(
@@ -224,8 +240,19 @@ NO_NEWS_MARK_DARK = QColor("#FF6B6B")
 PRIORITY_THEMES = STRONG_EVENT_THEMES
 
 
+REASON_MARKS = {"T": "▶", "D": "▣"}  # 특징주 · 공시
+
+
+def _reason_prefix(reason) -> str:
+    """오른 이유가 있으면 테마 맨 앞에 붙일 글자. 없으면 빈 문자열."""
+    if not reason:
+        return ""
+    return f"{REASON_MARKS.get(reason[1], '▶')}{reason[0]} | "
+
+
 def _theme_cell_text(labels, news_themes, has_news: bool = True,
-                     separator: str = "·", fresh_themes=None) -> str:
+                     separator: str = "·", fresh_themes=None,
+                     reason=None) -> str:
     """테마 이름을 잇되 뉴스로 붙은 것에만 표식을 단다.
 
     색은 테마 묶음 구분에 이미 쓰고 있어 표식으로 나타낸다.
@@ -248,6 +275,9 @@ def _theme_cell_text(labels, news_themes, has_news: bool = True,
         else name
         for name in labels
     )
+    prefix = _reason_prefix(reason)
+    if prefix:
+        return prefix + text
     return text if has_news else NO_NEWS_MARK + text
 
 
@@ -968,7 +998,8 @@ class TieredProxy(QSortFilterProxyModel):
                     return _theme_cell_text(
                         [group[1], *(t for t in labels if t != group[1])],
                         model.news_themes.get(plain), plain in model.news_codes,
-                        fresh_themes=model.news_fresh_themes.get(plain))
+                        fresh_themes=model.news_fresh_themes.get(plain),
+                        reason=model.news_reasons.get(plain))
         if index.isValid() and FIELDS[index.column()] == "theme" and self.theme_mode:
             model = self.sourceModel()
             source_index = self.mapToSource(index)
@@ -988,7 +1019,8 @@ class TieredProxy(QSortFilterProxyModel):
                     return _theme_cell_text(
                         [name, *labels], model.news_themes.get(plain),
                         plain in model.news_codes,
-                        fresh_themes=model.news_fresh_themes.get(plain))
+                        fresh_themes=model.news_fresh_themes.get(plain),
+                        reason=model.news_reasons.get(plain))
                 if role == Qt.UserRole:
                     return name
                 if role == Qt.ForegroundRole:
@@ -1277,6 +1309,7 @@ class StockModel(QAbstractTableModel):
         # 뉴스로 붙은 테마와 오늘 재료 기사가 있는 종목. 표식에만 쓴다.
         self.news_themes: dict[str, tuple[str, ...]] = {}
         self.news_fresh_themes: dict[str, tuple[str, ...]] = {}
+        self.news_reasons: dict[str, tuple[str, str, str]] = {}
         self.news_codes: set[str] = set()
         self.relation_labels: dict[str, tuple[str, ...]] = {}
         self.relation_evidence: dict[str, tuple[str, ...]] = {}
@@ -1317,6 +1350,8 @@ class StockModel(QAbstractTableModel):
         self.exit_hotkeys: dict[str, tuple[int, str]] = {}
         # 청산키를 따라 main이 거는 짝 취소키 이름(F5~F8). 등록 실패면 "충돌".
         self.cancel_hotkeys: dict[str, str] = {}
+        # 종목코드 -> (보유수량, 매입금액). 앱 장부에서 밀어 준다. 손익 칸 전용.
+        self.positions: dict[str, tuple[int, int]] = {}
 
     # --- 웹소켓/전략 계층이 부르는 API ---------------------------------
     def add_stock(self, code: str, data: dict):
@@ -1437,6 +1472,44 @@ class StockModel(QAbstractTableModel):
             self.dataChanged.emit(
                 self.index(0, ORDER_COL),
                 self.index(len(self.codes) - 1, ORDER_COL))
+
+    def set_position(self, code: str, held: int, amount: int):
+        """보유 장부 값을 받아 손익 칸을 갱신한다. 보유가 0이면 칸을 비운다."""
+        held, amount = max(0, int(held or 0)), max(0, int(amount or 0))
+        new = (held, amount) if held > 0 else None
+        if self.positions.get(code) == new:
+            return
+        if new is None:
+            self.positions.pop(code, None)
+        else:
+            self.positions[code] = new
+        if code in self.rows:
+            cell = self.index(self.codes.index(code), PNL_COL)
+            self.dataChanged.emit(cell, cell)
+
+    def _pnl(self, code: str):
+        """지금 팔았을 때 손에 남는 순손익. 보유·매입금액·현재가 중 하나라도 없으면 None.
+
+        순손익 = 평가금액 − 매입금액 − 매수 수수료 − 매도 수수료 − 매도 세금.
+        수수료는 10원 미만, 세금은 1원 미만을 버린다. 영웅문 실시간잔고의
+        총손익이 이렇게 나온다(2026-11-23 역산: 총매입 220,000 · 총평가 219,750 →
+        수수료 30 + 30, 세금 439, 총손익 −749). 손익률은 순손익 ÷ 매입금액이다.
+        앱은 주문별이 아니라 보유 전체 금액으로 계산하므로 분할 체결이 많으면
+        영웅문과 몇십 원 어긋날 수 있다.
+        """
+        held, amount = self.positions.get(code, (0, 0))
+        price = int((self.rows.get(code) or {}).get("price") or 0)
+        if held <= 0 or amount <= 0 or price <= 0:
+            return None
+        value = price * held
+        buy_fee = amount * PNL_FEE_PPM // 1_000_000 // 10 * 10
+        sell_fee = value * PNL_FEE_PPM // 1_000_000 // 10 * 10
+        tax = value * PNL_TAX_PPM // 1_000_000
+        gross = value - amount
+        net = gross - buy_fee - sell_fee - tax
+        return {"held": held, "average": amount / held, "price": price,
+                "gross": gross, "net": net, "rate": net / amount * 100,
+                "buy_fee": buy_fee, "sell_fee": sell_fee, "tax": tax}
 
     def set_cancellable(self, code: str, on: bool):
         """미체결 매수가 있으면 주문 셀에 취소 영역을 그린다.
@@ -1728,6 +1801,8 @@ class StockModel(QAbstractTableModel):
                 cols.add(STREAK_COL)
             if f in ("price", "base"):  # 시가총액 의존
                 cols.add(MCAP_COL)
+            if f == "price" and code in self.positions:  # 보유 종목 실시간 손익
+                cols.add(PNL_COL)
         stored.update(fields)
         # 예상등락률은 예상체결가/전일종가에서 파생 (동시호가/VI 때만 값이 옴)
         if "exp_price" in fields or "base" in fields:
@@ -2059,8 +2134,11 @@ class StockModel(QAbstractTableModel):
             )
 
     def set_news_marks(self, news_themes: dict[str, tuple[str, ...]],
-                       news_codes: set[str], fresh_themes=None):
+                       news_codes: set[str], fresh_themes=None, reasons=None):
         """뉴스로 붙은 테마와 오늘 재료 기사가 있는 종목을 설정한다."""
+        self.news_reasons = {
+            str(code).removesuffix("_AL"): value
+            for code, value in (reasons or {}).items() if value}
         self.news_themes = {
             str(code).removesuffix("_AL"): tuple(names)
             for code, names in news_themes.items() if names
@@ -2109,7 +2187,8 @@ class StockModel(QAbstractTableModel):
             if FIELDS[section] == "rate":
                 return "등락률 · 셀 클릭=분석창 뉴스·종토방 바로 열기"
             if FIELDS[section] == "theme":
-                return "대표 테마 · ★ 대장과 현재 편입 종목수 · ◇ 단독 테마"
+                return ("대표 테마 · ★ 대장과 현재 편입 종목수 · ◇ 단독 테마 · "
+                        "맨 앞 ▶특징주 ▣공시 = 오늘 오른 이유")
             if FIELDS[section] == "streak":
                 return "연속 상한가 일수 · 셀 클릭=실시간 뉴스 감시 등록/해제"
             if FIELDS[section] == "minute_value":
@@ -2133,12 +2212,16 @@ class StockModel(QAbstractTableModel):
             if role == Qt.DisplayRole:
                 # 가진 테마를 모두 적는다. 대표만 적으면 오늘 재료가 안 보인다.
                 plain = code.removesuffix("_AL")
+                reason = self.news_reasons.get(plain)
                 if not themes:
-                    return "미분류" if plain in self.news_codes else "?미분류"
+                    return (_reason_prefix(reason) + "미분류" if reason
+                            else "미분류" if plain in self.news_codes
+                            else "?미분류")
                 return _theme_cell_text(
                     themes, self.news_themes.get(plain),
                     plain in self.news_codes,
-                    fresh_themes=self.news_fresh_themes.get(plain))
+                    fresh_themes=self.news_fresh_themes.get(plain),
+                    reason=reason)
             if role == Qt.UserRole:
                 return primary
             if role == Qt.ForegroundRole:
@@ -2156,6 +2239,10 @@ class StockModel(QAbstractTableModel):
                     return "테마 미분류"
                 plain = code.removesuffix("_AL")
                 lines = ["테마: " + " · ".join(themes)]
+                reason = self.news_reasons.get(plain)
+                if reason:
+                    lines.insert(0, f"{REASON_MARKS.get(reason[1], '▶')} "
+                                    f"{reason[2]}  (▶특징주 ▣공시)")
                 news = self.news_themes.get(plain)
                 if news:
                     lines.append(f"{NEWS_THEME_MARK} 최근 뉴스 재료: "
@@ -2229,6 +2316,27 @@ class StockModel(QAbstractTableModel):
                     "현재 잔량의 50%부터 3단 기준을 자동 제안합니다.\n"
                     "클릭하여 잔량매도 기준 설정")
             return None
+        if field == "pnl":
+            result = self._pnl(code)
+            if role == Qt.DisplayRole:
+                # 손익금이 먼저, 손익률은 그 뒤. 단타는 금액을 먼저 본다.
+                return (f"{result['net']:+,} {result['rate']:+.2f}%"
+                        if result else "")
+            if role == Qt.UserRole:
+                return float(result["net"]) if result else 0.0
+            if role == Qt.TextAlignmentRole:
+                return Qt.AlignRight | Qt.AlignVCenter
+            if role == Qt.ForegroundRole and result:
+                # 한국 관행: 수익 빨강, 손실 파랑.
+                return (QColor("#D32F2F") if result["net"] > 0
+                        else QColor("#1976D2") if result["net"] < 0 else None)
+            if role == Qt.FontRole and result:
+                font = QFont()
+                font.setBold(True)
+                return font
+            if role == Qt.ToolTipRole and result:
+                return pnl_detail_text(result) + "\n클릭하면 확대 창"
+            return None
         if field == "cancel_hotkey":
             label = self.cancel_hotkeys.get(code, "")
             if role in (Qt.DisplayRole, Qt.UserRole):
@@ -2236,7 +2344,7 @@ class StockModel(QAbstractTableModel):
             if role == Qt.TextAlignmentRole:
                 return Qt.AlignCenter
             if role == Qt.ToolTipRole:
-                return ("미체결 매수 전부 취소 · 보유는 팔지 않음\n"
+                return ("미체결 매수·매도 전부 취소 · 보유는 팔지 않음\n"
                         "청산키 F1·F3·F5·F7을 걸면 바로 옆 F2·F4·F6·F8이 같이 걸립니다\n"
                         "좌클릭: 걸려 있으면 해제, 비어 있으면 새 키 지정")
             if role == Qt.BackgroundRole and label:
@@ -3143,6 +3251,14 @@ class BidQtyPopup(QWidget):
         self._paint_timer.timeout.connect(self._refresh_text)
         self._drag_offset = None
         self._resize_from = None
+        self._press_global = QPoint()
+        self._system_drag = False
+        self._system_drag_failed = False
+        # OS가 옮긴 창은 마우스 놓음 이벤트가 안 와서, 이동·크기 변화를 모아 저장한다.
+        self._geo_timer = QTimer(self)
+        self._geo_timer.setSingleShot(True)
+        self._geo_timer.setInterval(400)
+        self._geo_timer.timeout.connect(self._save_geo)
         # 레이아웃 없이 라벨을 직접 채운다. 레이아웃을 쓰면 글자가 커질수록
         # 창 최소 크기가 따라 커져 다시 줄일 수 없다.
         self._label = (OutlinedLabel if self.OUTLINED_TEXT else QLabel)(self)
@@ -3291,6 +3407,13 @@ class BidQtyPopup(QWidget):
         super().resizeEvent(event)
         self._label.setGeometry(self.rect())
         self._refresh()
+        if self.isVisible():
+            self._geo_timer.start()
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        if self.isVisible():
+            self._geo_timer.start()
 
     def _in_grip(self, pos) -> bool:
         return (pos.x() >= self.width() - self.GRIP
@@ -3299,17 +3422,55 @@ class BidQtyPopup(QWidget):
     def mousePressEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton:
             return
+        self._press_global = event.globalPosition().toPoint()
+        self._system_drag = False
         if self._in_grip(event.position().toPoint()):
             self._resize_from = (event.globalPosition().toPoint(), self.size())
         else:
             self._drag_offset = (event.globalPosition().toPoint()
                                  - self.frameGeometry().topLeft())
 
+    def _start_system_drag(self, event) -> bool:
+        """충분히 끌린 순간 이동·크기 조절을 윈도우에 넘긴다. 넘겼으면 True.
+
+        마우스 이동 이벤트마다 `move()`를 부르면 메인 스레드가 시세 틱으로 바쁠 때
+        이벤트가 밀려 창이 끊기듯 따라온다(앱이 코어 하나의 90%를 쓸 때 확인).
+        OS가 직접 옮기면 앱이 바빠도 부드럽다. 클릭과 더블클릭(닫기)이 먹도록
+        몇 픽셀 끌리기 전에는 넘기지 않는다. 못 넘기면(지원 안 하는 플랫폼) False를
+        돌려줘 예전 방식으로 간다.
+        """
+        if self._system_drag_failed:
+            return False
+        delta = event.globalPosition().toPoint() - self._press_global
+        if abs(delta.x()) + abs(delta.y()) < 4:
+            return True  # 클릭인지 끌기인지 아직 모른다. 창은 그대로 둔다.
+        handle = self.windowHandle()
+        started = False
+        if handle is not None:
+            if self._resize_from is not None:
+                started = handle.startSystemResize(
+                    Qt.Edge.RightEdge | Qt.Edge.BottomEdge)
+            else:
+                started = handle.startSystemMove()
+        if not started:
+            self._system_drag_failed = True
+            return False
+        # OS가 마우스를 잡으므로 놓음 이벤트가 안 올 수 있다. 위치 저장은
+        # `_geo_timer`가 이동·크기 변화를 모아서 한다.
+        self._resize_from = self._drag_offset = None
+        self._system_drag = True
+        return True
+
     def mouseMoveEvent(self, event):
         point = event.position().toPoint()
         self.setCursor(
             Qt.CursorShape.SizeFDiagCursor if self._in_grip(point)
             else Qt.CursorShape.SizeAllCursor)
+        if (event.buttons() & Qt.MouseButton.LeftButton
+                and (self._resize_from is not None
+                     or self._drag_offset is not None)
+                and self._start_system_drag(event)):
+            return
         if self._resize_from is not None:
             origin, size = self._resize_from
             delta = event.globalPosition().toPoint() - origin
@@ -3356,6 +3517,92 @@ class BidQtyPopup(QWidget):
         self._save_geo()
         getattr(self._screen, self.POPUPS_ATTR).pop(self.code, None)
         super().closeEvent(event)
+
+
+class PnlPopup(BidQtyPopup):
+    """보유 종목의 실시간 순손익을 크게 띄우는 창. 손익 칸을 누르면 뜬다.
+
+    조회가 없다. 장부(체결 이벤트)와 체결 틱으로 이미 계산되는 값을
+    `StockModel._pnl`에서 받아 그린다. 조작은 매수잔량 확대 창과 같다 — 드래그,
+    우하단 크기 조절, 휠 투명도, 더블클릭 닫기, 조건 이탈 시 자동 닫기.
+    """
+
+    POPUPS_ATTR = "_pnl_popups"
+    KEY_PREFIX = "pnl_popup_"
+    WIN = QColor("#FF6B6B")     # 수익 빨강(한국 관행)
+    LOSE = QColor("#5DA8FF")    # 손실 파랑
+    FLAT = "#C9A968"
+
+    def __init__(self, screen, code: str, name: str, restore: bool = False):
+        self._rate_text = ""
+        self._net_text = "—"
+        self._foot_text = "보유 없음"
+        self._color = self.FLAT
+        self._detail = ""
+        super().__init__(screen, code, name, restore)
+        self.setMinimumSize(160, 84)
+        if self.height() < 84:
+            self.resize(max(self.width(), 240), 110)
+
+    def set_pnl(self, result):
+        """`StockModel._pnl` 결과(없으면 None)를 받아 다시 그린다. 같으면 건너뛴다."""
+        if result is None:
+            state = ("", "—", "보유 없음", self.FLAT, "")
+        else:
+            color = (self.WIN.name() if result["net"] > 0
+                     else self.LOSE.name() if result["net"] < 0 else self.FLAT)
+            state = (f"{result['rate']:+.2f}%", f"{result['net']:+,}원",
+                     f"{result['held']:,}주 · 평균 {result['average']:,.0f}",
+                     color, pnl_detail_text(result))
+        current = (self._rate_text, self._net_text, self._foot_text,
+                   self._color, self._detail)
+        if state == current:
+            return
+        (self._rate_text, self._net_text, self._foot_text,
+         self._color, self._detail) = state
+        self.setToolTip(self._tip())
+        if not self._paint_timer.isActive():
+            self._paint_timer.start()
+
+    def _tip(self) -> str:
+        return (f"{self._name} 실시간 순손익 (수수료·세금 반영)\n"
+                + (self._detail + "\n" if self._detail else "")
+                + f"배경 불투명도 {self._alpha * 100 // 255}% (휠로 조절)\n"
+                "끌어서 이동 · 우하단 모서리로 크기 조절\n"
+                "더블클릭하면 닫습니다.")
+
+    def _refresh(self):
+        super()._refresh()
+        self.setToolTip(self._tip())
+
+    def _refresh_text(self):
+        big = max(12, int(self.height() * 0.30))
+        font = QFont(self._label.font())
+        available = max(1, self.width() - 20)
+
+        def fit(size: int, text: str) -> int:
+            while size > 8:
+                font.setPixelSize(size)
+                if QFontMetrics(font).horizontalAdvance(text) <= available:
+                    break
+                size -= 1
+            return size
+
+        # 손익금이 가장 크고 그 아래에 손익률이다. 단타는 금액을 먼저 본다.
+        big = fit(big, self._net_text)
+        mid = fit(max(8, int(big * 0.62)), self._rate_text or "0")
+        small = max(8, int(big * 0.30))
+        foot = fit(max(8, int(big * 0.34)), self._foot_text)
+        html = (
+            f"<div style='font-size:{small}px; font-weight:700; color:#C9A968;'>"
+            f"{self._name}</div>"
+            f"<div style='font-size:{big}px; font-weight:900; color:{self._color};'>"
+            f"{self._net_text}</div>"
+            f"<div style='font-size:{mid}px; font-weight:800; color:{self._color};'>"
+            f"{self._rate_text or '&nbsp;'}</div>"
+            f"<div style='font-size:{foot}px; font-weight:700; color:#9FB3C8;'>"
+            f"{self._foot_text}</div>")
+        self._label.setText(html)
 
 
 class DepthPopup(BidQtyPopup):
@@ -3598,6 +3845,7 @@ class ConditionScreen(QWidget):
         self.model = StockModel()
         self._bid_popups: dict[str, BidQtyPopup] = {}
         self._depth_popups: dict[str, DepthPopup] = {}
+        self._pnl_popups: dict[str, PnlPopup] = {}
 
         # 툴바: 조건목록 새로고침 / 조건식 선택 / 등록 토글 / 이탈삭제 / 종목수
         self.reload_btn = QPushButton()  # 조건 목록(CNSRLST) 새로 받기: 영웅문서 조건 추가/수정 시
@@ -4046,8 +4294,10 @@ class ConditionScreen(QWidget):
         self.model.rowsRemoved.connect(self._on_data_changed)
         self.model.rowsRemoved.connect(self._close_orphan_bid_popups)
         self.model.rowsRemoved.connect(self._close_orphan_depth_popups)
+        self.model.rowsRemoved.connect(self._close_orphan_pnl_popups)
+        self.model.dataChanged.connect(self._on_pnl_data_changed)
         self._popup_restore = {cls: cls.saved_open(self)
-                               for cls in (BidQtyPopup, DepthPopup)}
+                               for cls in (BidQtyPopup, DepthPopup, PnlPopup)}
         # 행이 들어온 뒤 이름·시세가 채워지므로 한 박자 늦게 띄운다.
         self.model.rowsInserted.connect(
             lambda *_: QTimer.singleShot(0, self._restore_popups))
@@ -4088,6 +4338,7 @@ class ConditionScreen(QWidget):
         self.table.setColumnWidth(AUTO_CANCEL_ARM_COL, 62)
         self.table.setColumnWidth(EXIT_HOTKEY_COL, 56)
         self.table.setColumnWidth(CANCEL_HOTKEY_COL, 48)
+        self.table.setColumnWidth(PNL_COL, 128)
         self.table.setColumnWidth(BAR_COL, 70)
         self.table.setColumnWidth(MINUTE_VALUE_COL, 72)
         self.table.setColumnWidth(ACC_VALUE_COL, 72)
@@ -4226,6 +4477,7 @@ class ConditionScreen(QWidget):
         amount는 보유분의 체결(매입)금액이다. 0이면 생략한다."""
         # 취소 영역은 선택 종목이 아니어도 그려야 하므로 먼저 반영한다.
         self.model.set_cancellable(code, buy[0] > 0)
+        self.model.set_position(code, position[0], amount)
         if not buy[0] and self.model.order_status.get(code) == "취소전송":
             # 계좌 취소는 '취소전송'에서 멈춘다. 거래소 확인은 웹소켓이 장부를
             # 비우는 것으로만 오므로, 미체결이 0이 되는 순간을 완료로 읽는다.
@@ -5205,6 +5457,11 @@ class ConditionScreen(QWidget):
             self._open_bid_popup(code)
         elif index.column() == ASK_QTY_COL:
             self._open_depth_popup(code)
+        elif index.column() == PNL_COL:
+            if code in self._pnl_popups or code in self.model.positions:
+                self._open_pnl_popup(code)
+            else:
+                QToolTip.showText(QCursor.pos(), f"{code}: 보유 종목이 아닙니다")
         elif index.column() == NAME_COL:
             QApplication.clipboard().setText(code)
             QToolTip.showText(QCursor.pos(), f"{code} 복사됨")
@@ -5280,6 +5537,39 @@ class ConditionScreen(QWidget):
                 popup.close()
         DepthPopup.remember_open(self)
 
+    def _open_pnl_popup(self, code: str, restore: bool = False):
+        """손익 칸 클릭 -> 종목별 실시간 순손익 확대 창. 떠 있으면 앞으로 올린다.
+
+        갱신은 체결 틱이 바꾸는 손익 칸의 `dataChanged`가 한다. 조회는 하지 않는다.
+        """
+        popup = self._pnl_popups.get(code)
+        if popup is not None:
+            popup.raise_()
+            return
+        stored = self.model.rows.get(code, {})
+        popup = PnlPopup(self, code, str(stored.get("name") or code), restore)
+        popup.set_pnl(self.model._pnl(code))
+        self._pnl_popups[code] = popup
+        popup.show()
+        PnlPopup.remember_open(self)
+
+    def _close_orphan_pnl_popups(self, *_):
+        """조건 이탈로 행이 사라진 종목은 손익 창도 닫는다."""
+        for code, popup in list(self._pnl_popups.items()):
+            if code not in self.model.rows:
+                popup.close()
+        PnlPopup.remember_open(self)
+
+    def _on_pnl_data_changed(self, top, bottom, *_):
+        """손익 칸이 바뀐 행의 확대 창을 다시 그린다. 값이 같으면 창이 건너뛴다."""
+        if not self._pnl_popups or not (
+                top.column() <= PNL_COL <= bottom.column()):
+            return
+        for code, popup in list(self._pnl_popups.items()):
+            if code in self.model.rows and (
+                    top.row() <= self.model.codes.index(code) <= bottom.row()):
+                popup.set_pnl(self.model._pnl(code))
+
     def _restore_popups(self):
         """지난 실행에 떠 있던 확대 창을 그 종목 행이 생기면 다시 띄운다.
 
@@ -5287,7 +5577,8 @@ class ConditionScreen(QWidget):
         기다렸다가 편입되는 순간 띄운다.
         """
         for cls, opener in ((BidQtyPopup, self._open_bid_popup),
-                            (DepthPopup, self._open_depth_popup)):
+                            (DepthPopup, self._open_depth_popup),
+                            (PnlPopup, self._open_pnl_popup)):
             pending = self._popup_restore[cls]
             for code in [c for c in pending if c in self.model.rows]:
                 pending.discard(code)
@@ -5570,7 +5861,14 @@ class ConditionScreen(QWidget):
             news_themes = {}
             fresh_themes = {}
             news_codes = set()
-        self.model.set_news_marks(news_themes, news_codes, fresh_themes)
+        try:
+            from analysis_db import limit_up_reasons
+            from ui.realtime_news_tab import is_material_disclosure
+            reasons = limit_up_reasons(is_material=is_material_disclosure)
+        except Exception as error:  # noqa: BLE001
+            log.warning("limit-up reasons unavailable: %s", error)
+            reasons = {}
+        self.model.set_news_marks(news_themes, news_codes, fresh_themes, reasons)
         self.model.set_theme_labels(labels)
         self.model.set_relation_groups(relation_groups)
         self.model.set_relation_evidence(relation_evidence)
@@ -5698,7 +5996,8 @@ class ConditionScreen(QWidget):
         # 편입 조회 틱으로 나중에 오므로 그때 바꿔 단다.
         if "name" in fields:
             name = str(self.model.rows.get(code, {}).get("name") or "")
-            for popups in (self._bid_popups, self._depth_popups):
+            for popups in (self._bid_popups, self._depth_popups,
+                           self._pnl_popups):
                 popup = popups.get(code)
                 if popup is not None and name and popup._name != name:
                     popup._name = name

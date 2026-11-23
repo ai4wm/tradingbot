@@ -4193,6 +4193,102 @@ def codes_with_individual_news(trade_date: str = "",
     return codes
 
 
+_MOVE_RE = re.compile(
+    r"\s*(?:에\s*)?(?:장\s*초반\s*)?['‘]?"
+    r"(?:상한가|이틀째|사흘째|\d+(?:\.\d+)?%|급등|강세|상승|↑)")
+_DOWN_RE = re.compile(r"하락|급락|폭락|약세|밀렸|내림|↓")
+_UP_RE = re.compile(r"상한가|급등|강세|상승|↑")
+REASON_MAX_CHARS = 40
+
+
+def extract_move_reason(title: str, name: str) -> str:
+    """「~에 상한가·급등」 제목에서 이유 절만 잘라 낸다. 못 잘라 내면 빈 문자열.
+
+    이유는 종목명 뒤(`[특징주] 휴림로봇, 삼성전기 로봇 공급 본계약 체결에 23%↑`)나
+    앞(`림카토 건보 적용 소식에…큐로셀 ‘상한가’`)에 온다. 앞에 길게 있으면 그것이
+    이유고, 아니면 이름 뒤에서 움직임 말(상한가·급등·%)이 나오기 전까지다.
+    움직임 말만 있으면(`큐로셀, 장 초반 상한가`) 이유가 없다.
+    """
+    text = re.sub(r"\[[^\]]*\]", "", str(title or "")).strip()
+    at = text.find(name) if name else -1
+    if at < 0:
+        return ""
+    before = " ".join(part.strip(" ,·'‘’") for part in text[:at].split("…")
+                      if part.strip(" ,·'‘’"))
+    if len(before) >= 6:
+        reason = before
+    else:
+        after = re.sub(r"^[\s,·()'‘’]+", "", text[at + len(name):])
+        after = after.split("…")[0]
+        found = _MOVE_RE.search(after)
+        if found:
+            after = after[:found.start()]
+            if len(after.strip(" ,·'‘’")) <= 3:
+                return ""
+        reason = after
+    reason = re.sub(r"에$", "", reason.strip(" ,·'‘’"))
+    return reason[:REASON_MAX_CHARS]
+
+
+def limit_up_reasons(trade_date: str = "", db_path: Path = DB_PATH,
+                     is_material=None) -> dict[str, tuple[str, str, str]]:
+    """그날 오른 종목의 이유를 종목코드별로 (이유, 종류, 원제목)으로 돌려준다.
+
+    종류는 `T` 특징주 제목, `D` 재료급 공시다. 특징주 제목은 종목이 움직였다는
+    말과 이유를 한 문장에 담는다. 같은 종류면 가장 늦은 기사를 쓴다. 관련
+    종목코드가 여러 개 붙은 테마 기사도 제목에 그 종목명이 있는 종목만 이유를
+    받는다. 하락 기사는 뺀다(왜 올랐는지가 목적이다). 못 찾으면 키가 없다 —
+    틀린 이유를 붙이느니 비워 둔다.
+
+    일반 기사 제목(「~에 상한가·급등」)은 쓰지 않는다. 2026-11-23에 넣어 보니
+    「코스닥 7.7% 급락에도」·「목표가 ↓」·「지분 ↑」가 이유로 잘렸다. 10/1~11/5
+    상한가 168건 중 특징주 24%, 일반 제목까지 49%, 공시까지 65%였는데, 그 25%p는
+    이 정확도를 못 지켰다.
+    `is_material(source, title)`가 있으면 재료급 공시만 `D`로 쓴다.
+    """
+    if not db_path.exists():
+        return {}
+    day = trade_date or datetime.now().strftime("%Y%m%d")
+    rank = {"T": 2, "D": 1}
+    result: dict[str, tuple[str, str, str]] = {}
+    with closing(connect(db_path)) as connection:
+        names = {str(row[0]): str(row[1] or "") for row in connection.execute(
+            "SELECT stock_code, stock_name FROM stocks")}
+        for row in connection.execute(
+                """SELECT source_name, stock_code, related_stock_codes, title
+                     FROM ls_realtime_news WHERE news_date=?
+                    ORDER BY published_at, news_key""", (day,)).fetchall():
+            title = str(row["title"] or "")
+            source = str(row["source_name"] or "")
+            found = list(dict.fromkeys(
+                split_ls_news_stock_codes(row["stock_code"])
+                + split_ls_news_stock_codes(row["related_stock_codes"])))
+            if not found:
+                continue
+            if "[특징주]" in title:
+                kind = "T"
+            elif source == "한국거래소":
+                # 공시는 한 종목 것이다. 종목명이 제목에 있는지로 못 거른다.
+                kind = ("D" if is_material and is_material(source, title)
+                        and len(found) <= NEWS_THEME_MAX_CODES else "")
+            else:  # 일반 기사(「~에 상한가」)는 이유 절이 틀릴 때가 많아 쓰지 않는다
+                kind = ""
+            if not kind or (_DOWN_RE.search(title) and not _UP_RE.search(title)):
+                continue
+            for code in found:
+                name = names.get(code, "")
+                if kind == "D":  # 「(주)대우건설 단일판매ㆍ공급계약체결」: 회사명 한 덩어리를 뗀다
+                    reason = re.sub(r"^(?:\(주\)\s*)?\S+\s+(?:주식회사\s+)?", "", title)
+                elif len(name) >= 3:  # 두 글자 이름은 다른 말에 묻어 나온다
+                    reason = extract_move_reason(title, name)
+                else:
+                    reason = ""
+                if reason and rank[kind] >= rank.get(
+                        result.get(code, ("", "", ""))[1], 0):
+                    result[code] = (reason[:REASON_MAX_CHARS], kind, title)
+    return result
+
+
 # 시간외 단일가 상한 기사. 인포스탁이 17:55쯤 보낸다. 제목이 종목명으로
 # 시작해 따옴표 친 '상한가'로 끝난다. [시간외Y] 머리표는 붙을 때도 있고
 # 빠질 때도 있어(8/5 유니켐) 머리표 대신 끝맺음으로 가른다.

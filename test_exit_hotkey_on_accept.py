@@ -120,6 +120,8 @@ def demo_cancel_key():
                                      "A3": (0, "KRX")}},
         views=[],
         _cancel_order=lambda code: fallback.append(code))
+    app._cancel_open_sells = lambda code, reason: (0, 0)
+    app._show_cancel_sent = lambda *a: None
     app._pending_open_buys = lambda code: main.App._pending_open_buys(app, code)
     app._cancel_open_buys_now = lambda code, orders, reason, cap=9: (
         sent.append((code, sorted(orders), reason, cap)) or [])
@@ -130,6 +132,51 @@ def demo_cancel_key():
     main.App._cancel_key_pressed(app, "000660", "F6")
     assert fallback == ["000660"], fallback
     print("ok (취소키: 미체결 매수 전부 취소)")
+    demo_cancel_sells()
+
+
+def demo_cancel_sells():
+    """취소키는 미체결 매도도 거둔다. 2026-11-23 매도 297주가 걸려 있었는데 매수가 없어
+    F2를 다섯 번 눌러도 `orders=0`으로 아무것도 안 나갔다."""
+    import asyncio
+    import types
+    sent, fallback, shown = [], [], []
+
+    async def cancel_order(code, order_no, qty, exchange):
+        sent.append((code, order_no, qty, exchange))
+
+    app = types.SimpleNamespace(
+        _open_buy_orders={}, views=[], _cancel_sent_orders=set(),
+        _open_sell_orders={"005930": {"S1": (297, "KRX"), "S2": (0, "KRX")}},
+        rest=types.SimpleNamespace(cancel_order=cancel_order),
+        _cancel_order=lambda code: fallback.append(code))
+    app._pending_open_buys = lambda code: main.App._pending_open_buys(app, code)
+    app._cancel_open_sells = lambda code, reason: main.App._cancel_open_sells(app, code, reason)
+    app._cancel_one_open_buy = (
+        lambda *a, **k: main.App._cancel_one_open_buy(app, *a, **k))
+    app._show_cancel_sent = lambda *a: shown.append(a)
+    app._cancel_open_buys_now = lambda code, orders, reason, cap=9: (
+        sent.extend((code, o[0], 0, o[2]) for o in orders) or [])
+
+    async def press():
+        main.App._cancel_key_pressed(app, "005930", "F2")
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    asyncio.run(press())                      # 매도만: 잔량 있는 한 건만, 매수 조회 길은 안 탄다
+    assert sent == [("005930", "S1", 0, "KRX")], sent
+    assert fallback == [] and shown and shown[0][4:] == (1, 297), (fallback, shown)
+    asyncio.run(press())                      # 다시 눌러도 같은 주문을 또 취소하지 않는다
+    assert len(sent) == 1, sent
+    assert fallback == ["005930"], fallback   # 보낼 것이 없으면 예전 길(계좌 조회)
+
+    app._open_buy_orders = {"005930": {"B1": (50, "KRX")}}   # 매수·매도 함께
+    app._open_sell_orders = {"005930": {"S3": (100, "KRX")}}
+    sent.clear(); shown.clear()
+    asyncio.run(press())
+    assert ("005930", "S3", 0, "KRX") in sent and ("005930", "B1", 0, "KRX") in sent, sent
+    assert shown[-1][2:] == (1, 50, 1, 100), shown
+    print("ok (취소키: 미체결 매도도 취소, 중복 전송 없음)")
 
 
 if __name__ == "__main__":
