@@ -3151,6 +3151,14 @@ class App:
                         position["amount"] * position["held"] // before_held)
                 if position["held"] <= 0:
                     self._clear_spent_balance_sell(code)
+                    # 3단매도 없이 영웅문에서 판 종목은 위 관문(걸린 설정·단계
+                    # 소진)에 막혀 청산·취소키가 남는다. 다 팔고 미체결도 없으면
+                    # 푼다. 청산 중인 종목은 `_clear_after_emergency`가 맡는다.
+                    if (self._position_book_primed
+                            and not self._pending_open_buys(code)
+                            and not self._open_sell_orders.get(code)
+                            and code not in self._emergency_locked):
+                        self._clear_exit_hotkey(code)
         if code in self._emergency_locked:
             # 청산 매도가 체결돼 비었을 때도 뒤처리가 돌아야 한다.
             self._clear_after_emergency(code)

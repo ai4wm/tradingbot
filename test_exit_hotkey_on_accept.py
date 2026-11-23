@@ -8,6 +8,8 @@ import main
 
 class _App:
     _track_open_buy = main.App._track_open_buy
+    _track_open_sell = main.App._track_open_sell
+    _pending_open_buys = main.App._pending_open_buys
     _track_order_book = main.App._track_order_book
 
     def __init__(self, held=0):
@@ -17,6 +19,10 @@ class _App:
         self._emergency_locked = set()
         self._order_cancelled, self._cancel_sent_orders = {}, set()
         self.calls = []
+        self._sell_accepts = {}
+
+    def _clear_spent_balance_sell(self, code):
+        pass
 
     def _new_fill_qty(self, order_no, event):
         return int(event.get("fill_qty") or 0)
@@ -75,6 +81,34 @@ def demo():
     assert app.calls == ["assign"], app.calls
     print("ok (영웅문 접수 시 청산키, 빈 키 해제)")
     demo_cancel_key()
+    demo_sold_outside()
+
+
+def demo_sold_outside():
+    """영웅문에서 다 팔면(3단매도 없이) 청산·취소키가 풀린다. 남은 게 있으면 안 푼다."""
+    def sell(app, qty, remaining=0):
+        app._track_open_sell("005930", "S1", {
+            "status": "체결", "original_order_no": "0000000",
+            "order_qty": qty, "remaining_qty": remaining, "fill_qty": qty})
+
+    app = _App(held=100)
+    sell(app, 100)
+    assert app.calls == ["clear"], app.calls
+
+    app = _App(held=100)                       # 일부만 팔았다
+    sell(app, 40, remaining=0)
+    assert app.calls == [], app.calls
+
+    app = _App(held=100)                       # 들어올 매수가 남았다
+    app._open_buy_orders["005930"] = {"B1": (50, "KRX")}
+    sell(app, 100)
+    assert app.calls == [], app.calls
+
+    app = _App(held=100)                       # 장부를 못 세웠다
+    app._position_book_primed = False
+    sell(app, 100)
+    assert app.calls == [], app.calls
+    print("ok (영웅문 전량 매도 시 청산·취소키 해제)")
 
 
 def demo_cancel_key():
