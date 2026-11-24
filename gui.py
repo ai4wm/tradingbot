@@ -2282,8 +2282,10 @@ class StockModel(QAbstractTableModel):
                         if int(setting.get(key, 0)) > 0)
                 bid = max(0, int(stored.get("bid_qty") or 0))
                 if bid:
-                    first, _, _ = _balance_sell_suggestion(bid)
-                    return _shares_in_ten_thousands(first)
+                    return " / ".join(
+                        _shares_in_ten_thousands(value)
+                        for value in _balance_sell_suggestion(bid)
+                        if value > 0)
                 return "설정"
             if role == Qt.UserRole:
                 return setting["first"] if setting else 0
@@ -2830,7 +2832,8 @@ class BalanceSellDialog(QDialog):
         self._manual_edit = self.config is not None
         name = screen.model.rows.get(code, {}).get("name") or code
         self.setWindowTitle(f"3단 잔량매도 설정 — {name}")
-        self.setModal(True)
+        # 비모달: 떠 있는 동안 다른 창(주문·취소·확대 창)을 그대로 쓴다.
+        self.setModal(False)
         self.setMinimumWidth(430)
 
         self.applied_label = QLabel()
@@ -2927,7 +2930,7 @@ class BalanceSellDialog(QDialog):
 
         self.apply_btn = QPushButton("설정 적용  Enter")
         cancel_btn = QPushButton("취소  Esc")
-        off_btn = QPushButton("감시 해제")
+        off_btn = self.off_btn = QPushButton("감시 해제")
         rebase_btn = QPushButton("현재 잔량으로 다시 계산")
         rebase_btn.setToolTip(
             "현재 매수잔량으로 3단 기준 숫자만 다시 잡습니다."
@@ -3109,9 +3112,33 @@ class BalanceSellDialog(QDialog):
         self.apply_btn.setFocus()
 
     def _refresh_live(self):
+        # 떠 있는 동안 다른 곳(주문 때 자동 설정, 15:33 해제, 다 팔아 해제)이 설정을
+        # 바꾸면 '현재 적용값'과 해제 버튼이 옛것이 된다. 편집 중인 값은 건드리지 않는다.
+        current = self.screen.model.balance_sell_settings.get(self.code)
+        if current != self.config:
+            self.config = current
+            self._refresh_applied()
         if not self._manual_edit and self.config is None:
             self._refresh_suggestion()
         self._refresh_amounts()
+
+    def _refresh_applied(self):
+        self.off_btn.setEnabled(self.config is not None)
+        if self.config is None:
+            self.applied_label.setText("없음 — 실제 주문은 실행되지 않습니다")
+            return
+        combo = self.first_sell_combo
+        self.applied_label.setText(
+            ("하한가 · " if self.config.get("market_sell", False)
+             else "지정가 · ")
+            + " / ".join(
+                f"{_compact_shares(self.config[key])}↓ "
+                f"{combo.itemText(max(0, combo.findData(float(self.config.get(ratio_key, default)))))}"
+                if int(self.config.get(key, 0)) > 0 else f"{label}번 제외"
+                for key, label, ratio_key, default in zip(
+                    BALANCE_SELL_STAGE_KEYS, ("1", "2", "3"),
+                    ("first_ratio", "second_ratio", "third_ratio"),
+                    (0.0, .50, 1.0))))
 
     def _refresh_amounts(self):
         """기준 수량과 현재 잔량 옆에 상한가 기준 금액(억)을 붙인다."""
@@ -3878,6 +3905,7 @@ class ConditionScreen(QWidget):
         self._bid_popups: dict[str, BidQtyPopup] = {}
         self._depth_popups: dict[str, DepthPopup] = {}
         self._pnl_popups: dict[str, PnlPopup] = {}
+        self._balance_dialogs: dict[str, BalanceSellDialog] = {}
 
         # 툴바: 조건목록 새로고침 / 조건식 선택 / 등록 토글 / 이탈삭제 / 종목수
         self.reload_btn = QPushButton()  # 조건 목록(CNSRLST) 새로 받기: 영웅문서 조건 추가/수정 시
@@ -5421,7 +5449,17 @@ class ConditionScreen(QWidget):
             self._select_order_target(code)
         elif index.column() == BALANCE_SELL_COL:
             self._acknowledge_balance_alert(code)
+            open_dialog = self._balance_dialogs.get(code)
+            if open_dialog is not None:
+                # 이미 떠 있으면 새로 만들지 않고 앞으로 가져온다.
+                open_dialog.raise_()
+                open_dialog.activateWindow()
+                return
             dialog = BalanceSellDialog(self, code, self)
+            dialog.setAttribute(Qt.WA_DeleteOnClose)
+            self._balance_dialogs[code] = dialog
+            dialog.finished.connect(
+                lambda *_: self._balance_dialogs.pop(code, None))
             dialog.adjustSize()
             # 네이티브 창을 생성해야 Windows 제목 표시줄까지 포함한 실제
             # 프레임 크기를 얻을 수 있다. 표시 전이라 화면에는 나타나지 않는다.
@@ -5454,7 +5492,7 @@ class ConditionScreen(QWidget):
                     available.bottom() - frame_height - gap + 1,
                 )
             dialog.move(target_x, target_y)
-            dialog.exec()
+            dialog.show()
         elif index.column() == AUTO_CANCEL_ARM_COL:
             armed = code not in self.model.account_auto_cancel_armed
             self.account_auto_cancel_changed.emit(code, armed)
